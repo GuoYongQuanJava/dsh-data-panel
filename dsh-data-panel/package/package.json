@@ -1,7 +1,7 @@
 {
   "name": "dsh-data-panel",
-  "version": "0.1.0",
-  "description": "A CRUD data panel for DeepSeek Harness: a conversation-view tab with a record table and a right-sidebar record detail.",
+  "version": "0.2.0",
+  "description": "A test-case panel for DeepSeek Harness: a conversation-view tab with a case table (标识 / 名称 / 类型 / 说明 / 输入 / 预期输出) and a right-sidebar case detail.",
   "type": "module",
   "main": "lib/index.js",
   "exports": {

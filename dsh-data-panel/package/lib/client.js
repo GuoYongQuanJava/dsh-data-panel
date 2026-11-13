@@ -81,7 +81,7 @@ window.__ModuleLoader__.load({
 .dp-alert button { margin-left: auto; padding: 0; border: 0; background: none; color: inherit; font: inherit; font-size: 12px; font-weight: 500; cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
 .dp-card { overflow: hidden; border: 1px solid var(--dp-border); border-radius: 14px; background: var(--dp-bg); }
 .dp-card-scroll { overflow-x: auto; }
-.dp-table { width: 100%; min-width: 760px; border-collapse: collapse; table-layout: fixed; }
+.dp-table { width: 100%; min-width: 1120px; border-collapse: collapse; table-layout: fixed; }
 .dp-table th { padding: 10px 14px; border-bottom: 1px solid var(--dp-border); background: var(--dp-bg2); color: var(--dp-text3); font-size: 11px; font-weight: 600; letter-spacing: .02em; text-align: left; white-space: nowrap; }
 .dp-table th.dp-right { text-align: right; }
 .dp-table td { padding: 11px 14px; border-bottom: 1px solid var(--dp-border2); vertical-align: middle; }
@@ -102,6 +102,13 @@ window.__ModuleLoader__.load({
 .dp-pill[data-tone="done"] { background: color-mix(in srgb, var(--dp-success) 10%, transparent); color: var(--dp-success); }
 .dp-pill[data-tone="blocked"] { background: color-mix(in srgb, var(--dp-danger) 10%, transparent); color: var(--dp-danger); }
 .dp-chip { display: inline-block; max-width: 100%; overflow: hidden; padding: 1px 8px; border: 1px solid var(--dp-border); border-radius: 6px; color: var(--dp-text2); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.dp-case-id { display: block; overflow: hidden; color: var(--dp-text2); font-family: ui-monospace, SFMono-Regular, "Cascadia Code", Consolas, monospace; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.dp-cell-text { display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 2; margin: 0; color: var(--dp-text2); font-size: 12px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
+.dp-cell-text.empty { color: var(--dp-text3); }
+.dp-type { display: inline-block; padding: 1px 8px; border: 1px solid color-mix(in srgb, var(--dp-brand) 34%, transparent); border-radius: 6px; background: color-mix(in srgb, var(--dp-brand) 5%, transparent); color: var(--dp-brand); font-size: 12px; line-height: 18px; white-space: nowrap; }
+.dp-type[data-tone="perf"] { border-color: color-mix(in srgb, var(--dp-warning) 36%, transparent); background: color-mix(in srgb, var(--dp-warning) 7%, transparent); color: var(--dp-warning); }
+.dp-type[data-tone="exception"] { border-color: color-mix(in srgb, var(--dp-danger) 34%, transparent); background: color-mix(in srgb, var(--dp-danger) 6%, transparent); color: var(--dp-danger); }
+.dp-type[data-tone="compat"] { border-color: var(--dp-border); background: var(--dp-bg2); color: var(--dp-text2); }
 .dp-owner { color: var(--dp-text2); }
 .dp-time { color: var(--dp-text3); font-size: 12px; white-space: nowrap; }
 .dp-actions { display: flex; justify-content: flex-end; gap: 2px; opacity: 0; transition: opacity .12s; }
@@ -139,6 +146,8 @@ window.__ModuleLoader__.load({
 .dp-input, .dp-select { height: 36px; padding: 0 10px; }
 .dp-textarea { min-height: 64px; padding: 8px 10px; line-height: 1.55; resize: vertical; }
 .dp-input:focus, .dp-select:focus, .dp-textarea:focus { border-color: var(--dp-brand); box-shadow: 0 0 0 3px color-mix(in srgb, var(--dp-brand) 13%, transparent); }
+.dp-input-mono, .dp-textarea.mono { font-family: ui-monospace, SFMono-Regular, "Cascadia Code", Consolas, monospace; font-size: 12px; }
+.dp-chip-mono { font-family: ui-monospace, SFMono-Regular, "Cascadia Code", Consolas, monospace; font-size: 11px; }
 .dp-input::placeholder, .dp-textarea::placeholder { color: var(--dp-text3); }
 .dp-form .dp-alert { grid-column: 1 / -1; margin: 0; }
 .dp-detail { height: 100%; overflow: auto; padding: 18px 18px 40px; background: var(--dp-bg); color: var(--dp-text); font-size: 13px; }
@@ -183,18 +192,14 @@ window.__ModuleLoader__.load({
 		//#endregion
 
 		//#region helpers
-		var STATUS_META = {
-			todo: { label: "待开始", tone: "muted" },
-			doing: { label: "进行中", tone: "doing" },
-			done: { label: "已完成", tone: "done" },
-			blocked: { label: "受阻", tone: "blocked" }
+		var TEST_TYPES = {
+			functional: { label: "功能测试", tone: "func" },
+			boundary: { label: "边界测试", tone: "boundary" },
+			performance: { label: "性能测试", tone: "perf" },
+			exception: { label: "异常测试", tone: "exception" },
+			compat: { label: "兼容性测试", tone: "compat" }
 		};
-		var PRIORITY_META = {
-			high: { label: "高", tone: "high" },
-			medium: { label: "中", tone: "medium" },
-			low: { label: "低", tone: "low" }
-		};
-		var CATEGORIES = ["产品", "研发", "设计", "运营", "数据", "市场", "其他"];
+		var TEST_TYPE_KEYS = Object.keys(TEST_TYPES);
 
 		function cn() {
 			var parts = [];
@@ -424,20 +429,19 @@ window.__ModuleLoader__.load({
 			);
 		}
 
-		function StatusPill(props) {
-			var meta = STATUS_META[props.status] || STATUS_META.todo;
-			return h("span", { className: "dp-pill", "data-tone": meta.tone },
-				h("i", { className: "dp-dot" }),
-				meta.label
-			);
+		function TypeTag(props) {
+			var meta = TEST_TYPES[props.testType] || TEST_TYPES.functional;
+			return h("span", { className: "dp-type", "data-tone": meta.tone }, meta.label);
 		}
 
-		function PriorityPill(props) {
-			var meta = PRIORITY_META[props.priority] || PRIORITY_META.medium;
-			return h("span", { className: "dp-pill", "data-tone": "muted" },
-				h("i", { className: "dp-dot" }),
-				"优先级 " + meta.label
-			);
+		function CaseId(props) {
+			var value = props.caseId || "";
+			return h("span", { className: "dp-case-id", title: value || "未填写用例标识" }, value || "—");
+		}
+
+		function CellText(props) {
+			var value = props.value || "";
+			return h("p", { className: cn("dp-cell-text", value ? "" : "empty") }, value || "—");
 		}
 
 		function Modal(props) {
@@ -498,9 +502,9 @@ window.__ModuleLoader__.load({
 				h("input", {
 					type: "search",
 					value: props.value,
-					placeholder: "搜索标题、分类、负责人或内容…",
+					placeholder: "搜索用例名称 / 用例标识 / 测试说明",
 					onChange: function (event) { props.onChange(event.target.value); },
-					"aria-label": "搜索记录"
+					"aria-label": "搜索用例"
 				})
 			);
 		}
@@ -509,21 +513,21 @@ window.__ModuleLoader__.load({
 			var filtered = props.filtered;
 			return h("div", { className: "dp-empty" },
 				h("div", { className: "dp-empty-icon" }, h(Icon, { name: "doc", size: 23 })),
-				h("h3", null, filtered ? "没有匹配的记录" : "还没有记录"),
+				h("h3", null, filtered ? "没有匹配的用例" : "还没有用例"),
 				h("p", null, filtered
 					? "换个关键词或清除筛选条件试试。"
-					: "把需要持续跟踪的事情放进面板，点击标题即可在右侧查看详情。"),
+					: "把需要跟踪的测试用例放进面板，点击用例名称即可在右侧查看详情。"),
 				filtered
 					? h(Button, { onClick: props.onClear }, "清除筛选")
 					: h(Button, { variant: "primary", onClick: props.onCreate },
 						h(Icon, { name: "plus", size: 15 }),
-						"新建第一条"
+						"新增用例"
 					)
 			);
 		}
 
 		function SkeletonTable() {
-			var widths = [["34%", "10%", "12%", "10%", "12%"], ["46%", "12%", "10%", "9%", "10%"], ["28%", "9%", "13%", "11%", "11%"], ["40%", "11%", "10%", "10%", "10%"]];
+			var widths = [["14%", "16%", "9%", "20%", "14%", "13%", "6%"], ["18%", "12%", "8%", "22%", "12%", "14%", "6%"], ["12%", "18%", "9%", "19%", "15%", "12%", "6%"], ["16%", "14%", "8%", "21%", "13%", "13%", "6%"]];
 			return h("div", { className: "dp-skeleton-wrap" }, widths.map(function (widths, index) {
 				return h("div", { className: "dp-skeleton-row", key: index }, widths.map(function (width, column) {
 					return h("div", { className: "dp-skeleton", key: column, style: { width: width } });
@@ -535,14 +539,12 @@ window.__ModuleLoader__.load({
 			var initial = props.record || {};
 			var state = useState(function () {
 				return {
+					caseId: initial.caseId || "",
 					title: initial.title || "",
-					category: initial.category || "产品",
-					status: initial.status || "todo",
-					priority: initial.priority || "medium",
-					owner: initial.owner || "",
-					url: initial.url || "",
-					summary: initial.summary || "",
-					content: initial.content || ""
+					testType: initial.testType || "functional",
+					description: initial.description || "",
+					input: initial.input || "",
+					expected: initial.expected || ""
 				};
 			});
 			var values = state[0];
@@ -567,7 +569,7 @@ window.__ModuleLoader__.load({
 			function submit(event) {
 				if (event) event.preventDefault();
 				if (!values.title.trim()) {
-					setLocalError("标题不能为空");
+					setLocalError("用例名称不能为空");
 					return;
 				}
 				setLocalError("");
@@ -576,100 +578,79 @@ window.__ModuleLoader__.load({
 
 			var error = localError || props.error || "";
 			return h(Modal, {
-				title: props.mode === "edit" ? "编辑记录" : "新建记录",
+				title: props.mode === "edit" ? "编辑用例" : "新增用例",
 				subtitle: props.mode === "edit"
 					? "修改后立即写入本地数据文件，右侧详情会同步更新。"
-					: "填写基本信息，保存后点击标题即可在右侧查看详情。",
+					: "填写用例标识、类型、说明与输入输出，保存后点击用例名称可查看详情。",
 				onClose: props.onClose,
 				busy: props.busy,
 				footer: [
 					h(Button, { key: "cancel", onClick: props.onClose, disabled: props.busy }, "取消"),
 					h(Button, { key: "save", variant: "primary", onClick: function () { submit(); }, disabled: props.busy },
-						props.busy ? "保存中…" : (props.mode === "edit" ? "保存修改" : "创建记录")
+						props.busy ? "保存中…" : (props.mode === "edit" ? "保存修改" : "创建用例")
 					)
 				]
 			},
 				h("form", { className: "dp-form", onSubmit: submit },
 					error ? h("div", { className: "dp-alert" }, error) : null,
-					h(Field, { label: "标题", required: true, full: true },
+					h(Field, { label: "用例名称", required: true, full: true },
 						h("input", {
 							ref: firstRef,
 							className: "dp-input",
 							value: values.title,
 							maxLength: 200,
-							placeholder: "例如：Q4 产品路线图评审",
+							placeholder: "例如：RingBuffer功能测试",
 							onChange: function (event) { set("title", event.target.value); }
 						})
 					),
-					h(Field, { label: "分类" },
+					h(Field, { label: "用例标识", hint: "留空会自动生成一个 TC-xxxxxxxx。" },
 						h("input", {
-							className: "dp-input",
-							value: values.category,
-							maxLength: 40,
-							list: "dp-category-options-modal",
-							placeholder: "产品 / 研发 / 运营…",
-							onChange: function (event) { set("category", event.target.value); }
-						})
-					),
-					h(Field, { label: "负责人" },
-						h("input", {
-							className: "dp-input",
-							value: values.owner,
+							className: "dp-input dp-input-mono",
+							value: values.caseId,
 							maxLength: 80,
-							placeholder: "谁在跟进",
-							onChange: function (event) { set("owner", event.target.value); }
+							placeholder: "GN-ZZKZ-RINGBUFF-T001",
+							onChange: function (event) { set("caseId", event.target.value); }
 						})
 					),
-					h(Field, { label: "状态" },
+					h(Field, { label: "测试类型" },
 						h("select", {
 							className: "dp-select",
-							value: values.status,
-							onChange: function (event) { set("status", event.target.value); }
-						}, Object.keys(STATUS_META).map(function (key) {
-							return h("option", { key: key, value: key }, STATUS_META[key].label);
+							value: values.testType,
+							onChange: function (event) { set("testType", event.target.value); }
+						}, TEST_TYPE_KEYS.map(function (key) {
+							return h("option", { key: key, value: key }, TEST_TYPES[key].label);
 						}))
 					),
-					h(Field, { label: "优先级" },
-						h("select", {
-							className: "dp-select",
-							value: values.priority,
-							onChange: function (event) { set("priority", event.target.value); }
-						}, Object.keys(PRIORITY_META).map(function (key) {
-							return h("option", { key: key, value: key }, PRIORITY_META[key].label);
-						}))
-					),
-					h(Field, { label: "链接", full: true, hint: "可选。点击标题进右侧详情，点标题旁的小图标打开这个链接。" },
-						h("input", {
-							className: "dp-input",
-							value: values.url,
-							maxLength: 2000,
-							placeholder: "https://…",
-							onChange: function (event) { set("url", event.target.value); }
-						})
-					),
-					h(Field, { label: "摘要", full: true },
+					h(Field, { label: "测试说明", full: true },
 						h("textarea", {
 							className: "dp-textarea",
 							rows: 2,
-							value: values.summary,
+							value: values.description,
 							maxLength: 2000,
-							placeholder: "一句话说明这条记录",
-							onChange: function (event) { set("summary", event.target.value); }
+							placeholder: "这条用例验证什么行为",
+							onChange: function (event) { set("description", event.target.value); }
 						})
 					),
-					h(Field, { label: "内容", full: true, hint: "支持换行，详情页会按原样展示。" },
+					h(Field, { label: "输入", hint: "调用参数、前置数据等。" },
 						h("textarea", {
-							className: "dp-textarea",
-							rows: 6,
-							value: values.content,
-							maxLength: 20000,
-							placeholder: "背景、进展、下一步…",
-							onChange: function (event) { set("content", event.target.value); }
+							className: "dp-textarea mono",
+							rows: 4,
+							value: values.input,
+							maxLength: 4000,
+							placeholder: "m_totalCapacity=5",
+							onChange: function (event) { set("input", event.target.value); }
 						})
 					),
-					h("datalist", { id: "dp-category-options-modal" }, CATEGORIES.map(function (name) {
-						return h("option", { key: name, value: name });
-					}))
+					h(Field, { label: "预期输出", hint: "执行后应当观察到的结果。" },
+						h("textarea", {
+							className: "dp-textarea mono",
+							rows: 4,
+							value: values.expected,
+							maxLength: 4000,
+							placeholder: "m_size=0",
+							onChange: function (event) { set("expected", event.target.value); }
+						})
+					)
 				)
 			);
 		}
@@ -679,9 +660,9 @@ window.__ModuleLoader__.load({
 			var queryState = useState("");
 			var query = queryState[0];
 			var setQuery = queryState[1];
-			var statusState = useState("all");
-			var status = statusState[0];
-			var setStatus = statusState[1];
+			var typeState = useState("all");
+			var type = typeState[0];
+			var setType = typeState[1];
 			var formState = useState(null);
 			var form = formState[0];
 			var setForm = formState[1];
@@ -703,16 +684,17 @@ window.__ModuleLoader__.load({
 			var filtered = useMemo(function () {
 				var needle = query.trim().toLowerCase();
 				return records.filter(function (record) {
-					if (status !== "all" && record.status !== status) return false;
+					if (type !== "all" && record.testType !== type) return false;
 					if (!needle) return true;
-					return [record.title, record.category, record.owner, record.summary, record.content]
+					return [record.caseId, record.title, record.description, record.input, record.expected]
 						.join(" ")
 						.toLowerCase()
 						.indexOf(needle) !== -1;
 				});
-			}, [records, query, status]);
+			}, [records, query, type]);
 
-			var doingCount = records.filter(function (record) { return record.status === "doing"; }).length;
+			var functionalCount = records.filter(function (record) { return record.testType === "functional"; }).length;
+			var boundaryCount = records.filter(function (record) { return record.testType === "boundary"; }).length;
 
 			function openDetail(id) {
 				if (typeof props.openDetail !== "function") {
@@ -771,24 +753,28 @@ window.__ModuleLoader__.load({
 			}
 
 			var loading = (snap.status === "idle" || snap.status === "loading") && records.length === 0;
-			var filtering = query.trim() !== "" || status !== "all";
+			var filtering = query.trim() !== "" || type !== "all";
 
 			return h("div", { className: "dp-root" },
 				h("div", { className: "dp-shell" },
 					h("div", { className: "dp-header" },
 						h("div", null,
-							h("div", { className: "dp-eyebrow" }, "Data Panel"),
-							h("h1", { className: "dp-title" }, "数据面板"),
-							h("p", { className: "dp-subtitle" }, "会话里的轻量记录台。点击标题在右侧查看详情，表格里直接完成增删改查。")
+							h("div", { className: "dp-eyebrow" }, "Test Cases"),
+							h("h1", { className: "dp-title" }, "测试用例"),
+							h("p", { className: "dp-subtitle" }, "会话里的用例台账。点击用例名称在右侧查看详情，表格里直接完成增删改查。")
 						),
 						h("div", { className: "dp-stats" },
 							h("div", { className: "dp-stat" },
 								h("b", null, String(records.length)),
-								h("span", null, "全部记录")
+								h("span", null, "全部用例")
 							),
 							h("div", { className: "dp-stat" },
-								h("b", null, String(doingCount)),
-								h("span", null, "进行中")
+								h("b", null, String(functionalCount)),
+								h("span", null, "功能测试")
+							),
+							h("div", { className: "dp-stat" },
+								h("b", null, String(boundaryCount)),
+								h("span", null, "边界测试")
 							),
 							snap.demoCount > 0 ? h("div", { className: "dp-stat" },
 								h("b", null, String(snap.demoCount)),
@@ -800,13 +786,13 @@ window.__ModuleLoader__.load({
 						h(SearchBox, { value: query, onChange: setQuery }),
 						h("select", {
 							className: "dp-select",
-							value: status,
-							onChange: function (event) { setStatus(event.target.value); },
-							"aria-label": "按状态筛选"
+							value: type,
+							onChange: function (event) { setType(event.target.value); },
+							"aria-label": "按测试类型筛选"
 						},
-							h("option", { value: "all" }, "全部状态"),
-							Object.keys(STATUS_META).map(function (key) {
-								return h("option", { key: key, value: key }, STATUS_META[key].label);
+							h("option", { value: "all" }, "全部类型"),
+							TEST_TYPE_KEYS.map(function (key) {
+								return h("option", { key: key, value: key }, TEST_TYPES[key].label);
 							})
 						),
 						h(Button, { variant: "ghost", onClick: refresh, disabled: snap.status === "refreshing" },
@@ -815,7 +801,7 @@ window.__ModuleLoader__.load({
 						),
 						h(Button, { variant: "primary", onClick: openCreate },
 							h(Icon, { name: "plus", size: 15 }),
-							"新建"
+							"新增用例"
 						)
 					),
 					snap.error ? h("div", { className: "dp-alert" },
@@ -824,7 +810,7 @@ window.__ModuleLoader__.load({
 					) : null,
 					snap.demoCount > 0 ? h("div", { className: "dp-demo-banner" },
 						h("b", null, "示例数据"),
-						h("span", null, "这些记录用于演示面板能力，可直接编辑或删除。"),
+						h("span", null, "这些用例用于演示面板能力，可直接编辑或删除。"),
 						h("button", {
 							type: "button",
 							onClick: function () { setConfirm({ kind: "clearDemo" }); }
@@ -837,30 +823,33 @@ window.__ModuleLoader__.load({
 								: filtered.length === 0
 									? h(EmptyState, {
 										filtered: filtering,
-										onClear: function () { setQuery(""); setStatus("all"); },
+										onClear: function () { setQuery(""); setType("all"); },
 										onCreate: openCreate
 									})
 									: h("table", { className: "dp-table" },
 										h("colgroup", null,
-											h("col", { style: { width: "36%" } }),
-											h("col", { style: { width: "12%" } }),
-											h("col", { style: { width: "14%" } }),
-											h("col", { style: { width: "12%" } }),
-											h("col", { style: { width: "14%" } }),
-											h("col", { style: { width: "12%" } })
+											h("col", { style: { width: "16%" } }),
+											h("col", { style: { width: "17%" } }),
+											h("col", { style: { width: "9%" } }),
+											h("col", { style: { width: "22%" } }),
+											h("col", { style: { width: "15%" } }),
+											h("col", { style: { width: "15%" } }),
+											h("col", { style: { width: "6%" } })
 										),
 										h("thead", null,
 											h("tr", null,
-												h("th", null, "标题"),
-												h("th", null, "分类"),
-												h("th", null, "状态"),
-												h("th", null, "负责人"),
-												h("th", null, "更新时间"),
+												h("th", null, "用例标识"),
+												h("th", null, "用例名称"),
+												h("th", null, "测试类型"),
+												h("th", null, "测试说明"),
+												h("th", null, "输入"),
+												h("th", null, "预期输出"),
 												h("th", { className: "dp-right" }, "操作")
 											)
 										),
 										h("tbody", null, filtered.map(function (record) {
 											return h("tr", { key: record.id, className: "dp-row" },
+												h("td", null, h(CaseId, { caseId: record.caseId })),
 												h("td", null,
 													h("div", { className: "dp-title-cell" },
 														h("button", {
@@ -871,21 +860,13 @@ window.__ModuleLoader__.load({
 														},
 															h("span", { className: "dp-title-text" }, record.title)
 														),
-														record.demo ? h("span", { className: "dp-demo-tag" }, "示例") : null,
-														record.url ? h("a", {
-															className: "dp-ext",
-															href: record.url,
-															target: "_blank",
-															rel: "noreferrer noopener",
-															title: "打开链接",
-															onClick: function (event) { event.stopPropagation(); }
-														}, h(Icon, { name: "external", size: 13 })) : null
+														record.demo ? h("span", { className: "dp-demo-tag" }, "示例") : null
 													)
 												),
-												h("td", null, h("span", { className: "dp-chip" }, record.category)),
-												h("td", null, h(StatusPill, { status: record.status })),
-												h("td", null, h("span", { className: "dp-owner" }, record.owner || "—")),
-												h("td", null, h("span", { className: "dp-time", title: fmtFull(record.updatedAt) }, fmtRelative(record.updatedAt))),
+												h("td", null, h(TypeTag, { testType: record.testType })),
+												h("td", null, h(CellText, { value: record.description })),
+												h("td", null, h(CellText, { value: record.input })),
+												h("td", null, h(CellText, { value: record.expected })),
 												h("td", null,
 													h("div", { className: "dp-actions" },
 														h(IconButton, {
@@ -907,7 +888,7 @@ window.__ModuleLoader__.load({
 						)
 					),
 					h("div", { className: "dp-foot" },
-						h("span", null, "共 " + records.length + " 条记录" + (filtering ? " · 当前筛出 " + filtered.length + " 条" : "")),
+						h("span", null, "共 " + records.length + " 条用例" + (filtering ? " · 当前筛出 " + filtered.length + " 条" : "")),
 						h("span", null, "本地数据 · 自动保存")
 					)
 				),
@@ -920,9 +901,9 @@ window.__ModuleLoader__.load({
 					onSubmit: submit
 				}) : null,
 				confirm !== null ? h(ConfirmDialog, {
-					title: confirm.kind === "clearDemo" ? "清空示例数据？" : "删除这条记录？",
+					title: confirm.kind === "clearDemo" ? "清空示例用例？" : "删除这条用例？",
 					message: confirm.kind === "clearDemo"
-						? "只会移除标记为示例的记录，你后来新建或编辑过的内容会保留。"
+						? "只会移除标记为示例的用例，你后来新建或编辑过的内容会保留。"
 						: "删除后无法恢复，右侧已打开的详情页也会变为空。",
 					detail: confirm.kind === "delete" ? h("span", null, "即将删除：", h("b", null, confirm.record.title)) : null,
 					confirmLabel: confirm.kind === "clearDemo" ? "清空示例" : "删除",
@@ -939,14 +920,12 @@ window.__ModuleLoader__.load({
 			var record = props.record;
 			var state = useState(function () {
 				return {
+					caseId: record.caseId || "",
 					title: record.title || "",
-					category: record.category || "产品",
-					status: record.status || "todo",
-					priority: record.priority || "medium",
-					owner: record.owner || "",
-					url: record.url || "",
-					summary: record.summary || "",
-					content: record.content || ""
+					testType: record.testType || "functional",
+					description: record.description || "",
+					input: record.input || "",
+					expected: record.expected || ""
 				};
 			});
 			var values = state[0];
@@ -966,7 +945,7 @@ window.__ModuleLoader__.load({
 			function submit(event) {
 				if (event) event.preventDefault();
 				if (!values.title.trim()) {
-					setLocalError("标题不能为空");
+					setLocalError("用例名称不能为空");
 					return;
 				}
 				setLocalError("");
@@ -977,7 +956,7 @@ window.__ModuleLoader__.load({
 			return h("div", { className: "dp-detail-editor" },
 				h("form", { className: "dp-form dp-form-detail", onSubmit: submit },
 					error ? h("div", { className: "dp-alert" }, error) : null,
-					h(Field, { label: "标题", required: true },
+					h(Field, { label: "用例名称", required: true },
 						h("input", {
 							className: "dp-input",
 							value: values.title,
@@ -985,71 +964,51 @@ window.__ModuleLoader__.load({
 							onChange: function (event) { set("title", event.target.value); }
 						})
 					),
-					h(Field, { label: "分类" },
+					h(Field, { label: "用例标识" },
 						h("input", {
-							className: "dp-input",
-							value: values.category,
-							maxLength: 40,
-							list: "dp-category-options-detail",
-							onChange: function (event) { set("category", event.target.value); }
-						})
-					),
-					h(Field, { label: "负责人" },
-						h("input", {
-							className: "dp-input",
-							value: values.owner,
+							className: "dp-input dp-input-mono",
+							value: values.caseId,
 							maxLength: 80,
-							onChange: function (event) { set("owner", event.target.value); }
+							placeholder: "GN-ZZKZ-RINGBUFF-T001",
+							onChange: function (event) { set("caseId", event.target.value); }
 						})
 					),
-					h(Field, { label: "状态" },
+					h(Field, { label: "测试类型" },
 						h("select", {
 							className: "dp-select",
-							value: values.status,
-							onChange: function (event) { set("status", event.target.value); }
-						}, Object.keys(STATUS_META).map(function (key) {
-							return h("option", { key: key, value: key }, STATUS_META[key].label);
+							value: values.testType,
+							onChange: function (event) { set("testType", event.target.value); }
+						}, TEST_TYPE_KEYS.map(function (key) {
+							return h("option", { key: key, value: key }, TEST_TYPES[key].label);
 						}))
 					),
-					h(Field, { label: "优先级" },
-						h("select", {
-							className: "dp-select",
-							value: values.priority,
-							onChange: function (event) { set("priority", event.target.value); }
-						}, Object.keys(PRIORITY_META).map(function (key) {
-							return h("option", { key: key, value: key }, PRIORITY_META[key].label);
-						}))
-					),
-					h(Field, { label: "链接" },
-						h("input", {
-							className: "dp-input",
-							value: values.url,
-							maxLength: 2000,
-							placeholder: "https://…",
-							onChange: function (event) { set("url", event.target.value); }
-						})
-					),
-					h(Field, { label: "摘要" },
+					h(Field, { label: "测试说明" },
 						h("textarea", {
 							className: "dp-textarea",
 							rows: 2,
-							value: values.summary,
+							value: values.description,
 							maxLength: 2000,
-							onChange: function (event) { set("summary", event.target.value); }
+							onChange: function (event) { set("description", event.target.value); }
 						})
 					),
-					h(Field, { label: "内容" },
+					h(Field, { label: "输入" },
 						h("textarea", {
-							className: "dp-textarea",
-							rows: 7,
-							value: values.content,
-							maxLength: 20000,
-							onChange: function (event) { set("content", event.target.value); }
+							className: "dp-textarea mono",
+							rows: 4,
+							value: values.input,
+							maxLength: 4000,
+							onChange: function (event) { set("input", event.target.value); }
 						})
 					),
-					h("datalist", { id: "dp-category-options-detail" }, CATEGORIES.map(function (name) {
-						return h("option", { key: name, value: name });
-					}))
+					h(Field, { label: "预期输出" },
+						h("textarea", {
+							className: "dp-textarea mono",
+							rows: 4,
+							value: values.expected,
+							maxLength: 4000,
+							onChange: function (event) { set("expected", event.target.value); }
+						})
+					)
 				),
 				h("div", { className: "dp-detail-editor-foot" },
 					h(Button, { onClick: props.onCancel, disabled: props.busy }, "取消"),
@@ -1063,38 +1022,37 @@ window.__ModuleLoader__.load({
 			return h("div", { className: "dp-detail" },
 				h("div", { className: "dp-detail-head" },
 					h("div", { className: "dp-detail-kicker" },
-						h("span", { className: "dp-chip" }, record.category),
-						h(StatusPill, { status: record.status }),
-						h(PriorityPill, { priority: record.priority }),
+						record.caseId ? h("span", { className: "dp-chip dp-chip-mono" }, record.caseId) : null,
+						h(TypeTag, { testType: record.testType }),
 						record.demo ? h("span", { className: "dp-demo-tag" }, "示例数据") : null
 					),
 					h("h2", { className: "dp-detail-title" }, record.title),
 					h("div", { className: "dp-detail-meta" },
-						h("span", { className: "dp-meta-item" }, "负责人 ", h("b", null, record.owner || "未指定")),
 						h("span", { className: "dp-meta-item" }, "更新 ", h("b", null, fmtRelative(record.updatedAt))),
 						h("span", { className: "dp-meta-item", title: fmtFull(record.createdAt) }, "创建 ", h("b", null, fmtRelative(record.createdAt)))
 					)
 				),
 				h("div", { className: "dp-detail-actions" },
 					h(Button, { size: "sm", onClick: props.onEdit }, h(Icon, { name: "edit", size: 14 }), "编辑"),
-					record.url ? h("a", {
-						className: "dp-btn dp-btn-sm",
-						href: record.url,
-						target: "_blank",
-						rel: "noreferrer noopener",
-						style: { textDecoration: "none" }
-					}, h(Icon, { name: "external", size: 14 }), "打开链接") : null,
 					h(Button, { size: "sm", variant: "danger", onClick: props.onDelete }, h(Icon, { name: "trash", size: 14 }), "删除")
 				),
-				record.summary ? h("div", { className: "dp-section" },
-					h("h4", null, "摘要"),
-					h("p", { className: "dp-summary" }, record.summary)
-				) : null,
 				h("div", { className: "dp-section" },
-					h("h4", null, "内容"),
-					record.content
-						? h("pre", { className: "dp-content" }, record.content)
-						: h("p", { className: "dp-summary", style: { color: "var(--dp-text3)" } }, "暂无内容，点击「编辑」补充背景、进展或下一步。")
+					h("h4", null, "测试说明"),
+					record.description
+						? h("p", { className: "dp-summary" }, record.description)
+						: h("p", { className: "dp-summary", style: { color: "var(--dp-text3)" } }, "暂无说明，点击「编辑」补充这条用例验证的行为。")
+				),
+				h("div", { className: "dp-section" },
+					h("h4", null, "输入"),
+					record.input
+						? h("pre", { className: "dp-content" }, record.input)
+						: h("p", { className: "dp-summary", style: { color: "var(--dp-text3)" } }, "未填写输入。")
+				),
+				h("div", { className: "dp-section" },
+					h("h4", null, "预期输出"),
+					record.expected
+						? h("pre", { className: "dp-content" }, record.expected)
+						: h("p", { className: "dp-summary", style: { color: "var(--dp-text3)" } }, "未填写预期输出。")
 				),
 				h("div", { className: "dp-section" },
 					h("h4", null, "元信息"),
@@ -1221,7 +1179,7 @@ window.__ModuleLoader__.load({
 				return h("div", { className: "dp-detail" },
 					h("div", { className: "dp-detail-empty" },
 						h("div", { className: "dp-empty-icon" }, h(Icon, { name: "doc", size: 22 })),
-						h("h3", null, "记录不存在"),
+						h("h3", null, "用例不存在"),
 						h("p", null, "它可能已经被删除，或这条详情链接来自另一份数据。"),
 						h(Button, { size: "sm", onClick: closeTab }, "关闭标签")
 					)
@@ -1243,7 +1201,7 @@ window.__ModuleLoader__.load({
 				}) : null,
 				!editing && error ? h("div", { className: "dp-alert", style: { marginTop: "12px" } }, error) : null,
 				confirm ? h(ConfirmDialog, {
-					title: "删除这条记录？",
+					title: "删除这条用例？",
 					message: "删除后无法恢复，列表和右侧详情都会同步移除。",
 					detail: h("span", null, "即将删除：", h("b", null, record.title)),
 					confirmLabel: "删除",
@@ -1289,7 +1247,7 @@ window.__ModuleLoader__.load({
 					return sub.sidebarRightTabs.register({
 						id: "data-panel-detail",
 						kind: "data-panel-detail",
-						title: function () { return "记录详情"; },
+						title: function () { return "用例详情"; },
 						keepMounted: true
 					});
 				}, "dsh-data-panel: detail tab type");

@@ -1,9 +1,17 @@
 /**
  * dsh-data-panel — host half.
  *
- * Owns a small JSON record store and exposes it over one same-origin route:
+ * Owns a small JSON test-case store and exposes it over one same-origin route:
  *   GET  /data-panel/api            → { ok, records, demoCount, seeded }
  *   POST /data-panel/api { op, … }  → create / update / delete / clearDemo
+ *
+ * A record is one test case:
+ *   caseId      用例标识 (e.g. GN-ZZKZ-RINGBUFF-T001)
+ *   title       用例名称 (required)
+ *   testType    功能测试 / 边界测试 / 性能测试 / 异常测试 / 兼容性测试
+ *   description 测试说明
+ *   input       输入
+ *   expected    预期输出
  *
  * The store lives under <DSH_HOME>/plugin-data/dsh-data-panel/records.json so
  * it survives page reloads, plugin upgrades and app restarts without touching
@@ -19,15 +27,14 @@ export const inject = ['webServer']
 
 const PLUGIN = 'dsh-data-panel'
 const API_PATH = '/data-panel/api'
+const STORE_VERSION = 2
 const MAX_BODY = 1024 * 1024
+const MAX_CASE_ID = 80
 const MAX_TITLE = 200
-const MAX_CATEGORY = 40
-const MAX_OWNER = 80
-const MAX_URL = 2000
-const MAX_SUMMARY = 2000
-const MAX_CONTENT = 20000
-const STATUSES = new Set(['todo', 'doing', 'done', 'blocked'])
-const PRIORITIES = new Set(['high', 'medium', 'low'])
+const MAX_DESCRIPTION = 2000
+const MAX_INPUT = 4000
+const MAX_EXPECTED = 4000
+const TEST_TYPES = new Set(['functional', 'boundary', 'performance', 'exception', 'compat'])
 
 /** Single write lane: read-modify-write operations never interleave. */
 let lane = Promise.resolve()
@@ -60,18 +67,6 @@ function text(value, max) {
   return typeof value === 'string' ? value.trim().slice(0, max) : ''
 }
 
-function httpUrl(value) {
-  const raw = text(value, MAX_URL)
-  if (!raw) return ''
-  const candidate = /^[a-z][a-z0-9+.-]*:/i.test(raw) ? raw : `https://${raw}`
-  try {
-    const parsed = new URL(candidate)
-    return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? parsed.toString() : ''
-  } catch {
-    return ''
-  }
-}
-
 function isoOrNow(value) {
   if (typeof value === 'string' && Number.isFinite(Date.parse(value))) return value
   return new Date().toISOString()
@@ -81,69 +76,96 @@ function isoAgo(hours) {
   return new Date(Date.now() - hours * 3600 * 1000).toISOString()
 }
 
-/** First-run records, marked `demo` so the UI can label them visibly. */
+function newCaseId() {
+  return `TC-${randomUUID().replace(/-/g, '').slice(0, 8).toUpperCase()}`
+}
+
+/** First-run test cases, marked `demo` so the UI can label them visibly. */
 function seedRecords() {
-  return [
-    {
-      id: 'demo-roadmap',
-      title: 'Q4 产品路线图评审',
-      category: '产品',
-      status: 'doing',
-      priority: 'high',
-      owner: '林晓',
-      url: 'https://example.com/roadmap',
-      summary: '汇总三条产品线的 Q4 目标，确认优先级、依赖和验收口径。',
-      content:
-        '## 会议目标\n\n- 对齐 Q4 三条产品线的优先级\n- 确认跨团队依赖与负责人\n- 输出一页可签字的路线图\n\n## 待确认\n\n1. 数据中台版本窗口\n2. 移动端发版节奏',
-      demo: true,
-      createdAt: isoAgo(30),
-      updatedAt: isoAgo(2),
-    },
-    {
-      id: 'demo-perf',
-      title: '登录页首屏性能优化',
-      category: '研发',
-      status: 'todo',
-      priority: 'medium',
-      owner: '陈默',
-      url: '',
-      summary: '把登录页 LCP 从 3.2s 压到 1.8s 以内，先做资源拆包和图片压缩。',
-      content:
-        '## 现状\n\n- LCP 3.2s（移动端 4G）\n- 首包 680 KB\n\n## 计划\n\n- [ ] 路由级拆包\n- [ ] 登录插画改 WebP\n- [ ] 字体子集化',
-      demo: true,
-      createdAt: isoAgo(26),
-      updatedAt: isoAgo(8),
-    },
-    {
-      id: 'demo-feedback',
-      title: '客户反馈周报（第 45 周）',
-      category: '运营',
-      status: 'done',
-      priority: 'low',
-      owner: '王悦',
-      url: '',
-      summary: '本周共收集 37 条反馈，其中 6 条进入需求池，1 条需要本周回复。',
-      content:
-        '## 本周概览\n\n- 新增反馈 37 条\n- 进入需求池 6 条\n- 需本周回复 1 条\n\n## 高频关键词\n\n导出、权限、速度',
-      demo: true,
-      createdAt: isoAgo(20),
-      updatedAt: isoAgo(20),
-    },
+  const rows = [
+    [
+      'GN-ZZKZ-RINGBUFF-T001',
+      'RingBuffer功能测试',
+      'functional',
+      '初始化一个新的环形缓冲区对象，验证初始状态下 size、head、tail 是否符合预期。',
+      'm_totalCapacity=5',
+      'm_size=0',
+    ],
+    [
+      'BJ-ZZKZ-RINGBUFF-T001',
+      'RingBuffer边界测试',
+      'boundary',
+      '容量取 0 初始化，验证边界条件下对象的处理策略是否给出明确报错。',
+      'm_totalCapacity=0',
+      'm_size=编译报错',
+    ],
+    [
+      'GN-ZZKZ-PUSH-T001',
+      'push功能测试',
+      'functional',
+      '将元素存入缓冲区，验证插入后的状态变化和容量计数是否正确。',
+      'm_totalCapacity=2, p_id=0, p_value=Test0',
+      'm_size=1, m_head=2, m_tail=1',
+    ],
+    [
+      'JK-ZZKZ-PUSH-T002',
+      'push满容量测试',
+      'boundary',
+      '缓冲区已满后继续 push，验证满容量时的覆盖顺序与读写指针推进。',
+      'm_totalCapacity=2，已存 2 个元素',
+      'm_size=2, m_head=1, m_tail=1',
+    ],
+    [
+      'GN-ZZKZ-CLEAR-T001',
+      'clearAll功能测试',
+      'functional',
+      '清空缓冲区，验证头部、尾部与长度归零且内存不被释放。',
+      'clearAll()',
+      'm_size=0, m_head=0, m_tail=0',
+    ],
+    [
+      'BJ-ZZKZ-POP-T001',
+      'pop边界测试',
+      'boundary',
+      '空缓冲区执行 pop，验证下溢时不再修改状态。',
+      'm_totalCapacity=3, m_size=0',
+      '返回失败，m_size 保持 0',
+    ],
+    [
+      'GN-ZZKZ-ITER-T001',
+      '迭代器遍历测试',
+      'functional',
+      '遍历缓冲区中的全部元素，验证顺序与写入顺序一致。',
+      'm_totalCapacity=4，依次 push A、B、C',
+      '遍历输出 A → B → C',
+    ],
   ]
+  return rows.map(function (row, index) {
+    return {
+      id: `demo-${index + 1}`,
+      caseId: row[0],
+      title: row[1],
+      testType: row[2],
+      description: row[3],
+      input: row[4],
+      expected: row[5],
+      demo: true,
+      createdAt: isoAgo(36 + index * 2),
+      updatedAt: isoAgo(8 + index * 2),
+    }
+  })
 }
 
 function normalizeStored(input) {
   if (input === null || typeof input !== 'object' || typeof input.id !== 'string' || input.id === '') return null
   return {
     id: input.id.slice(0, 120),
-    title: text(input.title, MAX_TITLE) || '未命名记录',
-    category: text(input.category, MAX_CATEGORY) || '未分类',
-    status: STATUSES.has(input.status) ? input.status : 'todo',
-    priority: PRIORITIES.has(input.priority) ? input.priority : 'medium',
-    owner: text(input.owner, MAX_OWNER),
-    url: httpUrl(input.url),
-    summary: text(input.summary, MAX_SUMMARY),
-    content: text(input.content, MAX_CONTENT),
+    caseId: text(input.caseId, MAX_CASE_ID),
+    title: text(input.title, MAX_TITLE) || '未命名用例',
+    testType: TEST_TYPES.has(input.testType) ? input.testType : 'functional',
+    description: text(input.description, MAX_DESCRIPTION),
+    input: text(input.input, MAX_INPUT),
+    expected: text(input.expected, MAX_EXPECTED),
     demo: input.demo === true,
     createdAt: isoOrNow(input.createdAt),
     updatedAt: isoOrNow(input.updatedAt),
@@ -152,24 +174,22 @@ function normalizeStored(input) {
 
 function normalizePatch(input, existing) {
   const title = text(input.title, MAX_TITLE)
-  if (!title) throw bad(400, '标题不能为空')
+  if (!title) throw bad(400, '用例名称不能为空')
   return {
     ...existing,
+    caseId: text(input.caseId, MAX_CASE_ID),
     title,
-    category: text(input.category, MAX_CATEGORY) || '未分类',
-    status: STATUSES.has(input.status) ? input.status : existing.status,
-    priority: PRIORITIES.has(input.priority) ? input.priority : existing.priority,
-    owner: text(input.owner, MAX_OWNER),
-    url: httpUrl(input.url),
-    summary: text(input.summary, MAX_SUMMARY),
-    content: text(input.content, MAX_CONTENT),
+    testType: TEST_TYPES.has(input.testType) ? input.testType : existing.testType,
+    description: text(input.description, MAX_DESCRIPTION),
+    input: text(input.input, MAX_INPUT),
+    expected: text(input.expected, MAX_EXPECTED),
     updatedAt: new Date().toISOString(),
   }
 }
 
-async function quarantine() {
+async function quarantine(suffix) {
   try {
-    await rename(dataFile(), `${dataFile()}.corrupt-${Date.now()}`)
+    await rename(dataFile(), `${dataFile()}.${suffix}-${Date.now()}`)
   } catch {
     // Nothing to preserve.
   }
@@ -177,7 +197,7 @@ async function quarantine() {
 
 async function persist(records, seeded) {
   await mkdir(dataDir(), { recursive: true })
-  const payload = JSON.stringify({ version: 1, seeded: seeded === true, records }, null, 2)
+  const payload = JSON.stringify({ version: STORE_VERSION, seeded: seeded === true, records }, null, 2)
   const temp = join(dataDir(), `.records.${process.pid}.${Date.now()}.tmp`)
   await writeFile(temp, payload, 'utf8')
   try {
@@ -196,6 +216,14 @@ async function readStore() {
   try {
     const raw = await readFile(dataFile(), 'utf8')
     const parsed = JSON.parse(raw)
+    // A store written by the previous record schema (v1) is kept aside instead
+    // of being coerced: those records were notes, not test cases.
+    if (parsed?.version !== STORE_VERSION) {
+      await quarantine('v1')
+      const records = seedRecords()
+      await persist(records, true)
+      return { records, seeded: true }
+    }
     const source = Array.isArray(parsed?.records) ? parsed.records : []
     const records = source.map(normalizeStored).filter(Boolean)
     return { records, seeded: parsed?.seeded === true }
@@ -206,7 +234,7 @@ async function readStore() {
       return { records, seeded: true }
     }
     if (error instanceof SyntaxError) {
-      await quarantine()
+      await quarantine('corrupt')
       const records = seedRecords()
       await persist(records, true)
       return { records, seeded: true }
@@ -286,20 +314,19 @@ async function handle(req, res) {
         const now = new Date().toISOString()
         const created = {
           ...normalizePatch({ ...(body.record || {}), title: body.record?.title }, {
+            caseId: '',
             title: '',
-            category: '未分类',
-            status: 'todo',
-            priority: 'medium',
-            owner: '',
-            url: '',
-            summary: '',
-            content: '',
+            testType: 'functional',
+            description: '',
+            input: '',
+            expected: '',
             createdAt: now,
           }),
           id: `rec_${randomUUID().replace(/-/g, '').slice(0, 12)}`,
           demo: false,
           createdAt: now,
         }
+        if (!created.caseId) created.caseId = newCaseId()
         store.records.push(created)
         await persist(store.records, store.seeded)
         return created
