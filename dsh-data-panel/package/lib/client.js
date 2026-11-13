@@ -129,6 +129,18 @@ window.__ModuleLoader__.load({
 .dp-skeleton { height: 12px; border-radius: 6px; background: linear-gradient(90deg, var(--dp-bg2) 25%, var(--dp-bg3) 37%, var(--dp-bg2) 63%); background-size: 400% 100%; animation: dp-shimmer 1.35s ease infinite; }
 @keyframes dp-shimmer { 0% { background-position: 100% 0; } 100% { background-position: 0 0; } }
 .dp-foot { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-top: 10px; color: var(--dp-text3); font-size: 11px; }
+.dp-pager { display: flex; align-items: center; justify-content: flex-end; gap: 10px; flex-wrap: wrap; margin-top: 12px; color: var(--dp-text2); font-size: 12px; }
+.dp-pager-total { margin-right: auto; color: var(--dp-text3); }
+.dp-pager-btn { display: inline-flex; align-items: center; justify-content: center; min-width: 66px; height: 30px; padding: 0 12px; border: 1px solid var(--dp-border); border-radius: 8px; background: var(--dp-bg); color: var(--dp-text); font: inherit; font-size: 12px; cursor: pointer; transition: background .12s, border-color .12s, color .12s; }
+.dp-pager-btn:hover:not(:disabled) { border-color: var(--dp-text3); background: var(--dp-bg2); }
+.dp-pager-btn:disabled { color: var(--dp-text3); cursor: not-allowed; opacity: .6; }
+.dp-pager-page { display: inline-flex; align-items: center; justify-content: center; min-width: 62px; height: 30px; padding: 0 10px; border: 1px solid var(--dp-border); border-radius: 8px; background: var(--dp-bg2); color: var(--dp-text); font-size: 12px; font-variant-numeric: tabular-nums; }
+.dp-pager-size { display: inline-flex; align-items: center; gap: 6px; }
+.dp-pager-size select { height: 30px; padding: 0 24px 0 8px; border: 1px solid var(--dp-border); border-radius: 8px; background: var(--dp-bg); color: var(--dp-text); font: inherit; font-size: 12px; outline: none; cursor: pointer; }
+.dp-code-body { margin: 0; padding: 14px 16px; max-height: 56vh; overflow: auto; border: 1px solid var(--dp-border); border-radius: 10px; background: var(--dp-bg2); color: var(--dp-text); font-family: ui-monospace, SFMono-Regular, "Cascadia Code", Consolas, monospace; font-size: 12.5px; line-height: 1.7; white-space: pre; tab-size: 2; }
+.dp-code-empty { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 34px 16px; border: 1px dashed var(--dp-border); border-radius: 10px; color: var(--dp-text3); font-size: 12px; text-align: center; }
+.dp-code-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; color: var(--dp-text3); font-size: 11px; }
+.dp-code-meta code { font-family: ui-monospace, SFMono-Regular, "Cascadia Code", Consolas, monospace; }
 .dp-mask { position: fixed; inset: 0; z-index: 80; display: flex; align-items: center; justify-content: center; padding: 24px; background: rgba(15, 18, 24, .36); backdrop-filter: blur(2px); animation: dp-fade .14s ease; }
 .dp-modal { display: flex; flex-direction: column; width: min(640px, 100%); max-height: 86vh; overflow: hidden; border: 1px solid var(--dp-border); border-radius: 16px; background: var(--dp-bg); box-shadow: 0 24px 80px rgba(0, 0, 0, .24); animation: dp-pop .16s ease; }
 .dp-modal-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 18px 20px 12px; }
@@ -275,6 +287,12 @@ window.__ModuleLoader__.load({
 					break;
 				case "external":
 					children = [h("path", { key: "a", d: "M14 4h6v6" }), h("path", { key: "b", d: "M20 4 11 13" }), h("path", { key: "c", d: "M20 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h5" })];
+					break;
+				case "code":
+					children = [h("path", { key: "a", d: "m9 8-5 4 5 4" }), h("path", { key: "b", d: "m15 8 5 4-5 4" }), h("path", { key: "c", d: "m13 5-2 14" })];
+					break;
+				case "copy":
+					children = [h("rect", { key: "a", x: 9, y: 9, width: 11, height: 11, rx: 2 }), h("path", { key: "b", d: "M5 15V5a1 1 0 0 1 1-1h9" })];
 					break;
 				case "close":
 					children = [h("path", { key: "a", d: "m6 6 12 12" }), h("path", { key: "b", d: "m18 6-12 12" })];
@@ -493,6 +511,86 @@ window.__ModuleLoader__.load({
 				]
 			}, props.detail ? h("p", { className: "dp-confirm-text" }, props.detail) : null);
 		}
+
+		function Pager(props) {
+			var sizes = [5, 10, 20, 50];
+			var atFirst = props.page <= 1;
+			var atLast = props.page >= props.pageCount;
+			return h("div", { className: "dp-pager" },
+				h("span", { className: "dp-pager-total" }, "共 " + props.total + " 条"),
+				h("span", { className: "dp-pager-size" }, "每页",
+					h("select", {
+						value: String(props.pageSize),
+						onChange: function (event) { props.onPageSize(Number(event.target.value)); },
+						"aria-label": "每页条数"
+					}, sizes.map(function (size) {
+						return h("option", { key: size, value: String(size) }, size + " 条");
+					})),
+					"条"
+				),
+				h("button", {
+					type: "button",
+					className: "dp-pager-btn",
+					disabled: atFirst,
+					onClick: function () { if (!atFirst) props.onPage(props.page - 1); }
+				}, "上一页"),
+				h("span", { className: "dp-pager-page" }, props.page + " / " + props.pageCount),
+				h("button", {
+					type: "button",
+					className: "dp-pager-btn",
+					disabled: atLast,
+					onClick: function () { if (!atLast) props.onPage(props.page + 1); }
+				}, "下一页")
+			);
+		}
+
+		function CodeModal(props) {
+			var record = props.record;
+			var code = record.code || "";
+			var labelState = useState("复制代码");
+			var copyLabel = labelState[0];
+			var setCopyLabel = labelState[1];
+
+			function copy() {
+				try {
+					if (typeof navigator === "undefined" || !navigator.clipboard) {
+						setCopyLabel("请手动选中复制");
+						return;
+					}
+					navigator.clipboard.writeText(code).then(function () {
+						setCopyLabel("已复制");
+					}, function () {
+						setCopyLabel("复制失败");
+					});
+				} catch (error) {
+					setCopyLabel("复制失败");
+				}
+			}
+
+			return h(Modal, {
+				title: "用例代码",
+				subtitle: record.title,
+				onClose: props.onClose,
+				footer: [
+					h(Button, { key: "close", onClick: props.onClose }, "关闭"),
+					code ? h(Button, { key: "copy", variant: "primary", onClick: copy },
+						h(Icon, { name: "copy", size: 14 }),
+						copyLabel
+					) : null
+				]
+			},
+				h("div", { className: "dp-code-meta" },
+					record.caseId ? h("code", null, record.caseId) : null,
+					h(TypeTag, { testType: record.testType })
+				),
+				code
+					? h("pre", { className: "dp-code-body" }, code)
+					: h("div", { className: "dp-code-empty" },
+						h(Icon, { name: "code", size: 22 }),
+						"这条用例还没有关联代码，点「编辑」补充。"
+					)
+			);
+		}
 		//#endregion
 
 		//#region table view
@@ -544,7 +642,8 @@ window.__ModuleLoader__.load({
 					testType: initial.testType || "functional",
 					description: initial.description || "",
 					input: initial.input || "",
-					expected: initial.expected || ""
+					expected: initial.expected || "",
+					code: initial.code || ""
 				};
 			});
 			var values = state[0];
@@ -650,6 +749,16 @@ window.__ModuleLoader__.load({
 							placeholder: "m_size=0",
 							onChange: function (event) { set("expected", event.target.value); }
 						})
+					),
+					h(Field, { label: "代码", full: true, hint: "这条用例对应的测试代码，表格操作列的「</>」按钮可随时查看。" },
+						h("textarea", {
+							className: "dp-textarea mono",
+							rows: 8,
+							value: values.code,
+							maxLength: 20000,
+							placeholder: "TEST(RingBufferTest, InitState) {\n  RingBuffer<int> buf(5);\n  EXPECT_EQ(buf.size(), 0);\n}",
+							onChange: function (event) { set("code", event.target.value); }
+						})
 					)
 				)
 			);
@@ -675,6 +784,15 @@ window.__ModuleLoader__.load({
 			var formErrorState = useState("");
 			var formError = formErrorState[0];
 			var setFormError = formErrorState[1];
+			var pageState = useState(1);
+			var page = pageState[0];
+			var setPage = pageState[1];
+			var pageSizeState = useState(5);
+			var pageSize = pageSizeState[0];
+			var setPageSize = pageSizeState[1];
+			var codeState = useState(null);
+			var codeRecord = codeState[0];
+			var setCodeRecord = codeState[1];
 
 			useEffect(function () {
 				store.load().catch(function () {});
@@ -695,6 +813,26 @@ window.__ModuleLoader__.load({
 
 			var functionalCount = records.filter(function (record) { return record.testType === "functional"; }).length;
 			var boundaryCount = records.filter(function (record) { return record.testType === "boundary"; }).length;
+
+			useEffect(function () {
+				setPage(1);
+			}, [query, type]);
+
+			var pageCount = Math.max(1, Math.ceil(filtered.length / pageSize));
+			var currentPage = Math.min(Math.max(1, page), pageCount);
+			var pageStart = (currentPage - 1) * pageSize;
+			var pageRecords = filtered.slice(pageStart, pageStart + pageSize);
+
+			function changePageSize(size) {
+				if (!Number.isFinite(size) || size <= 0) return;
+				setPageSize(size);
+				setPage(1);
+			}
+
+			function changePage(next) {
+				if (next < 1 || next > pageCount) return;
+				setPage(next);
+			}
 
 			function openDetail(id) {
 				if (typeof props.openDetail !== "function") {
@@ -828,13 +966,13 @@ window.__ModuleLoader__.load({
 									})
 									: h("table", { className: "dp-table" },
 										h("colgroup", null,
+											h("col", { style: { width: "15%" } }),
 											h("col", { style: { width: "16%" } }),
-											h("col", { style: { width: "17%" } }),
 											h("col", { style: { width: "9%" } }),
-											h("col", { style: { width: "22%" } }),
-											h("col", { style: { width: "15%" } }),
-											h("col", { style: { width: "15%" } }),
-											h("col", { style: { width: "6%" } })
+											h("col", { style: { width: "20%" } }),
+											h("col", { style: { width: "14%" } }),
+											h("col", { style: { width: "14%" } }),
+											h("col", { style: { width: "12%" } })
 										),
 										h("thead", null,
 											h("tr", null,
@@ -847,7 +985,7 @@ window.__ModuleLoader__.load({
 												h("th", { className: "dp-right" }, "操作")
 											)
 										),
-										h("tbody", null, filtered.map(function (record) {
+										h("tbody", null, pageRecords.map(function (record) {
 											return h("tr", { key: record.id, className: "dp-row" },
 												h("td", null, h(CaseId, { caseId: record.caseId })),
 												h("td", null,
@@ -870,6 +1008,11 @@ window.__ModuleLoader__.load({
 												h("td", null,
 													h("div", { className: "dp-actions" },
 														h(IconButton, {
+															name: "code",
+															label: "查看代码 " + record.title,
+															onClick: function () { setCodeRecord(record); }
+														}),
+														h(IconButton, {
 															name: "edit",
 															label: "编辑 " + record.title,
 															onClick: function () { openEdit(record); }
@@ -887,10 +1030,14 @@ window.__ModuleLoader__.load({
 									)
 						)
 					),
-					h("div", { className: "dp-foot" },
-						h("span", null, "共 " + records.length + " 条用例" + (filtering ? " · 当前筛出 " + filtered.length + " 条" : "")),
-						h("span", null, "本地数据 · 自动保存")
-					)
+					loading || filtered.length === 0 ? null : h(Pager, {
+						total: filtered.length,
+						page: currentPage,
+						pageCount: pageCount,
+						pageSize: pageSize,
+						onPage: changePage,
+						onPageSize: changePageSize
+					})
 				),
 				form !== null ? h(RecordFormModal, {
 					mode: form.mode,
@@ -899,6 +1046,10 @@ window.__ModuleLoader__.load({
 					error: formError,
 					onClose: function () { if (!busy) setForm(null); },
 					onSubmit: submit
+				}) : null,
+				codeRecord !== null ? h(CodeModal, {
+					record: codeRecord,
+					onClose: function () { setCodeRecord(null); }
 				}) : null,
 				confirm !== null ? h(ConfirmDialog, {
 					title: confirm.kind === "clearDemo" ? "清空示例用例？" : "删除这条用例？",
@@ -925,7 +1076,8 @@ window.__ModuleLoader__.load({
 					testType: record.testType || "functional",
 					description: record.description || "",
 					input: record.input || "",
-					expected: record.expected || ""
+					expected: record.expected || "",
+					code: record.code || ""
 				};
 			});
 			var values = state[0];
@@ -1008,6 +1160,15 @@ window.__ModuleLoader__.load({
 							maxLength: 4000,
 							onChange: function (event) { set("expected", event.target.value); }
 						})
+					),
+					h(Field, { label: "代码" },
+						h("textarea", {
+							className: "dp-textarea mono",
+							rows: 8,
+							value: values.code,
+							maxLength: 20000,
+							onChange: function (event) { set("code", event.target.value); }
+						})
 					)
 				),
 				h("div", { className: "dp-detail-editor-foot" },
@@ -1053,6 +1214,12 @@ window.__ModuleLoader__.load({
 					record.expected
 						? h("pre", { className: "dp-content" }, record.expected)
 						: h("p", { className: "dp-summary", style: { color: "var(--dp-text3)" } }, "未填写预期输出。")
+				),
+				h("div", { className: "dp-section" },
+					h("h4", null, "代码"),
+					record.code
+						? h("pre", { className: "dp-content dp-code-body" }, record.code)
+						: h("p", { className: "dp-summary", style: { color: "var(--dp-text3)" } }, "这条用例还没有关联代码，点击「编辑」补充。")
 				),
 				h("div", { className: "dp-section" },
 					h("h4", null, "元信息"),
@@ -1284,7 +1451,9 @@ window.__ModuleLoader__.load({
 			DataPanelView: DataPanelView,
 			DetailView: DetailView,
 			DetailBody: DetailBody,
-			RecordFormModal: RecordFormModal
+			RecordFormModal: RecordFormModal,
+			CodeModal: CodeModal,
+			Pager: Pager
 		};
 		return module.exports;
 	}

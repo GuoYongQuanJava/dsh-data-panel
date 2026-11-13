@@ -27,13 +27,14 @@ export const inject = ['webServer']
 
 const PLUGIN = 'dsh-data-panel'
 const API_PATH = '/data-panel/api'
-const STORE_VERSION = 2
+const STORE_VERSION = 3
 const MAX_BODY = 1024 * 1024
 const MAX_CASE_ID = 80
 const MAX_TITLE = 200
 const MAX_DESCRIPTION = 2000
 const MAX_INPUT = 4000
 const MAX_EXPECTED = 4000
+const MAX_CODE = 20000
 const TEST_TYPES = new Set(['functional', 'boundary', 'performance', 'exception', 'compat'])
 
 /** Single write lane: read-modify-write operations never interleave. */
@@ -90,6 +91,7 @@ function seedRecords() {
       '初始化一个新的环形缓冲区对象，验证初始状态下 size、head、tail 是否符合预期。',
       'm_totalCapacity=5',
       'm_size=0',
+      'TEST(RingBufferTest, InitState) {\n  RingBuffer<int> buf(5);\n  EXPECT_EQ(buf.size(), 0);\n  EXPECT_EQ(buf.head(), 0);\n  EXPECT_EQ(buf.tail(), 0);\n}',
     ],
     [
       'BJ-ZZKZ-RINGBUFF-T001',
@@ -98,6 +100,7 @@ function seedRecords() {
       '容量取 0 初始化，验证边界条件下对象的处理策略是否给出明确报错。',
       'm_totalCapacity=0',
       'm_size=编译报错',
+      'TEST(RingBufferTest, ZeroCapacityRejected) {\n  // 容量 0 在编译期或构造期即被拒绝\n  static_assert(RingBuffer<int>::minCapacity > 0);\n  EXPECT_THROW(RingBuffer<int> buf(0), std::invalid_argument);\n}',
     ],
     [
       'GN-ZZKZ-PUSH-T001',
@@ -106,6 +109,7 @@ function seedRecords() {
       '将元素存入缓冲区，验证插入后的状态变化和容量计数是否正确。',
       'm_totalCapacity=2, p_id=0, p_value=Test0',
       'm_size=1, m_head=2, m_tail=1',
+      'TEST(RingBufferTest, PushOne) {\n  RingBuffer<std::string> buf(2);\n  buf.push(0, "Test0");\n  EXPECT_EQ(buf.size(), 1);\n  EXPECT_EQ(buf.head(), 2);\n  EXPECT_EQ(buf.tail(), 1);\n}',
     ],
     [
       'JK-ZZKZ-PUSH-T002',
@@ -114,6 +118,7 @@ function seedRecords() {
       '缓冲区已满后继续 push，验证满容量时的覆盖顺序与读写指针推进。',
       'm_totalCapacity=2，已存 2 个元素',
       'm_size=2, m_head=1, m_tail=1',
+      'TEST(RingBufferTest, PushWhenFull) {\n  RingBuffer<std::string> buf(2);\n  buf.push(0, "A");\n  buf.push(1, "B");\n  buf.push(2, "C");  // 覆盖最旧的 A\n  EXPECT_EQ(buf.size(), 2);\n  EXPECT_EQ(buf.head(), 1);\n  EXPECT_EQ(buf.tail(), 1);\n}',
     ],
     [
       'GN-ZZKZ-CLEAR-T001',
@@ -122,6 +127,7 @@ function seedRecords() {
       '清空缓冲区，验证头部、尾部与长度归零且内存不被释放。',
       'clearAll()',
       'm_size=0, m_head=0, m_tail=0',
+      'TEST(RingBufferTest, ClearAll) {\n  RingBuffer<int> buf(4);\n  buf.push(0, 1);\n  buf.clearAll();\n  EXPECT_EQ(buf.size(), 0);\n  EXPECT_EQ(buf.head(), 0);\n  EXPECT_EQ(buf.tail(), 0);\n}',
     ],
     [
       'BJ-ZZKZ-POP-T001',
@@ -130,6 +136,7 @@ function seedRecords() {
       '空缓冲区执行 pop，验证下溢时不再修改状态。',
       'm_totalCapacity=3, m_size=0',
       '返回失败，m_size 保持 0',
+      'TEST(RingBufferTest, PopEmpty) {\n  RingBuffer<int> buf(3);\n  EXPECT_FALSE(buf.pop());\n  EXPECT_EQ(buf.size(), 0);\n}',
     ],
     [
       'GN-ZZKZ-ITER-T001',
@@ -138,6 +145,7 @@ function seedRecords() {
       '遍历缓冲区中的全部元素，验证顺序与写入顺序一致。',
       'm_totalCapacity=4，依次 push A、B、C',
       '遍历输出 A → B → C',
+      'TEST(RingBufferTest, IterateInPushOrder) {\n  RingBuffer<char> buf(4);\n  buf.push(0, \'A\');\n  buf.push(1, \'B\');\n  buf.push(2, \'C\');\n  std::string seen;\n  for (const auto& ch : buf) seen += ch;\n  EXPECT_EQ(seen, "ABC");\n}',
     ],
   ]
   return rows.map(function (row, index) {
@@ -149,6 +157,7 @@ function seedRecords() {
       description: row[3],
       input: row[4],
       expected: row[5],
+      code: row[6],
       demo: true,
       createdAt: isoAgo(36 + index * 2),
       updatedAt: isoAgo(8 + index * 2),
@@ -166,6 +175,7 @@ function normalizeStored(input) {
     description: text(input.description, MAX_DESCRIPTION),
     input: text(input.input, MAX_INPUT),
     expected: text(input.expected, MAX_EXPECTED),
+    code: text(input.code, MAX_CODE),
     demo: input.demo === true,
     createdAt: isoOrNow(input.createdAt),
     updatedAt: isoOrNow(input.updatedAt),
@@ -183,6 +193,7 @@ function normalizePatch(input, existing) {
     description: text(input.description, MAX_DESCRIPTION),
     input: text(input.input, MAX_INPUT),
     expected: text(input.expected, MAX_EXPECTED),
+    code: text(input.code, MAX_CODE),
     updatedAt: new Date().toISOString(),
   }
 }
@@ -216,10 +227,10 @@ async function readStore() {
   try {
     const raw = await readFile(dataFile(), 'utf8')
     const parsed = JSON.parse(raw)
-    // A store written by the previous record schema (v1) is kept aside instead
-    // of being coerced: those records were notes, not test cases.
+    // A store written by an older schema is kept aside instead of being
+    // coerced: those records had different fields and no case code.
     if (parsed?.version !== STORE_VERSION) {
-      await quarantine('v1')
+      await quarantine(`v${parsed?.version ?? 0}`)
       const records = seedRecords()
       await persist(records, true)
       return { records, seeded: true }
@@ -320,6 +331,7 @@ async function handle(req, res) {
             description: '',
             input: '',
             expected: '',
+            code: '',
             createdAt: now,
           }),
           id: `rec_${randomUUID().replace(/-/g, '').slice(0, 12)}`,
