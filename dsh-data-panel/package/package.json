@@ -1,7 +1,7 @@
 {
   "name": "dsh-data-panel",
-  "version": "0.3.1",
-  "description": "A test-case panel for DeepSeek Harness: a conversation-view tab with a case table (鏍囪瘑 / 鍚嶇О / 绫诲瀷 / 璇存槑 / 杈撳叆 / 棰勬湡杈撳嚭) and a right-sidebar case detail.",
+  "version": "0.3.2",
+  "description": "A test-case panel for DeepSeek Harness: a conversation-view tab with a case table (閺嶅洩鐦?/ 閸氬秶袨 / 缁鐎?/ 鐠囧瓨妲?/ 鏉堟挸鍙?/ 妫板嫭婀℃潏鎾冲毉) and a right-sidebar case detail.",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
