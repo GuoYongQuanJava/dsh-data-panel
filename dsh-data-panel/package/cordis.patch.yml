@@ -1,0 +1,8 @@
+# dsh-data-panel bundle patch.
+#
+# The official installer reads this when the package is added as a bundle and
+# mounts the plugin row below. A manual profile mount can use the same row in
+# ~/.dsh/profiles/<name>/cordis.patch.yml.
+- insert:
+    - id: data-panel
+      name: 'dsh-data-panel'

@@ -1,0 +1,1333 @@
+window.__ModuleLoader__.load({
+	id: "dsh-data-panel",
+	factory: (require) => {
+		var module = { exports: {} };
+		var exports = module.exports;
+		Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
+
+		var React = require("react");
+		var ReactDOM = require("react-dom");
+
+		var h = React.createElement;
+		var useState = React.useState;
+		var useEffect = React.useEffect;
+		var useMemo = React.useMemo;
+		var useRef = React.useRef;
+		var useSyncExternalStore = React.useSyncExternalStore;
+
+		//#region styles
+		var CSS = `
+.dp-root, .dp-root *, .dp-detail, .dp-detail *, .dp-mask, .dp-mask * { box-sizing: border-box; }
+.dp-root, .dp-detail, .dp-mask {
+	--dp-bg: var(--dsw-alias-bg-layer-1, #ffffff);
+	--dp-bg2: var(--dsw-alias-bg-layer-2, #f7f8fa);
+	--dp-bg3: var(--dsw-alias-bg-layer-3, #f2f3f5);
+	--dp-text: var(--dsw-alias-label-primary, #1f2329);
+	--dp-text2: var(--dsw-alias-label-secondary, #646a73);
+	--dp-text3: var(--dsw-alias-label-tertiary, #8f959e);
+	--dp-border: var(--dsw-alias-border-l1, #e5e6eb);
+	--dp-border2: var(--dsw-alias-border-l2, #eef0f3);
+	--dp-brand: var(--dsw-alias-brand-primary, #4d6bfe);
+	--dp-on-brand: var(--dsw-alias-label-primary-foreground, #ffffff);
+	--dp-danger: var(--dsw-alias-label-error, #f54a45);
+	--dp-success: var(--dsw-alias-label-success, #2ea121);
+	--dp-warning: var(--dsw-alias-label-warning, #ff8800);
+	height: 100%;
+	overflow: auto;
+	background: var(--dp-bg);
+	color: var(--dp-text);
+	font-family: var(--dsw-font-family, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif);
+	font-size: 13px;
+	line-height: 1.5;
+	-webkit-font-smoothing: antialiased;
+}
+.dp-root ::-webkit-scrollbar { width: 10px; height: 10px; }
+.dp-root ::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--dp-text3) 28%, transparent); border: 3px solid transparent; border-radius: 999px; background-clip: padding-box; }
+.dp-root ::-webkit-scrollbar-track { background: transparent; }
+.dp-shell { max-width: 1180px; margin: 0 auto; padding: 26px 30px 56px; }
+.dp-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; flex-wrap: wrap; }
+.dp-eyebrow { color: var(--dp-text3); font-size: 10px; font-weight: 650; letter-spacing: .14em; text-transform: uppercase; }
+.dp-title { margin: 5px 0 5px; font-size: 24px; font-weight: 650; letter-spacing: -.015em; line-height: 1.25; }
+.dp-subtitle { margin: 0; max-width: 620px; color: var(--dp-text2); font-size: 13px; }
+.dp-stats { display: flex; gap: 8px; }
+.dp-stat { min-width: 76px; padding: 10px 14px; border: 1px solid var(--dp-border); border-radius: 12px; background: var(--dp-bg); }
+.dp-stat b { display: block; font-size: 20px; font-weight: 650; line-height: 1.2; letter-spacing: -.01em; }
+.dp-stat span { display: block; margin-top: 1px; color: var(--dp-text3); font-size: 11px; }
+.dp-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 22px 0 12px; }
+.dp-search { position: relative; flex: 1 1 240px; max-width: 360px; }
+.dp-search svg { position: absolute; left: 11px; top: 50%; transform: translateY(-50%); color: var(--dp-text3); pointer-events: none; }
+.dp-search input { width: 100%; height: 36px; padding: 0 12px 0 34px; border: 1px solid transparent; border-radius: 10px; background: var(--dp-bg2); color: var(--dp-text); font: inherit; outline: none; transition: border-color .15s, background .15s, box-shadow .15s; }
+.dp-search input:hover { border-color: var(--dp-border); }
+.dp-search input:focus { border-color: var(--dp-brand); background: var(--dp-bg); box-shadow: 0 0 0 3px color-mix(in srgb, var(--dp-brand) 13%, transparent); }
+.dp-search input::placeholder { color: var(--dp-text3); }
+.dp-select { height: 36px; padding: 0 28px 0 10px; border: 1px solid var(--dp-border); border-radius: 10px; background: var(--dp-bg); color: var(--dp-text); font: inherit; font-size: 13px; outline: none; cursor: pointer; }
+.dp-select:focus { border-color: var(--dp-brand); box-shadow: 0 0 0 3px color-mix(in srgb, var(--dp-brand) 13%, transparent); }
+.dp-btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 36px; padding: 0 14px; border: 1px solid var(--dp-border); border-radius: 10px; background: var(--dp-bg); color: var(--dp-text); font: inherit; font-size: 13px; font-weight: 500; white-space: nowrap; cursor: pointer; transition: background .15s, border-color .15s, color .15s, box-shadow .15s, filter .15s; }
+.dp-btn:hover { background: var(--dp-bg2); }
+.dp-btn:focus-visible { outline: 2px solid var(--dp-brand); outline-offset: 2px; }
+.dp-btn:disabled { opacity: .55; cursor: not-allowed; }
+.dp-btn-primary { border-color: var(--dp-brand); background: var(--dp-brand); color: var(--dp-on-brand); }
+.dp-btn-primary:hover { background: var(--dp-brand); filter: brightness(1.06); }
+.dp-btn-ghost { border-color: transparent; background: transparent; color: var(--dp-text2); }
+.dp-btn-ghost:hover { background: var(--dp-bg2); color: var(--dp-text); }
+.dp-btn-danger { border-color: color-mix(in srgb, var(--dp-danger) 30%, transparent); color: var(--dp-danger); }
+.dp-btn-danger:hover { background: color-mix(in srgb, var(--dp-danger) 8%, transparent); }
+.dp-btn-sm { height: 30px; padding: 0 10px; font-size: 12px; }
+.dp-demo-banner { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 0 0 12px; padding: 9px 12px; border: 1px solid color-mix(in srgb, var(--dp-warning) 26%, transparent); border-radius: 10px; background: color-mix(in srgb, var(--dp-warning) 7%, transparent); color: var(--dp-text2); font-size: 12px; }
+.dp-demo-banner b { color: var(--dp-warning); font-weight: 650; }
+.dp-demo-banner button { margin-left: auto; padding: 0; border: 0; background: none; color: var(--dp-warning); font: inherit; font-size: 12px; font-weight: 500; cursor: pointer; }
+.dp-demo-banner button:hover { text-decoration: underline; text-underline-offset: 2px; }
+.dp-alert { display: flex; align-items: center; gap: 8px; margin: 0 0 12px; padding: 9px 12px; border: 1px solid color-mix(in srgb, var(--dp-danger) 26%, transparent); border-radius: 10px; background: color-mix(in srgb, var(--dp-danger) 7%, transparent); color: var(--dp-danger); font-size: 12px; }
+.dp-alert button { margin-left: auto; padding: 0; border: 0; background: none; color: inherit; font: inherit; font-size: 12px; font-weight: 500; cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
+.dp-card { overflow: hidden; border: 1px solid var(--dp-border); border-radius: 14px; background: var(--dp-bg); }
+.dp-card-scroll { overflow-x: auto; }
+.dp-table { width: 100%; min-width: 760px; border-collapse: collapse; table-layout: fixed; }
+.dp-table th { padding: 10px 14px; border-bottom: 1px solid var(--dp-border); background: var(--dp-bg2); color: var(--dp-text3); font-size: 11px; font-weight: 600; letter-spacing: .02em; text-align: left; white-space: nowrap; }
+.dp-table th.dp-right { text-align: right; }
+.dp-table td { padding: 11px 14px; border-bottom: 1px solid var(--dp-border2); vertical-align: middle; }
+.dp-table tbody tr:last-child td { border-bottom: 0; }
+.dp-row { transition: background .12s; }
+.dp-row:hover { background: var(--dp-bg2); }
+.dp-title-cell { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.dp-title-link { display: inline-flex; align-items: center; min-width: 0; max-width: 100%; padding: 0; border: 0; background: none; color: var(--dp-text); font: inherit; font-weight: 550; text-align: left; cursor: pointer; }
+.dp-title-link:hover { color: var(--dp-brand); }
+.dp-title-link:hover .dp-title-text { text-decoration: underline; text-underline-offset: 3px; }
+.dp-title-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dp-demo-tag { flex: 0 0 auto; padding: 0 6px; border: 1px solid color-mix(in srgb, var(--dp-warning) 36%, transparent); border-radius: 5px; color: var(--dp-warning); font-size: 10px; line-height: 16px; }
+.dp-ext { display: inline-flex; flex: 0 0 auto; align-items: center; justify-content: center; width: 20px; height: 20px; border-radius: 6px; color: var(--dp-text3); }
+.dp-ext:hover { background: var(--dp-bg3); color: var(--dp-brand); }
+.dp-pill { display: inline-flex; align-items: center; gap: 6px; padding: 2px 9px; border-radius: 999px; background: var(--dp-bg3); color: var(--dp-text2); font-size: 12px; font-weight: 500; line-height: 18px; white-space: nowrap; }
+.dp-dot { width: 6px; height: 6px; flex: 0 0 auto; border-radius: 50%; background: currentColor; }
+.dp-pill[data-tone="doing"] { background: color-mix(in srgb, var(--dp-brand) 10%, transparent); color: var(--dp-brand); }
+.dp-pill[data-tone="done"] { background: color-mix(in srgb, var(--dp-success) 10%, transparent); color: var(--dp-success); }
+.dp-pill[data-tone="blocked"] { background: color-mix(in srgb, var(--dp-danger) 10%, transparent); color: var(--dp-danger); }
+.dp-chip { display: inline-block; max-width: 100%; overflow: hidden; padding: 1px 8px; border: 1px solid var(--dp-border); border-radius: 6px; color: var(--dp-text2); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.dp-owner { color: var(--dp-text2); }
+.dp-time { color: var(--dp-text3); font-size: 12px; white-space: nowrap; }
+.dp-actions { display: flex; justify-content: flex-end; gap: 2px; opacity: 0; transition: opacity .12s; }
+.dp-row:hover .dp-actions, .dp-row:focus-within .dp-actions { opacity: 1; }
+@media (hover: none) { .dp-actions { opacity: 1; } }
+.dp-icon-btn { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; padding: 0; border: 0; border-radius: 8px; background: transparent; color: var(--dp-text3); cursor: pointer; transition: background .12s, color .12s; }
+.dp-icon-btn:hover { background: var(--dp-bg3); color: var(--dp-text); }
+.dp-icon-btn.danger:hover { background: color-mix(in srgb, var(--dp-danger) 10%, transparent); color: var(--dp-danger); }
+.dp-icon-btn:focus-visible { outline: 2px solid var(--dp-brand); outline-offset: 1px; }
+.dp-icon-btn:disabled { opacity: .5; cursor: not-allowed; }
+.dp-empty { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 72px 24px; text-align: center; }
+.dp-empty-icon { display: flex; align-items: center; justify-content: center; width: 48px; height: 48px; margin-bottom: 14px; border-radius: 14px; background: var(--dp-bg2); color: var(--dp-text3); }
+.dp-empty h3 { margin: 0 0 6px; font-size: 15px; font-weight: 600; }
+.dp-empty p { max-width: 380px; margin: 0 0 18px; color: var(--dp-text2); font-size: 13px; }
+.dp-skeleton-wrap { padding: 6px 0; }
+.dp-skeleton-row { display: flex; align-items: center; gap: 24px; padding: 14px 16px; border-bottom: 1px solid var(--dp-border2); }
+.dp-skeleton-row:last-child { border-bottom: 0; }
+.dp-skeleton { height: 12px; border-radius: 6px; background: linear-gradient(90deg, var(--dp-bg2) 25%, var(--dp-bg3) 37%, var(--dp-bg2) 63%); background-size: 400% 100%; animation: dp-shimmer 1.35s ease infinite; }
+@keyframes dp-shimmer { 0% { background-position: 100% 0; } 100% { background-position: 0 0; } }
+.dp-foot { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-top: 10px; color: var(--dp-text3); font-size: 11px; }
+.dp-mask { position: fixed; inset: 0; z-index: 80; display: flex; align-items: center; justify-content: center; padding: 24px; background: rgba(15, 18, 24, .36); backdrop-filter: blur(2px); animation: dp-fade .14s ease; }
+.dp-modal { display: flex; flex-direction: column; width: min(640px, 100%); max-height: 86vh; overflow: hidden; border: 1px solid var(--dp-border); border-radius: 16px; background: var(--dp-bg); box-shadow: 0 24px 80px rgba(0, 0, 0, .24); animation: dp-pop .16s ease; }
+.dp-modal-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 18px 20px 12px; }
+.dp-modal-title { margin: 0; font-size: 16px; font-weight: 620; letter-spacing: -.01em; }
+.dp-modal-sub { margin: 4px 0 0; color: var(--dp-text2); font-size: 12px; line-height: 1.5; }
+.dp-modal-body { padding: 4px 20px 18px; overflow: auto; }
+.dp-modal-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 20px; border-top: 1px solid var(--dp-border); background: var(--dp-bg); }
+.dp-form { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 14px; }
+.dp-field { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.dp-field.full { grid-column: 1 / -1; }
+.dp-label { color: var(--dp-text2); font-size: 12px; font-weight: 500; }
+.dp-label em { margin-left: 2px; color: var(--dp-danger); font-style: normal; }
+.dp-hint { color: var(--dp-text3); font-size: 11px; line-height: 1.5; }
+.dp-input, .dp-select, .dp-textarea { width: 100%; border: 1px solid var(--dp-border); border-radius: 9px; background: var(--dp-bg); color: var(--dp-text); font: inherit; font-size: 13px; outline: none; transition: border-color .15s, box-shadow .15s; }
+.dp-input, .dp-select { height: 36px; padding: 0 10px; }
+.dp-textarea { min-height: 64px; padding: 8px 10px; line-height: 1.55; resize: vertical; }
+.dp-input:focus, .dp-select:focus, .dp-textarea:focus { border-color: var(--dp-brand); box-shadow: 0 0 0 3px color-mix(in srgb, var(--dp-brand) 13%, transparent); }
+.dp-input::placeholder, .dp-textarea::placeholder { color: var(--dp-text3); }
+.dp-form .dp-alert { grid-column: 1 / -1; margin: 0; }
+.dp-detail { height: 100%; overflow: auto; padding: 18px 18px 40px; background: var(--dp-bg); color: var(--dp-text); font-size: 13px; }
+.dp-detail-head { display: flex; flex-direction: column; gap: 9px; padding-bottom: 14px; border-bottom: 1px solid var(--dp-border); }
+.dp-detail-kicker { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.dp-detail-title { margin: 0; font-size: 20px; font-weight: 650; line-height: 1.35; letter-spacing: -.015em; word-break: break-word; }
+.dp-detail-meta { display: flex; flex-wrap: wrap; gap: 8px 16px; color: var(--dp-text2); font-size: 12px; }
+.dp-meta-item { display: inline-flex; align-items: center; gap: 5px; }
+.dp-meta-item b { color: var(--dp-text); font-weight: 500; }
+.dp-detail-actions { display: flex; flex-wrap: wrap; gap: 6px; margin: 14px 0 0; }
+.dp-section { margin-top: 18px; }
+.dp-section h4 { margin: 0 0 8px; color: var(--dp-text3); font-size: 11px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; }
+.dp-summary { margin: 0; padding: 11px 13px; border-radius: 10px; background: var(--dp-bg2); color: var(--dp-text); line-height: 1.65; white-space: pre-wrap; word-break: break-word; }
+.dp-content { margin: 0; padding: 13px 14px; border: 1px solid var(--dp-border); border-radius: 10px; background: var(--dp-bg); color: var(--dp-text); font: inherit; font-size: 13px; line-height: 1.7; white-space: pre-wrap; word-break: break-word; }
+.dp-detail-empty { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; height: 100%; min-height: 240px; padding: 24px; color: var(--dp-text2); text-align: center; }
+.dp-detail-empty h3 { margin: 0; color: var(--dp-text); font-size: 15px; font-weight: 600; }
+.dp-detail-empty p { max-width: 280px; margin: 0; font-size: 12px; }
+.dp-confirm-text { margin: 0; color: var(--dp-text2); font-size: 13px; line-height: 1.7; }
+.dp-confirm-text b { color: var(--dp-text); font-weight: 550; }
+.dp-form-detail { grid-template-columns: 1fr; gap: 11px; }
+.dp-detail-editor { padding-top: 14px; }
+.dp-detail-editor .dp-form { margin-top: 2px; }
+.dp-detail-editor-foot { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+@keyframes dp-fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes dp-pop { from { opacity: 0; transform: translateY(6px) scale(.985); } to { opacity: 1; transform: none; } }
+@media (max-width: 760px) {
+	.dp-shell { padding: 18px 16px 40px; }
+	.dp-stats { width: 100%; }
+	.dp-form { grid-template-columns: 1fr; }
+	.dp-modal { max-height: 92vh; }
+}
+`;
+
+		function ensureStyles() {
+			if (typeof document === "undefined") return;
+			if (document.getElementById("dsh-data-panel-style") !== null) return;
+			var style = document.createElement("style");
+			style.id = "dsh-data-panel-style";
+			style.textContent = CSS;
+			(document.head || document.documentElement).appendChild(style);
+		}
+		//#endregion
+
+		//#region helpers
+		var STATUS_META = {
+			todo: { label: "待开始", tone: "muted" },
+			doing: { label: "进行中", tone: "doing" },
+			done: { label: "已完成", tone: "done" },
+			blocked: { label: "受阻", tone: "blocked" }
+		};
+		var PRIORITY_META = {
+			high: { label: "高", tone: "high" },
+			medium: { label: "中", tone: "medium" },
+			low: { label: "低", tone: "low" }
+		};
+		var CATEGORIES = ["产品", "研发", "设计", "运营", "数据", "市场", "其他"];
+
+		function cn() {
+			var parts = [];
+			for (var i = 0; i < arguments.length; i += 1) {
+				var value = arguments[i];
+				if (value) parts.push(value);
+			}
+			return parts.join(" ");
+		}
+
+		function fmtRelative(iso) {
+			var time = Date.parse(iso);
+			if (!Number.isFinite(time)) return "—";
+			var diff = Date.now() - time;
+			var abs = Math.abs(diff);
+			if (abs < 60 * 1000) return "刚刚";
+			if (abs < 3600 * 1000) return Math.floor(abs / (60 * 1000)) + " 分钟前";
+			if (abs < 24 * 3600 * 1000) return Math.floor(abs / (3600 * 1000)) + " 小时前";
+			if (abs < 7 * 24 * 3600 * 1000) return Math.floor(abs / (24 * 3600 * 1000)) + " 天前";
+			return new Date(time).toLocaleDateString("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit" });
+		}
+
+		function fmtFull(iso) {
+			var time = Date.parse(iso);
+			if (!Number.isFinite(time)) return "—";
+			return new Date(time).toLocaleString("zh-CN", {
+				year: "numeric",
+				month: "2-digit",
+				day: "2-digit",
+				hour: "2-digit",
+				minute: "2-digit"
+			});
+		}
+
+		function sortRecords(records) {
+			return records.slice().sort(function (left, right) {
+				return String(right.updatedAt).localeCompare(String(left.updatedAt));
+			});
+		}
+		//#endregion
+
+		//#region icons
+		function Icon(props) {
+			var size = props.size || 16;
+			var common = {
+				width: size,
+				height: size,
+				viewBox: "0 0 24 24",
+				fill: "none",
+				stroke: "currentColor",
+				strokeWidth: 1.7,
+				strokeLinecap: "round",
+				strokeLinejoin: "round",
+				"aria-hidden": "true",
+				focusable: "false"
+			};
+			var children = null;
+			switch (props.name) {
+				case "search":
+					children = [h("circle", { key: "c", cx: 11, cy: 11, r: 7 }), h("path", { key: "p", d: "m20 20-3.5-3.5" })];
+					break;
+				case "plus":
+					children = [h("path", { key: "a", d: "M12 5v14" }), h("path", { key: "b", d: "M5 12h14" })];
+					break;
+				case "edit":
+					children = [h("path", { key: "a", d: "M12 20h9" }), h("path", { key: "b", d: "M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z" })];
+					break;
+				case "trash":
+					children = [h("path", { key: "a", d: "M3 6h18" }), h("path", { key: "b", d: "M8 6V4h8v2" }), h("path", { key: "c", d: "M19 6l-1 14H6L5 6" }), h("path", { key: "d", d: "M10 11v5M14 11v5" })];
+					break;
+				case "refresh":
+					children = [h("path", { key: "a", d: "M20 11a8 8 0 1 0-2.3 5.7" }), h("path", { key: "b", d: "M20 5v6h-6" })];
+					break;
+				case "external":
+					children = [h("path", { key: "a", d: "M14 4h6v6" }), h("path", { key: "b", d: "M20 4 11 13" }), h("path", { key: "c", d: "M20 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h5" })];
+					break;
+				case "close":
+					children = [h("path", { key: "a", d: "m6 6 12 12" }), h("path", { key: "b", d: "m18 6-12 12" })];
+					break;
+				case "doc":
+					children = [h("path", { key: "a", d: "M6 3h8l4 4v14H6z" }), h("path", { key: "b", d: "M14 3v5h5" }), h("path", { key: "c", d: "M9 13h6M9 17h4" })];
+					break;
+				case "link":
+					children = [h("path", { key: "a", d: "M10 13a5 5 0 0 0 7 0l2-2a5 5 0 0 0-7-7l-1 1" }), h("path", { key: "b", d: "M14 11a5 5 0 0 0-7 0l-2 2a5 5 0 0 0 7 7l1-1" })];
+					break;
+				default:
+					children = [h("circle", { key: "c", cx: 12, cy: 12, r: 8 })];
+			}
+			return h("svg", common, children);
+		}
+		//#endregion
+
+		//#region store
+		function createStore() {
+			var snapshot = { status: "idle", records: [], demoCount: 0, error: "" };
+			var listeners = new Set();
+			var inflight = null;
+
+			function emit() {
+				listeners.forEach(function (listener) {
+					listener();
+				});
+			}
+
+			function publish(patch) {
+				snapshot = Object.assign({}, snapshot, patch);
+				emit();
+			}
+
+			function commit(records) {
+				var next = sortRecords(records);
+				publish({
+					status: "ready",
+					records: next,
+					demoCount: next.filter(function (record) { return record.demo === true; }).length,
+					error: ""
+				});
+			}
+
+			function request(body) {
+				var init = body === undefined
+					? { method: "GET", headers: { accept: "application/json" } }
+					: {
+						method: "POST",
+						headers: { "content-type": "application/json", accept: "application/json" },
+						body: JSON.stringify(body)
+					};
+				return fetch("/data-panel/api", init).then(function (response) {
+					return response.json().catch(function () { return {}; }).then(function (data) {
+						if (!response.ok || data.ok === false) {
+							throw new Error(data && data.error ? data.error : "请求失败（HTTP " + response.status + "）");
+						}
+						return data;
+					});
+				});
+			}
+
+			return {
+				subscribe: function (listener) {
+					listeners.add(listener);
+					return function () {
+						listeners.delete(listener);
+					};
+				},
+				getSnapshot: function () {
+					return snapshot;
+				},
+				setError: function (message) {
+					publish({ error: message || "" });
+				},
+				load: function (force) {
+					if (!force && snapshot.status === "ready") return Promise.resolve(snapshot);
+					if (inflight !== null) return inflight;
+					publish({ status: snapshot.status === "ready" ? "refreshing" : "loading", error: "" });
+					inflight = request()
+						.then(function (data) {
+							commit(data.records || []);
+							return snapshot;
+						})
+						.catch(function (error) {
+							publish({ status: snapshot.status === "refreshing" ? "ready" : "error", error: error.message });
+							throw error;
+						})
+						.finally(function () {
+							inflight = null;
+						});
+					return inflight;
+				},
+				create: function (record) {
+					return request({ op: "create", record: record }).then(function (data) {
+						commit(snapshot.records.concat([data.record]));
+						return data.record;
+					});
+				},
+				update: function (id, patch) {
+					return request({ op: "update", id: id, patch: patch }).then(function (data) {
+						commit(snapshot.records.map(function (record) {
+							return record.id === id ? data.record : record;
+						}));
+						return data.record;
+					});
+				},
+				remove: function (id) {
+					return request({ op: "delete", id: id }).then(function () {
+						commit(snapshot.records.filter(function (record) { return record.id !== id; }));
+					});
+				},
+				clearDemo: function () {
+					return request({ op: "clearDemo" }).then(function () {
+						commit(snapshot.records.filter(function (record) { return record.demo !== true; }));
+					});
+				}
+			};
+		}
+
+		var store = createStore();
+		//#endregion
+
+		//#region primitives
+		function Button(props) {
+			var variant = props.variant ? "dp-btn-" + props.variant : "";
+			return h("button", {
+				type: "button",
+				className: cn("dp-btn", variant, props.size === "sm" ? "dp-btn-sm" : "", props.className),
+				onClick: props.onClick,
+				disabled: props.disabled === true,
+				title: props.title
+			}, props.children);
+		}
+
+		function IconButton(props) {
+			return h("button", {
+				type: "button",
+				className: cn("dp-icon-btn", props.danger ? "danger" : "", props.className),
+				onClick: props.onClick,
+				disabled: props.disabled === true,
+				title: props.label,
+				"aria-label": props.label
+			}, h(Icon, { name: props.name, size: 15 }));
+		}
+
+		function Field(props) {
+			return h("label", { className: cn("dp-field", props.full ? "full" : "") },
+				h("span", { className: "dp-label" }, props.label, props.required ? h("em", null, "*") : null),
+				props.children,
+				props.hint ? h("span", { className: "dp-hint" }, props.hint) : null
+			);
+		}
+
+		function StatusPill(props) {
+			var meta = STATUS_META[props.status] || STATUS_META.todo;
+			return h("span", { className: "dp-pill", "data-tone": meta.tone },
+				h("i", { className: "dp-dot" }),
+				meta.label
+			);
+		}
+
+		function PriorityPill(props) {
+			var meta = PRIORITY_META[props.priority] || PRIORITY_META.medium;
+			return h("span", { className: "dp-pill", "data-tone": "muted" },
+				h("i", { className: "dp-dot" }),
+				"优先级 " + meta.label
+			);
+		}
+
+		function Modal(props) {
+			useEffect(function () {
+				function onKey(event) {
+					if (event.key === "Escape" && props.busy !== true) props.onClose();
+				}
+				document.addEventListener("keydown", onKey);
+				return function () {
+					document.removeEventListener("keydown", onKey);
+				};
+			}, [props.busy, props.onClose]);
+
+			var content = h("div", {
+				className: "dp-mask",
+				onMouseDown: function (event) {
+					if (event.target === event.currentTarget && props.busy !== true) props.onClose();
+				}
+			},
+				h("div", {
+					className: "dp-modal",
+					role: "dialog",
+					"aria-modal": "true",
+					"aria-label": props.title
+				},
+					h("div", { className: "dp-modal-head" },
+						h("div", null,
+							h("h3", { className: "dp-modal-title" }, props.title),
+							props.subtitle ? h("p", { className: "dp-modal-sub" }, props.subtitle) : null
+						),
+						h(IconButton, { name: "close", label: "关闭", onClick: props.onClose, disabled: props.busy === true })
+					),
+					h("div", { className: "dp-modal-body" }, props.children),
+					props.footer ? h("div", { className: "dp-modal-foot" }, props.footer) : null
+				)
+			);
+			return ReactDOM.createPortal(content, document.body);
+		}
+
+		function ConfirmDialog(props) {
+			return h(Modal, {
+				title: props.title,
+				subtitle: props.message,
+				onClose: props.onCancel,
+				busy: props.busy,
+				footer: [
+					h(Button, { key: "cancel", onClick: props.onCancel, disabled: props.busy }, "取消"),
+					h(Button, { key: "ok", variant: "danger", onClick: props.onConfirm, disabled: props.busy }, props.busy ? "处理中…" : (props.confirmLabel || "删除"))
+				]
+			}, props.detail ? h("p", { className: "dp-confirm-text" }, props.detail) : null);
+		}
+		//#endregion
+
+		//#region table view
+		function SearchBox(props) {
+			return h("div", { className: "dp-search" },
+				h(Icon, { name: "search", size: 15 }),
+				h("input", {
+					type: "search",
+					value: props.value,
+					placeholder: "搜索标题、分类、负责人或内容…",
+					onChange: function (event) { props.onChange(event.target.value); },
+					"aria-label": "搜索记录"
+				})
+			);
+		}
+
+		function EmptyState(props) {
+			var filtered = props.filtered;
+			return h("div", { className: "dp-empty" },
+				h("div", { className: "dp-empty-icon" }, h(Icon, { name: "doc", size: 23 })),
+				h("h3", null, filtered ? "没有匹配的记录" : "还没有记录"),
+				h("p", null, filtered
+					? "换个关键词或清除筛选条件试试。"
+					: "把需要持续跟踪的事情放进面板，点击标题即可在右侧查看详情。"),
+				filtered
+					? h(Button, { onClick: props.onClear }, "清除筛选")
+					: h(Button, { variant: "primary", onClick: props.onCreate },
+						h(Icon, { name: "plus", size: 15 }),
+						"新建第一条"
+					)
+			);
+		}
+
+		function SkeletonTable() {
+			var widths = [["34%", "10%", "12%", "10%", "12%"], ["46%", "12%", "10%", "9%", "10%"], ["28%", "9%", "13%", "11%", "11%"], ["40%", "11%", "10%", "10%", "10%"]];
+			return h("div", { className: "dp-skeleton-wrap" }, widths.map(function (widths, index) {
+				return h("div", { className: "dp-skeleton-row", key: index }, widths.map(function (width, column) {
+					return h("div", { className: "dp-skeleton", key: column, style: { width: width } });
+				}));
+			}));
+		}
+
+		function RecordFormModal(props) {
+			var initial = props.record || {};
+			var state = useState(function () {
+				return {
+					title: initial.title || "",
+					category: initial.category || "产品",
+					status: initial.status || "todo",
+					priority: initial.priority || "medium",
+					owner: initial.owner || "",
+					url: initial.url || "",
+					summary: initial.summary || "",
+					content: initial.content || ""
+				};
+			});
+			var values = state[0];
+			var setValues = state[1];
+			var errorState = useState("");
+			var localError = errorState[0];
+			var setLocalError = errorState[1];
+			var firstRef = useRef(null);
+
+			useEffect(function () {
+				if (firstRef.current !== null) firstRef.current.focus();
+			}, []);
+
+			function set(key, value) {
+				setValues(function (previous) {
+					var next = Object.assign({}, previous);
+					next[key] = value;
+					return next;
+				});
+			}
+
+			function submit(event) {
+				if (event) event.preventDefault();
+				if (!values.title.trim()) {
+					setLocalError("标题不能为空");
+					return;
+				}
+				setLocalError("");
+				props.onSubmit(values);
+			}
+
+			var error = localError || props.error || "";
+			return h(Modal, {
+				title: props.mode === "edit" ? "编辑记录" : "新建记录",
+				subtitle: props.mode === "edit"
+					? "修改后立即写入本地数据文件，右侧详情会同步更新。"
+					: "填写基本信息，保存后点击标题即可在右侧查看详情。",
+				onClose: props.onClose,
+				busy: props.busy,
+				footer: [
+					h(Button, { key: "cancel", onClick: props.onClose, disabled: props.busy }, "取消"),
+					h(Button, { key: "save", variant: "primary", onClick: function () { submit(); }, disabled: props.busy },
+						props.busy ? "保存中…" : (props.mode === "edit" ? "保存修改" : "创建记录")
+					)
+				]
+			},
+				h("form", { className: "dp-form", onSubmit: submit },
+					error ? h("div", { className: "dp-alert" }, error) : null,
+					h(Field, { label: "标题", required: true, full: true },
+						h("input", {
+							ref: firstRef,
+							className: "dp-input",
+							value: values.title,
+							maxLength: 200,
+							placeholder: "例如：Q4 产品路线图评审",
+							onChange: function (event) { set("title", event.target.value); }
+						})
+					),
+					h(Field, { label: "分类" },
+						h("input", {
+							className: "dp-input",
+							value: values.category,
+							maxLength: 40,
+							list: "dp-category-options-modal",
+							placeholder: "产品 / 研发 / 运营…",
+							onChange: function (event) { set("category", event.target.value); }
+						})
+					),
+					h(Field, { label: "负责人" },
+						h("input", {
+							className: "dp-input",
+							value: values.owner,
+							maxLength: 80,
+							placeholder: "谁在跟进",
+							onChange: function (event) { set("owner", event.target.value); }
+						})
+					),
+					h(Field, { label: "状态" },
+						h("select", {
+							className: "dp-select",
+							value: values.status,
+							onChange: function (event) { set("status", event.target.value); }
+						}, Object.keys(STATUS_META).map(function (key) {
+							return h("option", { key: key, value: key }, STATUS_META[key].label);
+						}))
+					),
+					h(Field, { label: "优先级" },
+						h("select", {
+							className: "dp-select",
+							value: values.priority,
+							onChange: function (event) { set("priority", event.target.value); }
+						}, Object.keys(PRIORITY_META).map(function (key) {
+							return h("option", { key: key, value: key }, PRIORITY_META[key].label);
+						}))
+					),
+					h(Field, { label: "链接", full: true, hint: "可选。点击标题进右侧详情，点标题旁的小图标打开这个链接。" },
+						h("input", {
+							className: "dp-input",
+							value: values.url,
+							maxLength: 2000,
+							placeholder: "https://…",
+							onChange: function (event) { set("url", event.target.value); }
+						})
+					),
+					h(Field, { label: "摘要", full: true },
+						h("textarea", {
+							className: "dp-textarea",
+							rows: 2,
+							value: values.summary,
+							maxLength: 2000,
+							placeholder: "一句话说明这条记录",
+							onChange: function (event) { set("summary", event.target.value); }
+						})
+					),
+					h(Field, { label: "内容", full: true, hint: "支持换行，详情页会按原样展示。" },
+						h("textarea", {
+							className: "dp-textarea",
+							rows: 6,
+							value: values.content,
+							maxLength: 20000,
+							placeholder: "背景、进展、下一步…",
+							onChange: function (event) { set("content", event.target.value); }
+						})
+					),
+					h("datalist", { id: "dp-category-options-modal" }, CATEGORIES.map(function (name) {
+						return h("option", { key: name, value: name });
+					}))
+				)
+			);
+		}
+
+		function DataPanelView(props) {
+			var snap = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
+			var queryState = useState("");
+			var query = queryState[0];
+			var setQuery = queryState[1];
+			var statusState = useState("all");
+			var status = statusState[0];
+			var setStatus = statusState[1];
+			var formState = useState(null);
+			var form = formState[0];
+			var setForm = formState[1];
+			var confirmState = useState(null);
+			var confirm = confirmState[0];
+			var setConfirm = confirmState[1];
+			var busyState = useState(false);
+			var busy = busyState[0];
+			var setBusy = busyState[1];
+			var formErrorState = useState("");
+			var formError = formErrorState[0];
+			var setFormError = formErrorState[1];
+
+			useEffect(function () {
+				store.load().catch(function () {});
+			}, []);
+
+			var records = snap.records || [];
+			var filtered = useMemo(function () {
+				var needle = query.trim().toLowerCase();
+				return records.filter(function (record) {
+					if (status !== "all" && record.status !== status) return false;
+					if (!needle) return true;
+					return [record.title, record.category, record.owner, record.summary, record.content]
+						.join(" ")
+						.toLowerCase()
+						.indexOf(needle) !== -1;
+				});
+			}, [records, query, status]);
+
+			var doingCount = records.filter(function (record) { return record.status === "doing"; }).length;
+
+			function openDetail(id) {
+				if (typeof props.openDetail !== "function") {
+					store.setError("右侧栏服务尚未就绪，请刷新页面后再试。");
+					return;
+				}
+				props.openDetail(id);
+			}
+
+			function openCreate() {
+				setFormError("");
+				setForm({ mode: "create" });
+			}
+
+			function openEdit(record) {
+				setFormError("");
+				setForm({ mode: "edit", record: record });
+			}
+
+			function submit(values) {
+				setBusy(true);
+				setFormError("");
+				var action = form && form.mode === "edit"
+					? store.update(form.record.id, values)
+					: store.create(values);
+				action
+					.then(function () {
+						setForm(null);
+					})
+					.catch(function (error) {
+						setFormError(error.message);
+					})
+					.finally(function () {
+						setBusy(false);
+					});
+			}
+
+			function confirmAction() {
+				if (confirm === null) return;
+				setBusy(true);
+				var action = confirm.kind === "clearDemo" ? store.clearDemo() : store.remove(confirm.record.id);
+				action
+					.then(function () {
+						setConfirm(null);
+					})
+					.catch(function (error) {
+						store.setError(error.message);
+					})
+					.finally(function () {
+						setBusy(false);
+					});
+			}
+
+			function refresh() {
+				store.load(true).catch(function () {});
+			}
+
+			var loading = (snap.status === "idle" || snap.status === "loading") && records.length === 0;
+			var filtering = query.trim() !== "" || status !== "all";
+
+			return h("div", { className: "dp-root" },
+				h("div", { className: "dp-shell" },
+					h("div", { className: "dp-header" },
+						h("div", null,
+							h("div", { className: "dp-eyebrow" }, "Data Panel"),
+							h("h1", { className: "dp-title" }, "数据面板"),
+							h("p", { className: "dp-subtitle" }, "会话里的轻量记录台。点击标题在右侧查看详情，表格里直接完成增删改查。")
+						),
+						h("div", { className: "dp-stats" },
+							h("div", { className: "dp-stat" },
+								h("b", null, String(records.length)),
+								h("span", null, "全部记录")
+							),
+							h("div", { className: "dp-stat" },
+								h("b", null, String(doingCount)),
+								h("span", null, "进行中")
+							),
+							snap.demoCount > 0 ? h("div", { className: "dp-stat" },
+								h("b", null, String(snap.demoCount)),
+								h("span", null, "示例")
+							) : null
+						)
+					),
+					h("div", { className: "dp-toolbar" },
+						h(SearchBox, { value: query, onChange: setQuery }),
+						h("select", {
+							className: "dp-select",
+							value: status,
+							onChange: function (event) { setStatus(event.target.value); },
+							"aria-label": "按状态筛选"
+						},
+							h("option", { value: "all" }, "全部状态"),
+							Object.keys(STATUS_META).map(function (key) {
+								return h("option", { key: key, value: key }, STATUS_META[key].label);
+							})
+						),
+						h(Button, { variant: "ghost", onClick: refresh, disabled: snap.status === "refreshing" },
+							h(Icon, { name: "refresh", size: 15 }),
+							snap.status === "refreshing" ? "刷新中…" : "刷新"
+						),
+						h(Button, { variant: "primary", onClick: openCreate },
+							h(Icon, { name: "plus", size: 15 }),
+							"新建"
+						)
+					),
+					snap.error ? h("div", { className: "dp-alert" },
+						snap.error,
+						h("button", { type: "button", onClick: refresh }, "重试")
+					) : null,
+					snap.demoCount > 0 ? h("div", { className: "dp-demo-banner" },
+						h("b", null, "示例数据"),
+						h("span", null, "这些记录用于演示面板能力，可直接编辑或删除。"),
+						h("button", {
+							type: "button",
+							onClick: function () { setConfirm({ kind: "clearDemo" }); }
+						}, "清空示例")
+					) : null,
+					h("div", { className: "dp-card" },
+						h("div", { className: "dp-card-scroll" },
+							loading
+								? h(SkeletonTable)
+								: filtered.length === 0
+									? h(EmptyState, {
+										filtered: filtering,
+										onClear: function () { setQuery(""); setStatus("all"); },
+										onCreate: openCreate
+									})
+									: h("table", { className: "dp-table" },
+										h("colgroup", null,
+											h("col", { style: { width: "36%" } }),
+											h("col", { style: { width: "12%" } }),
+											h("col", { style: { width: "14%" } }),
+											h("col", { style: { width: "12%" } }),
+											h("col", { style: { width: "14%" } }),
+											h("col", { style: { width: "12%" } })
+										),
+										h("thead", null,
+											h("tr", null,
+												h("th", null, "标题"),
+												h("th", null, "分类"),
+												h("th", null, "状态"),
+												h("th", null, "负责人"),
+												h("th", null, "更新时间"),
+												h("th", { className: "dp-right" }, "操作")
+											)
+										),
+										h("tbody", null, filtered.map(function (record) {
+											return h("tr", { key: record.id, className: "dp-row" },
+												h("td", null,
+													h("div", { className: "dp-title-cell" },
+														h("button", {
+															type: "button",
+															className: "dp-title-link",
+															title: record.title,
+															onClick: function () { openDetail(record.id); }
+														},
+															h("span", { className: "dp-title-text" }, record.title)
+														),
+														record.demo ? h("span", { className: "dp-demo-tag" }, "示例") : null,
+														record.url ? h("a", {
+															className: "dp-ext",
+															href: record.url,
+															target: "_blank",
+															rel: "noreferrer noopener",
+															title: "打开链接",
+															onClick: function (event) { event.stopPropagation(); }
+														}, h(Icon, { name: "external", size: 13 })) : null
+													)
+												),
+												h("td", null, h("span", { className: "dp-chip" }, record.category)),
+												h("td", null, h(StatusPill, { status: record.status })),
+												h("td", null, h("span", { className: "dp-owner" }, record.owner || "—")),
+												h("td", null, h("span", { className: "dp-time", title: fmtFull(record.updatedAt) }, fmtRelative(record.updatedAt))),
+												h("td", null,
+													h("div", { className: "dp-actions" },
+														h(IconButton, {
+															name: "edit",
+															label: "编辑 " + record.title,
+															onClick: function () { openEdit(record); }
+														}),
+														h(IconButton, {
+															name: "trash",
+															label: "删除 " + record.title,
+															danger: true,
+															onClick: function () { setConfirm({ kind: "delete", record: record }); }
+														})
+													)
+												)
+											);
+										}))
+									)
+						)
+					),
+					h("div", { className: "dp-foot" },
+						h("span", null, "共 " + records.length + " 条记录" + (filtering ? " · 当前筛出 " + filtered.length + " 条" : "")),
+						h("span", null, "本地数据 · 自动保存")
+					)
+				),
+				form !== null ? h(RecordFormModal, {
+					mode: form.mode,
+					record: form.record,
+					busy: busy,
+					error: formError,
+					onClose: function () { if (!busy) setForm(null); },
+					onSubmit: submit
+				}) : null,
+				confirm !== null ? h(ConfirmDialog, {
+					title: confirm.kind === "clearDemo" ? "清空示例数据？" : "删除这条记录？",
+					message: confirm.kind === "clearDemo"
+						? "只会移除标记为示例的记录，你后来新建或编辑过的内容会保留。"
+						: "删除后无法恢复，右侧已打开的详情页也会变为空。",
+					detail: confirm.kind === "delete" ? h("span", null, "即将删除：", h("b", null, confirm.record.title)) : null,
+					confirmLabel: confirm.kind === "clearDemo" ? "清空示例" : "删除",
+					busy: busy,
+					onCancel: function () { if (!busy) setConfirm(null); },
+					onConfirm: confirmAction
+				}) : null
+			);
+		}
+		//#endregion
+
+		//#region detail view
+		function DetailEditor(props) {
+			var record = props.record;
+			var state = useState(function () {
+				return {
+					title: record.title || "",
+					category: record.category || "产品",
+					status: record.status || "todo",
+					priority: record.priority || "medium",
+					owner: record.owner || "",
+					url: record.url || "",
+					summary: record.summary || "",
+					content: record.content || ""
+				};
+			});
+			var values = state[0];
+			var setValues = state[1];
+			var errorState = useState("");
+			var localError = errorState[0];
+			var setLocalError = errorState[1];
+
+			function set(key, value) {
+				setValues(function (previous) {
+					var next = Object.assign({}, previous);
+					next[key] = value;
+					return next;
+				});
+			}
+
+			function submit(event) {
+				if (event) event.preventDefault();
+				if (!values.title.trim()) {
+					setLocalError("标题不能为空");
+					return;
+				}
+				setLocalError("");
+				props.onSave(values);
+			}
+
+			var error = localError || props.error || "";
+			return h("div", { className: "dp-detail-editor" },
+				h("form", { className: "dp-form dp-form-detail", onSubmit: submit },
+					error ? h("div", { className: "dp-alert" }, error) : null,
+					h(Field, { label: "标题", required: true },
+						h("input", {
+							className: "dp-input",
+							value: values.title,
+							maxLength: 200,
+							onChange: function (event) { set("title", event.target.value); }
+						})
+					),
+					h(Field, { label: "分类" },
+						h("input", {
+							className: "dp-input",
+							value: values.category,
+							maxLength: 40,
+							list: "dp-category-options-detail",
+							onChange: function (event) { set("category", event.target.value); }
+						})
+					),
+					h(Field, { label: "负责人" },
+						h("input", {
+							className: "dp-input",
+							value: values.owner,
+							maxLength: 80,
+							onChange: function (event) { set("owner", event.target.value); }
+						})
+					),
+					h(Field, { label: "状态" },
+						h("select", {
+							className: "dp-select",
+							value: values.status,
+							onChange: function (event) { set("status", event.target.value); }
+						}, Object.keys(STATUS_META).map(function (key) {
+							return h("option", { key: key, value: key }, STATUS_META[key].label);
+						}))
+					),
+					h(Field, { label: "优先级" },
+						h("select", {
+							className: "dp-select",
+							value: values.priority,
+							onChange: function (event) { set("priority", event.target.value); }
+						}, Object.keys(PRIORITY_META).map(function (key) {
+							return h("option", { key: key, value: key }, PRIORITY_META[key].label);
+						}))
+					),
+					h(Field, { label: "链接" },
+						h("input", {
+							className: "dp-input",
+							value: values.url,
+							maxLength: 2000,
+							placeholder: "https://…",
+							onChange: function (event) { set("url", event.target.value); }
+						})
+					),
+					h(Field, { label: "摘要" },
+						h("textarea", {
+							className: "dp-textarea",
+							rows: 2,
+							value: values.summary,
+							maxLength: 2000,
+							onChange: function (event) { set("summary", event.target.value); }
+						})
+					),
+					h(Field, { label: "内容" },
+						h("textarea", {
+							className: "dp-textarea",
+							rows: 7,
+							value: values.content,
+							maxLength: 20000,
+							onChange: function (event) { set("content", event.target.value); }
+						})
+					),
+					h("datalist", { id: "dp-category-options-detail" }, CATEGORIES.map(function (name) {
+						return h("option", { key: name, value: name });
+					}))
+				),
+				h("div", { className: "dp-detail-editor-foot" },
+					h(Button, { onClick: props.onCancel, disabled: props.busy }, "取消"),
+					h(Button, { variant: "primary", onClick: function () { submit(); }, disabled: props.busy }, props.busy ? "保存中…" : "保存")
+				)
+			);
+		}
+
+		function DetailView(props) {
+			var record = props.record;
+			return h("div", { className: "dp-detail" },
+				h("div", { className: "dp-detail-head" },
+					h("div", { className: "dp-detail-kicker" },
+						h("span", { className: "dp-chip" }, record.category),
+						h(StatusPill, { status: record.status }),
+						h(PriorityPill, { priority: record.priority }),
+						record.demo ? h("span", { className: "dp-demo-tag" }, "示例数据") : null
+					),
+					h("h2", { className: "dp-detail-title" }, record.title),
+					h("div", { className: "dp-detail-meta" },
+						h("span", { className: "dp-meta-item" }, "负责人 ", h("b", null, record.owner || "未指定")),
+						h("span", { className: "dp-meta-item" }, "更新 ", h("b", null, fmtRelative(record.updatedAt))),
+						h("span", { className: "dp-meta-item", title: fmtFull(record.createdAt) }, "创建 ", h("b", null, fmtRelative(record.createdAt)))
+					)
+				),
+				h("div", { className: "dp-detail-actions" },
+					h(Button, { size: "sm", onClick: props.onEdit }, h(Icon, { name: "edit", size: 14 }), "编辑"),
+					record.url ? h("a", {
+						className: "dp-btn dp-btn-sm",
+						href: record.url,
+						target: "_blank",
+						rel: "noreferrer noopener",
+						style: { textDecoration: "none" }
+					}, h(Icon, { name: "external", size: 14 }), "打开链接") : null,
+					h(Button, { size: "sm", variant: "danger", onClick: props.onDelete }, h(Icon, { name: "trash", size: 14 }), "删除")
+				),
+				record.summary ? h("div", { className: "dp-section" },
+					h("h4", null, "摘要"),
+					h("p", { className: "dp-summary" }, record.summary)
+				) : null,
+				h("div", { className: "dp-section" },
+					h("h4", null, "内容"),
+					record.content
+						? h("pre", { className: "dp-content" }, record.content)
+						: h("p", { className: "dp-summary", style: { color: "var(--dp-text3)" } }, "暂无内容，点击「编辑」补充背景、进展或下一步。")
+				),
+				h("div", { className: "dp-section" },
+					h("h4", null, "元信息"),
+					h("div", { className: "dp-detail-meta" },
+						h("span", { className: "dp-meta-item" }, "记录 ID ", h("b", null, record.id)),
+						h("span", { className: "dp-meta-item" }, "最后更新 ", h("b", null, fmtFull(record.updatedAt)))
+					)
+				)
+			);
+		}
+
+		function DetailBody(props) {
+			var info = null;
+			var infoError = "";
+			try {
+				info = props.useTabInfo();
+			} catch (error) {
+				infoError = error instanceof Error ? error.message : String(error);
+			}
+
+			var snap = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
+			var navigation = info && info.tab && info.tab.navigation ? info.tab.navigation : null;
+			var params = navigation && navigation.params ? navigation.params : {};
+			var id = typeof params.id === "string" ? params.id : "";
+
+			var editingState = useState(false);
+			var editing = editingState[0];
+			var setEditing = editingState[1];
+			var confirmState = useState(false);
+			var confirm = confirmState[0];
+			var setConfirm = confirmState[1];
+			var busyState = useState(false);
+			var busy = busyState[0];
+			var setBusy = busyState[1];
+			var errorState = useState("");
+			var error = errorState[0];
+			var setError = errorState[1];
+
+			useEffect(function () {
+				store.load().catch(function () {});
+			}, []);
+
+			useEffect(function () {
+				setEditing(false);
+				setConfirm(false);
+				setError("");
+			}, [id]);
+
+			var record = snap.records.find(function (item) { return item.id === id; }) || null;
+
+			function closeTab() {
+				try {
+					if (info && info.tab && info.tab.actions && typeof info.tab.actions.close === "function") {
+						info.tab.actions.close();
+					}
+				} catch {
+					// The tab may already be gone.
+				}
+			}
+
+			function save(values) {
+				setBusy(true);
+				setError("");
+				store.update(id, values)
+					.then(function () {
+						setEditing(false);
+					})
+					.catch(function (failure) {
+						setError(failure.message);
+					})
+					.finally(function () {
+						setBusy(false);
+					});
+			}
+
+			function remove() {
+				setBusy(true);
+				setError("");
+				store.remove(id)
+					.then(function () {
+						setConfirm(false);
+						closeTab();
+					})
+					.catch(function (failure) {
+						setError(failure.message);
+					})
+					.finally(function () {
+						setBusy(false);
+					});
+			}
+
+			if (infoError) {
+				return h("div", { className: "dp-detail" },
+					h("div", { className: "dp-detail-empty" },
+						h("h3", null, "无法读取标签信息"),
+						h("p", null, infoError)
+					)
+				);
+			}
+
+			if ((snap.status === "idle" || snap.status === "loading") && record === null) {
+				return h("div", { className: "dp-detail" },
+					h("div", { className: "dp-skeleton-wrap" },
+						[0, 1, 2].map(function (index) {
+							return h("div", { className: "dp-skeleton-row", key: index },
+								h("div", { className: "dp-skeleton", style: { width: (60 - index * 10) + "%" } })
+							);
+						})
+					)
+				);
+			}
+
+			if (record === null && snap.error) {
+				return h("div", { className: "dp-detail" },
+					h("div", { className: "dp-detail-empty" },
+						h("h3", null, "加载失败"),
+						h("p", null, snap.error),
+						h(Button, { size: "sm", onClick: function () { store.load(true).catch(function () {}); } }, "重试")
+					)
+				);
+			}
+
+			if (record === null) {
+				return h("div", { className: "dp-detail" },
+					h("div", { className: "dp-detail-empty" },
+						h("div", { className: "dp-empty-icon" }, h(Icon, { name: "doc", size: 22 })),
+						h("h3", null, "记录不存在"),
+						h("p", null, "它可能已经被删除，或这条详情链接来自另一份数据。"),
+						h(Button, { size: "sm", onClick: closeTab }, "关闭标签")
+					)
+				);
+			}
+
+			return h("div", { className: "dp-detail" },
+				h(DetailView, {
+					record: record,
+					onEdit: function () { setEditing(true); setError(""); },
+					onDelete: function () { setConfirm(true); setError(""); }
+				}),
+				editing ? h(DetailEditor, {
+					record: record,
+					busy: busy,
+					error: error,
+					onSave: save,
+					onCancel: function () { if (!busy) { setEditing(false); setError(""); } }
+				}) : null,
+				!editing && error ? h("div", { className: "dp-alert", style: { marginTop: "12px" } }, error) : null,
+				confirm ? h(ConfirmDialog, {
+					title: "删除这条记录？",
+					message: "删除后无法恢复，列表和右侧详情都会同步移除。",
+					detail: h("span", null, "即将删除：", h("b", null, record.title)),
+					confirmLabel: "删除",
+					busy: busy,
+					onCancel: function () { if (!busy) setConfirm(false); },
+					onConfirm: remove
+				}) : null
+			);
+		}
+		//#endregion
+
+		//#region plugin
+		var sidebarRight = null;
+
+		function openDetail(id) {
+			if (sidebarRight === null) {
+				store.setError("右侧栏服务尚未就绪，请刷新页面后再试。");
+				return;
+			}
+			try {
+				sidebarRight.openTab("data-panel-detail", { params: { id: id } });
+			} catch (error) {
+				store.setError(error instanceof Error ? error.message : "打开右侧栏失败");
+			}
+		}
+
+		var inject = ["slots"];
+
+		function apply(ctx) {
+			ensureStyles();
+
+			ctx.inject(["sidebarRight"], function (sub) {
+				sidebarRight = sub.sidebarRight;
+				sub.effect(function () {
+					return function () {
+						sidebarRight = null;
+					};
+				}, "dsh-data-panel: sidebar right service");
+			});
+
+			ctx.inject(["sidebarRightTabs"], function (sub) {
+				sub.effect(function () {
+					return sub.sidebarRightTabs.register({
+						id: "data-panel-detail",
+						kind: "data-panel-detail",
+						title: function () { return "记录详情"; },
+						keepMounted: true
+					});
+				}, "dsh-data-panel: detail tab type");
+			});
+
+			ctx.slots.inject("conversation.view", function () {
+				return ctx.slots.register({
+					name: "conversation.view",
+					id: "data-panel",
+					order: 30,
+					label: function () { return "面板"; },
+					inject: function () {
+						return { openDetail: openDetail };
+					}
+				}, DataPanelView);
+			});
+
+			ctx.slots.inject("sidebar.right.pane.tab", function () {
+				return ctx.slots.register({
+					name: "sidebar.right.pane.tab",
+					key: "data-panel-detail",
+					inject: function () {
+						return { store: store };
+					}
+				}, DetailBody);
+			});
+		}
+		//#endregion
+
+		exports.apply = apply;
+		exports.inject = inject;
+		exports.__test = {
+			store: store,
+			DataPanelView: DataPanelView,
+			DetailView: DetailView,
+			DetailBody: DetailBody,
+			RecordFormModal: RecordFormModal
+		};
+		return module.exports;
+	}
+});
