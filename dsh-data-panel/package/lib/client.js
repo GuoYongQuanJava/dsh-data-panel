@@ -1484,7 +1484,7 @@ window.__ModuleLoader__.load({
 		/** 挂载时的客户端上下文：betterSidebar 是第三方服务，按需动态取，避免启动顺序问题。 */
 		var clientCtx = null;
 
-		/** vscode-mode 的编辑器 Tab 类型（其 officialSidebar.ts 的 OFFICIAL_TAB_KIND）。 */
+		/** vscode-mode 的 openTab 判别符（其 officialSidebar.ts 的 OFFICIAL_TAB_KIND）。 */
 		var EDITOR_TAB_KIND = "edrvEditor";
 		/** dsh-better-sidebar 的编辑器 Tab 类型 id（内置注册表里的 `editor`）。 */
 		var BETTER_EDITOR_TAB = "editor";
@@ -1518,37 +1518,57 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
-		 * 代码打开落在哪一栏。
-		 * `side` 让 DSH 在右侧栏再开一个 pane（用例详情与代码并排可见）；
-		 * 窗口偏窄时退回 `right`，在当前栏复用编辑器 Tab，避免两个栏都挤成一条。
-		 */
-		function codeOpenTarget() {
-			try {
-				if (typeof window !== "undefined" && typeof window.innerWidth === "number" && window.innerWidth > 0 && window.innerWidth < 1280) {
-					return "right";
-				}
-			} catch {
-				// 非浏览器环境保持默认。
-			}
-			return "side";
-		}
-
-		/**
 		 * 走 better-sidebar 的编辑器打开并定位。
-		 * 它的 `openTab` 在类型未注册或被用户在设置里禁用时是静默 no-op，
-		 * 所以先自己判一次可用性，避免"点了没反应"。
+		 *
+		 * 源码（client.js 的 openTab）里有三处会静默 return，必须逐条对上：
+		 *   1. `descriptor === undefined`      → tab 类型没注册
+		 *   2. `!isTabEnabled(seed.type)`      → 用户在侧栏设置里关掉了
+		 *   3. `targetSessionId === undefined` → 目标会话拿不到
+		 * 第 3 条最隐蔽：不传 scope 时它退回 `store.getSnapshot().sessionId`，
+		 * 而该 store 的初始状态就是 `sessionId: void 0`（未绑定会话时一直是
+		 * undefined），于是整次打开变成 no-op、连报错都没有。
+		 * 所以这里**必须**把 sessionId 作为 scope 传进去。
+		 *
+		 * 另外 `target: 'side'` 会被源码里的 `const reveal = seed.reveal !== false && !side`
+		 * 强制成 reveal=false —— 即"打开了但不聚焦"，用户看起来就像没反应。
+		 * 因此默认走 'right'，让它聚焦并展开右侧栏。
 		 */
-		function openWithBetterSidebar(service, target, absolute) {
+		function openWithBetterSidebar(service, target, sessionId) {
 			try {
 				if (typeof service.getTab === "function" && !service.getTab(BETTER_EDITOR_TAB)) return false;
 				if (typeof service.isTabEnabled === "function" && !service.isTabEnabled(BETTER_EDITOR_TAB)) return false;
+
+				// openTab 拿不到目标会话时直接 return（no-op），连报错都没有。
+				// 这里先自己判一次：scope 给的会话和它 store 里的当前会话都为空时，
+				// 调用注定无效，干脆落到下一级去，而不是让按钮点了没反应。
+				var scoped = typeof sessionId === "string" && sessionId !== "" ? sessionId : "";
+				var active = "";
+				if (typeof service.getSnapshot === "function") {
+					try {
+						var snapshot = service.getSnapshot();
+						if (snapshot && typeof snapshot.sessionId === "string") active = snapshot.sessionId;
+					} catch {
+						// 快照读不到就按空处理。
+					}
+				}
+				if (!scoped && !active) return false;
+
+				// scope 里带上 cwd：它让相对路径能被正确解析到工作区。
+				// 统一成正斜杠：否则 Windows 反斜杠要靠它内部再转一次才对齐。
+				var scope = scoped !== ""
+					? { sessionId: scoped, cwd: toPosixPath(sessionCwd(scoped)) || undefined }
+					: undefined;
+
+				// 相对路径交给它自己按 scope.cwd 解析；本来就是绝对路径才原样传。
+				var path = isAbsoluteCodePath(toPosixPath(target.path)) ? toPosixPath(target.path) : target.path;
+
 				service.openTab({
 					type: BETTER_EDITOR_TAB,
-					path: absolute || target.path,
+					path: path,
 					line: target.line,
-					target: codeOpenTarget(),
+					target: "right",
 					reveal: true
-				});
+				}, scope);
 				return true;
 			} catch {
 				return false;
@@ -1593,15 +1613,20 @@ window.__ModuleLoader__.load({
 				+ "/" + relative.split("/").map(encodeAddressSegment).join("/");
 		}
 
-		/** 编辑器 Tab 是否已注册（vscode-mode 未装/禁用时为 false）。 */
+		/**
+		 * 侧栏是否具备打开文件的能力。
+		 *
+		 * 只探测 `register` / `openTab` 这类**一定有**的方法：
+		 * vscode-mode 自己的 `detectOfficial` 也是这么判的，它从不调
+		 * `sidebarRightTabs.get()` —— 官方注册表不一定提供按 id 查询，
+		 * 拿不存在的 `get` 去预检会让整层降级被静默跳过。
+		 * 真实可用性交给调用处的 try/catch：openTab 抛错就落到下一级。
+		 */
 		function hasEditorTab() {
-			if (sidebarRightTabs === null || typeof sidebarRightTabs.get !== "function") return false;
-			try {
-				var definition = sidebarRightTabs.get(EDITOR_TAB_KIND);
-				return definition !== undefined && definition !== null;
-			} catch {
-				return false;
-			}
+			return sidebarRight !== null
+				&& typeof sidebarRight.openTab === "function"
+				&& sidebarRightTabs !== null
+				&& typeof sidebarRightTabs.register === "function";
 		}
 
 		/**
@@ -1626,7 +1651,7 @@ window.__ModuleLoader__.load({
 
 			// ① better-sidebar：优先用它，团队以它为主编辑器。
 			var better = betterSidebarService();
-			if (better !== null && openWithBetterSidebar(better, target, absolute)) return true;
+			if (better !== null && openWithBetterSidebar(better, target, sessionId)) return true;
 
 			if (sidebarRight === null) {
 				store.setError("右侧栏服务尚未就绪，请刷新页面后再试。");
