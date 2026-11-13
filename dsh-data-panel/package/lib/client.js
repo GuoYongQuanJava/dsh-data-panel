@@ -45,6 +45,17 @@ window.__ModuleLoader__.load({
 .dp-root ::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--dp-text3) 28%, transparent); border: 3px solid transparent; border-radius: 999px; background-clip: padding-box; }
 .dp-root ::-webkit-scrollbar-track { background: transparent; }
 .dp-shell { max-width: 1180px; margin: 0 auto; padding: 26px 30px 56px; }
+/* 右侧栏里的面板：容器窄，收紧留白并让工具栏折行，表格靠 .dp-card-scroll 横向滚动。 */
+.dp-root.dp-docked .dp-shell { max-width: none; padding: 14px 12px 28px; }
+.dp-root.dp-docked .dp-header { gap: 12px; }
+.dp-root.dp-docked .dp-title { font-size: 18px; margin: 4px 0 3px; }
+.dp-root.dp-docked .dp-subtitle { font-size: 12px; }
+.dp-root.dp-docked .dp-toolbar { margin: 14px 0 10px; gap: 6px; }
+.dp-root.dp-docked .dp-search { flex: 1 1 150px; max-width: none; }
+.dp-root.dp-docked .dp-btn { height: 32px; padding: 0 10px; font-size: 12px; }
+.dp-root.dp-docked .dp-stat { min-width: 62px; padding: 8px 10px; }
+.dp-root.dp-docked .dp-stat b { font-size: 17px; }
+.dp-root.dp-docked .dp-card-foot { padding: 8px 10px; }
 .dp-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; flex-wrap: wrap; }
 .dp-eyebrow { color: var(--dp-text3); font-size: 10px; font-weight: 650; letter-spacing: .14em; text-transform: uppercase; }
 .dp-title { margin: 5px 0 5px; font-size: 24px; font-weight: 650; letter-spacing: -.015em; line-height: 1.25; }
@@ -80,8 +91,8 @@ window.__ModuleLoader__.load({
 .dp-alert { display: flex; align-items: center; gap: 8px; margin: 0 0 12px; padding: 9px 12px; border: 1px solid color-mix(in srgb, var(--dp-danger) 26%, transparent); border-radius: 10px; background: color-mix(in srgb, var(--dp-danger) 7%, transparent); color: var(--dp-danger); font-size: 12px; }
 .dp-alert button { margin-left: auto; padding: 0; border: 0; background: none; color: inherit; font: inherit; font-size: 12px; font-weight: 500; cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
 .dp-card { overflow: hidden; border: 1px solid var(--dp-border); border-radius: 14px; background: var(--dp-bg); }
-.dp-card-scroll { overflow-x: clip; }
-.dp-table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+.dp-card-scroll { overflow-x: auto; overflow-y: hidden; }
+.dp-table { width: 100%; min-width: 720px; border-collapse: collapse; table-layout: fixed; }
 .dp-table th { padding: 11px 12px; border-bottom: 1px solid var(--dp-border); background: var(--dp-bg2); color: var(--dp-text3); font-size: 11px; font-weight: 600; letter-spacing: .05em; text-align: left; white-space: nowrap; }
 .dp-table th.dp-right { text-align: right; }
 .dp-table td { padding: 12px; border-bottom: 1px solid var(--dp-border2); vertical-align: middle; letter-spacing: .02em; }
@@ -831,6 +842,19 @@ window.__ModuleLoader__.load({
 
 		function DataPanelView(props) {
 			var snap = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
+			// dock=true 表示本实例就渲染在右侧栏里；否则是主区的「面板」标签。
+			var docked = props.dock === true;
+			useEffect(function () {
+				// 主区的「面板」标签一挂载，就把面板投到右侧栏——
+				// 用户点「面板」是要在侧栏看它，而不是占住整个主区。
+				if (docked) return;
+				if (sidebarRight === null || typeof sidebarRight.openTab !== "function") return;
+				try {
+					sidebarRight.openTab("data-panel-board", { params: {} });
+				} catch {
+					// 侧栏不可用时主区这份照常渲染。
+				}
+			}, [docked]);
 			var queryState = useState("");
 			var query = queryState[0];
 			var setQuery = queryState[1];
@@ -958,7 +982,33 @@ window.__ModuleLoader__.load({
 			var loading = (snap.status === "idle" || snap.status === "loading") && records.length === 0;
 			var filtering = query.trim() !== "" || type !== "all";
 
-			return h("div", { className: "dp-root" },
+			// 主区那份只做入口：表格本体在右侧栏的「测试用例」tab 里渲染，
+			// 免得同一个表格在两处各维护一套滚动/分页状态。
+			if (!docked && sidebarRight !== null) {
+				return h("div", { className: "dp-root" },
+					h("div", { className: "dp-shell" },
+						h("div", { className: "dp-empty" },
+							h("div", { className: "dp-empty-icon" }, h(Icon, { name: "doc", size: 23 })),
+							h("h3", null, "测试用例面板已移到右侧栏"),
+							h("p", null, "看右侧栏的「测试用例」标签；在那里点操作列的定位按钮可以直接跳源码。"),
+							h(Button, {
+								variant: "primary",
+								onClick: function () {
+									if (sidebarRight !== null && typeof sidebarRight.openTab === "function") {
+										try {
+											sidebarRight.openTab("data-panel-board", { params: {} });
+										} catch {
+											store.setError("右侧栏打开失败，请刷新页面后重试。");
+										}
+									}
+								}
+							}, "在右侧栏打开")
+						)
+					)
+				);
+			}
+
+			return h("div", { className: cn("dp-root", docked ? "dp-docked" : "") },
 				h("div", { className: "dp-shell" },
 					h("div", { className: "dp-header" },
 						h("div", null,
@@ -1502,17 +1552,37 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
+		 * 定位链路的诊断轨迹。
+		 * 这些分支以前都是静默 return，出了问题在界面上完全看不出来。
+		 * 现在统一记为错误提示，让"点了没反应"变成一句可读的原因。
+		 */
+		function codeTrace(message) {
+			try {
+				store.setError("查看源码：" + message);
+			} catch {
+				// store 不可用时不至于再抛。
+			}
+		}
+
+		/**
 		 * 取 dsh-better-sidebar 的客户端服务。
 		 * 它不是 DSH 核心服务，未安装时 ctx.get 可能抛错，按需探测且不缓存，
 		 * 这样插件后于本插件加载也能被接上。
 		 */
 		function betterSidebarService() {
-			if (clientCtx === null || typeof clientCtx.get !== "function") return null;
+			if (clientCtx === null || typeof clientCtx.get !== "function") {
+				codeTrace("客户端上下文未就绪");
+				return null;
+			}
 			try {
 				var service = clientCtx.get("betterSidebar");
-				if (!service || typeof service.openTab !== "function") return null;
+				if (!service || typeof service.openTab !== "function") {
+					codeTrace("better-sidebar 服务未注册（可能未启用）");
+					return null;
+				}
 				return service;
-			} catch {
+			} catch (error) {
+				codeTrace("读取 betterSidebar 失败: " + (error instanceof Error ? error.message : String(error)));
 				return null;
 			}
 		}
@@ -1535,8 +1605,14 @@ window.__ModuleLoader__.load({
 		 */
 		function openWithBetterSidebar(service, target, sessionId) {
 			try {
-				if (typeof service.getTab === "function" && !service.getTab(BETTER_EDITOR_TAB)) return false;
-				if (typeof service.isTabEnabled === "function" && !service.isTabEnabled(BETTER_EDITOR_TAB)) return false;
+				if (typeof service.getTab === "function" && !service.getTab(BETTER_EDITOR_TAB)) {
+					codeTrace("better-sidebar: editor 类型未注册");
+					return false;
+				}
+				if (typeof service.isTabEnabled === "function" && !service.isTabEnabled(BETTER_EDITOR_TAB)) {
+					codeTrace("better-sidebar: editor 被侧栏设置禁用");
+					return false;
+				}
 
 				// openTab 拿不到目标会话时直接 return（no-op），连报错都没有。
 				// 这里先自己判一次：scope 给的会话和它 store 里的当前会话都为空时，
@@ -1551,7 +1627,10 @@ window.__ModuleLoader__.load({
 						// 快照读不到就按空处理。
 					}
 				}
-				if (!scoped && !active) return false;
+				if (!scoped && !active) {
+					codeTrace("better-sidebar: 拿不到会话 id（scope 与 store 都为空）");
+					return false;
+				}
 
 				// scope 里带上 cwd：它让相对路径能被正确解析到工作区。
 				// 统一成正斜杠：否则 Windows 反斜杠要靠它内部再转一次才对齐。
@@ -1569,8 +1648,11 @@ window.__ModuleLoader__.load({
 					target: "right",
 					reveal: true
 				}, scope);
+				codeTrace("better-sidebar: 已请求打开 " + path + ":" + target.line
+					+ "（scope=" + (scope ? scope.sessionId : "store") + "）");
 				return true;
-			} catch {
+			} catch (error) {
+				codeTrace("better-sidebar 抛错: " + (error instanceof Error ? error.message : String(error)));
 				return false;
 			}
 		}
@@ -1735,6 +1817,16 @@ window.__ModuleLoader__.load({
 						keepMounted: true
 					});
 				}, "dsh-data-panel: detail tab type");
+				// 面板本身也要进右侧栏：conversation.view 只能渲染在主区，
+				// 想在右侧栏出现就必须作为独立 tab 类型注册。
+				sub.effect(function () {
+					return sub.sidebarRightTabs.register({
+						id: "data-panel-board",
+						kind: "data-panel-board",
+						title: function () { return "测试用例"; },
+						keepMounted: true
+					});
+				}, "dsh-data-panel: board tab type");
 			});
 
 			// 相对路径要用会话工作区补全，跳转才能落到仓库里的真实文件。
@@ -1779,6 +1871,22 @@ window.__ModuleLoader__.load({
 						return { store: store, openCode: openCode };
 					}
 				}, DetailBody);
+			});
+
+			// 面板正文（右侧栏里的「测试用例」tab）。
+			// 窄容器下表格会有横向滚动，见 .dp-card-scroll。
+			ctx.slots.inject("sidebar.right.pane.tab", function () {
+				return ctx.slots.register({
+					name: "sidebar.right.pane.tab",
+					key: "data-panel-board",
+					inject: function () {
+						return {
+							openDetail: function (id) { openDetail(id); },
+							openCode: function (ref) { openCode(ref); },
+							dock: true
+						};
+					}
+				}, DataPanelView);
 			});
 		}
 		//#endregion
