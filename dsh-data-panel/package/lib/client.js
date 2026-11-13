@@ -17,6 +17,31 @@ window.__ModuleLoader__.load({
 
 		//#region styles
 		var CSS = `
+/* 主区 tab 行末尾的「面板」按钮：贴着「工作流」右边，视觉上像 tab 但不是 tab。 */
+.dp-tab-btn {
+	flex: 0 0 auto;
+	align-self: center;
+	height: 26px;
+	margin-left: 6px;
+	padding: 0 10px;
+	border: 1px solid transparent;
+	border-radius: 7px;
+	background: transparent;
+	color: var(--dsw-alias-label-secondary, #646a73);
+	font-family: var(--dsw-font-family, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif);
+	font-size: 13px;
+	line-height: 1;
+	white-space: nowrap;
+	cursor: pointer;
+	transition: background .14s, color .14s, border-color .14s;
+}
+.dp-tab-btn:hover {
+	background: var(--dsw-alias-bg-layer-3, #f2f3f5);
+	color: var(--dsw-alias-label-primary, #1f2329);
+}
+.dp-tab-btn:active { background: var(--dsw-alias-bg-layer-4, #e9eaee); }
+.dp-tab-btn:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary, #4d6bfe); outline-offset: 1px; }
+
 .dp-root, .dp-root *, .dp-detail, .dp-detail *, .dp-mask, .dp-mask * { box-sizing: border-box; }
 .dp-root, .dp-detail, .dp-mask {
 	--dp-bg: var(--dsw-alias-bg-layer-1, #ffffff);
@@ -842,19 +867,9 @@ window.__ModuleLoader__.load({
 
 		function DataPanelView(props) {
 			var snap = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
-			// dock=true 表示本实例就渲染在右侧栏里；否则是主区的「面板」标签。
+			// 本组件只作为右侧栏的「测试用例」tab 渲染（apply 里带 dock: true 注册）。
+			// 主区那个入口已经改成 tab 行末尾的按钮（见 startPanelButton）。
 			var docked = props.dock === true;
-			useEffect(function () {
-				// 主区的「面板」标签一挂载，就把面板投到右侧栏——
-				// 用户点「面板」是要在侧栏看它，而不是占住整个主区。
-				if (docked) return;
-				if (sidebarRight === null || typeof sidebarRight.openTab !== "function") return;
-				try {
-					sidebarRight.openTab("data-panel-board", { params: {} });
-				} catch {
-					// 侧栏不可用时主区这份照常渲染。
-				}
-			}, [docked]);
 			var queryState = useState("");
 			var query = queryState[0];
 			var setQuery = queryState[1];
@@ -982,32 +997,8 @@ window.__ModuleLoader__.load({
 			var loading = (snap.status === "idle" || snap.status === "loading") && records.length === 0;
 			var filtering = query.trim() !== "" || type !== "all";
 
-			// 主区那份只做入口：表格本体在右侧栏的「测试用例」tab 里渲染，
-			// 免得同一个表格在两处各维护一套滚动/分页状态。
-			if (!docked && sidebarRight !== null) {
-				return h("div", { className: "dp-root" },
-					h("div", { className: "dp-shell" },
-						h("div", { className: "dp-empty" },
-							h("div", { className: "dp-empty-icon" }, h(Icon, { name: "doc", size: 23 })),
-							h("h3", null, "测试用例面板已移到右侧栏"),
-							h("p", null, "看右侧栏的「测试用例」标签；在那里点操作列的定位按钮可以直接跳源码。"),
-							h(Button, {
-								variant: "primary",
-								onClick: function () {
-									if (sidebarRight !== null && typeof sidebarRight.openTab === "function") {
-										try {
-											sidebarRight.openTab("data-panel-board", { params: {} });
-										} catch {
-											store.setError("右侧栏打开失败，请刷新页面后重试。");
-										}
-									}
-								}
-							}, "在右侧栏打开")
-						)
-					)
-				);
-			}
-
+			// 面板只作为右侧栏的「测试用例」tab 存在（见 apply 里的注册）。
+			// 本组件现在只由右侧栏那个 tab 装载，不再有"主区形态"。
 			return h("div", { className: cn("dp-root", docked ? "dp-docked" : "") },
 				h("div", { className: "dp-shell" },
 					h("div", { className: "dp-header" },
@@ -1648,8 +1639,8 @@ window.__ModuleLoader__.load({
 					target: "right",
 					reveal: true
 				}, scope);
-				codeTrace("better-sidebar: 已请求打开 " + path + ":" + target.line
-					+ "（scope=" + (scope ? scope.sessionId : "store") + "）");
+				// 成功就清掉可能残留的提示——这条路径以前会留一条红色横幅。
+				store.setError("");
 				return true;
 			} catch (error) {
 				codeTrace("better-sidebar 抛错: " + (error instanceof Error ? error.message : String(error)));
@@ -1779,6 +1770,136 @@ window.__ModuleLoader__.load({
 			return false;
 		}
 
+		/**
+		 * 主区 tab 行右边的「面板」按钮。
+		 *
+		 * DSH 的 tab 行（`[data-conversation-tabs]`）只渲染宿主自己注册的 view tab，
+		 * 没有给第三方插按钮的 slot——`conversation.view` 注册出来的一定是 tab，
+		 * 而我们需要的是「点了只开右侧栏、不切主区」的按钮。所以这里直接往
+		 * tab 行末尾追加一个原生按钮，并用 MutationObserver 跟随 React 重渲染。
+		 *
+		 * 幂等：同一行里已经存在按钮就不再插；点击永远只调 openBoardTab()，
+		 * 面板已经在右侧栏时 openTab 自身会聚焦而不是新开，表现就是"再点没反应"。
+		 */
+		var panelButtonObserver = null;
+		var panelButtonTimer = null;
+		var panelButtonPoller = null;
+
+		function openBoardTab() {
+			if (sidebarRight === null || typeof sidebarRight.openTab !== "function") {
+				store.setError("右侧栏服务尚未就绪，请刷新页面后再试。");
+				return false;
+			}
+			try {
+				sidebarRight.openTab("data-panel-board", { params: {} });
+				store.setError("");
+				return true;
+			} catch (error) {
+				store.setError(error instanceof Error ? error.message : "打开右侧栏失败");
+				return false;
+			}
+		}
+
+		function createPanelButton() {
+			var button = document.createElement("button");
+			button.type = "button";
+			button.className = "dp-tab-btn";
+			button.textContent = "面板";
+			button.title = "打开测试用例面板";
+			button.setAttribute("aria-label", "打开测试用例面板");
+			button.addEventListener("click", function (event) {
+				event.preventDefault();
+				event.stopPropagation();
+				openBoardTab();
+			});
+			return button;
+		}
+
+		function syncPanelButton() {
+			if (typeof document === "undefined") return 0;
+			var rows = [];
+			// 优先用宿主自己的标记；再补上 role=tablist（要求确实含 tab 子元素，
+			// 避免误伤设置页里其它 tablist）。两条都收集并去重，这样多栏/多会话
+			// 场景下哪一行都能覆盖到。
+			var marked = document.querySelectorAll("[data-conversation-tabs]");
+			for (var m = 0; m < marked.length; m += 1) rows.push(marked[m]);
+			var lists = document.querySelectorAll('[role="tablist"]');
+			for (var l = 0; l < lists.length; l += 1) {
+				var candidate = lists[l];
+				if (rows.indexOf(candidate) !== -1) continue;
+				if (candidate.querySelector('[role="tab"]') === null) continue;
+				rows.push(candidate);
+			}
+			var inserted = 0;
+			for (var i = 0; i < rows.length; i += 1) {
+				var row = rows[i];
+				if (row.querySelector(".dp-tab-btn") !== null) continue;
+				row.appendChild(createPanelButton());
+				inserted += 1;
+			}
+			return inserted;
+		}
+
+		function schedulePanelButtonSync() {
+			if (panelButtonTimer !== null) return;
+			panelButtonTimer = setTimeout(function () {
+				panelButtonTimer = null;
+				try {
+					syncPanelButton();
+				} catch {
+					// 页面结构异常时静默跳过，不影响插件其它功能。
+				}
+			}, 60);
+		}
+
+		/**
+		 * 起两条路互补：
+		 *  - MutationObserver：React 重建 tab 行时立刻补回；
+		 *  - 低频轮询：兜住"插件先于 tab 行挂载"以及 observer 漏事件的情况。
+		 * 轮询只在还没插上按钮时插入，插上后就是一次 querySelectorAll 的开销。
+		 */
+		function startPanelButton() {
+			if (typeof document === "undefined") return;
+			try {
+				syncPanelButton();
+			} catch {
+				// 忽略首帧异常，交给下面的轮询。
+			}
+			if (typeof MutationObserver !== "undefined" && document.body !== null) {
+				panelButtonObserver = new MutationObserver(schedulePanelButtonSync);
+				panelButtonObserver.observe(document.body, { childList: true, subtree: true });
+			}
+			if (panelButtonPoller === null) {
+				panelButtonPoller = setInterval(function () {
+					try {
+						syncPanelButton();
+					} catch {
+						// 单次失败不打断轮询。
+					}
+				}, 1000);
+			}
+		}
+
+		function stopPanelButton() {
+			if (panelButtonObserver !== null) {
+				panelButtonObserver.disconnect();
+				panelButtonObserver = null;
+			}
+			if (panelButtonTimer !== null) {
+				clearTimeout(panelButtonTimer);
+				panelButtonTimer = null;
+			}
+			if (panelButtonPoller !== null) {
+				clearInterval(panelButtonPoller);
+				panelButtonPoller = null;
+			}
+			if (typeof document === "undefined") return;
+			var buttons = document.querySelectorAll(".dp-tab-btn");
+			for (var i = 0; i < buttons.length; i += 1) {
+				if (buttons[i].parentNode !== null) buttons[i].parentNode.removeChild(buttons[i]);
+			}
+		}
+
 		var inject = ["slots"];
 
 		function apply(ctx) {
@@ -1792,6 +1913,14 @@ window.__ModuleLoader__.load({
 					clientCtx = null;
 				};
 			}, "dsh-data-panel: client context");
+
+			// tab 行的「面板」按钮：挂载时插、卸载时收。
+			ctx.effect(function () {
+				startPanelButton();
+				return function () {
+					stopPanelButton();
+				};
+			}, "dsh-data-panel: panel tab button");
 
 			ctx.inject(["sidebarRight"], function (sub) {
 				sidebarRight = sub.sidebarRight;
@@ -1848,21 +1977,11 @@ window.__ModuleLoader__.load({
 				}, "dsh-data-panel: workspaces service");
 			});
 
-			ctx.slots.inject("conversation.view", function () {
-				return ctx.slots.register({
-					name: "conversation.view",
-					id: "data-panel",
-					order: 30,
-					label: function () { return "面板"; },
-					inject: function (sessionId) {
-						return {
-							openDetail: function (id) { openDetail(id, sessionId); },
-							openCode: function (ref) { openCode(ref, sessionId); }
-						};
-					}
-				}, DataPanelView);
-			});
-
+			// 主区只保留宿主自己的三个 tab（对话 / 轨迹 / 工作流）。
+			// 「面板」不再注册成 conversation.view：那个 slot 只能产出**tab**，
+			// 而我们要的是一个放在「工作流」右边的**按钮**（点了开右侧栏，
+			// 不切换主区视图）。tab 行没有给第三方的插槽，只能 DOM 注入，
+			// 见 startPanelButton()。
 			ctx.slots.inject("sidebar.right.pane.tab", function () {
 				return ctx.slots.register({
 					name: "sidebar.right.pane.tab",
@@ -1911,6 +2030,9 @@ window.__ModuleLoader__.load({
 					}
 				};
 			},
+			openBoardTab: openBoardTab,
+			syncPanelButton: syncPanelButton,
+			stopPanelButton: stopPanelButton,
 			DataPanelView: DataPanelView,
 			DetailView: DetailView,
 			DetailBody: DetailBody,
