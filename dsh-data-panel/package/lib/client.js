@@ -81,10 +81,10 @@ window.__ModuleLoader__.load({
 .dp-alert button { margin-left: auto; padding: 0; border: 0; background: none; color: inherit; font: inherit; font-size: 12px; font-weight: 500; cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
 .dp-card { overflow: hidden; border: 1px solid var(--dp-border); border-radius: 14px; background: var(--dp-bg); }
 .dp-card-scroll { overflow-x: auto; }
-.dp-table { width: 100%; min-width: 1120px; border-collapse: collapse; table-layout: fixed; }
-.dp-table th { padding: 10px 14px; border-bottom: 1px solid var(--dp-border); background: var(--dp-bg2); color: var(--dp-text3); font-size: 11px; font-weight: 600; letter-spacing: .02em; text-align: left; white-space: nowrap; }
+.dp-table { width: 100%; min-width: 1160px; border-collapse: collapse; table-layout: fixed; }
+.dp-table th { padding: 11px 16px; border-bottom: 1px solid var(--dp-border); background: var(--dp-bg2); color: var(--dp-text3); font-size: 11px; font-weight: 600; letter-spacing: .06em; text-align: left; white-space: nowrap; }
 .dp-table th.dp-right { text-align: right; }
-.dp-table td { padding: 11px 14px; border-bottom: 1px solid var(--dp-border2); vertical-align: middle; }
+.dp-table td { padding: 13px 16px; border-bottom: 1px solid var(--dp-border2); vertical-align: middle; letter-spacing: .02em; }
 .dp-table tbody tr:last-child td { border-bottom: 0; }
 .dp-row { transition: background .12s; }
 .dp-row:hover { background: var(--dp-bg2); }
@@ -129,14 +129,15 @@ window.__ModuleLoader__.load({
 .dp-skeleton { height: 12px; border-radius: 6px; background: linear-gradient(90deg, var(--dp-bg2) 25%, var(--dp-bg3) 37%, var(--dp-bg2) 63%); background-size: 400% 100%; animation: dp-shimmer 1.35s ease infinite; }
 @keyframes dp-shimmer { 0% { background-position: 100% 0; } 100% { background-position: 0 0; } }
 .dp-foot { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-top: 10px; color: var(--dp-text3); font-size: 11px; }
-.dp-pager { display: flex; align-items: center; justify-content: flex-end; gap: 10px; flex-wrap: wrap; margin-top: 12px; color: var(--dp-text2); font-size: 12px; }
-.dp-pager-total { margin-right: auto; color: var(--dp-text3); }
-.dp-pager-btn { display: inline-flex; align-items: center; justify-content: center; min-width: 66px; height: 30px; padding: 0 12px; border: 1px solid var(--dp-border); border-radius: 8px; background: var(--dp-bg); color: var(--dp-text); font: inherit; font-size: 12px; cursor: pointer; transition: background .12s, border-color .12s, color .12s; }
+.dp-card-foot { display: flex; justify-content: flex-end; padding: 10px 16px 11px; border-top: 1px solid var(--dp-border); background: var(--dp-bg); }
+.dp-pager { display: flex; align-items: center; justify-content: flex-end; gap: 14px; color: var(--dp-text2); font-size: 12.5px; letter-spacing: .03em; }
+.dp-pager-total { color: var(--dp-text3); letter-spacing: .05em; }
+.dp-pager-btn { display: inline-flex; align-items: center; justify-content: center; min-width: 74px; height: 32px; padding: 0 14px; border: 1px solid var(--dp-border); border-radius: 9px; background: var(--dp-bg); color: var(--dp-text); font: inherit; font-size: 12.5px; letter-spacing: .06em; cursor: pointer; transition: background .12s, border-color .12s, color .12s; }
 .dp-pager-btn:hover:not(:disabled) { border-color: var(--dp-text3); background: var(--dp-bg2); }
 .dp-pager-btn:disabled { color: var(--dp-text3); cursor: not-allowed; opacity: .6; }
-.dp-pager-page { display: inline-flex; align-items: center; justify-content: center; min-width: 62px; height: 30px; padding: 0 10px; border: 1px solid var(--dp-border); border-radius: 8px; background: var(--dp-bg2); color: var(--dp-text); font-size: 12px; font-variant-numeric: tabular-nums; }
-.dp-pager-size { display: inline-flex; align-items: center; gap: 6px; }
-.dp-pager-size select { height: 30px; padding: 0 24px 0 8px; border: 1px solid var(--dp-border); border-radius: 8px; background: var(--dp-bg); color: var(--dp-text); font: inherit; font-size: 12px; outline: none; cursor: pointer; }
+.dp-pager-page { display: inline-flex; align-items: center; justify-content: center; min-width: 68px; height: 32px; padding: 0 12px; border: 1px solid var(--dp-border); border-radius: 9px; background: var(--dp-bg2); color: var(--dp-text); font-size: 12.5px; font-variant-numeric: tabular-nums; letter-spacing: .08em; }
+.dp-pager-size { display: inline-flex; align-items: center; gap: 8px; letter-spacing: .04em; }
+.dp-pager-size select { height: 32px; padding: 0 26px 0 10px; border: 1px solid var(--dp-border); border-radius: 9px; background: var(--dp-bg); color: var(--dp-text); font: inherit; font-size: 12.5px; letter-spacing: .04em; outline: none; cursor: pointer; }
 .dp-code-body { margin: 0; padding: 14px 16px; max-height: 56vh; overflow: auto; border: 1px solid var(--dp-border); border-radius: 10px; background: var(--dp-bg2); color: var(--dp-text); font-family: ui-monospace, SFMono-Regular, "Cascadia Code", Consolas, monospace; font-size: 12.5px; line-height: 1.7; white-space: pre; tab-size: 2; }
 .dp-code-empty { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 34px 16px; border: 1px dashed var(--dp-border); border-radius: 10px; color: var(--dp-text3); font-size: 12px; text-align: center; }
 .dp-code-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; color: var(--dp-text3); font-size: 11px; }
@@ -1028,16 +1029,18 @@ window.__ModuleLoader__.load({
 											);
 										}))
 									)
+						),
+						loading || filtered.length === 0 ? null : h("div", { className: "dp-card-foot" },
+							h(Pager, {
+								total: filtered.length,
+								page: currentPage,
+								pageCount: pageCount,
+								pageSize: pageSize,
+								onPage: changePage,
+								onPageSize: changePageSize
+							})
 						)
-					),
-					loading || filtered.length === 0 ? null : h(Pager, {
-						total: filtered.length,
-						page: currentPage,
-						pageCount: pageCount,
-						pageSize: pageSize,
-						onPage: changePage,
-						onPageSize: changePageSize
-					})
+					)
 				),
 				form !== null ? h(RecordFormModal, {
 					mode: form.mode,
