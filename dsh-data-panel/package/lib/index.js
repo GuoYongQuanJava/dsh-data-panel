@@ -35,6 +35,12 @@ const MAX_DESCRIPTION = 2000
 const MAX_INPUT = 4000
 const MAX_EXPECTED = 4000
 const MAX_CODE = 20000
+/**
+ * Where the case's subject lives in the repository, as `path:line`
+ * (`path#L12`, `path#L12-20` also accepted). Read by the client's
+ * "查看代码" action to jump straight to the covered source.
+ */
+const MAX_CODE_REF = 200
 const TEST_TYPES = new Set(['functional', 'boundary', 'performance', 'exception', 'compat'])
 
 /** Single write lane: read-modify-write operations never interleave. */
@@ -80,6 +86,21 @@ function isoAgo(hours) {
 function newCaseId() {
   return `TC-${randomUUID().replace(/-/g, '').slice(0, 8).toUpperCase()}`
 }
+
+/**
+ * Covered source each demo case exercises, in the `path:line` shape the
+ * client's "查看代码" parses. Kept beside the rows below so the fixtures stay
+ * readable as plain case text.
+ */
+const DEMO_CODE_REFS = [
+  'RingBuffer.h:24',
+  'RingBuffer.h:31',
+  'RingBuffer.h:48',
+  'RingBuffer.h:52',
+  'RingBuffer.h:71',
+  'RingBuffer.h:63',
+  'RingBuffer.h:88',
+]
 
 /** First-run test cases, marked `demo` so the UI can label them visibly. */
 function seedRecords() {
@@ -158,6 +179,10 @@ function seedRecords() {
       input: row[4],
       expected: row[5],
       code: row[6],
+      // Covered source in the demo repository, in the `path:line` shape the
+      // client's "查看代码" parses. Kept beside `rows` so the fixtures above
+      // stay readable as plain case text.
+      codeRef: DEMO_CODE_REFS[index] || '',
       demo: true,
       createdAt: isoAgo(36 + index * 2),
       updatedAt: isoAgo(8 + index * 2),
@@ -176,6 +201,7 @@ function normalizeStored(input) {
     input: text(input.input, MAX_INPUT),
     expected: text(input.expected, MAX_EXPECTED),
     code: text(input.code, MAX_CODE),
+    codeRef: text(input.codeRef, MAX_CODE_REF),
     demo: input.demo === true,
     createdAt: isoOrNow(input.createdAt),
     updatedAt: isoOrNow(input.updatedAt),
@@ -194,6 +220,7 @@ function normalizePatch(input, existing) {
     input: text(input.input, MAX_INPUT),
     expected: text(input.expected, MAX_EXPECTED),
     code: text(input.code, MAX_CODE),
+    codeRef: text(input.codeRef, MAX_CODE_REF),
     updatedAt: new Date().toISOString(),
   }
 }
@@ -420,6 +447,7 @@ export function apply(ctx) {
 export const __test = {
   seedRecords,
   normalizeStored,
+  normalizePatch,
   dataDir,
   dataFile,
   readStore,

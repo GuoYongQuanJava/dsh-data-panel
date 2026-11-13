@@ -258,6 +258,47 @@ window.__ModuleLoader__.load({
 				return String(right.updatedAt).localeCompare(String(left.updatedAt));
 			});
 		}
+
+		/**
+		 * Parse a stored `codeRef` into a jump target.
+		 *
+		 * Accepted spellings, all resolved against the case's repository:
+		 *   src/RingBuffer.h:42        src/RingBuffer.h#L42
+		 *   src/RingBuffer.h#L42-58    C:\repo\src\RingBuffer.h:42
+		 *   src/RingBuffer.h:42:7      (line:column)
+		 *
+		 * The Windows drive colon is safe: the trailing group only matches when
+		 * the colon is followed by digits AND nothing but the line/column tail
+		 * remains, so `C:` can never be read as a line separator.
+		 */
+		function parseCodeRef(raw) {
+			var ref = typeof raw === "string" ? raw.trim() : "";
+			if (!ref) return null;
+			var match = /^(.*?)\s*(?:#L(\d+)(?:[-~](\d+))?|:(\d+)(?::(\d+))?)$/.exec(ref);
+			if (match === null) return null;
+			var path = match[1].trim();
+			if (!path) return null;
+			var line = Number(match[2] !== undefined ? match[2] : match[4]);
+			var end = match[3] !== undefined ? Number(match[3]) : undefined;
+			var column = match[5] !== undefined ? Number(match[5]) : undefined;
+			if (!Number.isFinite(line) || line < 1) return null;
+			return {
+				path: path,
+				line: Math.floor(line),
+				end: end !== undefined && Number.isFinite(end) && end >= line ? Math.floor(end) : undefined,
+				column: column !== undefined && Number.isFinite(column) && column >= 1 ? Math.floor(column) : undefined
+			};
+		}
+
+		/** 盘符绝对路径 / POSIX 绝对路径 / UNC 路径。 */
+		function isAbsoluteCodePath(path) {
+			return /^[A-Za-z]:[\\/]/.test(path) || path.charAt(0) === "/" || path.slice(0, 2) === "\\\\";
+		}
+
+		/** 反斜杠归一为正斜杠，去掉尾随分隔符。 */
+		function toPosixPath(path) {
+			return String(path).replace(/\\/g, "/").replace(/\/+$/, "");
+		}
 		//#endregion
 
 		//#region icons
@@ -300,6 +341,9 @@ window.__ModuleLoader__.load({
 					break;
 				case "copy":
 					children = [h("rect", { key: "a", x: 9, y: 9, width: 11, height: 11, rx: 2 }), h("path", { key: "b", d: "M5 15V5a1 1 0 0 1 1-1h9" })];
+					break;
+				case "location":
+					children = [h("circle", { key: "a", cx: 12, cy: 12, r: 3 }), h("path", { key: "b", d: "M12 3v3M12 18v3M3 12h3M18 12h3" })];
 					break;
 				case "close":
 					children = [h("path", { key: "a", d: "m6 6 12 12" }), h("path", { key: "b", d: "m18 6-12 12" })];
@@ -650,7 +694,8 @@ window.__ModuleLoader__.load({
 					description: initial.description || "",
 					input: initial.input || "",
 					expected: initial.expected || "",
-					code: initial.code || ""
+					code: initial.code || "",
+					codeRef: initial.codeRef || ""
 				};
 			});
 			var values = state[0];
@@ -757,7 +802,20 @@ window.__ModuleLoader__.load({
 							onChange: function (event) { set("expected", event.target.value); }
 						})
 					),
-					h(Field, { label: "代码", full: true, hint: "这条用例对应的测试代码，表格操作列的「</>」按钮可随时查看。" },
+					h(Field, {
+						label: "被测源码",
+						full: true,
+						hint: "这条用例覆盖的源文件位置，形如 src/RingBuffer.h:42（也接受 #L42、#L42-58）。表格操作列的定位按钮据此跳到编辑器。"
+					},
+						h("input", {
+							className: "dp-input mono",
+							value: values.codeRef,
+							maxLength: 200,
+							placeholder: "src/RingBuffer.h:42",
+							onChange: function (event) { set("codeRef", event.target.value); }
+						})
+					),
+					h(Field, { label: "代码", full: true, hint: "这条用例的测试代码。填了「被测源码」后表格的定位按钮会跳原件，这里的代码仍可用「</>」按钮查看。" },
 						h("textarea", {
 							className: "dp-textarea mono",
 							rows: 8,
@@ -1015,9 +1073,13 @@ window.__ModuleLoader__.load({
 												h("td", null,
 													h("div", { className: "dp-actions" },
 														h(IconButton, {
-															name: "code",
-															label: "查看代码 " + record.title,
-															onClick: function () { setCodeRecord(record); }
+															name: record.codeRef ? "location" : "code",
+															label: (record.codeRef ? "查看源码 " : "查看代码 ") + record.title,
+															onClick: function () {
+																// 有用例源码位置就跳编辑器；没有则沿用弹窗看用例代码。
+																if (record.codeRef && typeof props.openCode === "function") props.openCode(record.codeRef);
+																else setCodeRecord(record);
+															}
 														}),
 														h(IconButton, {
 															name: "edit",
@@ -1086,7 +1148,8 @@ window.__ModuleLoader__.load({
 					description: record.description || "",
 					input: record.input || "",
 					expected: record.expected || "",
-					code: record.code || ""
+					code: record.code || "",
+					codeRef: record.codeRef || ""
 				};
 			});
 			var values = state[0];
@@ -1170,6 +1233,15 @@ window.__ModuleLoader__.load({
 							onChange: function (event) { set("expected", event.target.value); }
 						})
 					),
+					h(Field, { label: "被测源码", hint: "形如 src/RingBuffer.h:42" },
+						h("input", {
+							className: "dp-input mono",
+							value: values.codeRef,
+							maxLength: 200,
+							placeholder: "src/RingBuffer.h:42",
+							onChange: function (event) { set("codeRef", event.target.value); }
+						})
+					),
 					h(Field, { label: "代码" },
 						h("textarea", {
 							className: "dp-textarea mono",
@@ -1203,6 +1275,10 @@ window.__ModuleLoader__.load({
 					)
 				),
 				h("div", { className: "dp-detail-actions" },
+					record.codeRef ? h(Button, { size: "sm", onClick: props.onOpenCode },
+						h(Icon, { name: "location", size: 14 }),
+						"查看源码"
+					) : null,
 					h(Button, { size: "sm", onClick: props.onEdit }, h(Icon, { name: "edit", size: 14 }), "编辑"),
 					h(Button, { size: "sm", variant: "danger", onClick: props.onDelete }, h(Icon, { name: "trash", size: 14 }), "删除")
 				),
@@ -1223,6 +1299,12 @@ window.__ModuleLoader__.load({
 					record.expected
 						? h("pre", { className: "dp-content" }, record.expected)
 						: h("p", { className: "dp-summary", style: { color: "var(--dp-text3)" } }, "未填写预期输出。")
+				),
+				h("div", { className: "dp-section" },
+					h("h4", null, "被测源码"),
+					record.codeRef
+						? h("p", { className: "dp-summary" }, h("code", { className: "dp-chip-mono" }, record.codeRef))
+						: h("p", { className: "dp-summary", style: { color: "var(--dp-text3)" } }, "未记录代码位置，点击「编辑」补充这条用例覆盖的源文件与行号。")
 				),
 				h("div", { className: "dp-section" },
 					h("h4", null, "代码"),
@@ -1253,6 +1335,8 @@ window.__ModuleLoader__.load({
 			var navigation = info && info.tab && info.tab.navigation ? info.tab.navigation : null;
 			var params = navigation && navigation.params ? navigation.params : {};
 			var id = typeof params.id === "string" ? params.id : "";
+			// 详情 Tab 由表格打开：带上记录所属会话，相对路径才能解析到工作区。
+			var sessionId = typeof params.sessionId === "string" ? params.sessionId : "";
 
 			var editingState = useState(false);
 			var editing = editingState[0];
@@ -1366,7 +1450,10 @@ window.__ModuleLoader__.load({
 				h(DetailView, {
 					record: record,
 					onEdit: function () { setEditing(true); setError(""); },
-					onDelete: function () { setConfirm(true); setError(""); }
+					onDelete: function () { setConfirm(true); setError(""); },
+					onOpenCode: function () {
+						if (typeof props.openCode === "function") props.openCode(record.codeRef, sessionId);
+					}
 				}),
 				editing ? h(DetailEditor, {
 					record: record,
@@ -1391,23 +1478,213 @@ window.__ModuleLoader__.load({
 
 		//#region plugin
 		var sidebarRight = null;
+		var sidebarRightTabs = null;
+		var sessions = null;
+		var workspaces = null;
+		/** 挂载时的客户端上下文：betterSidebar 是第三方服务，按需动态取，避免启动顺序问题。 */
+		var clientCtx = null;
 
-		function openDetail(id) {
+		/** vscode-mode 的编辑器 Tab 类型（其 officialSidebar.ts 的 OFFICIAL_TAB_KIND）。 */
+		var EDITOR_TAB_KIND = "edrvEditor";
+		/** dsh-better-sidebar 的编辑器 Tab 类型 id（内置注册表里的 `editor`）。 */
+		var BETTER_EDITOR_TAB = "editor";
+
+		function openDetail(id, sessionId) {
 			if (sidebarRight === null) {
 				store.setError("右侧栏服务尚未就绪，请刷新页面后再试。");
 				return;
 			}
 			try {
-				sidebarRight.openTab("data-panel-detail", { params: { id: id } });
+				sidebarRight.openTab("data-panel-detail", { params: { id: id, sessionId: sessionId } });
 			} catch (error) {
 				store.setError(error instanceof Error ? error.message : "打开右侧栏失败");
 			}
+		}
+
+		/**
+		 * 取 dsh-better-sidebar 的客户端服务。
+		 * 它不是 DSH 核心服务，未安装时 ctx.get 可能抛错，按需探测且不缓存，
+		 * 这样插件后于本插件加载也能被接上。
+		 */
+		function betterSidebarService() {
+			if (clientCtx === null || typeof clientCtx.get !== "function") return null;
+			try {
+				var service = clientCtx.get("betterSidebar");
+				if (!service || typeof service.openTab !== "function") return null;
+				return service;
+			} catch {
+				return null;
+			}
+		}
+
+		/**
+		 * 代码打开落在哪一栏。
+		 * `side` 让 DSH 在右侧栏再开一个 pane（用例详情与代码并排可见）；
+		 * 窗口偏窄时退回 `right`，在当前栏复用编辑器 Tab，避免两个栏都挤成一条。
+		 */
+		function codeOpenTarget() {
+			try {
+				if (typeof window !== "undefined" && typeof window.innerWidth === "number" && window.innerWidth > 0 && window.innerWidth < 1280) {
+					return "right";
+				}
+			} catch {
+				// 非浏览器环境保持默认。
+			}
+			return "side";
+		}
+
+		/**
+		 * 走 better-sidebar 的编辑器打开并定位。
+		 * 它的 `openTab` 在类型未注册或被用户在设置里禁用时是静默 no-op，
+		 * 所以先自己判一次可用性，避免"点了没反应"。
+		 */
+		function openWithBetterSidebar(service, target, absolute) {
+			try {
+				if (typeof service.getTab === "function" && !service.getTab(BETTER_EDITOR_TAB)) return false;
+				if (typeof service.isTabEnabled === "function" && !service.isTabEnabled(BETTER_EDITOR_TAB)) return false;
+				service.openTab({
+					type: BETTER_EDITOR_TAB,
+					path: absolute || target.path,
+					line: target.line,
+					target: codeOpenTarget(),
+					reveal: true
+				});
+				return true;
+			} catch {
+				return false;
+			}
+		}
+
+		/** 会话工作区目录（相对路径要拼它才能交给编辑器）。 */
+		function sessionCwd(sessionId) {
+			if (sessions === null || typeof sessionId !== "string" || !sessionId) return "";
+			try {
+				var list = sessions.list.getSnapshot();
+				var row = list && list.byId ? list.byId[sessionId] : null;
+				return row && typeof row.cwd === "string" ? row.cwd : "";
+			} catch {
+				return "";
+			}
+		}
+
+		/** 相对路径补上工作区目录；拿不到工作区时返回空串。 */
+		function absoluteCodePath(path, sessionId) {
+			var posix = toPosixPath(path);
+			if (isAbsoluteCodePath(posix)) return posix;
+			var cwd = toPosixPath(sessionCwd(sessionId));
+			if (!cwd) return "";
+			return cwd + "/" + posix.replace(/^(?:\.\/)+/, "").replace(/^\/+/, "");
+		}
+
+		/** 一段路径按官方 file 资源语法编码（盘符冒号保持字面）。 */
+		function encodeAddressSegment(segment) {
+			return encodeURIComponent(segment).replace(/%3A/gi, ":");
+		}
+
+		/** `dsh-resource://file/…` 地址：绝对路径走 absolute 域，相对路径走 session 域。 */
+		function codeFileAddress(path, sessionId) {
+			var posix = toPosixPath(path);
+			if (isAbsoluteCodePath(posix)) {
+				return "dsh-resource://file/absolute/"
+					+ posix.replace(/^\/+/, "").split("/").map(encodeAddressSegment).join("/");
+			}
+			var relative = posix.replace(/^(?:\.\/)+/, "").replace(/^\/+/, "");
+			return "dsh-resource://file/session/" + encodeURIComponent(String(sessionId))
+				+ "/" + relative.split("/").map(encodeAddressSegment).join("/");
+		}
+
+		/** 编辑器 Tab 是否已注册（vscode-mode 未装/禁用时为 false）。 */
+		function hasEditorTab() {
+			if (sidebarRightTabs === null || typeof sidebarRightTabs.get !== "function") return false;
+			try {
+				var definition = sidebarRightTabs.get(EDITOR_TAB_KIND);
+				return definition !== undefined && definition !== null;
+			} catch {
+				return false;
+			}
+		}
+
+		/**
+		 * 打开用例覆盖的被测源码并定位到行。
+		 *
+		 * 四级降级，逐级丢失一点精度而不是直接失败：
+		 *   ① dsh-better-sidebar 编辑器 —— 定位到行，可编辑，能落到并排的第二栏
+		 *   ② dsh-vscode-mode 编辑器 —— 定位到行/列，可编辑
+		 *   ③ 官方 file 资源预览 —— 只读，但能把行号交给查看器
+		 *   ④ 系统默认程序 openPath —— 只能打开文件，丢失行号
+		 * @param ref 记录里的 codeRef（`path:line` 等形态）
+		 * @param sessionId 记录所属会话，用于解析相对路径
+		 * @returns 是否成功发起了一次打开
+		 */
+		function openCode(ref, sessionId) {
+			var target = parseCodeRef(ref);
+			if (target === null) {
+				store.setError("这条用例还没有填代码位置。编辑用例，在「被测源码」里填 src/…:行号。");
+				return false;
+			}
+			var absolute = absoluteCodePath(target.path, sessionId);
+
+			// ① better-sidebar：优先用它，团队以它为主编辑器。
+			var better = betterSidebarService();
+			if (better !== null && openWithBetterSidebar(better, target, absolute)) return true;
+
+			if (sidebarRight === null) {
+				store.setError("右侧栏服务尚未就绪，请刷新页面后再试。");
+				return false;
+			}
+
+			// ② vscode-mode。
+			if (hasEditorTab()) {
+				try {
+					sidebarRight.openTab(EDITOR_TAB_KIND, {
+						params: { openPath: absolute || target.path, line: target.line, column: target.column }
+					});
+					return true;
+				} catch (error) {
+					// 落到下一级，不把用户的点击变成纯报错。
+				}
+			}
+
+			// ③ 官方 file 资源预览。
+			if (typeof sidebarRight.openResource === "function") {
+				try {
+					sidebarRight.openResource(codeFileAddress(target.path, sessionId), {
+						params: { line: target.line }
+					});
+					return true;
+				} catch (error) {
+					// 同上。
+				}
+			}
+
+			// ④ 系统默认程序。
+			if (workspaces !== null && typeof workspaces.openPath === "function" && absolute) {
+				try {
+					workspaces.openPath(absolute);
+					store.setError("已用系统默认程序打开，但没能定位到第 " + target.line + " 行。");
+					return true;
+				} catch (error) {
+					// 落到最终提示。
+				}
+			}
+
+			store.setError("找不到可用的代码打开方式：请确认已启用右侧边栏（dsh-better-sidebar）或 VS Code 工作台（dsh-vscode-mode），或代码位于当前会话工作区内。");
+			return false;
 		}
 
 		var inject = ["slots"];
 
 		function apply(ctx) {
 			ensureStyles();
+
+			// betterSidebar 是第三方服务（dsh-better-sidebar 注册），按需用 ctx.get 取，
+			// 故这里只保留上下文引用，不写进 inject——未装该插件时 inject 会一直停等。
+			clientCtx = ctx;
+			ctx.effect(function () {
+				return function () {
+					clientCtx = null;
+				};
+			}, "dsh-data-panel: client context");
 
 			ctx.inject(["sidebarRight"], function (sub) {
 				sidebarRight = sub.sidebarRight;
@@ -1419,6 +1696,12 @@ window.__ModuleLoader__.load({
 			});
 
 			ctx.inject(["sidebarRightTabs"], function (sub) {
+				sidebarRightTabs = sub.sidebarRightTabs;
+				sub.effect(function () {
+					return function () {
+						sidebarRightTabs = null;
+					};
+				}, "dsh-data-panel: sidebar right tabs service");
 				sub.effect(function () {
 					return sub.sidebarRightTabs.register({
 						id: "data-panel-detail",
@@ -1429,14 +1712,36 @@ window.__ModuleLoader__.load({
 				}, "dsh-data-panel: detail tab type");
 			});
 
+			// 相对路径要用会话工作区补全，跳转才能落到仓库里的真实文件。
+			ctx.inject(["sessions"], function (sub) {
+				sessions = sub.sessions;
+				sub.effect(function () {
+					return function () {
+						sessions = null;
+					};
+				}, "dsh-data-panel: sessions service");
+			});
+
+			ctx.inject(["workspaces"], function (sub) {
+				workspaces = sub.workspaces;
+				sub.effect(function () {
+					return function () {
+						workspaces = null;
+					};
+				}, "dsh-data-panel: workspaces service");
+			});
+
 			ctx.slots.inject("conversation.view", function () {
 				return ctx.slots.register({
 					name: "conversation.view",
 					id: "data-panel",
 					order: 30,
 					label: function () { return "面板"; },
-					inject: function () {
-						return { openDetail: openDetail };
+					inject: function (sessionId) {
+						return {
+							openDetail: function (id) { openDetail(id, sessionId); },
+							openCode: function (ref) { openCode(ref, sessionId); }
+						};
 					}
 				}, DataPanelView);
 			});
@@ -1446,7 +1751,7 @@ window.__ModuleLoader__.load({
 					name: "sidebar.right.pane.tab",
 					key: "data-panel-detail",
 					inject: function () {
-						return { store: store };
+						return { store: store, openCode: openCode };
 					}
 				}, DetailBody);
 			});
@@ -1457,6 +1762,22 @@ window.__ModuleLoader__.load({
 		exports.inject = inject;
 		exports.__test = {
 			store: store,
+			parseCodeRef: parseCodeRef,
+			openCode: openCode,
+			/** Test-only: 注入打开代码所需的服务替身（生产路径由 ctx.inject 填充）。 */
+			setCodeServices: function (next) {
+				var source = next || {};
+				sidebarRight = source.sidebarRight === undefined ? null : source.sidebarRight;
+				sidebarRightTabs = source.sidebarRightTabs === undefined ? null : source.sidebarRightTabs;
+				sessions = source.sessions === undefined ? null : source.sessions;
+				workspaces = source.workspaces === undefined ? null : source.workspaces;
+				// betterSidebar 走 ctx.get 动态取，替身挂在假上下文上。
+				clientCtx = source.betterSidebar === undefined ? null : {
+					get: function (name) {
+						return name === "betterSidebar" ? source.betterSidebar : undefined;
+					}
+				};
+			},
 			DataPanelView: DataPanelView,
 			DetailView: DetailView,
 			DetailBody: DetailBody,
