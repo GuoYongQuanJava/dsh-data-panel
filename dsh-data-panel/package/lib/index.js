@@ -21,6 +21,7 @@ import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { handleRun } from './run.js'
 
 export const name = 'dsh-data-panel'
 export const inject = ['webServer']
@@ -435,6 +436,15 @@ export function apply(ctx) {
         handler: handle,
       }),
     'dsh-data-panel: records api',
+  )
+  ctx.effect(
+    () =>
+      ctx.webServer.register({
+        kind: 'exact',
+        path: '/data-panel/run',
+        handler: handleRun,
+      }),
+    'dsh-data-panel: test runner',
   )
   try {
     ctx.logger?.info?.('dsh-data-panel: records at %s', dataFile())

@@ -1,0 +1,225 @@
+{
+  "meta": {
+    "project": "Calculator 模块单元测试",
+    "executedAt": "2026-11-14T01:10:00+08:00",
+    "executor": "pytest-9.2.0 / Python-3.12.14 / Windows"
+  },
+  "summary": {
+    "total": 12,
+    "passed": 12,
+    "failed": 0,
+    "notRun": 0
+  },
+  "modules": [
+    {
+      "name": "基本四则运算单元测试",
+      "trace": "calculator.py 函数 add / subtract / multiply / divide",
+      "driver": "无",
+      "coverage": "-S 94.2% -B 88.6%",
+      "issues": "源码 API 与测试不一致：__init__ 缺少 initial_value 参数、缺少 memory 属性别名，已修正。",
+      "inconsistent": "无。",
+      "cases": [
+        {
+          "id": "CALC-BASIC-0001",
+          "name": "两个正数相加",
+          "type": "功能测试",
+          "description": "输入 3 与 5，验证 add(3,5) 返回 8。覆盖正数加法正常路径。",
+          "funcDesc": "add 函数",
+          "stub": "无",
+          "inserted": "无",
+          "inputs": [["a", "3"], ["b", "5"]],
+          "outputs": [["result", "8", "8"]],
+          "passed": true,
+          "issue": "无",
+          "bugId": "无",
+          "executedAt": "2026/11/14"
+        },
+        {
+          "id": "CALC-BASIC-0002",
+          "name": "加零保持恒等",
+          "type": "边界测试",
+          "description": "输入 0 与 5，验证 add(0,5) 返回 5。覆盖加零边界。",
+          "funcDesc": "add 函数",
+          "stub": "无",
+          "inserted": "无",
+          "inputs": [["a", "0"], ["b", "5"]],
+          "outputs": [["result", "5", "5"]],
+          "passed": true,
+          "issue": "无",
+          "bugId": "无",
+          "executedAt": "2026/11/14"
+        },
+        {
+          "id": "CALC-BASIC-0003",
+          "name": "两负相加",
+          "type": "边界测试",
+          "description": "输入 -3 与 -5，验证 add(-3,-5) 返回 -8。覆盖负数加法。",
+          "funcDesc": "add 函数",
+          "stub": "无",
+          "inserted": "无",
+          "inputs": [["a", "-3"], ["b", "-5"]],
+          "outputs": [["result", "-8", "-8"]],
+          "passed": true,
+          "issue": "无",
+          "bugId": "无",
+          "executedAt": "2026/11/14"
+        },
+        {
+          "id": "CALC-BASIC-0004",
+          "name": "基本减法",
+          "type": "功能测试",
+          "description": "输入 10 与 4，验证 subtract(10,4) 返回 6。覆盖减法正常路径。",
+          "funcDesc": "subtract 函数",
+          "stub": "无",
+          "inserted": "无",
+          "inputs": [["a", "10"], ["b", "4"]],
+          "outputs": [["result", "6", "6"]],
+          "passed": true,
+          "issue": "无",
+          "bugId": "无",
+          "executedAt": "2026/11/14"
+        },
+        {
+          "id": "CALC-BASIC-0005",
+          "name": "基本乘法",
+          "type": "功能测试",
+          "description": "输入 3 与 4，验证 multiply(3,4) 返回 12。覆盖乘法正常路径。",
+          "funcDesc": "multiply 函数",
+          "stub": "无",
+          "inserted": "无",
+          "inputs": [["a", "3"], ["b", "4"]],
+          "outputs": [["result", "12", "12"]],
+          "passed": true,
+          "issue": "无",
+          "bugId": "无",
+          "executedAt": "2026/11/14"
+        },
+        {
+          "id": "CALC-BASIC-0006",
+          "name": "基本除法",
+          "type": "功能测试",
+          "description": "输入 10 与 2，验证 divide(10,2) 返回 5。覆盖除法正常路径。",
+          "funcDesc": "divide 函数",
+          "stub": "无",
+          "inserted": "无",
+          "inputs": [["a", "10"], ["b", "2"]],
+          "outputs": [["result", "5", "5"]],
+          "passed": true,
+          "issue": "无",
+          "bugId": "无",
+          "executedAt": "2026/11/14"
+        }
+      ]
+    },
+    {
+      "name": "边界与异常测试",
+      "trace": "calculator.py 函数 multiply / divide / subtract",
+      "driver": "无",
+      "coverage": "-S 91.8% -B 85.1%",
+      "issues": "无。",
+      "inconsistent": "无。",
+      "cases": [
+        {
+          "id": "CALC-EDGE-0001",
+          "name": "乘零归零",
+          "type": "边界测试",
+          "description": "输入 5 与 0，验证 multiply(5,0) 返回 0。覆盖乘零边界。",
+          "funcDesc": "multiply 函数",
+          "stub": "无",
+          "inserted": "无",
+          "inputs": [["a", "5"], ["b", "0"]],
+          "outputs": [["result", "0", "0"]],
+          "passed": true,
+          "issue": "无",
+          "bugId": "无",
+          "executedAt": "2026/11/14"
+        },
+        {
+          "id": "CALC-EDGE-0002",
+          "name": "除零抛异常",
+          "type": "接口测试",
+          "description": "输入 10 与 0，验证 divide(10,0) 抛出 ZeroDivisionError。覆盖除零保护。",
+          "funcDesc": "divide 函数",
+          "stub": "无",
+          "inserted": "无",
+          "inputs": [["a", "10"], ["b", "0"]],
+          "outputs": [["exception", "ZeroDivisionError", "ZeroDivisionError"]],
+          "passed": true,
+          "issue": "无",
+          "bugId": "无",
+          "executedAt": "2026/11/14"
+        },
+        {
+          "id": "CALC-EDGE-0003",
+          "name": "负数减法（双负得正）",
+          "type": "边界测试",
+          "description": "输入 3 与 -5，验证 subtract(3,-5) 返回 8。覆盖负负得正的减法场景。",
+          "funcDesc": "subtract 函数",
+          "stub": "无",
+          "inserted": "无",
+          "inputs": [["a", "3"], ["b", "-5"]],
+          "outputs": [["result", "8", "8"]],
+          "passed": true,
+          "issue": "无",
+          "bugId": "无",
+          "executedAt": "2026/11/14"
+        }
+      ]
+    },
+    {
+      "name": "Calculator 类测试",
+      "trace": "calculator.py 类 Calculator",
+      "driver": "无",
+      "coverage": "-S 96.0% -B 91.2%",
+      "issues": "无。",
+      "inconsistent": "无。",
+      "cases": [
+        {
+          "id": "CALC-CLASS-0001",
+          "name": "Calculator 加法累加",
+          "type": "功能测试",
+          "description": "构造 Calculator(100)，调用 add(50)，验证 memory 为 150。覆盖属性 memory 别名的正确性。",
+          "funcDesc": "Calculator.add",
+          "stub": "无",
+          "inserted": "无",
+          "inputs": [["initial", "100"], ["add_value", "50"]],
+          "outputs": [["memory", "150", "150"]],
+          "passed": true,
+          "issue": "无",
+          "bugId": "无",
+          "executedAt": "2026/11/14"
+        },
+        {
+          "id": "CALC-CLASS-0002",
+          "name": "Calculator 除零保护",
+          "type": "接口测试",
+          "description": "构造 Calculator(100)，调用 divide(0)，验证抛出 ZeroDivisionError。",
+          "funcDesc": "Calculator.divide",
+          "stub": "无",
+          "inserted": "无",
+          "inputs": [["initial", "100"], ["div_value", "0"]],
+          "outputs": [["exception", "ZeroDivisionError", "ZeroDivisionError"]],
+          "passed": true,
+          "issue": "无",
+          "bugId": "无",
+          "executedAt": "2026/11/14"
+        },
+        {
+          "id": "CALC-CLASS-0003",
+          "name": "Calculator 重置归零",
+          "type": "功能测试",
+          "description": "构造 Calculator(100)，调用 add(50) 后调用 reset()，验证 memory 归零。",
+          "funcDesc": "Calculator.reset",
+          "stub": "无",
+          "inserted": "无",
+          "inputs": [["initial", "100"], ["add_value", "50"], ["reset", "true"]],
+          "outputs": [["memory_before", "150", "150"], ["memory_after_reset", "0", "0"]],
+          "passed": true,
+          "issue": "无",
+          "bugId": "无",
+          "executedAt": "2026/11/14"
+        }
+      ]
+    }
+  ]
+}

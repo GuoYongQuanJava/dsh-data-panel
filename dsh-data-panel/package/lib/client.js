@@ -114,6 +114,7 @@ window.__ModuleLoader__.load({
 .dp-demo-banner button { margin-left: auto; padding: 0; border: 0; background: none; color: var(--dp-warning); font: inherit; font-size: 12px; font-weight: 500; cursor: pointer; }
 .dp-demo-banner button:hover { text-decoration: underline; text-underline-offset: 2px; }
 .dp-alert { display: flex; align-items: center; gap: 8px; margin: 0 0 12px; padding: 9px 12px; border: 1px solid color-mix(in srgb, var(--dp-danger) 26%, transparent); border-radius: 10px; background: color-mix(in srgb, var(--dp-danger) 7%, transparent); color: var(--dp-danger); font-size: 12px; }
+.dp-run-result { margin: 0 0 12px; padding: 9px 12px; border: 1px solid var(--dp-border); border-radius: 10px; color: var(--dp-text); font-size: 12px; white-space: pre-wrap; }
 .dp-alert button { margin-left: auto; padding: 0; border: 0; background: none; color: inherit; font: inherit; font-size: 12px; font-weight: 500; cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
 .dp-card { overflow: hidden; border: 1px solid var(--dp-border); border-radius: 14px; background: var(--dp-bg); }
 .dp-card-scroll { overflow-x: auto; overflow-y: hidden; }
@@ -897,6 +898,9 @@ window.__ModuleLoader__.load({
 			var codeState = useState(null);
 			var codeRecord = codeState[0];
 			var setCodeRecord = codeState[1];
+			var runResultState = useState("");
+			var runResult = runResultState[0];
+			var setRunResult = runResultState[1];
 
 			useEffect(function () {
 				store.load().catch(function () {});
@@ -1043,11 +1047,34 @@ window.__ModuleLoader__.load({
 							h(Icon, { name: "refresh", size: 15 }),
 							snap.status === "refreshing" ? "刷新中…" : "刷新"
 						),
+						h(Button, { variant: "ghost", onClick: function () {
+							var cwd = runWorkspaceCwd();
+							if (!cwd) { store.setError("无法确定当前会话的项目目录"); return; }
+							setRunResult("正在执行全部测试…");
+							console.log('[dsh-data-panel] run all tests');
+							fetch('/data-panel/run', {
+								method: 'POST',
+								headers: { 'Content-Type': 'application/json' },
+								body: JSON.stringify({ caseId: '__ALL__', testFile: 'tests/test_generated.py', cwd: cwd })
+							}).then(function (r) { return r.json(); }).then(function (data) {
+								if (!data.ok) throw new Error(data.error || "执行失败");
+								console.log('[dsh-data-panel] all tests done:', data);
+								setRunResult(data.passed ? "全部测试通过" : "测试未全部通过：" + data.output);
+								refresh();
+							}).catch(function (e) {
+								console.error('[dsh-data-panel] run all failed', e);
+								setRunResult("执行失败：" + e.message);
+							});
+						}, disabled: snap.status === "refreshing" },
+							h(Icon, { name: "code", size: 15 }),
+							"全部执行"
+						),
 						h(Button, { variant: "primary", onClick: openCreate },
 							h(Icon, { name: "plus", size: 15 }),
 							"新增用例"
 						)
 					),
+					runResult ? h("div", { className: "dp-run-result" }, runResult) : null,
 					snap.error ? h("div", { className: "dp-alert" },
 						snap.error,
 						h("button", { type: "button", onClick: refresh }, "重试")
@@ -1120,6 +1147,27 @@ window.__ModuleLoader__.load({
 																// 有用例源码位置就跳编辑器；没有则沿用弹窗看用例代码。
 																if (record.codeRef && typeof props.openCode === "function") props.openCode(record.codeRef);
 																else setCodeRecord(record);
+															}
+														}),
+														h(IconButton, {
+															name: "external",
+															label: "执行 " + record.title,
+															onClick: function () {
+													var cwd = runWorkspaceCwd();
+													if (!cwd) { store.setError("无法确定当前会话的项目目录"); return; }
+													setRunResult("正在执行 " + record.caseId + "…");
+																console.log('[dsh-data-panel] run test', record.caseId);
+													fetch('/data-panel/run', {
+																	method: 'POST',
+																	headers: { 'Content-Type': 'application/json' },
+														body: JSON.stringify({ caseId: record.caseId, testFile: 'tests/test_generated.py', cwd: cwd })
+													}).then(function (r) { return r.json(); }).then(function (data) {
+														if (!data.ok) throw new Error(data.error || "执行失败");
+																	console.log('[dsh-data-panel] run result', data.caseId, data.passed ? 'PASS' : 'FAIL');
+														setRunResult(record.caseId + (data.passed ? " 执行通过" : " 执行失败：" + data.output));
+												}).catch(function (e) {
+														setRunResult("执行失败：" + e.message);
+																});
 															}
 														}),
 														h(IconButton, {
@@ -1633,10 +1681,10 @@ window.__ModuleLoader__.load({
 				var path = isAbsoluteCodePath(toPosixPath(target.path)) ? toPosixPath(target.path) : target.path;
 
 				service.openTab({
-					type: BETTER_EDITOR_TAB,
+					type: "editor",
 					path: path,
 					line: target.line,
-					target: "right",
+					target: "side",
 					reveal: true
 				}, scope);
 				// 成功就清掉可能残留的提示——这条路径以前会留一条红色横幅。
@@ -1655,6 +1703,29 @@ window.__ModuleLoader__.load({
 				var list = sessions.list.getSnapshot();
 				var row = list && list.byId ? list.byId[sessionId] : null;
 				return row && typeof row.cwd === "string" ? row.cwd : "";
+			} catch {
+				return "";
+			}
+		}
+
+		function runWorkspaceCwd() {
+			var service = betterSidebarService();
+			if (service !== null && typeof service.getSnapshot === "function") {
+				try {
+					var activeId = service.getSnapshot().sessionId;
+					var activeCwd = sessionCwd(activeId);
+					if (activeCwd) return activeCwd;
+				} catch {}
+			}
+			if (sessions === null) return "";
+			try {
+				var byId = sessions.list.getSnapshot().byId || {};
+				var cwds = [];
+				Object.keys(byId).forEach(function (id) {
+					var cwd = byId[id] && byId[id].cwd;
+					if (typeof cwd === "string" && cwd && cwds.indexOf(cwd) === -1) cwds.push(cwd);
+				});
+				return cwds.length === 1 ? cwds[0] : "";
 			} catch {
 				return "";
 			}
@@ -1904,6 +1975,18 @@ window.__ModuleLoader__.load({
 
 		function apply(ctx) {
 			ensureStyles();
+			if (typeof window !== "undefined") {
+				var previousOpenPanel = window.__dshOpenDataPanel;
+				window.__dshOpenDataPanel = openBoardTab;
+				ctx.effect(function () {
+					return function () {
+						if (window.__dshOpenDataPanel === openBoardTab) {
+							if (previousOpenPanel === undefined) delete window.__dshOpenDataPanel;
+							else window.__dshOpenDataPanel = previousOpenPanel;
+						}
+					};
+				}, "dsh-data-panel: open board from workflow");
+			}
 
 			// betterSidebar 是第三方服务（dsh-better-sidebar 注册），按需用 ctx.get 取，
 			// 故这里只保留上下文引用，不写进 inject——未装该插件时 inject 会一直停等。

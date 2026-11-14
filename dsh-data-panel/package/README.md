@@ -2,12 +2,13 @@
 
 一个给 DeepSeek Harness 用的测试用例台账：
 
-- **对话行新增「面板」标签**，和「对话 / 轨迹 / 工作流」并排。
+- **对话行新增「面板」按钮**，点击后在右侧栏打开测试用例看板；工作流也可调用 `window.__dshOpenDataPanel()` 自动打开。
 - **表格列**：用例标识 / 用例名称 / 测试类型 / 测试说明 / 输入 / 预期输出 / 操作。
 - **分页**：表格右下角有分页栏，可选每页 5 / 10 / 20 / 50 条，上一页 / 下一页 / 页码。
 - **增删改查**：搜索（名称、标识、说明、输入、输出）、按测试类型筛选、新增、编辑、删除。
 - **查看代码**：操作列最左侧的「</>」按钮打开用例代码弹窗，可一键复制。
 - **点击用例名称 → 右侧栏详情**：右侧栏展示输入、预期输出与代码，可继续编辑或删除。
+- **执行测试**：工具栏「全部执行」和每行「执行」调用本插件的 `/data-panel/run`，读取当前项目的 `.dsh/testcases/cases.json` 并运行 pytest。
 - **本地持久化**：数据写入 `<DSH_HOME>/plugin-data/dsh-data-panel/records.json`，刷新页面、重启应用都不丢。
 - **示例数据**：首次启动写入 7 条示例用例，面板顶部有「示例数据」标识和「清空示例」按钮。
 
@@ -21,7 +22,7 @@
 dsh plugin --profile desktop add file:D:/1/dsh-data-panel/dsh-data-panel/package
 ```
 
-安装完成后**刷新页面**（Ctrl/Cmd + Shift + R），对话行末尾会出现「面板」。
+安装完成后**刷新页面**（Ctrl/Cmd + Shift + R），对话行末尾会出现「面板」按钮。
 
 > 跨盘安装（工作区在 D 盘、profile 在 C 盘）是复制而不是硬链接：改完 `lib/` 里的代码要重新装一次才生效。
 
@@ -76,21 +77,24 @@ POST /data-panel/api   { "op": "create", "record": { ... } }
 POST /data-panel/api   { "op": "update", "id": "rec_…", "patch": { ... } }
 POST /data-panel/api   { "op": "delete", "id": "rec_…" }
 POST /data-panel/api   { "op": "clearDemo" }
+POST /data-panel/run   { "caseId": "TC-001", "testFile": "tests/test_generated.py", "cwd": "项目绝对路径" }
 ```
 
 返回统一为 `{ ok: true, … }` 或 `{ ok: false, error }`。
+`caseId` 为 `__ALL__` 时运行整个测试文件；单条执行从项目的 `.dsh/testcases/cases.json` 查找测试函数。
 
 ## 目录
 
 ```
 lib/index.js      Host 半：JSON 存储 + /data-panel/api
-lib/client.js     Client 半：conversation.view「面板」+ 右侧栏详情
+lib/run.js        Host 半：/data-panel/run 执行测试
+lib/client.js     Client 半：「面板」按钮 + 右侧栏看板和详情
 cordis.patch.yml  Bundle 挂载行
 ```
 
 ## 扩展点
 
-- 对话行标签：`ctx.slots.register({ name: 'conversation.view', id: 'data-panel', order: 30 })`
+- 对话行按钮：客户端在会话标签行挂载「面板」入口
 - 右侧栏详情类型：`ctx.sidebarRightTabs.register({ id: 'data-panel-detail', kind: 'data-panel-detail' })`
 - 详情正文：`ctx.slots.register({ name: 'sidebar.right.pane.tab', key: 'data-panel-detail' })`
 - 打开详情：`ctx.sidebarRight.openTab('data-panel-detail', { params: { id } })`
@@ -99,4 +103,5 @@ cordis.patch.yml  Bundle 挂载行
 
 - 表格列和表单字段是固定的；要加列（例如「执行结果」「负责人」）需要同步改 `lib/index.js` 的校验和 `lib/client.js` 的表格与表单。
 - 数据是全局一份，不按会话隔离；如果希望每个会话一份，把存储 key 换成 `sessionId` 即可。
+- 执行器读取当前项目的用例文件；面板记录与项目用例文件仍是两份数据，需由工作流同步。
 - 没有多用户/权限控制；它运行在本机 DSH 进程里，路由绑定在本地 web server 上。

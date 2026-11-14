@@ -1,0 +1,334 @@
+{
+  "meta": {
+    "project": "用户认证服务单元测试",
+    "executedAt": "2026-11-13T21:40:00+08:00",
+    "executor": "gtest-1.14 / gcc-13.2 / Ubuntu-22.04"
+  },
+  "summary": {
+    "total": 8,
+    "passed": 6,
+    "failed": 1,
+    "notRun": 1
+  },
+  "modules": [
+    {
+      "name": "密码校验单元测试",
+      "trace": "认证服务详细设计 7.2.1 密码策略",
+      "driver": "测试驱动（TestDriver）",
+      "coverage": "-S 96.1% -B 90.2% -MCDC n/a",
+      "issues": "无。",
+      "inconsistent": "无。",
+      "cases": [
+        {
+          "id": "AUTH-PWD-0001",
+          "name": "强密码通过校验",
+          "type": "功能测试",
+          "description": "长度达标且含大写字母与特殊符号时，密码校验应返回通过且无错误码。",
+          "funcDesc": "密码强度校验",
+          "stub": "无",
+          "inserted": "无",
+          "inputs": [
+            [
+              "password_length",
+              "12"
+            ],
+            [
+              "has_upper",
+              "true"
+            ],
+            [
+              "has_symbol",
+              "true"
+            ]
+          ],
+          "outputs": [
+            [
+              "result",
+              "PASS",
+              "PASS"
+            ],
+            [
+              "error_code",
+              "NONE",
+              "NONE"
+            ]
+          ],
+          "passed": true,
+          "issue": "无",
+          "bugId": "无",
+          "executedAt": "2026/11/13"
+        },
+        {
+          "id": "AUTH-PWD-0002",
+          "name": "长度下限边界值",
+          "type": "边界测试",
+          "description": "密码长度取策略下限减一（7 位），验证返回「过短」错误码而不是通过。",
+          "funcDesc": "密码强度校验",
+          "stub": "无",
+          "inserted": "无",
+          "inputs": [
+            [
+              "password_length",
+              "7"
+            ],
+            [
+              "min_length",
+              "8"
+            ]
+          ],
+          "outputs": [
+            [
+              "result",
+              "REJECT",
+              "REJECT"
+            ],
+            [
+              "error_code",
+              "ERR_TOO_SHORT",
+              "ERR_TOO_SHORT"
+            ]
+          ],
+          "passed": true,
+          "issue": "无",
+          "bugId": "无",
+          "executedAt": "2026/11/13"
+        },
+        {
+          "id": "AUTH-PWD-0003",
+          "name": "连续失败触发账号锁定",
+          "type": "逻辑测试",
+          "description": "连续失败次数达到阈值时账号应转为锁定态，并给出建议重试等待时长。",
+          "funcDesc": "登录失败计数",
+          "stub": "账号存储（StubAccountRepo）",
+          "inserted": "无",
+          "inputs": [
+            [
+              "fail_count",
+              "5"
+            ],
+            [
+              "lock_threshold",
+              "5"
+            ]
+          ],
+          "outputs": [
+            [
+              "locked",
+              "true",
+              "true"
+            ],
+            [
+              "retry_after",
+              "300",
+              "300"
+            ]
+          ],
+          "passed": true,
+          "issue": "无",
+          "bugId": "无",
+          "executedAt": "2026/11/13"
+        }
+      ]
+    },
+    {
+      "name": "令牌签发单元测试",
+      "trace": "认证服务详细设计 7.2.3 令牌生命周期",
+      "driver": "测试驱动（TestDriver）",
+      "coverage": "-S 92.4% -B 85.3% -MCDC n/a",
+      "issues": "时钟偏移方向取反，导致有效期被延长。",
+      "inconsistent": "无。",
+      "cases": [
+        {
+          "id": "AUTH-TOK-0001",
+          "name": "正常签发访问令牌",
+          "type": "功能测试",
+          "description": "合法用户与合法 scope 下签发访问令牌，验证令牌类型与默认有效期。",
+          "funcDesc": "访问令牌签发",
+          "stub": "签名服务（StubSigner）",
+          "inserted": "无",
+          "inputs": [
+            [
+              "user_id",
+              "U10086"
+            ],
+            [
+              "scope",
+              "read"
+            ],
+            [
+              "ttl",
+              "7200"
+            ]
+          ],
+          "outputs": [
+            [
+              "token_type",
+              "Bearer",
+              "Bearer"
+            ],
+            [
+              "expires_in",
+              "7200",
+              "7200"
+            ]
+          ],
+          "passed": true,
+          "issue": "无",
+          "bugId": "无",
+          "executedAt": "2026/11/13"
+        },
+        {
+          "id": "AUTH-TOK-0002",
+          "name": "时钟偏移下的有效期计算",
+          "type": "逻辑测试",
+          "description": "客户端时钟比服务端快 30 秒时，签发令牌的有效期应从配置值中扣除偏移量，避免令牌提前失效。",
+          "funcDesc": "令牌有效期补偿",
+          "stub": "时钟服务（StubClock）",
+          "inserted": "无",
+          "inputs": [
+            [
+              "clock_skew",
+              "+30"
+            ],
+            [
+              "ttl",
+              "7200"
+            ]
+          ],
+          "outputs": [
+            [
+              "effective_ttl",
+              "7170",
+              "7230"
+            ]
+          ],
+          "passed": false,
+          "issue": "时钟偏移被加到 TTL 上而不是从 TTL 中扣除，令牌实际有效期比配置长 30 秒，与设计文档 7.2.3 的补偿公式方向相反。",
+          "bugId": "BUG-AUTH-0107",
+          "executedAt": "2026/11/13"
+        }
+      ]
+    },
+    {
+      "name": "权限判定单元测试",
+      "trace": "认证服务详细设计 7.2.5 权限矩阵",
+      "driver": "测试驱动（TestDriver）",
+      "coverage": "-S 94.0% -B 88.6% -MCDC n/a",
+      "issues": "无。",
+      "inconsistent": "无。",
+      "cases": [
+        {
+          "id": "AUTH-PERM-0001",
+          "name": "只读角色访问写接口",
+          "type": "接口测试",
+          "description": "VIEWER 角色请求写操作应被拒绝，接口返回 403 且不产生副作用。",
+          "funcDesc": "权限矩阵判定",
+          "stub": "角色配置（StubRoleConfig）",
+          "inserted": "无",
+          "inputs": [
+            [
+              "role",
+              "VIEWER"
+            ],
+            [
+              "action",
+              "write"
+            ]
+          ],
+          "outputs": [
+            [
+              "granted",
+              "false",
+              "false"
+            ],
+            [
+              "http_status",
+              "403",
+              "403"
+            ]
+          ],
+          "passed": true,
+          "issue": "无",
+          "bugId": "无",
+          "executedAt": "2026/11/13"
+        },
+        {
+          "id": "AUTH-PERM-0002",
+          "name": "管理员全权限放行",
+          "type": "功能测试",
+          "description": "ADMIN 角色对任意 action 都应放行，验证删除操作返回 200。",
+          "funcDesc": "权限矩阵判定",
+          "stub": "角色配置（StubRoleConfig）",
+          "inserted": "无",
+          "inputs": [
+            [
+              "role",
+              "ADMIN"
+            ],
+            [
+              "action",
+              "delete"
+            ]
+          ],
+          "outputs": [
+            [
+              "granted",
+              "true",
+              "true"
+            ],
+            [
+              "http_status",
+              "200",
+              "200"
+            ]
+          ],
+          "passed": true,
+          "issue": "无",
+          "bugId": "无",
+          "executedAt": "2026/11/13"
+        },
+        {
+          "id": "AUTH-PERM-0003",
+          "name": "跨租户资源越权访问",
+          "type": "接口测试",
+          "description": "租户 A 的用户请求租户 B 的资源时应被拒绝，并写入一条审计日志。",
+          "funcDesc": "多租户隔离判定",
+          "stub": "租户配置（StubTenantConfig）",
+          "inserted": "无",
+          "inputs": [
+            [
+              "tenant_id",
+              "T-A"
+            ],
+            [
+              "target_tenant",
+              "T-B"
+            ],
+            [
+              "action",
+              "read"
+            ]
+          ],
+          "outputs": [
+            [
+              "granted",
+              "false",
+              ""
+            ],
+            [
+              "audit_logged",
+              "true",
+              ""
+            ]
+          ],
+          "passed": false,
+          "status": "notRun",
+          "notRunReason": "该用例依赖多租户测试夹具，当前执行环境未部署夹具，执行集跳过本条。",
+          "issue": "无",
+          "bugId": "无",
+          "executedAt": ""
+        }
+      ]
+    }
+  ]
+}
