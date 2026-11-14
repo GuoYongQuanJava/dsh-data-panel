@@ -11,8 +11,9 @@
 
 设计原则（重要）：
 * **不重跑测试**。报告只消费 `--run` 指定的那一次执行结果，保证报告和日志是同一件事。
-* **不信「整体通过」**。逐条结论只来自 result.json 里的 `tests`（runner 从 junit.xml 解析出的
-  逐条结果）；某条用例找不到自己的证据就标「未确认」，**绝不**用整体状态推断它通过。
+* **不信「整体通过」**。逐条结论只来自 result.json 里的 `tests`（batch 模式来自 JUnit，
+  per-case 模式来自每条命令的退出码）；某条用例找不到自己的证据就标「未确认」，**绝不**用整体状态推断它通过。
+
 * **不编造覆盖率**。没有真实覆盖率数据就写「未采集」。
 * 中间产物默认放在 `reports/<runId>/`，不同次执行不会互相覆盖。
 """
@@ -49,6 +50,7 @@ STATUS_TEXT = {
     "passed": "通过",
     "partial": "部分通过（有未执行用例）",
     "failed": "失败",
+    "build-failed": "构建失败",
     "timeout": "超时",
     "interrupted": "中断",
     "no-tests": "未收集到测试",
@@ -75,6 +77,16 @@ def default_out(run_path: Path) -> Path:
     run_id = run_path.parent.name
     session_root = run_path.parent.parent.parent  # runs/<runId>/result.json -> <root>
     return session_root / "reports" / run_id / "report-data.json"
+
+
+def runner_label(result: dict) -> str:
+    """报告里展示的执行器：优先用 runner 描述，兼容没有 runner 字段的旧结果。"""
+    runner = result.get("runner") or {}
+    label = str(runner.get("label") or runner.get("id") or "").strip()
+    language = str(runner.get("language") or "").strip()
+    if label and language:
+        return f"{label} / {language}"
+    return label or "未知测试框架"
 
 
 def case_project_name(result: dict, run_path: Path) -> str:
@@ -163,10 +175,10 @@ def main() -> int:
                         reason = ""
                     elif outcome in ("failed", "error"):
                         status = "failed"
-                        reason = str(evidence.get("message") or "") or f"pytest 判定 {outcome}"
+                        reason = str(evidence.get("message") or "") or f"{runner_label(result)} 判定 {outcome}"
                     else:
                         status = "unconfirmed"
-                        reason = f"pytest 判定 {outcome}"
+                        reason = f"{runner_label(result)} 判定 {outcome}"
 
             if status == "passed":
                 passed += 1
@@ -198,7 +210,7 @@ def main() -> int:
         module_list.append({
             "name": MODULE_NAMES.get(ctype, f"{ctype}用例"),
             "trace": f"runs/{run_id}/run.log",
-            "driver": "pytest",
+            "driver": runner_label(result),
             "coverage": COVERAGE_UNAVAILABLE,
             "issues": "无。" if all(c["status"] == "passed" for c in cases_out) else "存在未通过 / 未执行 / 未确认用例。",
             "inconsistent": "无。",
@@ -209,7 +221,7 @@ def main() -> int:
         "meta": {
             "project": f"{case_project_name(result, run_path)} 单元测试",
             "executedAt": result.get("startedAt", ""),
-            "executor": "pytest / Python",
+            "executor": runner_label(result),
             "runId": run_id,
             "status": overall_status,
             "statusText": STATUS_TEXT.get(overall_status, overall_status),

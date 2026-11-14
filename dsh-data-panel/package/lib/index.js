@@ -15,11 +15,13 @@
  * 所以“你看到的用例”就是“这次跑的用例”。
  */
 import { createHash, randomUUID } from 'node:crypto'
+import { spawn } from 'node:child_process'
 import { mkdir, readFile, readdir, rename, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import { existsSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname, isAbsolute, join, resolve } from 'node:path'
+import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { PRESETS, renderRunnerSpec, resolveRunner, targetDeclared, targetOf } from './runners.js'
 
 
 export const name = 'dsh-data-panel'
@@ -62,9 +64,10 @@ const RUN_LOG_PATH = '/data-panel/run/log'
 const RUN_RESULT_PATH = '/data-panel/run/result'
 const RUN_REPORT_PATH = '/data-panel/run/report'
 const RUN_DELETE_PATH = '/data-panel/run/delete'
+const OPEN_PATH = '/data-panel/open'
+const RUN_REPORT_LATEST_PATH = '/data-panel/run/report/latest'
 const MAX_RUN_LOG = 4 * 1024 * 1024
 const RUNNER_ASSET = new URL('../assets/run_tests.py', import.meta.url)
-const TEST_FILE_REL = join('tests', 'test_generated.py')
 
 /** Single write lane: read-modify-write operations never interleave. */
 let lane = Promise.resolve()
@@ -696,6 +699,30 @@ function pythonPath() {
   return existsSyncSafe(bundled) ? bundled : 'python'
 }
 
+/** 当前可用的 Node 解释器（DSH 自带优先，用于 node --test / vitest 等预设）。 */
+function nodePath() {
+  if (process.env.DSH_NODE_PATH) return process.env.DSH_NODE_PATH
+  const exec = typeof process.execPath === 'string' ? process.execPath : ''
+  if (/(^|[\\/])node(\.exe)?$/i.test(exec)) return exec
+  const exe = process.platform === 'win32' ? 'node.exe' : 'node'
+  for (const dir of ['bin', '']) {
+    const candidate = join(dshHome(), 'dsh-runtimes', 'dsh-primary-runtime', 'dependencies', 'node', dir, exe)
+    if (existsSyncSafe(candidate)) return candidate
+  }
+  return 'node'
+}
+
+/** npx 在 Windows 上是 npx.cmd，需要由 shell 启动。 */
+function npxPath() {
+  if (process.env.DSH_NPX_PATH) return process.env.DSH_NPX_PATH
+  return process.platform === 'win32' ? 'npx.cmd' : 'npx'
+}
+
+/** Gradle 包一层 wrapper：优先用项目自带的 gradlew / gradlew.bat。 */
+function gradlewPath(project) {
+  return join(project, process.platform === 'win32' ? 'gradlew.bat' : 'gradlew')
+}
+
 function existsSyncSafe(file) {
   try {
     return existsSync(file)
@@ -711,7 +738,7 @@ function existsSyncSafe(file) {
  * 如果直接拿面板记录重写，Skill 写的 testFunc 就没了，后面靠代码推断函数名，
  * 而面板里的代码不一定是最终测试代码。所以按 caseId 保留已有 testFunc。
  */
-async function exportCases(store, file) {
+async function exportCases(store, file, runner) {
   const previous = new Map()
   try {
     const parsed = JSON.parse((await readFile(file, 'utf8')).replace(/^\uFEFF/, ''))
@@ -737,7 +764,7 @@ async function exportCases(store, file) {
       codeRef: record.codeRef,
       // 测试函数名：**当前用例代码推导优先**，推导不出才用旧值。
       // 反过来的话，把 test_old 改名成 test_new 后，仍会去跑已经不存在的 test_old。
-      testFunc: testFuncOf(record) || ((old && typeof old.testFunc === 'string') ? old.testFunc.trim() : ''),
+      testFunc: testFuncOf(record, runner) || ((old && typeof old.testFunc === 'string') ? old.testFunc.trim() : ''),
     }
   })
   const payload = {
@@ -750,11 +777,8 @@ async function exportCases(store, file) {
 }
 
 /** 从用例代码里认测试函数名（面板没存 testFunc，靠这里推导）。 */
-function testFuncOf(record) {
-  const explicit = typeof record.testFunc === 'string' ? record.testFunc.trim() : ''
-  if (explicit) return explicit
-  const match = typeof record.code === 'string' ? record.code.match(/\bdef\s+(test_[A-Za-z0-9_]+)\s*\(/) : null
-  return match ? match[1] : ''
+function testFuncOf(record, runner) {
+  return targetOf(record, runner || { targetExtract: PRESETS.pytest.targetExtract })
 }
 
 /** 每个会话记一份“资产根”列表：切了 working directory 后，旧 run 仍能找回来。 */
@@ -852,6 +876,7 @@ async function listRuns(root) {
   return runs
 }
 
+
 function runQueryOf(req) {
   const url = new URL(req.url, 'http://localhost')
   return {
@@ -925,14 +950,161 @@ function requireRunId(raw) {
 }
 
 /**
- * 准备一次执行。
+ * 准备一次执行（不启动进程）。
  *
- * 冻结当次输入：把要跑的目标用例（含已解析的测试函数）写进
+ * 冻结当次输入：把要跑的目标用例（含已解析的测试函数/测试名）写进
  * `runs/<runId>/request.json`，并从面板导出 `cases.json`、快照测试代码。
  * 这样“点了执行、发送前又改了用例”不会让执行和报告拿到不同版本。
  *
  * 命令里**不拼任何用户内容**（用例标识等全在 request.json 里），只含宿主生成的路径与 runId。
  */
+async function prepareRun({ sessionId, cwd, scope, caseId, store }) {
+  const project = resolve(cwd)
+  const root = sessionAssetRoot(project, sessionId)
+  await mkdir(join(root, 'tests'), { recursive: true })
+  await mkdir(join(root, 'runs'), { recursive: true })
+  await mkdir(join(root, 'reports'), { recursive: true })
+
+  // 运行器描述决定测试文件、目标规则和命令。识别不出来时给出可操作的提示，
+  // 而不是悄悄按 Python 去猜。
+  let runner
+  try {
+    runner = resolveRunner({ project, root })
+  } catch (error) {
+    throw bad(400, error instanceof Error ? error.message : String(error))
+  }
+
+  // runner 每次覆盖成包内最新版，避免旧会话目录里的副本过期。
+  let runnerSource = ''
+  try {
+    runnerSource = await readFile(fileURLToPath(RUNNER_ASSET), 'utf8')
+  } catch (error) {
+    throw bad(500, '找不到 runner 脚本：' + (error instanceof Error ? error.message : String(error)))
+  }
+  const runnerPath = join(root, 'run_tests.py')
+  await writeTextFile(runnerPath, runnerSource)
+
+  const casesFile = join(root, 'cases.json')
+  const cases = await exportCases(store, casesFile, runner)
+
+  const runId = newRunId()
+  const runDir = join(root, 'runs', runId)
+  await mkdir(runDir, { recursive: true })
+  const snapshotDir = join(runDir, 'snapshot')
+  await mkdir(snapshotDir, { recursive: true })
+
+  // ── 先取内容、算哈希，再冻结请求 ──
+  // 执行**仍在原位置跑**：把测试文件换到快照目录会让 conftest、__file__、
+  // sys.path（以及其他框架的导入推导）都变样，可能测到不同内容。所以改为“内容校验”：
+  // 准备时记 SHA256，runner 执行前重算，不一致就拒绝执行。
+  const liveTestFile = runner.testFile
+  if (!existsSyncSafe(liveTestFile)) {
+    throw bad(
+      400,
+      `本会话还没有测试代码（${liveTestFile}）。当前测试框架：${runner.label}（${runner.language}）。`
+      + '请先生成测试代码，或在会话资产目录的 runner.json 里用 testFile 指向实际测试文件。',
+    )
+  }
+  const liveTestBytes = await readFile(liveTestFile)
+  const testFileSha256 = createHash('sha256').update(liveTestBytes).digest('hex')
+  const liveTestText = liveTestBytes.toString('utf8')
+
+  // 快照仍然存一份：报告与事后复查都读它，但不作为执行输入。
+  const snapshotTestFile = join(snapshotDir, basename(liveTestFile))
+  const snapshotCasesFile = join(snapshotDir, 'cases.json')
+  await writeTextFile(snapshotTestFile, liveTestText)
+  // 单条执行的快照只保留这一条：报告只应该覆盖本次真正执行的用例，
+  // 否则 bridge.py 会把同会话的其他用例都写成“未执行”。
+  const snapshotCases = scope === 'case' ? cases.filter((item) => item.caseId === caseId) : cases
+  await writeTextFile(snapshotCasesFile, JSON.stringify({
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    cases: snapshotCases,
+  }, null, 2))
+
+  // 本次要跑的目标；缺目标、或目标在测试文件里根本不存在的，都单独记账。
+  const targets = []
+  const notRun = []
+  const selected = scope === 'case' ? cases.filter((c) => c.caseId === caseId) : cases
+  for (const item of selected) {
+    const func = testFuncOf(item, runner)
+    if (func === '') {
+      notRun.push({ caseId: item.caseId, reason: '用例没有关联测试函数/测试名' })
+      continue
+    }
+    if (!targetDeclared(liveTestText, func, runner)) {
+      notRun.push({ caseId: item.caseId, reason: `测试文件里找不到 ${func}` })
+      continue
+    }
+    targets.push({ caseId: item.caseId, func })
+  }
+  if (targets.length === 0) {
+    const why = notRun.length > 0
+      ? '（' + notRun.map((n) => `${n.caseId}：${n.reason}`).join('；') + '）'
+      : ''
+    throw bad(400, '这次没有可执行的用例' + why + '。请先补上测试代码或修正测试函数名。')
+  }
+
+  // 把「怎么跑」冻结进 request.json：命令由宿主拼好，runner 只负责执行与记录。
+  const runnerSpec = renderRunnerSpec(runner, {
+    python: pythonPath(),
+    node: nodePath(),
+    npx: npxPath(),
+    gradlew: gradlewPath(project),
+    binary: runner.binary,
+    project,
+    root,
+    runId,
+    runDir,
+  })
+  // 冻结本次输入：执行与报告都只看 snapshot/ 里的副本。
+  const request = {
+    runId,
+    sessionId,
+    scope,
+    caseId: scope === 'case' ? caseId : '',
+    project,
+    root,
+    // testFile 指向**原位置**（执行用）；casesFile 指向快照（报告用）。
+    // 执行前 runner 会用 testFileSha256 校验原文件没被改过。
+    testFile: liveTestFile,
+    testFileSha256,
+    snapshotTestFile,
+    casesFile: snapshotCasesFile,
+    testFileExists: true,
+    targets,
+    notRun,
+    runner: runnerSpec,
+    createdAt: new Date().toISOString(),
+  }
+  await writeTextFile(join(runDir, 'request.json'), JSON.stringify(request, null, 2))
+
+  // 记下这个会话的资产根：切了 working directory 后，旧 run 仍能按 runId 找回来。
+  await rememberAssetRoot(sessionId, root, project)
+
+  const python = pythonPath()
+  const command = `"${python}" "${runnerPath}" --project "${project}" --root "${root}" --run-id "${runId}"`
+
+  return {
+    runId,
+    root,
+    command,
+    scope,
+    caseId: scope === 'case' ? caseId : '',
+    caseCount: cases.length,
+    targetCount: targets.length,
+    testFile: liveTestFile,
+    testFileExists: true,
+    missingTestFunc: notRun.map((n) => n.caseId),
+    notRun,
+    framework: runner.label,
+    frameworkId: runner.id,
+    runnerMode: runner.mode,
+    language: runner.language,
+  }
+}
+
+/** HTTP 入口：参数与会话解析，真正干活的是 prepareRun（便于测试直接调用）。 */
 async function handleRunPrepare(req, res) {
   try {
     if (req.method !== 'POST') {
@@ -951,114 +1123,8 @@ async function handleRunPrepare(req, res) {
     if (scope === 'case' && !store.records.some((r) => r.caseId === caseId)) {
       throw bad(404, `本会话找不到用例 ${caseId}`)
     }
-
-    const root = sessionAssetRoot(cwd, sessionId)
-    await mkdir(join(root, 'tests'), { recursive: true })
-    await mkdir(join(root, 'runs'), { recursive: true })
-    await mkdir(join(root, 'reports'), { recursive: true })
-
-    // runner 每次覆盖成包内最新版，避免旧会话目录里的副本过期。
-    let runnerSource = ''
-    try {
-      runnerSource = await readFile(fileURLToPath(RUNNER_ASSET), 'utf8')
-    } catch (error) {
-      throw bad(500, '找不到 runner 脚本：' + (error instanceof Error ? error.message : String(error)))
-    }
-    const runnerPath = join(root, 'run_tests.py')
-    await writeTextFile(runnerPath, runnerSource)
-
-    const casesFile = join(root, 'cases.json')
-    const cases = await exportCases(store, casesFile)
-
-    const runId = newRunId()
-    const runDir = join(root, 'runs', runId)
-    await mkdir(runDir, { recursive: true })
-    const snapshotDir = join(runDir, 'snapshot')
-    await mkdir(snapshotDir, { recursive: true })
-
-    // ── 先取内容、算哈希，再冻结请求 ──
-    // 执行**仍在原位置跑**：把测试文件换到快照目录会让 conftest、__file__、
-    // sys.path 的推导都变样，可能测到不同内容。所以改为“内容校验”：
-    // 准备时记 SHA256，runner 执行前重算，不一致就拒绝执行。
-    const liveTestFile = join(root, TEST_FILE_REL)
-    if (!existsSyncSafe(liveTestFile)) {
-      throw bad(400, `本会话还没有测试代码（${liveTestFile}）。请先生成测试代码，再点执行。`)
-    }
-    const liveTestBytes = await readFile(liveTestFile)
-    const testFileSha256 = createHash('sha256').update(liveTestBytes).digest('hex')
-    const liveTestText = liveTestBytes.toString('utf8')
-
-    // 快照仍然存一份：报告与事后复查都读它，但不作为执行输入。
-    const snapshotTestFile = join(snapshotDir, 'test_generated.py')
-    const snapshotCasesFile = join(snapshotDir, 'cases.json')
-    await writeTextFile(snapshotTestFile, liveTestText)
-    await writeTextFile(snapshotCasesFile, await readFile(casesFile, 'utf8'))
-
-    // 本次要跑的目标；缺函数、或函数在快照里根本不存在的，都单独记账。
-    const targets = []
-    const notRun = []
-    const selected = scope === 'case' ? cases.filter((c) => c.caseId === caseId) : cases
-    for (const item of selected) {
-      const func = testFuncOf(item)
-      if (func === '') {
-        notRun.push({ caseId: item.caseId, reason: '用例没有关联测试函数' })
-        continue
-      }
-      // 用例代码改了函数名、但测试文件里没有对应函数时，不能拿着旧名字去跑。
-      const declared = new RegExp(`\\bdef\\s+${func.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\(`).test(liveTestText)
-      if (!declared) {
-        notRun.push({ caseId: item.caseId, reason: `测试文件里找不到函数 ${func}` })
-        continue
-      }
-      targets.push({ caseId: item.caseId, func })
-    }
-    if (targets.length === 0) {
-      const why = notRun.length > 0
-        ? '（' + notRun.map((n) => `${n.caseId}：${n.reason}`).join('；') + '）'
-        : ''
-      throw bad(400, '这次没有可执行的用例' + why + '。请先补上测试代码或修正测试函数名。')
-    }
-
-    // 冻结本次输入：执行与报告都只看 snapshot/ 里的副本。
-    const request = {
-      runId,
-      sessionId,
-      scope,
-      caseId: scope === 'case' ? caseId : '',
-      project: cwd,
-      root,
-      // testFile 指向**原位置**（执行用）；casesFile 指向快照（报告用）。
-      // 执行前 runner 会用 testFileSha256 校验原文件没被改过。
-      testFile: liveTestFile,
-      testFileSha256,
-      snapshotTestFile,
-      casesFile: snapshotCasesFile,
-      testFileExists: true,
-      targets,
-      notRun,
-      createdAt: new Date().toISOString(),
-    }
-    await writeTextFile(join(runDir, 'request.json'), JSON.stringify(request, null, 2))
-
-    // 记下这个会话的资产根：切了 working directory 后，旧 run 仍能按 runId 找回来。
-    await rememberAssetRoot(sessionId, root, cwd)
-
-    const python = pythonPath()
-    const command = `"${python}" "${runnerPath}" --project "${cwd}" --root "${root}" --run-id "${runId}"`
-
-    send(res, 200, {
-      ok: true,
-      runId,
-      root,
-      command,
-      scope,
-      caseId: scope === 'case' ? caseId : '',
-      caseCount: cases.length,
-      targetCount: targets.length,
-      testFile: liveTestFile,
-      testFileExists: true,
-      missingTestFunc: notRun.map((n) => n.caseId),
-    })
+    const result = await prepareRun({ sessionId, cwd, scope, caseId, store })
+    send(res, 200, { ok: true, ...result })
   } catch (error) {
     const status = Number.isInteger(error?.status) ? error.status : 500
     send(res, status, { ok: false, error: error instanceof Error ? error.message : '服务内部错误' })
@@ -1131,6 +1197,16 @@ async function handleRunList(req, res) {
         }
         seen.add(run.runId)
         const result = run.result
+        const tests = Array.isArray(result.tests) ? result.tests : []
+        const matchingTest = query.scope === 'case'
+          ? tests.find((item) => item && String(item.caseId || '') === caseId)
+          : null
+        const caseOutcome = matchingTest && typeof matchingTest.outcome === 'string'
+          ? matchingTest.outcome
+          : (result.status === 'passed' ? 'passed' : 'failed')
+        const caseDuration = matchingTest && typeof matchingTest.durationMs === 'number'
+          ? matchingTest.durationMs
+          : (typeof result.durationMs === 'number' ? result.durationMs : 0)
         runs.push({
           runId: run.runId,
           // 只回传列表需要的摘要字段；完整结果仍走 /result，避免列表过重。
@@ -1139,7 +1215,10 @@ async function handleRunList(req, res) {
           failed: typeof result.failed === 'number' ? result.failed : 0,
           errors: typeof result.errors === 'number' ? result.errors : 0,
           skipped: typeof result.skipped === 'number' ? result.skipped : 0,
-          durationMs: typeof result.durationMs === 'number' ? result.durationMs : 0,
+          caseOutcome,
+          message: matchingTest && typeof matchingTest.message === 'string' ? matchingTest.message : '',
+          actual: matchingTest && typeof matchingTest.actual === 'string' ? matchingTest.actual : '',
+          durationMs: query.scope === 'case' ? caseDuration : (typeof result.durationMs === 'number' ? result.durationMs : 0),
           startedAt: typeof result.startedAt === 'string' ? result.startedAt : '',
           finishedAt: typeof result.finishedAt === 'string' ? result.finishedAt : '',
           note: typeof result.note === 'string' ? result.note : '',
@@ -1335,12 +1414,159 @@ async function handleRunReport(req, res) {
           }
         }
         if (files.length === 0) continue
+        // 让面板区分整体执行与单条执行：工具栏「报告」只打开总报告。
+        let scope = 'all'
+        let caseId = ''
+        try {
+          const resultMeta = JSON.parse(await readFile(join(dirname(reportsDir), 'runs', name, 'result.json'), 'utf8'))
+          scope = resultMeta.scope === 'case' ? 'case' : 'all'
+          caseId = typeof resultMeta.caseId === 'string' ? resultMeta.caseId : ''
+        } catch {
+          // 旧 run 没有 result.json 就按总报告处理。
+        }
         seen.add(name)
-        runs.push({ runId: name, files, dir })
+        runs.push({ runId: name, files, dir, scope, caseId })
       }
     }
     runs.sort((a, b) => String(b.runId).localeCompare(String(a.runId)))
     send(res, 200, { ok: true, runs })
+  } catch (error) {
+    const status = Number.isInteger(error?.status) ? error.status : 500
+    send(res, status, { ok: false, error: error instanceof Error ? error.message : '服务内部错误' })
+  }
+}
+
+/** 用系统默认程序打开一个文件（报告）。Windows 走 cmd start，不依赖前端 service。 */
+function openWithShell(file) {
+  return new Promise((resolvePromise, reject) => {
+    const platform = process.platform
+    const windir = process.env.SystemRoot || process.env.windir || 'C:\\Windows'
+    const command = platform === 'win32'
+      ? (process.env.ComSpec || join(windir, 'System32', 'cmd.exe'))
+      : (platform === 'darwin' ? 'open' : 'xdg-open')
+    const args = platform === 'win32' ? ['/c', 'start', '', file] : [file]
+    try {
+      const child = spawn(command, args, { detached: true, stdio: 'ignore', windowsHide: true })
+      child.once('error', reject)
+      child.once('spawn', () => {
+        child.unref()
+        resolvePromise()
+      })
+    } catch (error) {
+      reject(error)
+    }
+  })
+}
+
+/** 打开本会话 reports/ 下的报告文件。 */
+async function handleOpenFile(req, res) {
+  try {
+    if (req.method !== 'POST') {
+      send(res, 405, { ok: false, error: '仅支持 POST' })
+      return
+    }
+    const body = await readJson(req)
+    const sessionId = extractSessionId(req, body)
+    if (sessionId === '') throw bad(400, '缺少会话 ID')
+    const raw = typeof body.path === 'string' ? body.path.trim() : ''
+    if (raw === '' || !isAbsolute(raw)) throw bad(400, '报告路径必须是绝对路径')
+    const file = resolve(raw)
+    let info = null
+    try {
+      info = await stat(file)
+    } catch {
+      throw bad(404, '报告文件不存在：' + file)
+    }
+    if (!info.isFile()) throw bad(400, '报告路径不是文件')
+    const cwd = await resolveSessionCwd(sessionId, body.cwd)
+    const roots = await resolveReadRoots(sessionId, cwd)
+    const allowed = roots.some((root) => {
+      const reports = resolve(root, 'reports')
+      return file === reports || file.startsWith(reports + sep)
+    })
+    if (!allowed) throw bad(400, '只允许打开本会话 reports/ 下的文件')
+    await openWithShell(file)
+    send(res, 200, { ok: true })
+  } catch (error) {
+    const status = Number.isInteger(error?.status) ? error.status : 500
+    send(res, status, { ok: false, error: error instanceof Error ? error.message : '服务内部错误' })
+  }
+}
+
+/**
+ * 最近一次执行的报告（一次请求直接给出 docx），供面板「报告」按钮使用：
+ * 不用先列全部 run 再查详情，避免多一步请求挂住。
+ */
+async function handleRunReportLatest(req, res) {
+  try {
+    if (req.method !== 'GET') {
+      send(res, 405, { ok: false, error: '仅支持 GET' })
+      return
+    }
+    const query = runQueryOf(req)
+    if (query.sessionId === '') throw bad(400, '缺少会话 ID')
+    const scope = query.scope === 'case' ? 'case' : 'all'
+    if (scope === 'case' && query.caseId === '') throw bad(400, '单条报告需要 caseId')
+
+    const roots = await resolveReadRoots(query.sessionId, query.cwd)
+    let best = null
+    for (const root of roots) {
+      let names = []
+      try {
+        names = await readdir(join(root, 'runs'))
+      } catch {
+        continue
+      }
+      names.sort()
+      names.reverse()
+      for (const name of names) {
+        if (!/^[A-Za-z0-9_-]{1,80}$/.test(name)) continue
+        let meta = null
+        try {
+          meta = JSON.parse(await readFile(join(root, 'runs', name, 'result.json'), 'utf8'))
+        } catch {
+          meta = null
+        }
+        if (meta === null) continue
+        const runScope = meta.scope === 'case' ? 'case' : 'all'
+        if (scope === 'case') {
+          if (runScope !== 'case' || String(meta.caseId || '') !== query.caseId) continue
+        } else if (runScope !== 'all') {
+          continue
+        }
+        if (best === null || name > best.runId) best = { runId: name, root }
+        break
+      }
+    }
+
+    if (best === null) {
+      send(res, 200, { ok: true, exists: false })
+      return
+    }
+
+    const dir = join(best.root, 'reports', best.runId)
+    let names = []
+    try {
+      names = await readdir(dir)
+    } catch {
+      names = []
+    }
+    names.sort()
+    let docx = null
+    const files = []
+    for (const name of names) {
+      const file = join(dir, name)
+      try {
+        const info = await stat(file)
+        files.push({ name, size: info.size, updatedAt: info.mtime.toISOString(), path: file })
+        if (docx === null && /\.docx$/i.test(name)) {
+          docx = { name, size: info.size, updatedAt: info.mtime.toISOString(), path: file }
+        }
+      } catch {
+        // 读不到的文件跳过。
+      }
+    }
+    send(res, 200, { ok: true, exists: true, runId: best.runId, dir, docx, files })
   } catch (error) {
     const status = Number.isInteger(error?.status) ? error.status : 500
     send(res, status, { ok: false, error: error instanceof Error ? error.message : '服务内部错误' })
@@ -1365,6 +1591,8 @@ export function apply(ctx) {
     [RUN_RESULT_PATH, handleRunResult, 'dsh-data-panel: run result'],
     [RUN_REPORT_PATH, handleRunReport, 'dsh-data-panel: run report'],
     [RUN_DELETE_PATH, handleRunDelete, 'dsh-data-panel: run delete'],
+    [RUN_REPORT_LATEST_PATH, handleRunReportLatest, 'dsh-data-panel: run report latest'],
+    [OPEN_PATH, handleOpenFile, 'dsh-data-panel: open file'],
   ]
   for (const [path, handler, label] of runRoutes) {
     ctx.effect(
@@ -1411,6 +1639,9 @@ export const __test = {
   sessionAssetRoot,
   exportCases,
   testFuncOf,
+  prepareRun,
+  handleRunReportLatest,
+  handleOpenFile,
   listRuns,
   handleRunList,
   handleRunDelete,

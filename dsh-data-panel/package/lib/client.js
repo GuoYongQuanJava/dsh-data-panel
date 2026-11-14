@@ -171,6 +171,7 @@ window.__ModuleLoader__.load({
 .dp-run-table td { padding: 5px 8px; border-bottom: 1px solid var(--dp-border2); color: var(--dp-text2); vertical-align: middle; }
 .dp-run-table tr:last-child td { border-bottom: 0; }
 .dp-run-ops { display: flex; justify-content: flex-end; gap: 2px; }
+.dp-run-output pre { margin: 0; max-height: 72px; overflow: auto; white-space: pre-wrap; word-break: break-all; font-family: ui-monospace, SFMono-Regular, "Cascadia Code", Consolas, monospace; font-size: 11px; line-height: 1.5; color: var(--dp-text2); }
 .dp-run-state { display: inline-block; padding: 0 7px; border-radius: 5px; font-size: 11px; line-height: 18px; }
 .dp-run-state[data-tone="ok"] { background: color-mix(in srgb, #16a34a 14%, transparent); color: #16a34a; }
 .dp-run-state[data-tone="bad"] { background: color-mix(in srgb, var(--dp-danger) 12%, transparent); color: var(--dp-danger); }
@@ -880,14 +881,25 @@ window.__ModuleLoader__.load({
 
 		/** 调一个 /data-panel/* 的 JSON 接口（统一错误处理）。 */
 		function callApi(path, init) {
-			return fetch(path, init).then(function (response) {
+			// 本地宿主正常都是毫秒级；加超时避免某次请求挂住，界面一直停在“正在查找…”。
+			var controller = typeof AbortController === "function" ? new AbortController() : null;
+			var timer = controller !== null ? setTimeout(function () { controller.abort(); }, 8000) : null;
+			var options = init || {};
+			if (controller !== null) options = Object.assign({}, options, { signal: controller.signal });
+			function clearTimer() {
+				if (timer !== null) { clearTimeout(timer); timer = null; }
+			}
+			return fetch(path, options).then(function (response) {
 				return response.json().catch(function () { return {}; }).then(function (data) {
 					if (!response.ok || data.ok === false) {
 						throw new Error(data && data.error ? data.error : "请求失败（HTTP " + response.status + "）");
 					}
 					return data;
 				});
-			});
+			}).catch(function (error) {
+				if (error && error.name === "AbortError") throw new Error("请求超时（8 秒），请稍后重试");
+				throw error;
+			}).finally(clearTimer);
 		}
 
 		/** 某会话的项目目录（会话资产就在它下面）。 */
@@ -899,7 +911,7 @@ window.__ModuleLoader__.load({
 		/**
 		 * 请宿主准备一次执行：导出用例、铺好 runner、分配 runId，返回可直接运行的命令。
 		 *
-		 * 面板不再让模型自己跑 pytest 再回传日志 —— 那样漏调/超时/超长都会丢。
+		 * 面板不再让模型自己跑测试再回传日志 —— 那样漏调/超时/超长都会丢。
 		 * 现在模型只负责执行返回的命令，输出由 runner 边跑边写进 run.log。
 		 */
 		function prepareRun(sessionId, scope, caseId) {
@@ -982,6 +994,16 @@ window.__ModuleLoader__.load({
 			params.set("cwd", cwdOf(sessionId));
 			params.set("runId", runId);
 			return callApi("/data-panel/run/report?" + params.toString(), { method: "GET", headers: { accept: "application/json" } });
+		}
+
+		/** 最近一次执行的报告（一次请求直接拿 docx，少一步链路）。 */
+		function fetchReportLatest(sessionId, scope, caseId) {
+			var params = new URLSearchParams();
+			params.set("sessionId", sessionId);
+			params.set("cwd", cwdOf(sessionId));
+			params.set("scope", scope);
+			if (scope === "case") params.set("caseId", caseId || "");
+			return callApi("/data-panel/run/report/latest?" + params.toString(), { method: "GET", headers: { accept: "application/json" } });
 		}
 		//#endregion
 
@@ -1188,6 +1210,7 @@ window.__ModuleLoader__.load({
 		function LogModal(props) {
 			var record = props.record || null;
 			var sessionId = typeof props.sessionId === "string" ? props.sessionId : "";
+			var runId = typeof props.runId === "string" ? props.runId : "";
 			var state = useState({ status: "loading", content: "", error: "", updatedAt: "", result: null, runId: "" });
 			var view = state[0];
 			var setView = state[1];
@@ -1202,21 +1225,27 @@ window.__ModuleLoader__.load({
 				}
 				var alive = true;
 				setView({ status: "loading", content: "", error: "", updatedAt: "", result: null, runId: "" });
-				// 指定了 runId（从执行记录进来的）就直接读那一次；
-				// 否则退回「最近一次」：record 为空读整体执行，有值读该用例。
-				var pinnedRunId = typeof props.runId === "string" ? props.runId : "";
-				if (pinnedRunId !== "") {
-					return fetchRunLog(sessionId, pinnedRunId).then(function (log) {
+				if (runId !== "") {
+					// 从执行记录点进来：直接读这一条 run，不再按用例找最近一次。
+					Promise.all([fetchRunResult(sessionId, runId), fetchRunLog(sessionId, runId)]).then(function (both) {
 						if (!alive) return;
+						var resultData = both[0];
+						var logData = both[1];
 						setView({
 							status: "ready",
-							content: log && log.exists ? (log.content || "") : "",
+							content: logData && logData.exists ? (logData.content || "") : "",
 							error: "",
-							updatedAt: (log && log.updatedAt) || "",
-							result: null,
-							runId: pinnedRunId,
+							updatedAt: (logData && logData.updatedAt) || "",
+							result: resultData && resultData.exists ? resultData.result : null,
+							runId: runId,
 						});
+					}).catch(function (failure) {
+						if (!alive) return;
+						setView({ status: "error", content: "", error: failure && failure.message ? failure.message : "读取日志失败", updatedAt: "", result: null, runId: runId });
 					});
+					return function () {
+						alive = false;
+					};
 				}
 				var scope = record ? "case" : "all";
 				fetchLatestRun(sessionId, scope, record ? record.caseId : "").then(function (latest) {
@@ -1243,7 +1272,7 @@ window.__ModuleLoader__.load({
 				return function () {
 					alive = false;
 				};
-			}, [sessionId, record ? record.id : "", record ? record.caseId : "", typeof props.runId === "string" ? props.runId : ""]);
+			}, [sessionId, record ? record.id : "", record ? record.caseId : "", runId]);
 
 			function copy() {
 				try {
@@ -1295,14 +1324,9 @@ window.__ModuleLoader__.load({
 
 			return h(Modal, {
 				title: "执行日志",
-				subtitle: (function () {
-					var head = record
-						? (record.caseId ? record.caseId + " · " : "") + (record.title || "")
-						: "全部用例";
-					// 从某条执行记录点进来：说明读的是那一次，不是「最近一次」。
-					var pinned = typeof props.runId === "string" && props.runId !== "";
-					return pinned ? head + "　第 " + (props.runLabel || "") + " 次执行" : head + "（最近一次整体执行）";
-				})(),
+				subtitle: record
+					? (record.caseId ? record.caseId + " · " : "") + (record.title || "")
+					: "全部用例（最近一次整体执行）",
 				onClose: props.onClose,
 				footer: [
 					view.status === "ready" ? h(Button, { key: "copy", onClick: copy }, copyLabel) : null,
@@ -1417,37 +1441,43 @@ window.__ModuleLoader__.load({
 			} else if (view.status === "empty") {
 				body = h("div", { className: "dp-run-empty" }, "这条用例还没有执行过。点它的「执行」按钮，跑完再回来看。");
 			} else {
+				var outcomeLabels = { passed: "通过", failed: "未通过", error: "错误", skipped: "跳过", unknown: "未确认" };
+				var outcomeTones = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", unknown: "idle" };
 				body = h("table", { className: "dp-run-table" },
 					h("thead", null,
 						h("tr", null,
 							h("th", { style: { width: "42px" } }, "#"),
-							h("th", null, "执行时间"),
-							h("th", { style: { width: "118px" } }, "结果"),
-							h("th", { style: { width: "74px" } }, "耗时"),
-							h("th", { className: "dp-right", style: { width: "72px" } }, "操作")
+							h("th", { style: { width: "150px" } }, "执行时间"),
+							h("th", { style: { width: "82px" } }, "结果"),
+							h("th", { style: { width: "70px" } }, "耗时"),
+							h("th", null, "实际输出"),
+							h("th", { className: "dp-right", style: { width: "112px" } }, "操作")
 						)
 					),
 					h("tbody", null, view.runs.map(function (run, index) {
-						var tone = runStateOf(run);
+						var outcome = run.caseOutcome || run.status || "";
+						var label = outcomeLabels[outcome] || outcome || "—";
+						var tone = outcomeTones[outcome] || "idle";
+						var actualText = run.actual || run.message || "未记录实际值";
 						return h("tr", { key: run.runId },
 							h("td", null, String(view.runs.length - index)),
 							h("td", { title: run.runId }, fmtFull(run.startedAt)),
-							h("td", null,
-								h("span", { className: "dp-run-state", "data-tone": tone.tone }, tone.label),
-								run.failed > 0 ? h("span", { style: { marginLeft: "6px", color: "var(--dp-text3)" } }, "失败 " + run.failed) : null
-							),
+							h("td", null, h("span", { className: "dp-run-state", "data-tone": tone }, label)),
 							h("td", null, run.durationMs > 0 ? (run.durationMs / 1000).toFixed(1) + "s" : "—"),
+							h("td", { className: "dp-run-output" },
+								h("pre", { title: actualText }, actualText)
+							),
 							h("td", null,
 								h("div", { className: "dp-run-ops" },
 									h(IconButton, {
-										name: "eye",
-										label: "查看 " + record.caseId + " 第 " + (view.runs.length - index) + " 次执行的报告",
-										onClick: function () { props.onView(run); }
+										name: "doc",
+										label: "报告 " + record.caseId + " 第 " + (view.runs.length - index) + " 次执行",
+										onClick: function () { props.onReport(run); }
 									}),
-									// 这一次执行自己的原始日志（不是「最近一次」）。
-									h(LogButton, {
-										label: "查看 " + record.caseId + " 第 " + (view.runs.length - index) + " 次执行的日志",
-										onClick: function () { props.onLog(run, view.runs.length - index); }
+									h(IconButton, {
+										name: "log",
+										label: "日志 " + record.caseId + " 第 " + (view.runs.length - index) + " 次执行",
+										onClick: function () { props.onLog(run); }
 									}),
 									h(IconButton, {
 										name: "trash",
@@ -1465,7 +1495,14 @@ window.__ModuleLoader__.load({
 			return h("div", { className: "dp-run-panel" },
 				h("div", { className: "dp-run-title" },
 					h("span", null, "执行记录", h("b", null, record.caseId)),
-					h("span", null, "共 " + view.runs.length + " 次")
+					h("span", { style: { display: "inline-flex", alignItems: "center", gap: "8px" } },
+						"共 " + view.runs.length + " 次",
+						h(IconButton, {
+							name: "refresh",
+							label: "刷新执行记录",
+							onClick: function () { setReloadTick(function (n) { return n + 1; }); }
+						})
+					)
 				),
 				body
 			);
@@ -1571,6 +1608,7 @@ window.__ModuleLoader__.load({
 		 */
 		function ReportModal(props) {
 			var sessionId = typeof props.sessionId === "string" ? props.sessionId : "";
+			var initialRunId = typeof props.initialRunId === "string" ? props.initialRunId : "";
 			var state = useState({ status: "loading", error: "", runs: [], detail: null });
 			var view = state[0];
 			var setView = state[1];
@@ -1582,26 +1620,43 @@ window.__ModuleLoader__.load({
 				}
 				var alive = true;
 				setView({ status: "loading", error: "", runs: [], detail: null });
-				fetchReportList(sessionId).then(function (data) {
-					if (!alive) return;
-					var runs = (data && data.runs) || [];
-					if (runs.length === 0) {
-						setView({ status: "empty", error: "", runs: [], detail: null });
-						return null;
-					}
-					// 默认展开最新一份。
-					return fetchReportOf(sessionId, runs[0].runId).then(function (detail) {
+				if (initialRunId !== "") {
+					// 单条执行：只读这一条 run 的报告，不再列其他 run。
+					fetchReportOf(sessionId, initialRunId).then(function (detail) {
 						if (!alive) return;
-						setView({ status: "ready", error: "", runs: runs, detail: detail });
+						var files = (detail && detail.files) || [];
+						var hasData = !!(detail && detail.data);
+						if (!detail || detail.exists === false || (files.length === 0 && !hasData)) {
+							setView({ status: "empty", error: "", runs: [], detail: null, runId: initialRunId });
+						} else {
+							setView({ status: "ready", error: "", runs: [], detail: detail });
+						}
+					}).catch(function (failure) {
+						if (!alive) return;
+						setView({ status: "error", error: failure && failure.message ? failure.message : "读取报告失败", runs: [], detail: null });
 					});
-				}).catch(function (failure) {
-					if (!alive) return;
-					setView({ status: "error", error: failure && failure.message ? failure.message : "读取报告失败", runs: [], detail: null });
-				});
+				} else {
+					fetchReportList(sessionId).then(function (data) {
+						if (!alive) return;
+						var runs = (data && data.runs) || [];
+						if (runs.length === 0) {
+							setView({ status: "empty", error: "", runs: [], detail: null });
+							return null;
+						}
+						// 默认展开最新一份。
+						return fetchReportOf(sessionId, runs[0].runId).then(function (detail) {
+							if (!alive) return;
+							setView({ status: "ready", error: "", runs: runs, detail: detail });
+						});
+					}).catch(function (failure) {
+						if (!alive) return;
+						setView({ status: "error", error: failure && failure.message ? failure.message : "读取报告失败", runs: [], detail: null });
+					});
+				}
 				return function () {
 					alive = false;
 				};
-			}, [sessionId]);
+			}, [sessionId, initialRunId]);
 
 			function openRun(runId) {
 				fetchReportOf(sessionId, runId).then(function (detail) {
@@ -1625,13 +1680,21 @@ window.__ModuleLoader__.load({
 			} else if (view.status === "empty") {
 				body = h("div", { className: "dp-log-empty" },
 					h("span", { className: "dp-log-empty-icon" }, h(Icon, { name: "doc", size: 26 })),
-					h("p", null, "还没有生成过报告。执行完测试后，按 Skill 的步骤跑 bridge.py 就会出现在这里。")
+					h("p", null, initialRunId !== ""
+						? "这次执行还没有生成报告（runId " + initialRunId + "）。执行后请让 AI 按 Skill 的 Step 6 生成。"
+						: "还没有生成过报告。执行完测试后，按 Skill 的步骤跑 bridge.py 就会出现在这里。")
 				);
 			} else {
 				var detail = view.detail;
 				var data = detail && detail.data;
 				var summary = data && data.summary ? data.summary : null;
 				var meta = data && data.meta ? data.meta : null;
+				var reportDoc = null;
+				if (detail && detail.files) {
+					for (var fileIndex = 0; fileIndex < detail.files.length; fileIndex++) {
+						if (/\.docx$/i.test(detail.files[fileIndex].name)) { reportDoc = detail.files[fileIndex]; break; }
+					}
+				}
 				body = h("div", null,
 					h("div", { className: "dp-code-meta" },
 						view.runs.map(function (run) {
@@ -1655,6 +1718,13 @@ window.__ModuleLoader__.load({
 						+ (typeof summary.unconfirmed === "number" ? "，未确认 " + summary.unconfirmed : "")
 					) : null,
 					summary ? null : h("p", { className: "dp-hint" }, "这次 run 还没有 report-data.json（只生成了报告文件）。"),
+					reportDoc && reportDoc.path
+						? h(Button, {
+							variant: "primary",
+							style: "margin-bottom: 10px",
+							onClick: function () { openReportFile(reportDoc.path, sessionId); }
+						}, "打开 Word 报告")
+						: null,
 					detail && detail.files && detail.files.length > 0
 						? h("div", { className: "dp-code-meta" }, detail.files.map(function (file) {
 							return h("span", { key: file.name, style: { display: "inline-flex", alignItems: "center", gap: "6px" } },
@@ -1665,7 +1735,7 @@ window.__ModuleLoader__.load({
 									className: "dp-icon-btn",
 									title: "用系统默认程序打开",
 									"aria-label": "用系统默认程序打开 " + file.name,
-									onClick: function () { openReportFile(file.path); },
+									onClick: function () { openReportFile(file.path, sessionId); },
 								}, h(Icon, { name: "external", size: 14 })) : null
 							);
 						}))
@@ -1674,8 +1744,10 @@ window.__ModuleLoader__.load({
 			}
 
 			return h(Modal, {
-				title: "测试报告",
-				subtitle: "只读：由 bridge.py 生成在 reports/<runId>/",
+				title: props.title || "测试报告",
+				subtitle: initialRunId !== ""
+					? "单条用例执行报告 · runId " + initialRunId
+					: "只读：由 bridge.py 生成在 reports/<runId>/",
 				onClose: props.onClose,
 				footer: h(Button, { variant: "primary", onClick: props.onClose }, "关闭"),
 			}, body);
@@ -1943,10 +2015,12 @@ window.__ModuleLoader__.load({
 			var reportState = useState(false);
 			var reportView = reportState[0];
 			var setReportView = reportState[1];
-			// 当前展开执行记录的用例 id 集合（可同时展开多条，互不影响）。
-			var expandedState = useState([]);
-			var expandedIds = expandedState[0];
-			var setExpandedIds = expandedState[1];
+			// 报告列表入口暂时隐藏（代码保留，改回 true 即可恢复）。
+			var SHOW_REPORT_LIST = false;
+			// 当前展开执行记录的用例 id（一次只展开一行）。
+			var expandedState = useState("");
+			var expandedId = expandedState[0];
+			var setExpandedId = expandedState[1];
 			// 正在查看的那次执行（{ record, run }）。
 			var runViewState = useState(null);
 			var runView = runViewState[0];
@@ -1972,6 +2046,65 @@ window.__ModuleLoader__.load({
 			var categoryPromptState = useState(null);
 			var categoryPrompt = categoryPromptState[0];
 			var setCategoryPrompt = categoryPromptState[1];
+
+			function openLatestReport(scope, caseId, noDocMessage, noRunMessage) {
+				var sid = panelSessionId(props);
+				if (sid === "") { store.setError("还没取得当前会话"); return; }
+				setRunResult(scope === "case" ? "正在查找 " + caseId + " 的报告…" : "正在查找最近的测试报告…");
+				var finished = false;
+				var timer = setTimeout(function () {
+					if (finished) return;
+					finished = true;
+					setRunResult("");
+					store.setError("读取报告超时，请稍后重试。");
+				}, 10000);
+				function finish() {
+					if (finished) return false;
+					finished = true;
+					clearTimeout(timer);
+					return true;
+				}
+				try {
+					fetchReportLatest(sid, scope, caseId).then(function (result) {
+						if (!finish()) return;
+						setRunResult("");
+						if (!result || !result.exists) { store.setError(noRunMessage); return; }
+						if (!result.docx || !result.docx.path) { store.setError(noDocMessage); return; }
+						openReportFile(result.docx.path, sid, function () { setRunResult("已打开报告。"); });
+					}).catch(function (failure) {
+						if (!finish()) return;
+						setRunResult("");
+						store.setError("读取报告失败：" + (failure && failure.message ? failure.message : String(failure)));
+					});
+				} catch (error) {
+					finish();
+					setRunResult("");
+					store.setError("读取报告失败：" + (error && error.message ? error.message : String(error)));
+				}
+			}
+
+			function openCaseReport(record) {
+				openLatestReport("case", record.caseId, "这条用例最近一次单独执行还没有生成 Word 报告。", "这条用例还没有单独执行记录，先点「执行」再查看报告。");
+			}
+
+			function openRunReport(record, run) {
+				var sid = panelSessionId(props);
+				if (sid === "") { store.setError("还没取得当前会话"); return; }
+				setRunResult("正在查找这次执行的报告…");
+				fetchReportOf(sid, run.runId).then(function (detail) {
+					setRunResult("");
+					var doc = docxOf(detail);
+					if (!doc) { store.setError("这次执行还没有生成 Word 报告。"); return; }
+					openReportFile(doc.path, sid, function () { setRunResult("已打开报告。"); });
+				}).catch(function (failure) {
+					setRunResult("");
+					store.setError("读取报告失败：" + (failure && failure.message ? failure.message : String(failure)));
+				});
+			}
+
+			function openLatestTotalReport() {
+				openLatestReport("all", "", "最近一次整体执行还没有生成 Word 报告。", "还没有生成总报告。");
+			}
 
 			useEffect(function () {
 				// 面板打开是一个明确信号：至少此刻要确保会话订阅已经建立，
@@ -2017,13 +2150,6 @@ window.__ModuleLoader__.load({
 				picked.forEach(function (id) { map[id] = true; });
 				return map;
 			}, [picked]);
-
-			// 已展开执行记录的用例 id 集合：逐行判断 isOpen 时 O(1)。
-			var expandedIdSet = useMemo(function () {
-				var map = Object.create(null);
-				expandedIds.forEach(function (id) { map[id] = true; });
-				return map;
-			}, [expandedIds]);
 
 			var functionalCount = records.filter(function (record) { return record.testType === "functional"; }).length;
 			var boundaryCount = records.filter(function (record) { return record.testType === "boundary"; }).length;
@@ -2120,19 +2246,7 @@ window.__ModuleLoader__.load({
 			}
 
 			function refresh() {
-				// 刷新会重置整张表，顺手把展开的执行记录一起收齐，
-				// 免得刷新后下面挂着一堆旧数据的展开行。
-				setExpandedIds([]);
 				store.load(true).catch(function () {});
-			}
-
-			/** 展开 / 收起某条用例的执行记录：只动这一条，不影响其它已展开的。 */
-			function toggleExpand(id) {
-				setExpandedIds(function (previous) {
-					var at = previous.indexOf(id);
-					if (at === -1) return previous.concat([id]);
-					return previous.filter(function (item) { return item !== id; });
-				});
 			}
 
 			function togglePick(id) {
@@ -2291,7 +2405,7 @@ window.__ModuleLoader__.load({
 										var outcome = prefillDraft(targetSession, runAllPrompt(currentRecords, targetSession, prep));
 										if (!outcome.ok) { setRunResult(""); store.setError("执行：" + outcome.message); return; }
 										store.setError("");
-										setRunResult(outcome.message + "  运行编号：" + prep.runId);
+										setRunResult(outcome.message + "  运行编号：" + prep.runId + "  框架：" + (prep.framework || prep.frameworkId || "未知"));
 									}).catch(function (failure) {
 										setRunResult("");
 										store.setError("执行准备失败：" + (failure && failure.message ? failure.message : String(failure)));
@@ -2300,9 +2414,13 @@ window.__ModuleLoader__.load({
 							}, "全部执行"),
 							h(Button, {
 								className: "dp-report-btn",
-								onClick: function () { setReportView(true); },
-								title: "查看已生成的测试报告"
+								onClick: function () { openLatestTotalReport(); },
+								title: "打开最近一次整体执行的 Word 报告"
 							}, "报告"),
+							SHOW_REPORT_LIST ? h(Button, {
+								onClick: function () { setReportView(true); },
+								title: "查看已生成的测试报告列表"
+							}, "报告列表") : null,
 							h(Button, {
 								className: "dp-log-btn",
 								onClick: function () { setLogView({ record: null }); },
@@ -2428,8 +2546,7 @@ window.__ModuleLoader__.load({
 												)
 											),
 											h("tbody", null, pageRecords.map(function (record) {
-												// 每条用例各自独立展开，点开一条不会关掉别条。
-												var isOpen = expandedIdSet[record.id] === true;
+												var isOpen = expandedId === record.id;
 												return h(React.Fragment, { key: record.id },
 													h("tr", { className: cn("dp-row", isOpen ? "is-open" : "") },
 													h("td", { className: "dp-pick" },
@@ -2449,7 +2566,7 @@ window.__ModuleLoader__.load({
 															title: isOpen ? "收起执行记录" : "展开执行记录",
 															"aria-label": (isOpen ? "收起 " : "展开 ") + record.caseId + " 的执行记录",
 															"aria-expanded": isOpen,
-															onClick: function () { toggleExpand(record.id); }
+															onClick: function () { setExpandedId(expandedId === record.id ? "" : record.id); }
 														}, h(Icon, { name: "chevron", size: 16 })),
 														h(CaseId, { caseId: record.caseId })
 													)
@@ -2493,7 +2610,7 @@ window.__ModuleLoader__.load({
 																var outcome = prefillDraft(targetSession2, runPrompt(record, targetSession2, prep));
 																if (!outcome.ok) { setRunResult(""); store.setError("执行：" + outcome.message); return; }
 																store.setError("");
-																setRunResult(outcome.message + "  运行编号：" + prep.runId);
+																setRunResult(outcome.message + "  运行编号：" + prep.runId + "  框架：" + (prep.framework || prep.frameworkId || "未知"));
 															}).catch(function (failure) {
 																setRunResult("");
 																store.setError("执行准备失败：" + (failure && failure.message ? failure.message : String(failure)));
@@ -2518,7 +2635,7 @@ window.__ModuleLoader__.load({
 																	label: "删除 " + record.title,
 																	danger: true,
 																	onClick: function () { setConfirm({ kind: "delete", record: record }); }
-																})
+																}),
 														)
 													)
 											),
@@ -2528,11 +2645,8 @@ window.__ModuleLoader__.load({
 														h(RunRecords, {
 															record: record,
 															sessionId: panelSessionId(props),
-															onView: function (run) { setRunView({ record: record, run: run }); },
-															// 日志按钮挂在每条执行记录上：读那一次自己的 run.log。
-															onLog: function (run, ordinal) {
-																setLogView({ record: record, runId: run.runId, runLabel: String(ordinal) });
-															},
+											onReport: function (run) { openRunReport(record, run); },
+											onLog: function (run) { setLogView({ record: record, runId: run.runId }); },
 															onRemove: function (runId, done) { setRemoveRun({ record: record, runId: runId, done: done }); }
 														})
 													)
@@ -2619,9 +2733,7 @@ window.__ModuleLoader__.load({
 				}) : null,
 				logView !== null ? h(LogModal, {
 					record: logView.record,
-					// 从执行记录进来的那一次；为空则退回「最近一次」。
 					runId: logView.runId || "",
-					runLabel: logView.runLabel || "",
 					// 日志按面板所属会话读，不跟着主区会话飘。
 					sessionId: panelSessionId(props),
 					onClose: function () { setLogView(null); }
@@ -3102,6 +3214,7 @@ window.__ModuleLoader__.load({
 		var sidebarRightTabs = null;
 		var sessions = null;
 		var workspaces = null;
+		var remote = null;
 		/** 挂载时的客户端上下文：betterSidebar 是第三方服务，按需动态取，避免启动顺序问题。 */
 		var clientCtx = null;
 
@@ -3446,9 +3559,9 @@ window.__ModuleLoader__.load({
 		/**
 		 * 把一段指令预填进会话输入框，**不发送**。
 		 *
-		 * 为什么不再自己跑 pytest：测试文件与测试函数原先靠 client.js 里写死的
-		 * `tests/test_generated.py` 猜，文件不存在就直接 ENOENT。交给会话里的模型，
-		 * 它自己能找到文件、决定跑哪个用例、缺什么也能直接说。
+		 * 为什么不再自己跑测试：测试文件与测试目标原先靠 client.js 里写死的
+		 * Python 路径猜，文件不存在就直接 ENOENT。交给会话里的模型，
+		 * 它自己能按宿主生成的命令执行，输出由 runner 写成日志与结果。
 		 *
 		 * 两条通道都在插件边界内：
 		 *   ① conversation.input.requestDraftInitialization(binding, { prompt })
@@ -3515,24 +3628,26 @@ window.__ModuleLoader__.load({
 		 * 日志由 runner 边跑边写，不再靠模型回传 —— 漏调/超时/超长都会丢。
 		 */
 		function runInstruction(prep) {
+			var framework = prep && prep.framework ? prep.framework : "测试框架";
 			var lines = [
-				"执行方式（只需要跑下面这一条命令，不要自己另拼 pytest 命令）：",
+				"执行方式（只需要跑下面这一条命令，不要自己另拼其他测试命令）：",
 				"",
 				"    " + prep.command,
 				"",
 				"这条命令会自己做完下面几件事，不需要你另外处理：",
-				"1. 把 pytest 的原始输出实时打印出来（我能直接看到）；",
+				"1. 把 " + framework + " 的原始输出实时打印出来（我能直接看到）；",
 				"2. 把完整输出写进本会话的 runs/" + prep.runId + "/run.log；",
 				"3. 结束时写 result.json（退出码 / 通过失败数 / 耗时 / 状态）。",
 				"",
 				"要求：",
 				"1. 原样执行上面的命令，不要新建或修改测试文件，也不要改成跑别的用例。",
-				"2. 跑完后用一两句话总结：通过还是失败、失败的是哪条用例、失败原因是什么。",
-				"3. 如果命令本身起不来（找不到 python、测试文件缺失、权限问题），把报错原文告诉我，不要自己另找测试文件重跑。",
-				"4. 如果命令告诉你“测试文件在准备后被修改”，停下来告诉我要重新点一次执行，不要自己重跑。"
+				"2. 跑完后先按 Skill 的 Step 6，用本次 runId 生成 Word 报告到 reports/<runId>/（单条执行也要，文件名带 caseId）；如果项目还没配置报告模板，就明确告诉我缺什么，不要跳过不说。然后再总结。",
+				"3. 总结时用一两句话说明：通过还是失败、失败的是哪条用例、失败原因是什么。",
+				"4. 如果命令本身起不来（找不到运行时、测试文件缺失、权限问题），把报错原文告诉我，不要自己另找测试文件重跑。",
+				"5. 如果命令告诉你“测试文件在准备后被修改”，停下来告诉我要重新点一次执行，不要自己重跑。"
 			];
 			if (Array.isArray(prep.missingTestFunc) && prep.missingTestFunc.length > 0) {
-				lines.push("5. 注意：以下用例没有关联测试函数，这次不会被执行：" + prep.missingTestFunc.join("、"));
+				lines.push("6. 注意：以下用例没有关联测试函数/测试名，这次不会被执行：" + prep.missingTestFunc.join("、"));
 			}
 			return lines.join("\n");
 		}
@@ -3608,9 +3723,87 @@ window.__ModuleLoader__.load({
 		 * 面板不内联渲染 docx：交给宿主打开。打不开就把原因说清楚，
 		 * 而不是“点了没反应”。
 		 */
-		function openReportFile(path) {
+		function docxOf(detail) {
+			if (!detail || !Array.isArray(detail.files)) return null;
+			for (var index = 0; index < detail.files.length; index++) {
+				var file = detail.files[index];
+				if (file && typeof file.name === "string" && /\.docx$/i.test(file.name) && file.path) return file;
+			}
+			return null;
+		}
+
+		/** 优先把报告开在右侧栏（better-sidebar 会把 docx 交给 DSH 的文档预览）。 */
+		function openReportInSidebar(path, sessionId) {
+			var service = betterSidebarService(true);
+			if (service === null || typeof service.openFile !== "function") return false;
+			if (typeof sessionId !== "string" || sessionId === "") return false;
+			try {
+				var scope = { sessionId: sessionId };
+				var cwd = toPosixPath(sessionCwd(sessionId));
+				if (cwd !== "") scope.cwd = cwd;
+				var title = path.split(/[\\/]/).pop();
+				service.openFile(scope, toPosixPath(path), title);
+				store.setError("");
+				return true;
+			} catch (error) {
+				codeTrace("better-sidebar 打开报告失败: " + (error instanceof Error ? error.message : String(error)));
+				return false;
+			}
+		}
+
+		/** 打开报告：优先走 host 的 /data-panel/open（不依赖前端 remote/workspaces）。 */
+		function openReportFile(path, sessionId, onOpened) {
 			if (typeof path !== "string" || path === "") {
 				store.setError("报告文件路径为空");
+				return;
+			}
+			if (openReportInSidebar(path, sessionId)) {
+				if (typeof onOpened === "function") onOpened();
+				return;
+			}
+			if (typeof sessionId === "string" && sessionId !== "") {
+				callApi("/data-panel/open", {
+					method: "POST",
+					headers: { "content-type": "application/json", accept: "application/json" },
+					body: JSON.stringify({ sessionId: sessionId, cwd: cwdOf(sessionId), path: path }),
+				}).then(function () {
+					store.setError("");
+					if (typeof onOpened === "function") onOpened();
+				}).catch(function (failure) {
+					// 旧宿主没有 /data-panel/open 时，退回原来的打开方式。
+					if (failure && failure.message && failure.message.indexOf("HTTP 404") !== -1) {
+						fallbackOpenReportFile(path, onOpened);
+						return;
+					}
+					store.setError("打开报告失败：" + (failure && failure.message ? failure.message : String(failure)));
+				});
+				return;
+			}
+			fallbackOpenReportFile(path, onOpened);
+		}
+		function fallbackOpenReportFile(path, onOpened) {
+			if (typeof path !== "string" || path === "") {
+				store.setError("报告文件路径为空");
+				return;
+			}
+			// 优先用 DSH 官方的“用系统默认程序打开”RPC（openWorkspacePath）。
+			// 面板里的 workspaces.openPath 在部分宿主上不存在/不落原生应用，会表现为点了没反应。
+			var remoteSession = remote !== null && remote.session ? remote.session : null;
+			if (remoteSession !== null && typeof remoteSession.openWorkspacePath === "function") {
+				try {
+					remoteSession.openWorkspacePath({ path: path }).then(function (result) {
+						if (result && (result.ok === false || result.opened === false)) {
+							store.setError("打开报告失败，请确认文件还存在：" + path);
+							return;
+						}
+						store.setError("");
+						if (typeof onOpened === "function") onOpened();
+					}).catch(function (error) {
+						store.setError("打开报告失败：" + (error && error.message ? error.message : String(error)));
+					});
+				} catch (error) {
+					store.setError("打开报告失败：" + (error instanceof Error ? error.message : String(error)));
+				}
 				return;
 			}
 			if (workspaces === null || typeof workspaces.openPath !== "function") {
@@ -3620,6 +3813,7 @@ window.__ModuleLoader__.load({
 			try {
 				workspaces.openPath(path);
 				store.setError("");
+				if (typeof onOpened === "function") onOpened();
 			} catch (error) {
 				store.setError("打开失败：" + (error instanceof Error ? error.message : String(error)));
 			}
@@ -3629,6 +3823,7 @@ window.__ModuleLoader__.load({
 			var statusText = {
 				passed: "全部通过",
 				failed: "有失败",
+				"build-failed": "构建失败",
 				timeout: "执行超时",
 				interrupted: "执行被中断",
 				"no-cases": "本会话没有用例",
@@ -3690,6 +3885,18 @@ window.__ModuleLoader__.load({
 			// ① better-sidebar：优先用它，团队以它为主编辑器。
 			var better = betterSidebarService();
 			if (better !== null && openWithBetterSidebar(better, target, sessionId)) return true;
+			if (better !== null && typeof better.openFile === "function" && sessionId !== "") {
+				try {
+					var codeScope = { sessionId: sessionId };
+					var codeCwd = toPosixPath(sessionCwd(sessionId));
+					if (codeCwd !== "") codeScope.cwd = codeCwd;
+					better.openFile(codeScope, toPosixPath(absolute || target.path), String(target.path).split(/[\\/]/).pop(), { line: target.line, lineEnd: target.end });
+					store.setError("");
+					return true;
+				} catch (error) {
+					// 落到下一级。
+				}
+			}
 
 			if (sidebarRight === null) {
 				store.setError("右侧栏服务尚未就绪，请刷新页面后再试。");
@@ -3963,6 +4170,15 @@ window.__ModuleLoader__.load({
 				}, "dsh-data-panel: workspaces service");
 			});
 
+			ctx.inject(["remote"], function (sub) {
+				remote = sub.remote || null;
+				sub.effect(function () {
+					return function () {
+						remote = null;
+					};
+				}, "dsh-data-panel: remote service");
+			});
+
 			// 主区只保留宿主自己的三个 tab（对话 / 轨迹 / 工作流）。
 			// 「面板」不再注册成 conversation.view：那个 slot 只能产出**tab**，
 			// 而我们要的是一个放在「工作流」右边的**按钮**（点了开右侧栏，
@@ -3993,7 +4209,7 @@ window.__ModuleLoader__.load({
 							// 会被判成「另一个会话」，而那条分支在 sessionId === "" 时直接不发请求，
 							// 于是 record 恒为 null，界面上永远是「用例不存在」。
 							openDetail: function (id) { openDetail(id, ownSessionId); },
-							openCode: function (ref) { openCode(ref); },
+							openCode: function (ref, refSessionId) { openCode(ref, refSessionId || ownSessionId); },
 							sessionId: ownSessionId,
 							dock: true
 						};

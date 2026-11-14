@@ -1,0 +1,477 @@
+/**
+ * dsh-data-panel 运行器适配层 + 执行准备/执行的自动化测试。
+ *
+ * 覆盖三件事：
+ *   1. 框架识别、目标提取、runner.json 合并与命令渲染（纯函数）；
+ *   2. Python/pytest 的完整链路（prepare → run_tests.py → result.json）；
+ *   3. Node test runner 的完整链路，证明执行链路不依赖 Python 项目。
+ *
+ * 运行：node --test test
+ */
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { spawnSync } from 'node:child_process'
+
+// 测试不能写用户真实的 DSH_HOME；但先用它找到 DSH 自带的 Python。
+const REAL_DSH_HOME = process.env.DSH_HOME || join(homedir(), '.dsh')
+const BUNDLED_PYTHON = join(
+  REAL_DSH_HOME, 'dsh-runtimes', 'dsh-primary-runtime', 'dependencies', 'python',
+  process.platform === 'win32' ? 'python.exe' : 'python3',
+)
+const TEST_HOME = mkdtempSync(join(tmpdir(), 'dsh-panel-home-'))
+process.env.DSH_HOME = TEST_HOME
+process.env.DSH_PYTHON_PATH = existsSync(BUNDLED_PYTHON)
+  ? BUNDLED_PYTHON
+  : (process.env.DSH_PYTHON_PATH || (process.platform === 'win32' ? 'python' : 'python3'))
+
+const { __test } = await import('../lib/index.js')
+const { PRESETS, detectPreset, targetOf, targetDeclared, resolveRunner, renderRunnerSpec, escapeRegExp } =
+  await import('../lib/runners.js')
+
+const tempDirs = []
+function makeDir(prefix) {
+  const dir = mkdtempSync(join(tmpdir(), prefix))
+  tempDirs.push(dir)
+  return dir
+}
+
+function write(file, content) {
+  mkdirSync(join(file, '..'), { recursive: true })
+  writeFileSync(file, content, 'utf8')
+}
+
+function makeRecord(overrides) {
+  return {
+    id: 'rec_test',
+    caseId: 'TC-1',
+    title: '用例',
+    testType: 'functional',
+    description: '',
+    input: '',
+    expected: '',
+    code: '',
+    codeRef: '',
+    demo: false,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    ...overrides,
+  }
+}
+
+function runPrepared(prep) {
+  // 直接跑面板给出的整条命令，顺带验证它对 shell 是可直接执行的。
+  // 测试进程本身在 node --test 下，子进程要清掉 NODE_TEST_CONTEXT，否则 node --test 会认为自己在递归。
+  const env = { ...process.env }
+  delete env.NODE_TEST_CONTEXT
+  return spawnSync(prep.command, { shell: true, encoding: 'utf8', timeout: 120000, env })
+}
+
+test.after(() => {
+  for (const dir of tempDirs) {
+    try {
+      rmSync(dir, { recursive: true, force: true })
+    } catch {
+      // 清理失败不影响结论。
+    }
+  }
+  try {
+    rmSync(TEST_HOME, { recursive: true, force: true })
+  } catch {
+    // 同上。
+  }
+})
+
+test('detectPreset：按项目标记识别常见框架', () => {
+  const go = makeDir('panel-go-')
+  write(join(go, 'go.mod'), 'module demo\n')
+  assert.equal(detectPreset({ project: go }), 'go')
+
+  const py = makeDir('panel-py-')
+  write(join(py, 'pyproject.toml'), '[tool.pytest.ini_options]\n')
+  assert.equal(detectPreset({ project: py }), 'pytest')
+
+  const js = makeDir('panel-js-')
+  write(join(js, 'package.json'), JSON.stringify({ devDependencies: { vitest: '^1.0.0' } }))
+  assert.equal(detectPreset({ project: js }), 'vitest')
+
+  const node = makeDir('panel-node-')
+  write(join(node, 'package.json'), JSON.stringify({ type: 'module' }))
+  assert.equal(detectPreset({ project: node }), 'node-test')
+
+  const empty = makeDir('panel-empty-')
+  assert.equal(detectPreset({ project: empty }), '')
+
+  const gtestCmake = makeDir('panel-cmake-gtest-')
+  write(join(gtestCmake, 'CMakeLists.txt'), 'cmake_minimum_required(VERSION 3.20)\nfind_package(GTest REQUIRED)\n')
+  assert.equal(detectPreset({ project: gtestCmake }), 'gtest')
+
+  const plainCmake = makeDir('panel-cmake-plain-')
+  write(join(plainCmake, 'CMakeLists.txt'), 'cmake_minimum_required(VERSION 3.20)\nproject(demo)\n')
+  assert.equal(detectPreset({ project: plainCmake }), 'ctest')
+})
+
+test('targetOf：按框架规则从用例代码里提取目标，显式 testFunc 优先', () => {
+  const pytest = { targetExtract: PRESETS.pytest.targetExtract }
+  assert.equal(targetOf({ code: 'def test_add():\n    pass' }, pytest), 'test_add')
+  assert.equal(targetOf({ code: 'def helper():\n    pass' }, pytest), '')
+  assert.equal(targetOf({ code: '', testFunc: 'explicit' }, pytest), 'explicit')
+
+  const node = { targetExtract: PRESETS['node-test'].targetExtract }
+  assert.equal(targetOf({ code: "it('adds two numbers', () => {})" }, node), 'adds two numbers')
+  assert.equal(targetOf({ code: "test(`模板名`, () => {})" }, node), '模板名')
+
+  const go = { targetExtract: PRESETS.go.targetExtract }
+  assert.equal(targetOf({ code: 'func TestAdd(t *testing.T) {}' }, go), 'TestAdd')
+})
+
+test('targetDeclared：按框架规则校验测试文件里确实有该目标', () => {
+  const pytest = { targetDeclare: PRESETS.pytest.targetDeclare }
+  assert.equal(targetDeclared('def test_a():\n    pass\n', 'test_a', pytest), true)
+  assert.equal(targetDeclared('def test_b():\n    pass\n', 'test_a', pytest), false)
+
+  const node = { targetDeclare: PRESETS['node-test'].targetDeclare }
+  assert.equal(targetDeclared("it('adds', () => {})", 'adds', node), true)
+  assert.equal(targetDeclared("it('adds', () => {})", 'subs', node), false)
+})
+
+test('gtest：TEST(Suite, Name) 组合成 Suite.Name，并按逗号形式校验', () => {
+  const gtest = { ...PRESETS.gtest }
+  assert.equal(targetOf({ code: 'TEST(Suite, Pass) { EXPECT_EQ(1, 1); }' }, gtest), 'Suite.Pass')
+  assert.equal(targetOf({ code: 'TEST_F(Fixture, Works) {}' }, gtest), 'Fixture.Works')
+  assert.equal(targetDeclared('TEST(Suite, Pass) {}', 'Suite.Pass', gtest), true)
+  assert.equal(targetDeclared('TEST(Suite, Pass) {}', 'Suite.Other', gtest), false)
+})
+
+test('resolveRunner：runner.json 可以覆盖预置，也可以完全自定义', () => {
+  const project = makeDir('panel-custom-')
+  const root = join(project, '.dsh', 'test-sessions', 's1')
+  mkdirSync(root, { recursive: true })
+
+  assert.throws(() => resolveRunner({ project, root }), /无法识别项目的测试框架/)
+
+  write(join(root, 'runner.json'), JSON.stringify({
+    label: 'RSpec',
+    language: 'ruby',
+    testFile: 'tests/generated_spec.rb',
+    mode: 'per-case',
+    command: ['rspec', '{file}', '-e', '{target}'],
+    targetExtract: ['it\\s+[\'"]([^\'"]+)[\'"]'],
+    targetDeclare: '[\'"]{target}[\'"]',
+  }))
+  const custom = resolveRunner({ project, root })
+  assert.equal(custom.id, 'custom')
+  assert.equal(custom.label, 'RSpec')
+  assert.equal(custom.testFile, join(root, 'tests', 'generated_spec.rb'))
+  assert.equal(custom.source, 'runner.json')
+
+  assert.throws(() => resolveRunner({ project, root: join(project, 'missing') }), /无法识别/)
+})
+
+test('renderRunnerSpec：占位符与 junit 路径在宿主侧解析', () => {
+  const project = makeDir('panel-render-')
+  const root = join(project, '.dsh', 'test-sessions', 's1')
+  const runDir = join(root, 'runs', 'run-1')
+  mkdirSync(runDir, { recursive: true })
+  const spec = {
+    ...PRESETS.pytest,
+    testFile: join(root, 'tests', 'test_generated.py'),
+    source: 'auto:pytest',
+  }
+  const rendered = renderRunnerSpec(spec, {
+    python: 'PYTHON', node: 'NODE', npx: 'NPX', gradlew: 'GRADLEW', binary: 'BINARY',
+    project, root, runId: 'run-1', runDir,
+  })
+  assert.equal(rendered.mode, 'batch')
+  assert.equal(rendered.command[0], 'PYTHON')
+  assert.equal(rendered.command[rendered.command.length - 1], '{targets}')
+  assert.equal(rendered.junit, join(runDir, 'junit.xml'))
+  assert.equal(rendered.env.PYTHONPATH, project)
+  assert.equal(rendered.testFile, join(root, 'tests', 'test_generated.py'))
+
+  const perCase = renderRunnerSpec(PRESETS['node-test'], {
+    python: 'PYTHON', node: 'NODE', npx: 'NPX', gradlew: 'GRADLEW', binary: 'BINARY',
+    project, root, runId: 'run-1', runDir,
+  })
+  assert.equal(perCase.mode, 'per-case')
+  assert.equal(perCase.shell, false)
+  assert.match(perCase.command.join(' '), /\{target\}/)
+})
+
+test('内置 preset：每条命令都能渲染，不留未解析的宿主占位符', () => {
+  const project = makeDir('panel-presets-')
+  const root = join(project, '.dsh', 'test-sessions', 's1')
+  const runDir = join(root, 'runs', 'run-1')
+  mkdirSync(runDir, { recursive: true })
+  const ctx = {
+    python: 'PYTHON', node: 'NODE', npx: 'NPX', gradlew: 'GRADLEW', binary: 'BINARY',
+    project, root, runId: 'run-1', runDir,
+  }
+  for (const [id, preset] of Object.entries(PRESETS)) {
+    const rendered = renderRunnerSpec({ ...preset, source: `auto:${id}` }, ctx)
+    assert.ok(rendered.testFile, `${id} 没有 testFile`)
+    const placeholder = preset.mode === 'batch' ? '{targets}' : '{target}'
+    assert.ok(preset.command.some((token) => token.includes(placeholder)), `${id} 缺少 ${placeholder}`)
+    for (const token of rendered.command) {
+      const rest = token.replace(/\{targets?\}/g, '')
+      assert.doesNotMatch(rest, /\{(python|node|npx|gradlew|project|root|runId|runDir|file|junit)\}/, `${id} 还有未解析占位符: ${token}`)
+    }
+  }
+})
+
+function writePytestProject(project) {
+  const root = join(project, '.dsh', 'test-sessions', 'test-session-1')
+  write(join(project, 'calc.py'), 'def add(a, b):\n    return a + b\n')
+  write(join(root, 'tests', 'test_generated.py'), [
+    'import sys',
+    'from pathlib import Path',
+    'sys.path.insert(0, str(Path(__file__).resolve().parents[4]))',
+    'from calc import add',
+    '',
+    'def test_add_ok():',
+    '    actual = add(1, 2)',
+    '    print(f"ACTUAL[TC-1]: {actual!r}")',
+    '    assert actual == 3',
+    '',
+    'def test_add_bad():',
+    '    actual = add(1, 2)',
+    '    print(f"ACTUAL[TC-2]: {actual!r}")',
+    '    assert actual == 4',
+    '',
+  ].join('\n'))
+  return root
+}
+
+test('pytest 链路：prepare 冻结请求，runner 写出逐条结果', async () => {
+  const project = makeDir('panel-e2e-py-')
+  const root = writePytestProject(project)
+  const store = {
+    records: [
+      makeRecord({ caseId: 'TC-1', title: '加法通过', code: 'def test_add_ok():\n    assert add(1, 2) == 3' }),
+      makeRecord({ caseId: 'TC-2', title: '加法失败', code: 'def test_add_bad():\n    assert add(1, 2) == 4' }),
+    ],
+  }
+
+  const prep = await __test.prepareRun({ sessionId: 'test-session-1', cwd: project, scope: 'all', caseId: '', store })
+  assert.equal(prep.framework, 'pytest')
+  assert.equal(prep.runnerMode, 'batch')
+  assert.equal(prep.targetCount, 2)
+  assert.equal(prep.testFile, join(root, 'tests', 'test_generated.py'))
+
+  const request = JSON.parse(readFileSync(join(root, 'runs', prep.runId, 'request.json'), 'utf8'))
+  assert.equal(request.runner.mode, 'batch')
+  assert.deepEqual(request.targets.map((item) => item.func), ['test_add_ok', 'test_add_bad'])
+
+  const run = runPrepared(prep)
+  assert.equal(run.status, 1, run.stdout + run.stderr)
+
+  const result = JSON.parse(readFileSync(join(root, 'runs', prep.runId, 'result.json'), 'utf8'))
+  assert.equal(result.status, 'failed')
+  assert.equal(result.passed, 1)
+  assert.equal(result.failed, 1)
+  const byFunc = Object.fromEntries(result.tests.map((item) => [item.func, item.outcome]))
+  assert.equal(byFunc.test_add_ok, 'passed')
+  assert.equal(byFunc.test_add_bad, 'failed')
+  assert.equal(result.tests.find((item) => item.func === 'test_add_ok').actual, '3')
+  assert.equal(result.tests.find((item) => item.func === 'test_add_bad').actual, '3')
+  assert.equal(result.runner.id, 'pytest')
+  assert.ok(existsSync(join(root, 'runs', prep.runId, 'run.log')))
+  assert.ok(readFileSync(join(root, 'runs', prep.runId, 'run.log'), 'utf8').includes('test_add_ok'))
+
+  // 单条执行：快照只应包含这一条，报告才不会把其他用例标成“未执行”。
+  const single = await __test.prepareRun({ sessionId: 'test-session-1', cwd: project, scope: 'case', caseId: 'TC-2', store })
+  assert.equal(single.targetCount, 1)
+  const snapshot = JSON.parse(readFileSync(join(single.root, 'runs', single.runId, 'snapshot', 'cases.json'), 'utf8'))
+  assert.equal(snapshot.cases.length, 1)
+  assert.equal(snapshot.cases[0].caseId, 'TC-2')
+  const singleRun = runPrepared(single)
+  assert.equal(singleRun.status, 1, singleRun.stdout + singleRun.stderr)
+  const singleResult = JSON.parse(readFileSync(join(single.root, 'runs', single.runId, 'result.json'), 'utf8'))
+  assert.deepEqual(singleResult.cases, ['TC-2'])
+  assert.equal(singleResult.passed, 0)
+  assert.equal(singleResult.failed, 1)
+})
+
+test('Node test runner 链路：不依赖 Python 项目，per-case 逐条记录结果', async () => {
+  const project = makeDir('panel-e2e-js-')
+  const root = join(project, '.dsh', 'test-sessions', 'test-session-2')
+  write(join(project, 'package.json'), JSON.stringify({ name: 'demo', type: 'module' }))
+  write(join(root, 'runner.json'), JSON.stringify({
+    preset: 'node-test',
+    testFile: 'tests/test_generated.test.mjs',
+  }))
+  write(join(root, 'tests', 'test_generated.test.mjs'), [
+    "import test from 'node:test'",
+    "import assert from 'node:assert/strict'",
+    '',
+    "test('alpha adds', () => { assert.equal(1 + 1, 2) })",
+    "test('beta fails', () => { assert.equal(1 + 1, 3) })",
+    '',
+  ].join('\n'))
+
+  const store = {
+    records: [
+      makeRecord({ caseId: 'TC-A', title: 'alpha', code: "test('alpha adds', () => { assert.equal(1 + 1, 2) })" }),
+      makeRecord({ caseId: 'TC-B', title: 'beta', code: "test('beta fails', () => { assert.equal(1 + 1, 3) })" }),
+    ],
+  }
+
+  const prep = await __test.prepareRun({ sessionId: 'test-session-2', cwd: project, scope: 'all', caseId: '', store })
+  assert.equal(prep.framework, 'Node test runner')
+  assert.equal(prep.runnerMode, 'per-case')
+  assert.equal(prep.language, 'javascript')
+  assert.equal(prep.testFile, join(root, 'tests', 'test_generated.test.mjs'))
+
+  const run = runPrepared(prep)
+  assert.equal(run.status, 1, run.stdout + run.stderr)
+
+  const result = JSON.parse(readFileSync(join(root, 'runs', prep.runId, 'result.json'), 'utf8'))
+  assert.equal(result.status, 'failed')
+  assert.equal(result.passed, 1)
+  assert.equal(result.failed, 1)
+  const byFunc = Object.fromEntries(result.tests.map((item) => [item.func, item.outcome]))
+  assert.equal(byFunc['alpha adds'], 'passed')
+  assert.equal(byFunc['beta fails'], 'failed')
+  assert.equal(result.runner.mode, 'per-case')
+})
+
+test('准备阶段：测试文件缺失时给出框架相关的可操作错误', async () => {
+  const project = makeDir('panel-missing-')
+  write(join(project, 'go.mod'), 'module demo\n')
+  const store = { records: [makeRecord({ caseId: 'TC-1', code: 'func TestX(t *testing.T) {}' })] }
+  await assert.rejects(
+    () => __test.prepareRun({ sessionId: 's1', cwd: project, scope: 'all', caseId: '', store }),
+    /go test|test_generated_test\.go/,
+  )
+})
+
+test('单条执行：scope=case 只冻结这一条目标', async () => {
+  const project = makeDir('panel-single-')
+  writePytestProject(project)
+  const store = {
+    records: [
+      makeRecord({ caseId: 'TC-1', code: 'def test_add_ok():\n    pass' }),
+      makeRecord({ caseId: 'TC-2', code: 'def test_add_bad():\n    pass' }),
+    ],
+  }
+  const prep = await __test.prepareRun({ sessionId: 'test-session-1', cwd: project, scope: 'case', caseId: 'TC-2', store })
+  assert.equal(prep.targetCount, 1)
+  const request = JSON.parse(readFileSync(join(prep.root, 'runs', prep.runId, 'request.json'), 'utf8'))
+  assert.deepEqual(request.targets.map((item) => item.caseId), ['TC-2'])
+  assert.equal(request.scope, 'case')
+})
+
+test('目标缺失：没有 testFunc 且代码认不出时计入 notRun', async () => {
+  const project = makeDir('panel-notrun-')
+  writePytestProject(project)
+  const store = {
+    records: [
+      makeRecord({ caseId: 'TC-1', code: 'def test_add_ok():\n    pass' }),
+      makeRecord({ caseId: 'TC-2', code: 'print("no test here")' }),
+    ],
+  }
+  const prep = await __test.prepareRun({ sessionId: 'test-session-1', cwd: project, scope: 'all', caseId: '', store })
+  assert.equal(prep.targetCount, 1)
+  assert.deepEqual(prep.missingTestFunc, ['TC-2'])
+})
+
+test('escapeRegExp 不会让特殊字符逃出 pattern', () => {
+  assert.equal(escapeRegExp('a.b(c)'), 'a\\.b\\(c\\)')
+})
+
+test('resolveRunner：项目没标记但已有本会话测试文件时，按文件兜底识别', () => {
+  const project = makeDir('panel-fallback-')
+  const root = join(project, '.dsh', 'test-sessions', 's1')
+  write(join(root, 'tests', 'test_generated.py'), 'def test_a():\n    pass\n')
+  const runner = resolveRunner({ project, root })
+  assert.equal(runner.id, 'pytest')
+  assert.equal(runner.source, 'auto:pytest')
+})
+
+test('gtest 链路：per-case 用 --gtest_filter 逐条执行', { skip: process.platform !== 'win32' }, async () => {
+  const project = makeDir('panel-gtest-')
+  const root = join(project, '.dsh', 'test-sessions', 'session-gtest')
+  write(join(root, 'runner.json'), JSON.stringify({
+    preset: 'gtest',
+    testFile: 'tests/test_generated.cpp',
+    binary: 'project:fake_gtest.cmd',
+    shell: true,
+    preCommand: [process.execPath, '-e', 'console.log("prebuild-ok")'],
+  }))
+  write(join(root, 'tests', 'test_generated.cpp'), [
+    'TEST(Suite, Pass) { EXPECT_EQ(1, 1); }',
+    'TEST(Suite, Fail) { EXPECT_EQ(1, 2); }',
+    '',
+  ].join('\n'))
+  write(join(project, 'fake_gtest.cmd'), [
+    '@echo off',
+    'echo [==========] Running 1 test from 1 test suite.',
+    'echo [ RUN      ] %*',
+    'if "%*"=="--gtest_filter=Suite.Pass --gtest_color=no" (',
+    '  echo [       OK ] Suite.Pass',
+    '  exit /b 0',
+    ')',
+    'echo [  FAILED  ] Suite.Fail',
+    'exit /b 1',
+  ].join('\r\n'))
+  const store = {
+    records: [
+      makeRecord({ caseId: 'TC-G1', code: 'TEST(Suite, Pass) { EXPECT_EQ(1, 1); }' }),
+      makeRecord({ caseId: 'TC-G2', code: 'TEST(Suite, Fail) { EXPECT_EQ(1, 2); }' }),
+    ],
+  }
+  const prep = await __test.prepareRun({ sessionId: 'session-gtest', cwd: project, scope: 'all', caseId: '', store })
+  assert.equal(prep.framework, 'GoogleTest')
+  assert.equal(prep.runnerMode, 'per-case')
+  assert.equal(prep.targetCount, 2)
+  assert.ok(prep.testFile.endsWith('test_generated.cpp'))
+  const run = runPrepared(prep)
+  assert.equal(run.status, 1, run.stdout + run.stderr)
+  assert.ok(readFileSync(join(root, 'runs', prep.runId, 'run.log'), 'utf8').includes('prebuild-ok'))
+  const result = JSON.parse(readFileSync(join(root, 'runs', prep.runId, 'result.json'), 'utf8'))
+  assert.equal(result.failed, 1)
+  assert.equal(result.passed, 1)
+  const byFunc = Object.fromEntries(result.tests.map((item) => [item.func, item.outcome]))
+  assert.equal(byFunc['Suite.Pass'], 'passed')
+  assert.equal(byFunc['Suite.Fail'], 'failed')
+})
+
+test('batch 退出码为 0 但缺少逐条证据时标记未确认', async () => {
+  const project = makeDir('panel-batch-unknown-')
+  const root = join(project, '.dsh', 'test-sessions', 'batch-unknown')
+  write(join(project, 'package.json'), JSON.stringify({ type: 'module' }))
+  write(join(root, 'tests', 'test_generated.test.mjs'), "test('alpha', () => {})\n")
+  write(join(root, 'runner.json'), JSON.stringify({
+    preset: 'node-test', mode: 'batch',
+    command: [process.execPath, '-e', 'process.exit(0)', '{targets}'],
+    targetArg: '{target}', junit: 'junit.xml',
+  }))
+  const store = { records: [makeRecord({ code: "test('alpha', () => {})" })] }
+  const prep = await __test.prepareRun({ sessionId: 'batch-unknown', cwd: project, scope: 'all', caseId: '', store })
+  const run = runPrepared(prep)
+  assert.equal(run.status, 0, run.stdout + run.stderr)
+  const result = JSON.parse(readFileSync(join(root, 'runs', prep.runId, 'result.json'), 'utf8'))
+  assert.equal(result.status, 'partial')
+  assert.equal(result.unconfirmed, 1)
+  assert.equal(result.tests[0].outcome, 'unknown')
+})
+
+test('runner.json 的 timeoutSec 限制执行时长', async () => {
+  const project = makeDir('panel-run-timeout-')
+  const root = join(project, '.dsh', 'test-sessions', 'run-timeout')
+  write(join(project, 'package.json'), JSON.stringify({ type: 'module' }))
+  write(join(root, 'tests', 'test_generated.test.mjs'), "test('slow', () => {})\n")
+  write(join(root, 'runner.json'), JSON.stringify({
+    preset: 'node-test', timeoutSec: 1,
+    command: [process.execPath, '-e', 'setTimeout(() => {}, 5000)', '{target}'],
+  }))
+  const store = { records: [makeRecord({ code: "test('slow', () => {})" })] }
+  const prep = await __test.prepareRun({ sessionId: 'run-timeout', cwd: project, scope: 'all', caseId: '', store })
+  const run = runPrepared(prep)
+  assert.equal(run.status, 3, run.stdout + run.stderr)
+  const result = JSON.parse(readFileSync(join(root, 'runs', prep.runId, 'result.json'), 'utf8'))
+  assert.equal(result.status, 'timeout')
+  assert.match(result.note, /超过 1 秒/)
+})
