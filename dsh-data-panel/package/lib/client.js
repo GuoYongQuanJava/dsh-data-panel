@@ -79,7 +79,7 @@ window.__ModuleLoader__.load({
 .dp-root.dp-docked .dp-title { font-size: 18px; margin: 4px 0 3px; }
 .dp-root.dp-docked .dp-subtitle { font-size: 12px; }
 .dp-root.dp-docked .dp-toolbar { margin: 14px 0 10px; gap: 6px; }
-.dp-root.dp-docked .dp-search { flex: 1 1 150px; max-width: none; }
+.dp-root.dp-docked .dp-search { flex: 1 1 150px; max-width: 360px; }
 .dp-root.dp-docked .dp-btn { height: 32px; padding: 0 10px; font-size: 12px; }
 .dp-root.dp-docked .dp-stat { min-width: 62px; padding: 8px 10px; }
 .dp-root.dp-docked .dp-stat b { font-size: 17px; }
@@ -249,13 +249,21 @@ window.__ModuleLoader__.load({
 .dp-icon-btn:focus-visible { outline: 2px solid var(--dp-brand); outline-offset: 1px; }
 .dp-icon-btn:disabled { opacity: .5; cursor: not-allowed; }
 /*
+ * 工具栏里的类型筛选：表单里的 .dp-select 是 width:100%（弹窗要撑满），
+ * 但工具栏是横向排布，撑满会把整个筛选器挤成独占一行。这里只收敛工具栏内的。
+ */
+.dp-toolbar .dp-select { width: auto; }
+/*
  * 工具栏尾部三个强调按钮：全部执行（绿）/ 报告（蓝）/ 日志（橙）。
  * 容器整体靠右：margin-left:auto 吃掉左侧剩余空间。
  * 单独给按钮加 auto 的话，flex-wrap 换行后位置会飘，所以包一层。
+ *
+ * 这里不能再给固定宽度（曾经是 docked 下无条件 flex:1 1 100%），
+ * 那样不管容器多宽都会把按钮组逼到下一行，和左边「刷新 / 新增用例」错位。
+ * 现在恢复成「宽度由内容决定」：容器宽时与左控件同排靠右，
+ * 真放不下时 flex-wrap 才让它整体折到下一行（仍靠右）。
  */
 .dp-toolbar-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; flex: 0 0 auto; }
-/* 窄容器里工具栏会折行：这时让三个按钮占满一整行并靠右，不要缩在左边半截。 */
-.dp-root.dp-docked .dp-toolbar-actions { flex: 1 1 100%; justify-content: flex-end; margin-left: 0; }
 /*
  * 尺寸只在这里定义一次，三色共用，避免各自写一套导致高度不一致。
  */
