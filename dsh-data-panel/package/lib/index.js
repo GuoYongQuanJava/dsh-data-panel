@@ -958,21 +958,50 @@ function requireRunId(raw) {
  *
  * 命令里**不拼任何用户内容**（用例标识等全在 request.json 里），只含宿主生成的路径与 runId。
  */
+
+/** 从用例 codeRef 反推项目目录：codeRef 通常指向 <project>/.dsh/test-sessions/<sid>/tests/... */
+function projectFromCodeRef(store, scope, caseId) {
+  const records = store && Array.isArray(store.records) ? store.records : []
+  const record = scope === 'case'
+    ? records.find((item) => item && item.caseId === caseId)
+    : records.find((item) => item && typeof item.codeRef === 'string' && item.codeRef.trim() !== '')
+  const raw = record && typeof record.codeRef === 'string' ? record.codeRef.trim() : ''
+  if (raw === '') return ''
+  const path = raw.replace(/#L\d+(?:[-~]\d+)?$/, '').replace(/:\d+(?::\d+)?$/, '')
+  const normalized = path.replace(/\\/g, '/')
+  const marker = '/.dsh/test-sessions/'
+  const index = normalized.toLowerCase().indexOf(marker)
+  if (index <= 0) return ''
+  const project = normalized.slice(0, index)
+  return isAbsolute(project) ? resolve(project) : ''
+}
 async function prepareRun({ sessionId, cwd, scope, caseId, store }) {
-  const project = resolve(cwd)
-  const root = sessionAssetRoot(project, sessionId)
+  const preferred = await resolveSessionCwd(sessionId, cwd)
+  const codeProject = projectFromCodeRef(store, scope, caseId)
+  const candidates = codeProject !== '' && resolve(codeProject) !== preferred
+    ? [preferred, codeProject]
+    : [preferred]
+  let project = preferred
+  let root = ''
+  let runner = null
+  let lastError = null
+  for (const candidate of candidates) {
+    const candidateRoot = sessionAssetRoot(candidate, sessionId)
+    try {
+      runner = resolveRunner({ project: candidate, root: candidateRoot })
+      project = candidate
+      root = candidateRoot
+      break
+    } catch (error) {
+      lastError = error
+    }
+  }
+  if (runner === null) {
+    throw bad(400, lastError instanceof Error ? lastError.message : String(lastError || '无法识别项目的测试框架'))
+  }
   await mkdir(join(root, 'tests'), { recursive: true })
   await mkdir(join(root, 'runs'), { recursive: true })
   await mkdir(join(root, 'reports'), { recursive: true })
-
-  // 运行器描述决定测试文件、目标规则和命令。识别不出来时给出可操作的提示，
-  // 而不是悄悄按 Python 去猜。
-  let runner
-  try {
-    runner = resolveRunner({ project, root })
-  } catch (error) {
-    throw bad(400, error instanceof Error ? error.message : String(error))
-  }
 
   // runner 每次覆盖成包内最新版，避免旧会话目录里的副本过期。
   let runnerSource = ''

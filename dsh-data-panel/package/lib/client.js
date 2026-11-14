@@ -2605,6 +2605,11 @@ window.__ModuleLoader__.load({
 																onClick: function () {
 															// 点执行 = 宿主准备好命令，再预填到面板所属会话的输入框。
 															var targetSession2 = panelSessionId(props);
+											if (record.demo) {
+												setRunResult("");
+												store.setError("这是示例数据，没有可执行的测试代码。先让 AI 按 Skill 生成测试代码，或换一个真实用例。");
+												return;
+											}
 															setRunResult("正在准备执行 " + record.caseId + "…");
 															prepareRun(targetSession2, "case", record.caseId).then(function (prep) {
 																var outcome = prefillDraft(targetSession2, runPrompt(record, targetSession2, prep));
