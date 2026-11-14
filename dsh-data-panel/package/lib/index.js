@@ -15,7 +15,7 @@
  * 所以“你看到的用例”就是“这次跑的用例”。
  */
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, rename, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import { existsSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
@@ -46,6 +46,10 @@ const MAX_CODE = 20000
  * "查看代码" action to jump straight to the covered source.
  */
 const MAX_CODE_REF = 200
+/** 用例层级（分类）名长度上限；空串表示「默认」层级。 */
+const MAX_CATEGORY = 60
+/** 内置层级名：固定存在、含全部用例，不能改名/删除。 */
+const DEFAULT_CATEGORY = '默认'
 
 const TEST_TYPES = new Set(['functional', 'boundary', 'performance', 'exception', 'compat'])
 
@@ -53,9 +57,11 @@ const TEST_TYPES = new Set(['functional', 'boundary', 'performance', 'exception'
 const SESSION_ASSET_DIR = join('.dsh', 'test-sessions')
 const RUN_PREPARE_PATH = '/data-panel/run/prepare'
 const RUN_LATEST_PATH = '/data-panel/run/latest'
+const RUN_LIST_PATH = '/data-panel/run/list'
 const RUN_LOG_PATH = '/data-panel/run/log'
 const RUN_RESULT_PATH = '/data-panel/run/result'
 const RUN_REPORT_PATH = '/data-panel/run/report'
+const RUN_DELETE_PATH = '/data-panel/run/delete'
 const MAX_RUN_LOG = 4 * 1024 * 1024
 const RUNNER_ASSET = new URL('../assets/run_tests.py', import.meta.url)
 const TEST_FILE_REL = join('tests', 'test_generated.py')
@@ -284,6 +290,9 @@ function normalizeStored(input) {
     expected: text(input.expected, MAX_EXPECTED),
     code: text(input.code, MAX_CODE),
     codeRef: text(input.codeRef, MAX_CODE_REF),
+    // 用例层级：空串 = 默认层级。旧数据没有这个字段，读出来就是空串，
+    // 不需要升 STORE_VERSION（升版本会把用户用例隔离重置成示例数据）。
+    category: text(input.category, MAX_CATEGORY),
     demo: input.demo === true,
     createdAt: isoOrNow(input.createdAt),
     updatedAt: isoOrNow(input.updatedAt),
@@ -303,6 +312,7 @@ function normalizePatch(input, existing) {
     expected: text(input.expected, MAX_EXPECTED),
     code: text(input.code, MAX_CODE),
     codeRef: text(input.codeRef, MAX_CODE_REF),
+    category: text(input.category, MAX_CATEGORY),
     updatedAt: new Date().toISOString(),
   }
 }
@@ -316,10 +326,22 @@ async function quarantine(suffix, sessionId) {
   }
 }
 
-async function persist(records, seeded, sessionId) {
+/**
+ * 落盘。
+ *
+ * `categories` 与 `records` 平级单独存：层级可以**先建后归**（空层级也要能存在），
+ * 所以不能只靠 records[].category 去重推导。
+ * 不升 STORE_VERSION —— 升版本会触发 quarantine 把用户用例重置成示例数据。
+ */
+async function persist(records, seeded, sessionId, categories) {
   const file = dataFile(sessionId)
   await mkdir(dataDir(), { recursive: true })
-  const payload = JSON.stringify({ version: STORE_VERSION, seeded: seeded === true, records }, null, 2)
+  const payload = JSON.stringify({
+    version: STORE_VERSION,
+    seeded: seeded === true,
+    categories: categoryList(records, categories),
+    records,
+  }, null, 2)
   const temp = join(dataDir(), `.records.${process.pid}.${Date.now()}.tmp`)
   await writeFile(temp, payload, 'utf8')
   try {
@@ -343,23 +365,25 @@ async function readStore(sessionId) {
       await quarantine(`v${parsed?.version ?? 0}`, sessionId)
       const records = seedRecords()
       await persist(records, true, sessionId)
-      return { records, seeded: true }
+      return { records, categories: categoryList(records), seeded: true }
     }
     const source = Array.isArray(parsed?.records) ? parsed.records : []
     const records = source.map(normalizeStored).filter(Boolean)
-    return { records, seeded: parsed?.seeded === true }
+    // 显式层级 + 用例上实际用到的层级，取并集后排序。
+    const categories = categoryList(records, parsed?.categories)
+    return { records, categories, seeded: parsed?.seeded === true }
   } catch (error) {
     if (error?.code === 'ENOENT') {
       // 会话专属文件还没建过：直接从种子数据起步。
       const records = seedRecords()
       await persist(records, true, sessionId)
-      return { records, seeded: true }
+      return { records, categories: categoryList(records), seeded: true }
     }
     if (error instanceof SyntaxError) {
       await quarantine('corrupt', sessionId)
       const records = seedRecords()
       await persist(records, true, sessionId)
-      return { records, seeded: true }
+      return { records, categories: categoryList(records), seeded: true }
     }
     throw error
   }
@@ -399,6 +423,29 @@ function send(res, status, body) {
     'content-length': Buffer.byteLength(payload),
   })
   res.end(payload)
+}
+
+/**
+ * 用例层级清单（去掉空串，空串代表「默认」层）。
+ * 按名字排序，保证同一份数据每次渲染顺序稳定。
+ */
+/**
+ * 层级清单 = 显式存下的层级 ∪ 用例上实际用到的层级。
+ *
+ * 两者取并集：
+ *   - 显式清单让「空层级」能先建后归；
+ *   - 用例上的 category 兜住旧数据（老文件没有 categories 字段时自动补齐）。
+ */
+function categoryList(records, explicit) {
+  const seen = new Set()
+  for (const name of (Array.isArray(explicit) ? explicit : [])) {
+    if (typeof name === 'string' && name.trim() !== '') seen.add(name.trim())
+  }
+  for (const record of (Array.isArray(records) ? records : [])) {
+    const name = typeof record?.category === 'string' ? record.category.trim() : ''
+    if (name !== '') seen.add(name)
+  }
+  return Array.from(seen).sort((a, b) => a.localeCompare(b, 'zh-CN'))
 }
 
 function demoCount(records) {
@@ -453,6 +500,8 @@ async function handle(req, res) {
         records: sortRecords(store.records),
         demoCount: demoCount(store.records),
         seeded: store.seeded,
+        // 层级清单 = 显式层级 ∪ 用例上实际用到的（空串 = 默认层，不入列）。
+        categories: store.categories,
       })
       return
     }
@@ -477,6 +526,7 @@ async function handle(req, res) {
             input: '',
             expected: '',
             code: '',
+            category: '',
             createdAt: now,
           }),
           id: `rec_${randomUUID().replace(/-/g, '').slice(0, 12)}`,
@@ -485,7 +535,7 @@ async function handle(req, res) {
         }
         if (!created.caseId) created.caseId = newCaseId()
         store.records.push(created)
-        await persist(store.records, store.seeded, sessionId)
+        await persist(store.records, store.seeded, sessionId, store.categories)
         return created
       })
       send(res, 200, { ok: true, record })
@@ -505,7 +555,7 @@ async function handle(req, res) {
           demo: false,
         }
         store.records[index] = updated
-        await persist(store.records, store.seeded, sessionId)
+        await persist(store.records, store.seeded, sessionId, store.categories)
         return updated
       })
       send(res, 200, { ok: true, record })
@@ -519,7 +569,7 @@ async function handle(req, res) {
         const store = await readStore(sessionId)
         const next = store.records.filter((item) => item.id !== id)
         if (next.length === store.records.length) throw bad(404, '记录不存在')
-        await persist(next, store.seeded, sessionId)
+        await persist(next, store.seeded, sessionId, store.categories)
       })
       send(res, 200, { ok: true })
       return
@@ -530,10 +580,105 @@ async function handle(req, res) {
         const store = await readStore(sessionId)
         const next = store.records.filter((item) => !item.demo)
         const count = store.records.length - next.length
-        await persist(next, false, sessionId)
+        await persist(next, false, sessionId, store.categories)
         return count
       })
       send(res, 200, { ok: true, removed })
+      return
+    }
+
+    /* ── 用例层级（分类）────────────────────────────────────────
+     * 分类本身不单独存表：它就是 records[].category 的去重集合，
+     * 空串固定表示「默认」层（含全部用例）。这样不会出现空分类，
+     * 也不用担心分类表和用例数据不一致。
+     * 注意：exportCases 不受影响 —— cases.json 仍只导出用例字段，
+     * 不给同事的报告链路塞新字段。
+     */
+    /* 先建层级、再归入用例：不要求此刻就有用例挂上去。 */
+    if (op === 'createCategory') {
+      const raw = typeof body.category === 'string' ? body.category.trim() : ''
+      if (raw === '') throw bad(400, '层级名不能为空')
+      if (raw === DEFAULT_CATEGORY) throw bad(400, '「' + DEFAULT_CATEGORY + '」是内置层级，不能作为自定义分类名')
+      const name = raw.slice(0, MAX_CATEGORY)
+      const created = await serial(async () => {
+        const store = await readStore(sessionId)
+        const existing = categoryList(store.records, store.categories)
+        if (existing.includes(name)) throw bad(409, `层级「${name}」已存在`)
+        const categories = existing.concat([name])
+        await persist(store.records, store.seeded, sessionId, categories)
+        return name
+      })
+      send(res, 200, { ok: true, category: created })
+      return
+    }
+
+    if (op === 'assignCategory') {
+      const ids = Array.isArray(body.ids) ? body.ids.filter((x) => typeof x === 'string' && x !== '') : []
+      if (ids.length === 0) throw bad(400, '请先选择要归类的用例')
+      const raw = typeof body.category === 'string' ? body.category.trim() : ''
+      if (raw !== '' && raw === DEFAULT_CATEGORY) throw bad(400, '「' + DEFAULT_CATEGORY + '」是内置层级，不能作为自定义分类名')
+      const category = raw.slice(0, MAX_CATEGORY)
+      const moved = await serial(async () => {
+        const store = await readStore(sessionId)
+        const wanted = new Set(ids)
+        let count = 0
+        const next = store.records.map((item) => {
+          if (!wanted.has(item.id)) return item
+          count += 1
+          return { ...item, category, updatedAt: new Date().toISOString() }
+        })
+        if (count === 0) throw bad(404, '选中的用例都不存在')
+        await persist(next, store.seeded, sessionId, store.categories)
+        return count
+      })
+      send(res, 200, { ok: true, moved, category })
+      return
+    }
+
+    if (op === 'renameCategory') {
+      const from = typeof body.from === 'string' ? body.from.trim().slice(0, MAX_CATEGORY) : ''
+      const to = typeof body.to === 'string' ? body.to.trim().slice(0, MAX_CATEGORY) : ''
+      if (from === '') throw bad(400, '「' + DEFAULT_CATEGORY + '」层级不能改名')
+      if (to === '') throw bad(400, '新层级名不能为空')
+      if (to === DEFAULT_CATEGORY) throw bad(400, '「' + DEFAULT_CATEGORY + '」是内置层级，不能作为自定义分类名')
+      const moved = await serial(async () => {
+        const store = await readStore(sessionId)
+        let count = 0
+        const next = store.records.map((item) => {
+          if (item.category !== from) return item
+          count += 1
+          return { ...item, category: to, updatedAt: new Date().toISOString() }
+        })
+        // 空层级也要能改名，所以判定看显式清单而不是用例数。
+        const known = categoryList(store.records, store.categories)
+        if (!known.includes(from)) throw bad(404, `找不到名为「${from}」的层级`)
+        const categories = known.filter((name) => name !== from).concat([to])
+        await persist(next, store.seeded, sessionId, categories)
+        return count
+      })
+      send(res, 200, { ok: true, moved, from, to })
+      return
+    }
+
+    if (op === 'deleteCategory') {
+      const name = typeof body.category === 'string' ? body.category.trim().slice(0, MAX_CATEGORY) : ''
+      if (name === '') throw bad(400, '「' + DEFAULT_CATEGORY + '」层级不能删除')
+      // 只解散层级：里面的用例退回默认层级，一条都不删。
+      const moved = await serial(async () => {
+        const store = await readStore(sessionId)
+        let count = 0
+        const next = store.records.map((item) => {
+          if (item.category !== name) return item
+          count += 1
+          return { ...item, category: '', updatedAt: new Date().toISOString() }
+        })
+        const known = categoryList(store.records, store.categories)
+        if (!known.includes(name)) throw bad(404, `找不到名为「${name}」的层级`)
+        const categories = known.filter((item) => item !== name)
+        await persist(next, store.seeded, sessionId, categories)
+        return count
+      })
+      send(res, 200, { ok: true, moved, category: name })
       return
     }
 
@@ -953,6 +1098,62 @@ async function handleRunLatest(req, res) {
   }
 }
 
+/**
+ * 某条用例的历史执行列表（按 runId 倒序，最新在前）。
+ *
+ * 只读取已有的 runs/ 目录，不新增任何落盘内容；查询口径与 handleRunLatest 一致：
+ * scope=case + caseId 精确匹配。用来支撑表格里那一行的展开记录。
+ */
+async function handleRunList(req, res) {
+  try {
+    if (req.method !== 'GET') {
+      send(res, 405, { ok: false, error: '仅支持 GET' })
+      return
+    }
+    const query = runQueryOf(req)
+    if (query.sessionId === '') throw bad(400, '缺少会话 ID')
+    const caseId = typeof query.caseId === 'string' ? query.caseId.trim() : ''
+    if (query.scope === 'case' && caseId === '') throw bad(400, '单条用例的列表需要 caseId')
+
+    const roots = await resolveReadRoots(query.sessionId, query.cwd)
+    const runs = []
+    const seen = new Set()
+    for (const root of roots) {
+      for (const run of await listRuns(root)) {
+        if (run.result === null) continue
+        // 同一个 runId 可能在多个资产根里都能看到，只取一份。
+        if (seen.has(run.runId)) continue
+        if (query.scope === 'case') {
+          if (run.result.scope !== 'case') continue
+          if (String(run.result.caseId || '') !== caseId) continue
+        } else if (run.result.scope !== 'all') {
+          continue
+        }
+        seen.add(run.runId)
+        const result = run.result
+        runs.push({
+          runId: run.runId,
+          // 只回传列表需要的摘要字段；完整结果仍走 /result，避免列表过重。
+          status: typeof result.status === 'string' ? result.status : '',
+          passed: typeof result.passed === 'number' ? result.passed : 0,
+          failed: typeof result.failed === 'number' ? result.failed : 0,
+          errors: typeof result.errors === 'number' ? result.errors : 0,
+          skipped: typeof result.skipped === 'number' ? result.skipped : 0,
+          durationMs: typeof result.durationMs === 'number' ? result.durationMs : 0,
+          startedAt: typeof result.startedAt === 'string' ? result.startedAt : '',
+          finishedAt: typeof result.finishedAt === 'string' ? result.finishedAt : '',
+          note: typeof result.note === 'string' ? result.note : '',
+        })
+      }
+    }
+    runs.sort((a, b) => String(b.runId).localeCompare(String(a.runId)))
+    send(res, 200, { ok: true, runs })
+  } catch (error) {
+    const status = Number.isInteger(error?.status) ? error.status : 500
+    send(res, status, { ok: false, error: error instanceof Error ? error.message : '服务内部错误' })
+  }
+}
+
 /** 某次执行的原始日志。 */
 async function handleRunLog(req, res) {
   try {
@@ -1011,6 +1212,42 @@ async function handleRunResult(req, res) {
     } catch {
       send(res, 200, { ok: true, exists: false })
     }
+  } catch (error) {
+    const status = Number.isInteger(error?.status) ? error.status : 500
+    send(res, status, { ok: false, error: error instanceof Error ? error.message : '服务内部错误' })
+  }
+}
+
+/**
+ * 删除一次执行记录。
+ *
+ * 只删 `runs/<runId>/` 这一层目录（request.json / result.json / run.log / snapshot/），
+ * 不动用例、不动 reports/<runId>/（报告是独立产物，删记录不代表删报告）。
+ * runId 走 requireRunId 校验，目录也限定在已知资产根的 runs/ 下，防路径穿越。
+ */
+async function handleRunDelete(req, res) {
+  try {
+    if (req.method !== 'POST') {
+      send(res, 405, { ok: false, error: '仅支持 POST' })
+      return
+    }
+    const body = await readJson(req)
+    const sessionId = extractSessionId(req, body)
+    if (sessionId === '') throw bad(400, '缺少会话 ID')
+    const runId = requireRunId(body.runId)
+    const hint = typeof body.cwd === 'string' ? body.cwd : ''
+    const roots = await resolveReadRoots(sessionId, hint)
+
+    // 先在已知资产根里定位这次 run；找不到就明确报 404，不猜路径。
+    let dir = ''
+    for (const root of roots) {
+      const candidate = join(root, 'runs', runId)
+      if (existsSyncSafe(candidate)) { dir = candidate; break }
+    }
+    if (dir === '') throw bad(404, '找不到这次执行记录（可能已被删除）')
+
+    await rm(dir, { recursive: true, force: true })
+    send(res, 200, { ok: true, runId })
   } catch (error) {
     const status = Number.isInteger(error?.status) ? error.status : 500
     send(res, status, { ok: false, error: error instanceof Error ? error.message : '服务内部错误' })
@@ -1123,9 +1360,11 @@ export function apply(ctx) {
   const runRoutes = [
     [RUN_PREPARE_PATH, handleRunPrepare, 'dsh-data-panel: run prepare'],
     [RUN_LATEST_PATH, handleRunLatest, 'dsh-data-panel: run latest'],
+    [RUN_LIST_PATH, handleRunList, 'dsh-data-panel: run list'],
     [RUN_LOG_PATH, handleRunLog, 'dsh-data-panel: run log'],
     [RUN_RESULT_PATH, handleRunResult, 'dsh-data-panel: run result'],
     [RUN_REPORT_PATH, handleRunReport, 'dsh-data-panel: run report'],
+    [RUN_DELETE_PATH, handleRunDelete, 'dsh-data-panel: run delete'],
   ]
   for (const [path, handler, label] of runRoutes) {
     ctx.effect(
@@ -1163,6 +1402,7 @@ export function applySessions(service) {
 export const __test = {
   seedRecords,
   normalizeStored,
+  categoryList,
   normalizePatch,
   dataDir,
   dataFile,
@@ -1172,4 +1412,6 @@ export const __test = {
   exportCases,
   testFuncOf,
   listRuns,
+  handleRunList,
+  handleRunDelete,
 }

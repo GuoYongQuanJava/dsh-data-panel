@@ -119,20 +119,24 @@ window.__ModuleLoader__.load({
 .dp-alert { display: flex; align-items: center; gap: 8px; margin: 0 0 12px; padding: 9px 12px; border: 1px solid color-mix(in srgb, var(--dp-danger) 26%, transparent); border-radius: 10px; background: color-mix(in srgb, var(--dp-danger) 7%, transparent); color: var(--dp-danger); font-size: 12px; }
 .dp-run-result { margin: 0 0 12px; padding: 9px 12px; border: 1px solid var(--dp-border); border-radius: 10px; color: var(--dp-text); font-size: 12px; white-space: pre-wrap; }
 .dp-alert button { margin-left: auto; padding: 0; border: 0; background: none; color: inherit; font: inherit; font-size: 12px; font-weight: 500; cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
-.dp-card { overflow: hidden; border: 1px solid var(--dp-border); border-radius: 14px; background: var(--dp-bg); }
+/* 上拉菜单要能溢出卡片，所以这里不用 overflow:hidden；圆角靠内层各自裁。 */
+.dp-card { position: relative; border: 1px solid var(--dp-border); border-radius: 14px; background: var(--dp-bg); }
 .dp-card-scroll { overflow-x: auto; overflow-y: hidden; }
 .dp-table { width: 100%; min-width: 720px; border-collapse: collapse; table-layout: fixed; }
-.dp-table th { padding: 11px 12px; border-bottom: 1px solid var(--dp-border); background: var(--dp-bg2); color: var(--dp-text3); font-size: 11px; font-weight: 600; letter-spacing: .05em; text-align: left; white-space: nowrap; }
-.dp-table th.dp-right { text-align: right; }
+.dp-table th { padding: 11px 12px; border-bottom: 1px solid var(--dp-border); background: var(--dp-bg2); color: var(--dp-text3); font-size: 11px; font-weight: 600; letter-spacing: .05em; text-align: center; white-space: nowrap; }
+/* 表头统一居中：即使某列表头带了 dp-right，也按居中显示。 */
+.dp-table th.dp-right { text-align: center; }
 .dp-table td { padding: 12px; border-bottom: 1px solid var(--dp-border2); vertical-align: middle; letter-spacing: .02em; }
 .dp-table tbody tr:last-child td { border-bottom: 0; }
 .dp-row { transition: background .12s; }
 .dp-row:hover { background: var(--dp-bg2); }
-.dp-title-cell { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.dp-title-cell { display: flex; align-items: flex-start; gap: 6px; min-width: 0; }
+/* 「示例」标签在两行标题里要贴第一行走。 */
+.dp-title-cell .dp-demo-tag { flex: 0 0 auto; margin-top: 1px; }
 .dp-title-link { display: inline-flex; align-items: center; min-width: 0; max-width: 100%; padding: 0; border: 0; background: none; color: var(--dp-text); font: inherit; font-weight: 550; text-align: left; cursor: pointer; }
 .dp-title-link:hover { color: var(--dp-brand); }
 .dp-title-link:hover .dp-title-text { text-decoration: underline; text-underline-offset: 3px; }
-.dp-title-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dp-title-text { display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 2; word-break: break-word; }
 .dp-demo-tag { flex: 0 0 auto; padding: 0 6px; border: 1px solid color-mix(in srgb, var(--dp-warning) 36%, transparent); border-radius: 5px; color: var(--dp-warning); font-size: 10px; line-height: 16px; }
 .dp-ext { display: inline-flex; flex: 0 0 auto; align-items: center; justify-content: center; width: 20px; height: 20px; border-radius: 6px; color: var(--dp-text3); }
 .dp-ext:hover { background: var(--dp-bg3); color: var(--dp-brand); }
@@ -142,8 +146,95 @@ window.__ModuleLoader__.load({
 .dp-pill[data-tone="done"] { background: color-mix(in srgb, var(--dp-success) 10%, transparent); color: var(--dp-success); }
 .dp-pill[data-tone="blocked"] { background: color-mix(in srgb, var(--dp-danger) 10%, transparent); color: var(--dp-danger); }
 .dp-chip { display: inline-block; max-width: 100%; overflow: hidden; padding: 1px 8px; border: 1px solid var(--dp-border); border-radius: 6px; color: var(--dp-text2); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
-.dp-case-id { display: block; overflow: hidden; color: var(--dp-text2); font-family: ui-monospace, SFMono-Regular, "Cascadia Code", Consolas, monospace; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+/* 用例标识是无空格长串，2 行截断靠 break-all 才断得开。 */
+.dp-case-id { display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 2; color: var(--dp-text2); font-family: ui-monospace, SFMono-Regular, "Cascadia Code", Consolas, monospace; font-size: 12px; line-height: 1.45; word-break: break-all; }
 .dp-cell-text { display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 2; margin: 0; color: var(--dp-text2); font-size: 12px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
+/* 要 3 行的列（测试说明 / 输入 / 预期输出）加这个类。 */
+.dp-cell-text.dp-cell-3 { -webkit-line-clamp: 3; }
+/* 行首展开箭头：收起朝右，展开转 90 度朝下。 */
+.dp-expand-btn { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: var(--dp-text3); cursor: pointer; transition: background .12s, color .12s, transform .14s; }
+.dp-expand-btn:hover { background: var(--dp-bg3); color: var(--dp-text); }
+.dp-expand-btn[data-open="true"] { color: var(--dp-text); transform: rotate(90deg); }
+.dp-expand-btn:focus-visible { outline: 2px solid var(--dp-brand); outline-offset: 1px; }
+/* 展开出来的执行记录单元格。 */
+.dp-run-cell { padding: 0; background: var(--dp-bg2); }
+.dp-run-panel { padding: 10px 12px 12px; }
+.dp-run-title { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 8px; color: var(--dp-text2); font-size: 12px; }
+.dp-run-title b { margin-left: 6px; color: var(--dp-text); font-weight: 600; }
+.dp-run-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.dp-run-table th { padding: 5px 8px; border-bottom: 1px solid var(--dp-border); color: var(--dp-text3); font-weight: 500; text-align: center; white-space: nowrap; }
+.dp-run-table td { padding: 5px 8px; border-bottom: 1px solid var(--dp-border2); color: var(--dp-text2); vertical-align: middle; }
+.dp-run-table tr:last-child td { border-bottom: 0; }
+.dp-run-ops { display: flex; justify-content: flex-end; gap: 2px; }
+.dp-run-state { display: inline-block; padding: 0 7px; border-radius: 5px; font-size: 11px; line-height: 18px; }
+.dp-run-state[data-tone="ok"] { background: color-mix(in srgb, #16a34a 14%, transparent); color: #16a34a; }
+.dp-run-state[data-tone="bad"] { background: color-mix(in srgb, var(--dp-danger) 12%, transparent); color: var(--dp-danger); }
+.dp-run-state[data-tone="idle"] { background: var(--dp-bg3); color: var(--dp-text3); }
+.dp-run-empty { padding: 14px 10px; color: var(--dp-text3); font-size: 12px; text-align: center; }
+.dp-run-hint { margin: 8px 0 0; color: var(--dp-text3); font-size: 11px; }
+/* 「查看」弹窗要更宽：报告是长文本 + 表格。 */
+.dp-modal.dp-modal-wide { width: min(1080px, 92vw); max-width: none; height: 80vh; display: flex; flex-direction: column; }
+.dp-modal.dp-modal-wide .dp-modal-body { flex: 1 1 auto; overflow: auto; }
+/* ── 用例层级：左栏 + 右侧内容 ── */
+.dp-board { display: flex; align-items: flex-start; gap: 12px; margin-top: 4px; }
+.dp-sidebar { flex: 0 0 auto; width: 128px; max-height: 62vh; overflow: auto; padding: 8px 6px; border: 1px solid var(--dp-border); border-radius: 12px; background: var(--dp-bg); transition: width .16s ease, padding .16s ease; }
+.dp-main { flex: 1 1 auto; min-width: 0; }
+.dp-sidebar-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin-bottom: 4px; }
+.dp-sidebar-title { color: var(--dp-text3); font-size: 11px; font-weight: 650; letter-spacing: .08em; text-transform: uppercase; white-space: nowrap; }
+.dp-sidebar-tools { display: flex; align-items: center; gap: 2px; }
+/* 「默认」是分组标题：纯文字，不是按钮，也不响应 hover。 */
+/* 「默认」：外观是分组标题，但整行可点（点它 = 看全部用例）。 */
+.dp-cat-group { display: flex; align-items: baseline; justify-content: space-between; gap: 6px; width: 100%; margin: 0 0 2px; padding: 6px 8px; border: 0; border-radius: 7px; background: transparent; color: var(--dp-text3); font: inherit; font-size: 11px; font-weight: 650; letter-spacing: .06em; text-transform: uppercase; text-align: left; cursor: pointer; transition: background .12s, color .12s; }
+.dp-cat-group:hover { background: var(--dp-bg2); color: var(--dp-text2); }
+.dp-cat-group.is-active { color: var(--dp-text); }
+.dp-cat-group-count { font-variant-numeric: tabular-nums; font-weight: 500; }
+/* 底部操作条里的引导文案。 */
+.dp-pick-count { color: var(--dp-text); font-size: 12.5px; font-weight: 500; }
+.dp-pick-count b { color: var(--dp-brand); font-weight: 700; }
+.dp-pick-hint { color: var(--dp-text3); font-size: 11.5px; }
+.dp-cat { display: flex; align-items: center; gap: 2px; margin-bottom: 1px; border-radius: 7px; transition: background .12s; }
+.dp-cat:hover { background: var(--dp-bg2); }
+.dp-cat.is-active { background: color-mix(in srgb, var(--dp-brand) 9%, transparent); }
+.dp-cat-main { display: flex; align-items: center; gap: 6px; flex: 1 1 auto; min-width: 0; padding: 6px 8px; border: 0; border-radius: 8px; background: transparent; color: var(--dp-text2); font: inherit; font-size: 12.5px; text-align: left; cursor: pointer; }
+.dp-cat.is-active .dp-cat-main { color: var(--dp-brand); font-weight: 600; }
+.dp-cat-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dp-cat-count { flex: 0 0 auto; color: var(--dp-text3); font-size: 11px; font-variant-numeric: tabular-nums; }
+.dp-cat.is-active .dp-cat-count { color: var(--dp-brand); }
+.dp-cat-ops { display: none; flex: 0 0 auto; gap: 1px; padding-right: 2px; }
+.dp-cat:hover .dp-cat-ops { display: flex; }
+.dp-cat-ops.is-visible { display: flex; }
+.dp-cat-ops .dp-icon-btn { width: 20px; height: 20px; }
+/* 「放入」用品牌色，和改名/删除区分开。 */
+.dp-cat-ops .dp-cat-drop { color: var(--dp-brand); }
+.dp-cat-ops .dp-cat-drop:hover { background: color-mix(in srgb, var(--dp-brand) 16%, transparent); color: var(--dp-brand); }
+.dp-cat-flip { transform: rotate(180deg); }
+/* 表格勾选列 */
+.dp-pick { width: 30px; padding: 0 4px 0 0; text-align: center; }
+.dp-pick input { width: 14px; height: 14px; margin: 0; accent-color: var(--dp-brand); cursor: pointer; vertical-align: middle; }
+/* 勾选后浮在表格下方的提示条（不占表格上方空间）。 */
+.dp-pick-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 10px 0 0; padding: 8px 10px; border: 1px solid color-mix(in srgb, var(--dp-brand) 30%, transparent); border-radius: 10px; background: color-mix(in srgb, var(--dp-brand) 6%, transparent); color: var(--dp-text); font-size: 12.5px; }
+.dp-pick-bar b { font-weight: 600; }
+/* 「添加至层级」：贴在底栏，菜单向上展开，不挡住表格行。 */
+.dp-picker { position: relative; display: inline-flex; align-items: center; gap: 6px; margin-left: auto; }
+.dp-picker-toggle { display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px; border: 1px solid var(--dp-border); border-radius: 8px; background: var(--dp-bg); color: var(--dp-text); font: inherit; font-size: 12px; cursor: pointer; transition: background .12s, border-color .12s; }
+.dp-picker-toggle:hover { background: var(--dp-bg2); }
+.dp-picker-toggle.is-open { border-color: var(--dp-brand); color: var(--dp-brand); }
+.dp-picker-caret { display: inline-flex; transform: rotate(180deg); transition: transform .14s; }
+.dp-picker-toggle.is-open .dp-picker-caret { transform: rotate(0deg); }
+/* 菜单向上弹出：bottom 定在按钮上沿之上。 */
+.dp-picker-menu { position: absolute; bottom: calc(100% + 6px); right: 0; z-index: 20; display: flex; flex-direction: column; min-width: 180px; max-height: 240px; overflow-y: auto; padding: 4px; border: 1px solid var(--dp-border); border-radius: 10px; background: var(--dp-bg); box-shadow: 0 8px 24px rgba(15, 18, 24, .18); }
+.dp-picker-item { display: flex; align-items: center; gap: 8px; width: 100%; padding: 6px 8px; border: 0; border-radius: 7px; background: transparent; color: var(--dp-text2); font: inherit; font-size: 12.5px; text-align: left; cursor: pointer; }
+.dp-picker-item:hover { background: var(--dp-bg2); color: var(--dp-text); }
+.dp-picker-item.is-active { background: color-mix(in srgb, var(--dp-brand) 10%, transparent); color: var(--dp-brand); font-weight: 600; }
+.dp-picker-item-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dp-picker-item-count { flex: 0 0 auto; color: var(--dp-text3); font-size: 11px; font-variant-numeric: tabular-nums; }
+.dp-picker-item.is-active .dp-picker-item-count { color: var(--dp-brand); }
+.dp-picker-empty { margin: 0; padding: 10px; color: var(--dp-text3); font-size: 12px; line-height: 1.5; }
+.dp-picker-foot { display: flex; align-items: center; }
+/* 右侧栏本来就窄：左栏再收一档，宽度尽量留给表格。 */
+.dp-root.dp-docked .dp-board { gap: 8px; }
+.dp-root.dp-docked .dp-sidebar { width: 112px; padding: 6px 4px; }
+.dp-root.dp-docked .dp-cat-main { padding: 5px 6px; font-size: 12px; }
 .dp-cell-text.empty { color: var(--dp-text3); }
 .dp-type { display: inline-block; max-width: 100%; overflow: hidden; padding: 1px 8px; border: 1px solid color-mix(in srgb, var(--dp-brand) 34%, transparent); border-radius: 6px; background: color-mix(in srgb, var(--dp-brand) 5%, transparent); color: var(--dp-brand); font-size: 12px; line-height: 18px; text-overflow: ellipsis; white-space: nowrap; vertical-align: middle; }
 .dp-type[data-tone="perf"] { border-color: color-mix(in srgb, var(--dp-warning) 36%, transparent); background: color-mix(in srgb, var(--dp-warning) 7%, transparent); color: var(--dp-warning); }
@@ -157,11 +248,54 @@ window.__ModuleLoader__.load({
 .dp-icon-btn.danger:hover { background: color-mix(in srgb, var(--dp-danger) 10%, transparent); color: var(--dp-danger); }
 .dp-icon-btn:focus-visible { outline: 2px solid var(--dp-brand); outline-offset: 1px; }
 .dp-icon-btn:disabled { opacity: .5; cursor: not-allowed; }
-/* 工具栏的「日志」按钮：深底浅字的强调色，并推到这一行最右侧。 */
-.dp-log-btn { margin-left: auto; background: #FF8800; border-color: #FF8800; color: #F9FAFB; font-weight: 600; }
-.dp-log-btn:hover { background: #FF9A26; border-color: #FF9A26; color: #F9FAFB; }
+/*
+ * 工具栏尾部三个强调按钮：全部执行（绿）/ 报告（蓝）/ 日志（橙）。
+ * 容器整体靠右：margin-left:auto 吃掉左侧剩余空间。
+ * 单独给按钮加 auto 的话，flex-wrap 换行后位置会飘，所以包一层。
+ */
+.dp-toolbar-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; flex: 0 0 auto; }
+/* 窄容器里工具栏会折行：这时让三个按钮占满一整行并靠右，不要缩在左边半截。 */
+.dp-root.dp-docked .dp-toolbar-actions { flex: 1 1 100%; justify-content: flex-end; margin-left: 0; }
+/*
+ * 尺寸只在这里定义一次，三色共用，避免各自写一套导致高度不一致。
+ */
+.dp-run-all-btn,
+.dp-report-btn,
+.dp-log-btn {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	height: 32px;
+	padding: 0 12px;
+	border: 1px solid transparent;
+	border-radius: 10px;
+	font: inherit;
+	font-size: 12.5px;
+	font-weight: 600;
+	line-height: 1;
+	white-space: nowrap;
+	cursor: pointer;
+	color: #F9FAFB;
+	transition: background .15s, border-color .15s, filter .15s;
+}
+.dp-run-all-btn:disabled,
+.dp-report-btn:disabled,
+.dp-log-btn:disabled { opacity: .55; cursor: not-allowed; }
+/* 全部执行：绿色 */
+.dp-run-all-btn { background: #16A34A; border-color: #16A34A; }
+.dp-run-all-btn:hover:not(:disabled) { background: #22C55E; border-color: #22C55E; }
+.dp-run-all-btn:active:not(:disabled) { background: #15803D; border-color: #15803D; }
+.dp-run-all-btn:focus-visible { outline: 2px solid #16A34A; outline-offset: 2px; }
+/* 报告：蓝色 */
+.dp-report-btn { background: #2563EB; border-color: #2563EB; }
+.dp-report-btn:hover:not(:disabled) { background: #3B82F6; border-color: #3B82F6; }
+.dp-report-btn:active:not(:disabled) { background: #1D4ED8; border-color: #1D4ED8; }
+.dp-report-btn:focus-visible { outline: 2px solid #2563EB; outline-offset: 2px; }
+/* 日志：橙色 */
+.dp-log-btn { background: #FF8800; border-color: #FF8800; }
+.dp-log-btn:hover:not(:disabled) { background: #FF9A26; border-color: #FF9A26; }
+.dp-log-btn:active:not(:disabled) { background: #E67A00; border-color: #E67A00; }
 .dp-log-btn:focus-visible { outline: 2px solid #FF8800; outline-offset: 2px; }
-.dp-log-btn:active { background: #E67A00; border-color: #E67A00; }
 .dp-empty { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 72px 24px; text-align: center; }
 .dp-empty-icon { display: flex; align-items: center; justify-content: center; width: 48px; height: 48px; margin-bottom: 14px; border-radius: 14px; background: var(--dp-bg2); color: var(--dp-text3); }
 .dp-empty h3 { margin: 0 0 6px; font-size: 15px; font-weight: 600; }
@@ -403,6 +537,31 @@ window.__ModuleLoader__.load({
 				case "close":
 					children = [h("path", { key: "a", d: "m6 6 12 12" }), h("path", { key: "b", d: "m18 6-12 12" })];
 					break;
+				// 展开/收起箭头：收起朝右，展开转 90 度朝下。
+				case "chevron":
+					children = [h("path", { key: "a", d: "m9 6 6 6-6 6" })];
+					break;
+				// 移出（减号）。
+				case "minus":
+					children = [h("path", { key: "a", d: "M5 12h14" })];
+					break;
+				// 层级（信封式文件夹）。
+				case "folder":
+					children = [
+						h("path", { key: "a", d: "M3 7a1 1 0 0 1 1-1h5l2 2h9a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1z" })
+					];
+					break;
+				// 选中标记。
+				case "check":
+					children = [h("path", { key: "a", d: "m4 12 5 5L20 6" })];
+					break;
+				// 查看执行报告。
+				case "eye":
+					children = [
+						h("path", { key: "a", d: "M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6z" }),
+						h("circle", { key: "b", cx: 12, cy: 12, r: 2.6 })
+					];
+					break;
 				case "doc":
 					children = [h("path", { key: "a", d: "M6 3h8l4 4v14H6z" }), h("path", { key: "b", d: "M14 3v5h5" }), h("path", { key: "c", d: "M9 13h6M9 17h4" })];
 					break;
@@ -435,7 +594,7 @@ window.__ModuleLoader__.load({
 		//#region store
 		function createStore() {
 			var getSessionId = function () { return ""; };
-			var snapshot = { status: "idle", records: [], demoCount: 0, error: "" };
+			var snapshot = { status: "idle", records: [], demoCount: 0, categories: [], error: "" };
 			var loadGeneration = 0;
 			// 写次数**按会话**记：A 在加载时 B 详情页写入，不能把 A 的 GET 误判成过期。
 			var writeCounts = Object.create(null);
@@ -457,12 +616,26 @@ window.__ModuleLoader__.load({
 				emit();
 			}
 
-			function commit(records) {
+			/** 层级清单：宿主 GET 带 categories，写入路径没带就地从 records 重算。 */
+			function categoriesOf(records, fromServer) {
+				var seen = Object.create(null);
+				(Array.isArray(fromServer) ? fromServer : []).forEach(function (name) {
+					if (typeof name === "string" && name.trim() !== "") seen[name.trim()] = true;
+				});
+				records.forEach(function (record) {
+					var name = record && typeof record.category === "string" ? record.category.trim() : "";
+					if (name !== "") seen[name] = true;
+				});
+				return Object.keys(seen).sort(function (a, b) { return a.localeCompare(b, "zh-CN"); });
+			}
+
+			function commit(records, serverCategories) {
 				var next = sortRecords(records);
 				publish({
 					status: "ready",
 					records: next,
 					demoCount: next.filter(function (record) { return record.demo === true; }).length,
+					categories: categoriesOf(next, serverCategories),
 					error: ""
 				});
 			}
@@ -577,7 +750,7 @@ window.__ModuleLoader__.load({
 							staleReloadPending = true;
 							return;
 						}
-						commit(data.records || []);
+						commit(data.records || [], data.categories);
 						return snapshot;
 					})
 					.catch(function (error) {
@@ -650,6 +823,42 @@ window.__ModuleLoader__.load({
 					return mutate({ op: "clearDemo" }, function () {
 						commit(snapshot.records.filter(function (record) { return record.demo !== true; }));
 					}, forcedSessionId);
+				},
+				/** 先建层级（不要求先有勾选）；建完再挑用例放进去。 */
+				createCategory: function (category, forcedSessionId) {
+					return mutate({ op: "createCategory", category: category }, function (data) {
+						// 服务端已落盘，本地把新层级并进清单即可（records 不变）。
+						var name = data && typeof data.category === "string" ? data.category : category;
+						var list = Array.isArray(snapshot.categories) ? snapshot.categories.slice() : [];
+						if (list.indexOf(name) === -1) list.push(name);
+						list.sort(function (a, b) { return a.localeCompare(b, "zh-CN"); });
+						commit(snapshot.records, list);
+					}, forcedSessionId);
+				},
+
+				assignCategory: function (ids, category, forcedSessionId) {
+					return mutate({ op: "assignCategory", ids: ids, category: category }, function () {
+						var wanted = Object.create(null);
+						(ids || []).forEach(function (id) { wanted[id] = true; });
+						var next = typeof category === "string" ? category.trim() : "";
+						commit(snapshot.records.map(function (record) {
+							return wanted[record.id] ? Object.assign({}, record, { category: next }) : record;
+						}));
+					}, forcedSessionId);
+				},
+				renameCategory: function (from, to, forcedSessionId) {
+					return mutate({ op: "renameCategory", from: from, to: to }, function () {
+						commit(snapshot.records.map(function (record) {
+							return record.category === from ? Object.assign({}, record, { category: to }) : record;
+						}));
+					}, forcedSessionId);
+				},
+				deleteCategory: function (category, forcedSessionId) {
+					return mutate({ op: "deleteCategory", category: category }, function () {
+						commit(snapshot.records.map(function (record) {
+							return record.category === category ? Object.assign({}, record, { category: "" }) : record;
+						}));
+					}, forcedSessionId);
 				}
 			};
 		}
@@ -708,6 +917,34 @@ window.__ModuleLoader__.load({
 			return callApi("/data-panel/run/latest?" + params.toString(), { method: "GET", headers: { accept: "application/json" } });
 		}
 
+		/** 某条用例（或问题整批）的历史执行列表，最新在前。 */
+		function fetchRunList(sessionId, scope, caseId) {
+			var params = new URLSearchParams();
+			params.set("sessionId", sessionId);
+			params.set("cwd", cwdOf(sessionId));
+			params.set("scope", scope);
+			if (scope === "case") params.set("caseId", caseId || "");
+			return callApi("/data-panel/run/list?" + params.toString(), { method: "GET", headers: { accept: "application/json" } });
+		}
+
+		/** 删除某次执行记录（只删 runs/<runId>/，不动用例）。 */
+		function deleteRun(sessionId, runId) {
+			return callApi("/data-panel/run/delete", {
+				method: "POST",
+				headers: { "content-type": "application/json", accept: "application/json" },
+				body: JSON.stringify({ sessionId: sessionId, cwd: cwdOf(sessionId), runId: runId }),
+			});
+		}
+
+		/** 某次执行的结构化结果（result.json：status / counts / tests[]）。 */
+		function fetchRunResult(sessionId, runId) {
+			var params = new URLSearchParams();
+			params.set("sessionId", sessionId);
+			params.set("cwd", cwdOf(sessionId));
+			params.set("runId", runId);
+			return callApi("/data-panel/run/result?" + params.toString(), { method: "GET", headers: { accept: "application/json" } });
+		}
+
 		/** 某次执行的原始日志。 */
 		function fetchRunLog(sessionId, runId) {
 			var params = new URLSearchParams();
@@ -715,6 +952,7 @@ window.__ModuleLoader__.load({
 			params.set("cwd", cwdOf(sessionId));
 			params.set("runId", runId);
 			return callApi("/data-panel/run/log?" + params.toString(), { method: "GET", headers: { accept: "application/json" } });
+		}
 
 		/** 本会话各 runId 下的报告文件（只读）。 */
 		function fetchReportList(sessionId) {
@@ -731,7 +969,6 @@ window.__ModuleLoader__.load({
 			params.set("cwd", cwdOf(sessionId));
 			params.set("runId", runId);
 			return callApi("/data-panel/run/report?" + params.toString(), { method: "GET", headers: { accept: "application/json" } });
-		}
 		}
 		//#endregion
 
@@ -789,9 +1026,12 @@ window.__ModuleLoader__.load({
 			return h("span", { className: "dp-case-id", title: value || "未填写用例标识" }, value || "—");
 		}
 
+		/** 单元格文本。默认截断 2 行，传 lines={3} 截断 3 行。 */
 		function CellText(props) {
 			var value = props.value || "";
-			return h("p", { className: cn("dp-cell-text", value ? "" : "empty") }, value || "—");
+			return h("p", {
+				className: cn("dp-cell-text", props.lines === 3 ? "dp-cell-3" : "", value ? "" : "empty")
+			}, value || "—");
 		}
 
 		function Modal(props) {
@@ -812,7 +1052,7 @@ window.__ModuleLoader__.load({
 				}
 			},
 				h("div", {
-					className: "dp-modal",
+					className: cn("dp-modal", props.wide === true ? "dp-modal-wide" : ""),
 					role: "dialog",
 					"aria-modal": "true",
 					"aria-label": props.title
@@ -1037,6 +1277,253 @@ window.__ModuleLoader__.load({
 			}, body);
 		}
 
+		/** 新建 / 重命名层级的输入弹窗。 */
+		function CategoryPrompt(props) {
+			var valueState = useState(props.initialValue || "");
+			var value = valueState[0];
+			var setValue = valueState[1];
+			var errorState = useState("");
+			var error = errorState[0];
+			var setError = errorState[1];
+
+			function submit() {
+				var name = value.trim();
+				if (name === "") { setError("层级名不能为空"); return; }
+				if (name === "默认") { setError("「默认」是内置层级，换个名字"); return; }
+				props.onSubmit(name);
+			}
+
+			return h(Modal, {
+				title: props.title,
+				subtitle: props.subtitle,
+				onClose: props.onClose,
+				footer: [
+					h(Button, { key: "cancel", onClick: props.onClose }, "取消"),
+					h(Button, { key: "ok", variant: "primary", onClick: submit }, "确定")
+				]
+			},
+				h(Field, { label: "层级名称", full: true, hint: "填已有的名字就是把用例并进那个层级；填新名字就是新建一个层级。" },
+					h("input", {
+						className: "dp-input",
+						value: value,
+						maxLength: 60,
+						placeholder: "例如：RingBuffer 模块",
+						onChange: function (event) { setValue(event.target.value); setError(""); },
+						onKeyDown: function (event) { if (event.key === "Enter") submit(); }
+					})
+				),
+				error ? h("p", { className: "dp-hint", style: { color: "var(--dp-danger)" } }, error) : null
+			);
+		}
+
+		/** 一次执行的状态文案与色调。 */
+		function runStateOf(run) {
+			var status = run && typeof run.status === "string" ? run.status : "";
+			var labels = {
+				passed: "通过",
+				failed: "失败",
+				partial: "部分通过",
+				error: "出错",
+				timeout: "超时",
+				interrupted: "被中断",
+				running: "执行中",
+				"no-tests": "没收集到测试",
+				"no-test-file": "缺测试代码"
+			};
+			var tone = status === "passed" ? "ok" : (status === "failed" || status === "error" || status === "timeout" ? "bad" : "idle");
+			return { label: labels[status] || (status || "未知"), tone: tone };
+		}
+
+		/**
+		 * 表格行展开出来的「执行记录」。
+		 * 数据来自 /data-panel/run/list（只读会话资产目录里已有的 runs/），
+		 * 一次执行一条，最新在前；查看/删除都只影响这一条记录，不动用例。
+		 */
+		function RunRecords(props) {
+			var record = props.record;
+			var sessionId = typeof props.sessionId === "string" ? props.sessionId : "";
+			var state = useState({ status: "loading", runs: [], error: "" });
+			var view = state[0];
+			var setView = state[1];
+			var reloadState = useState(0);
+			var reloadTick = reloadState[0];
+			var setReloadTick = reloadState[1];
+
+			useEffect(function () {
+				if (sessionId === "") {
+					setView({ status: "error", runs: [], error: "还没拿到当前会话。" });
+					return undefined;
+				}
+				var alive = true;
+				setView({ status: "loading", runs: [], error: "" });
+				fetchRunList(sessionId, "case", record.caseId).then(function (data) {
+					if (!alive) return;
+					var runs = (data && data.runs) || [];
+					setView({ status: runs.length === 0 ? "empty" : "ready", runs: runs, error: "" });
+				}).catch(function (failure) {
+					if (!alive) return;
+					setView({ status: "error", runs: [], error: failure && failure.message ? failure.message : "读取执行记录失败" });
+				});
+				return function () {
+					alive = false;
+				};
+			}, [sessionId, record.caseId, reloadTick]);
+
+			function remove(runId) {
+				props.onRemove(runId, function (done) {
+					if (done) setReloadTick(function (n) { return n + 1; });
+				});
+			}
+
+			var body = null;
+			if (view.status === "loading") {
+				body = h("div", { className: "dp-run-empty" }, "正在读取执行记录…");
+			} else if (view.status === "error") {
+				body = h("div", { className: "dp-run-empty" }, view.error);
+			} else if (view.status === "empty") {
+				body = h("div", { className: "dp-run-empty" }, "这条用例还没有执行过。点它的「执行」按钮，跑完再回来看。");
+			} else {
+				body = h("table", { className: "dp-run-table" },
+					h("thead", null,
+						h("tr", null,
+							h("th", { style: { width: "42px" } }, "#"),
+							h("th", null, "执行时间"),
+							h("th", { style: { width: "118px" } }, "结果"),
+							h("th", { style: { width: "74px" } }, "耗时"),
+							h("th", { className: "dp-right", style: { width: "72px" } }, "操作")
+						)
+					),
+					h("tbody", null, view.runs.map(function (run, index) {
+						var tone = runStateOf(run);
+						return h("tr", { key: run.runId },
+							h("td", null, String(view.runs.length - index)),
+							h("td", { title: run.runId }, fmtFull(run.startedAt)),
+							h("td", null,
+								h("span", { className: "dp-run-state", "data-tone": tone.tone }, tone.label),
+								run.failed > 0 ? h("span", { style: { marginLeft: "6px", color: "var(--dp-text3)" } }, "失败 " + run.failed) : null
+							),
+							h("td", null, run.durationMs > 0 ? (run.durationMs / 1000).toFixed(1) + "s" : "—"),
+							h("td", null,
+								h("div", { className: "dp-run-ops" },
+									h(IconButton, {
+										name: "eye",
+										label: "查看 " + record.caseId + " 第 " + (view.runs.length - index) + " 次执行的报告",
+										onClick: function () { props.onView(run); }
+									}),
+									h(IconButton, {
+										name: "trash",
+										danger: true,
+										label: "删除 " + record.caseId + " 第 " + (view.runs.length - index) + " 次执行记录",
+										onClick: function () { remove(run.runId); }
+									})
+								)
+							)
+						);
+					}))
+				);
+			}
+
+			return h("div", { className: "dp-run-panel" },
+				h("div", { className: "dp-run-title" },
+					h("span", null, "执行记录", h("b", null, record.caseId)),
+					h("span", null, "共 " + view.runs.length + " 次")
+				),
+				body
+			);
+		}
+
+		/**
+		 * 一次执行的「查看」弹窗：宽弹窗，逐条结果 + 原始日志。
+		 * 只读 result.json 的 tests[] 与 run.log，不碰 reports/<runId>/。
+		 */
+		function RunReportModal(props) {
+			var run = props.run;
+			var sessionId = typeof props.sessionId === "string" ? props.sessionId : "";
+			var state = useState({ status: "loading", result: null, log: "", error: "" });
+			var view = state[0];
+			var setView = state[1];
+
+			useEffect(function () {
+				if (sessionId === "") {
+					setView({ status: "error", result: null, log: "", error: "还没拿到当前会话。" });
+					return undefined;
+				}
+				var alive = true;
+				setView({ status: "loading", result: null, log: "", error: "" });
+				Promise.all([
+					fetchRunResult(sessionId, run.runId),
+					fetchRunLog(sessionId, run.runId)
+				]).then(function (both) {
+					if (!alive) return;
+					var resultData = both[0];
+					var logData = both[1];
+					setView({
+						status: "ready",
+						result: resultData && resultData.exists ? resultData.result : null,
+						log: logData && logData.exists ? (logData.content || "") : "",
+						error: ""
+					});
+				}).catch(function (failure) {
+					if (!alive) return;
+					setView({ status: "error", result: null, log: "", error: failure && failure.message ? failure.message : "读取报告失败" });
+				});
+				return function () {
+					alive = false;
+				};
+			}, [sessionId, run.runId]);
+
+			var tests = view.result && Array.isArray(view.result.tests) ? view.result.tests : [];
+			var outcomeLabel = { passed: "通过", failed: "失败", error: "错误", skipped: "跳过" };
+			var outcomeTone = { passed: "ok", failed: "bad", error: "bad", skipped: "idle" };
+
+			var body = null;
+			if (view.status === "loading") {
+				body = h("div", { className: "dp-log-empty" }, h("p", null, "正在读取这次执行的报告…"));
+			} else if (view.status === "error") {
+				body = h("div", { className: "dp-log-empty" },
+					h("span", { className: "dp-log-empty-icon" }, h(Icon, { name: "warning", size: 26 })),
+					h("p", null, view.error)
+				);
+			} else {
+				var summary = view.result ? summarizeRun(view.result) : "";
+				body = h("div", null,
+					summary ? h("div", { className: "dp-run-result" }, summary) : null,
+					h("div", { className: "dp-code-meta" },
+						h("span", null, "运行 ", h("code", null, run.runId)),
+						view.result && view.result.finishedAt ? h("span", null, " · 结束 ", h("code", null, fmtFull(view.result.finishedAt))) : null
+					),
+					tests.length > 0
+						? h("table", { className: "dp-run-table" },
+							h("thead", null, h("tr", null,
+								h("th", { style: { width: "45%" } }, "测试函数"),
+								h("th", { style: { width: "80px" } }, "结果"),
+								h("th", null, "说明")
+							)),
+							h("tbody", null, tests.map(function (item, index) {
+								return h("tr", { key: String(index) },
+									h("td", { style: { fontFamily: "ui-monospace, Consolas, monospace" } }, item.func || "—"),
+									h("td", null, h("span", { className: "dp-run-state", "data-tone": outcomeTone[item.outcome] || "idle" }, outcomeLabel[item.outcome] || item.outcome || "—")),
+									h("td", null, item.message || "—")
+								);
+							}))
+						)
+						: h("p", { className: "dp-run-hint" }, "这次执行没有逐条测试结果（可能没收集到测试，或结果文件缺失）。"),
+					h("div", { className: "dp-code-meta", style: { marginTop: "14px" } }, "原始输出"),
+					view.log
+						? h("pre", { className: "dp-code-body" }, view.log)
+						: h("div", { className: "dp-log-empty" }, h("p", null, "这次执行没有产生输出。"))
+				);
+			}
+
+			return h(Modal, {
+				title: "执行报告",
+				subtitle: (props.record ? (props.record.caseId ? props.record.caseId + " · " : "") + (props.record.title || "") : "") + "　" + fmtFull(run.startedAt),
+				wide: true,
+				onClose: props.onClose,
+				footer: h(Button, { variant: "primary", onClick: props.onClose }, "关闭")
+			}, body);
+		}
+
 		/**
 		 * 报告弹窗（只读）。
 		 *
@@ -1170,20 +1657,39 @@ window.__ModuleLoader__.load({
 			);
 		}
 
+		/**
+		 * 空状态。三种情形分开说清楚：
+		 *   category — 当前层级里没有用例 → 引导去「默认」挑用例加进来
+		 *   filtered — 有筛选条件但没命中 → 清筛选
+		 *   都没有   — 面板里一条用例都没有 → 新增
+		 */
 		function EmptyState(props) {
 			var filtered = props.filtered;
+			var category = typeof props.category === "string" ? props.category : "";
+			var inCategory = category !== "" && !filtered;
 			return h("div", { className: "dp-empty" },
-				h("div", { className: "dp-empty-icon" }, h(Icon, { name: "doc", size: 23 })),
-				h("h3", null, filtered ? "没有匹配的用例" : "还没有用例"),
-				h("p", null, filtered
-					? "换个关键词或清除筛选条件试试。"
-					: "把需要跟踪的测试用例放进面板，点击用例名称即可在右侧查看详情。"),
-				filtered
-					? h(Button, { onClick: props.onClear }, "清除筛选")
-					: h(Button, { variant: "primary", onClick: props.onCreate },
-						h(Icon, { name: "plus", size: 15 }),
-						"新增用例"
+				h("div", { className: "dp-empty-icon" },
+					h(Icon, { name: inCategory ? "folder" : "doc", size: 23 })
+				),
+				h("h3", null, inCategory
+					? "「" + category + "」层级还是空的"
+					: (filtered ? "没有匹配的用例" : "还没有用例")),
+				h("p", null, inCategory
+					? "去「默认」层级勾选要放进这个层级的用例，再用下方的「添加至层级」归入。"
+					: (filtered
+						? "换个关键词或清除筛选条件试试。"
+						: "把需要跟踪的测试用例放进面板，点击用例名称即可在右侧查看详情。")),
+				inCategory
+					? h(Button, { variant: "primary", onClick: props.onGoDefault },
+						h(Icon, { name: "folder", size: 15 }),
+						"去「默认」挑选用例"
 					)
+					: (filtered
+						? h(Button, { onClick: props.onClear }, "清除筛选")
+						: h(Button, { variant: "primary", onClick: props.onCreate },
+							h(Icon, { name: "plus", size: 15 }),
+							"新增用例"
+						))
 			);
 		}
 
@@ -1207,7 +1713,8 @@ window.__ModuleLoader__.load({
 					input: initial.input || "",
 					expected: initial.expected || "",
 					code: initial.code || "",
-					codeRef: initial.codeRef || ""
+					codeRef: initial.codeRef || "",
+					category: initial.category || ""
 				};
 			});
 			var values = state[0];
@@ -1283,6 +1790,19 @@ window.__ModuleLoader__.load({
 						}, TEST_TYPE_KEYS.map(function (key) {
 							return h("option", { key: key, value: key }, TEST_TYPES[key].label);
 						}))
+					),
+					// 层级：选了就归到那一层，但用例本身永远在「默认」里可见。
+					h(Field, { label: "所属层级", hint: "留空表示只在「默认」层；选一个层级会同时把它归到那一层。" },
+						h("select", {
+							className: "dp-select",
+							value: values.category,
+							onChange: function (event) { set("category", event.target.value); }
+						},
+							h("option", { value: "" }, "不归入层级（仅默认）"),
+							(props.categories || []).map(function (name) {
+								return h("option", { key: name, value: name }, name);
+							})
+						)
 					),
 					h(Field, { label: "测试说明", full: true },
 						h("textarea", {
@@ -1384,6 +1904,35 @@ window.__ModuleLoader__.load({
 			var reportState = useState(false);
 			var reportView = reportState[0];
 			var setReportView = reportState[1];
+			// 当前展开执行记录的用例 id（一次只展开一行）。
+			var expandedState = useState("");
+			var expandedId = expandedState[0];
+			var setExpandedId = expandedState[1];
+			// 正在查看的那次执行（{ record, run }）。
+			var runViewState = useState(null);
+			var runView = runViewState[0];
+			var setRunView = runViewState[1];
+			// 删除执行记录的二次确认。
+			var removeRunState = useState(null);
+			var removeRun = removeRunState[0];
+			var setRemoveRun = removeRunState[1];
+			// 用例层级：当前选中的层级（"" = 默认层，含全部）。
+			var categoryState = useState("");
+			var activeCategory = categoryState[0];
+			var setActiveCategory = categoryState[1];
+			// 左栏常驻显示，不再提供折叠。
+			// 表格勾选（存 record.id）。
+			var pickedState = useState([]);
+			var picked = pickedState[0];
+			var setPicked = pickedState[1];
+			// 「添加至层级」上拉菜单：pickerOpen 控制展开，pickerChoice 是暂选但未确认的层级。
+			var pickerState = useState({ open: false, choice: "" });
+			var picker = pickerState[0];
+			var setPicker = pickerState[1];
+			// 层级弹窗：{ mode: "create" | "rename", from? }。
+			var categoryPromptState = useState(null);
+			var categoryPrompt = categoryPromptState[0];
+			var setCategoryPrompt = categoryPromptState[1];
 
 			useEffect(function () {
 				// 面板打开是一个明确信号：至少此刻要确保会话订阅已经建立，
@@ -1396,6 +1945,11 @@ window.__ModuleLoader__.load({
 			var filtered = useMemo(function () {
 				var needle = query.trim().toLowerCase();
 				return records.filter(function (record) {
+					// 默认层（空串）看全部，其它层只看自己名下的。
+					if (activeCategory !== "") {
+						var owned = typeof record.category === "string" ? record.category.trim() : "";
+						if (owned !== activeCategory) return false;
+					}
 					if (type !== "all" && record.testType !== type) return false;
 					if (!needle) return true;
 					return [record.caseId, record.title, record.description, record.input, record.expected]
@@ -1403,7 +1957,27 @@ window.__ModuleLoader__.load({
 						.toLowerCase()
 						.indexOf(needle) !== -1;
 				});
-			}, [records, query, type]);
+			}, [records, query, type, activeCategory]);
+
+
+			// 层级行：「默认」固定第一（含全部用例），其余按名字排。
+			var categoryRows = useMemo(function () {
+				var names = Array.isArray(snap.categories) ? snap.categories : [];
+				var rows = [{ key: "__all__", value: "", label: "默认", count: records.length }];
+				names.forEach(function (name) {
+					var count = records.filter(function (record) {
+						return (typeof record.category === "string" ? record.category.trim() : "") === name;
+					}).length;
+					rows.push({ key: name, value: name, label: name, count: count });
+				});
+				return rows;
+			}, [records, snap.categories]);
+
+			var pickedSet = useMemo(function () {
+				var map = Object.create(null);
+				picked.forEach(function (id) { map[id] = true; });
+				return map;
+			}, [picked]);
 
 			var functionalCount = records.filter(function (record) { return record.testType === "functional"; }).length;
 			var boundaryCount = records.filter(function (record) { return record.testType === "boundary"; }).length;
@@ -1468,7 +2042,25 @@ window.__ModuleLoader__.load({
 			function confirmAction() {
 				if (confirm === null) return;
 				setBusy(true);
-				var action = confirm.kind === "clearDemo" ? store.clearDemo() : store.remove(confirm.record.id);
+				var action = null;
+				if (confirm.kind === "clearDemo") {
+					action = store.clearDemo();
+				} else if (confirm.kind === "deleteCategory") {
+					// 只解散层级：里面的用例退回默认层，一条都不删。
+					action = store.deleteCategory(confirm.category).then(function () {
+						if (activeCategory === confirm.category) setActiveCategory("");
+					});
+				} else if (confirm.kind === "removeFromCategory") {
+					// 只把这一条移出层级（category 置空 → 回到默认层），用例本体不动。
+					var removing = confirm.record;
+					action = store.assignCategory([removing.id], "").then(function () {
+						setPicked(function (previous) {
+							return previous.filter(function (item) { return item !== removing.id; });
+						});
+					});
+				} else {
+					action = store.remove(confirm.record.id);
+				}
 				action
 					.then(function () {
 						setConfirm(null);
@@ -1483,6 +2075,88 @@ window.__ModuleLoader__.load({
 
 			function refresh() {
 				store.load(true).catch(function () {});
+			}
+
+			function togglePick(id) {
+				setPicked(function (previous) {
+					var at = previous.indexOf(id);
+					if (at === -1) return previous.concat([id]);
+					return previous.filter(function (item) { return item !== id; });
+				});
+			}
+
+			/**
+			 * 表头全选框：只作用**当前页**，但不能覆盖别的页已勾的。
+			 *
+			 * 勾选时把本页 id 并进已有集合；取消时只移除本页的 id。
+			 * 之前直接 `setPicked(ids.slice())` 会把前几页的选择整片丢掉。
+			 */
+			function togglePickAll(ids) {
+				var allPicked = ids.length > 0 && ids.every(function (id) { return pickedSet[id] === true; });
+				setPicked(function (previous) {
+					if (!allPicked) {
+						// 本页还没全选 → 并集（保留其它页已勾的）。
+						var merged = previous.slice();
+						ids.forEach(function (id) {
+							if (merged.indexOf(id) === -1) merged.push(id);
+						});
+						return merged;
+					}
+					// 本页已全选 → 只移除本页的，其它页保持不动。
+					var pageSet = Object.create(null);
+					ids.forEach(function (id) { pageSet[id] = true; });
+					return previous.filter(function (id) { return pageSet[id] !== true; });
+				});
+			}
+
+			function assignPicked(category) {
+				if (picked.length === 0) return;
+				var ids = picked.slice();
+				setBusy(true);
+				store.assignCategory(ids, category).then(function () {
+					setPicked([]);
+					setPicker({ open: false, choice: "" });
+					store.setError("");
+				}).catch(function (failure) {
+					store.setError("归类失败：" + (failure && failure.message ? failure.message : String(failure)));
+				}).finally(function () {
+					setBusy(false);
+				});
+			}
+
+			function submitCategoryName(name) {
+				var pending = categoryPrompt;
+				if (pending === null) return;
+				setCategoryPrompt(null);
+				setBusy(true);
+				var action = null;
+				if (pending.mode === "rename") {
+					action = store.renameCategory(pending.from, name).then(function () {
+						setActiveCategory(name);
+					});
+				} else {
+					// 不要求先勾选：先建层级，之后再挑用例放进去。
+					// 若此刻正好勾了用例，就顺手一起归入，省一步操作。
+					var ids = picked.slice();
+					action = store.createCategory(name).then(function () {
+						setActiveCategory(name);
+						if (ids.length === 0) {
+							// 从服务端重拉一次，确保左栏拿到的是落盘后的真实清单。
+							return store.load(true).catch(function () {});
+						}
+						return store.assignCategory(ids, name).then(function () {
+							setPicked([]);
+							return store.load(true).catch(function () {});
+						});
+					});
+				}
+				action.then(function () {
+					store.setError("");
+				}).catch(function (failure) {
+					store.setError("操作失败：" + (failure && failure.message ? failure.message : String(failure)));
+				}).finally(function () {
+					setBusy(false);
+				});
 			}
 
 			var loading = (snap.status === "idle" || snap.status === "loading") && records.length === 0;
@@ -1536,43 +2210,49 @@ window.__ModuleLoader__.load({
 							h(Icon, { name: "refresh", size: 15 }),
 							snap.status === "refreshing" ? "刷新中…" : "刷新"
 						),
-						h(Button, { variant: "ghost", onClick: function () {
-							// 先让宿主准备（导出用例 + 生成 runId + 给命令），再把命令预填到面板所属会话。
-							var currentRecords = snap.records || [];
-							var targetSession = panelSessionId(props);
-							if (currentRecords.length === 0) {
-								store.setError("当前面板里还没有用例，先新增或生成用例后再执行。");
-								return;
-							}
-							setRunResult("正在准备执行…");
-							prepareRun(targetSession, "all", "").then(function (prep) {
-								var outcome = prefillDraft(targetSession, runAllPrompt(currentRecords, targetSession, prep));
-								if (!outcome.ok) { setRunResult(""); store.setError("执行：" + outcome.message); return; }
-								store.setError("");
-								setRunResult(outcome.message + "  运行编号：" + prep.runId);
-							}).catch(function (failure) {
-								setRunResult("");
-								store.setError("执行准备失败：" + (failure && failure.message ? failure.message : String(failure)));
-							});
-						}, disabled: snap.status === "refreshing" },
-							h(Icon, { name: "code", size: 15 }),
-							"全部执行"
-						),
 						h(Button, { variant: "primary", onClick: openCreate },
 							h(Icon, { name: "plus", size: 15 }),
 							"新增用例"
 						),
-						// 整批执行日志 + 报告（只读）。
-						h(Button, {
-							className: "dp-log-btn",
-							onClick: function () { setLogView({ record: null }); },
-							title: "查看本节全部用例的执行日志"
-						}, "日志"),
-						h(Button, {
-							onClick: function () { setReportView(true); },
-							title: "查看已生成的测试报告"
-						}, "报告")
+						// 执行 / 报告 / 日志：三个同高、同规格，顺序固定为 全部执行 → 报告 → 日志。
+						h("div", { className: "dp-toolbar-actions" },
+								h(Button, {
+									className: "dp-run-all-btn",
+								disabled: snap.status === "refreshing",
+								title: "准备全部用例的执行命令，填进当前会话",
+								onClick: function () {
+									// 先让宿主准备（导出用例 + 生成 runId + 给命令），再把命令预填到面板所属会话。
+									var currentRecords = snap.records || [];
+									var targetSession = panelSessionId(props);
+									if (currentRecords.length === 0) {
+										store.setError("当前面板里还没有用例，先新增或生成用例后再执行。");
+										return;
+									}
+									setRunResult("正在准备执行…");
+									prepareRun(targetSession, "all", "").then(function (prep) {
+										var outcome = prefillDraft(targetSession, runAllPrompt(currentRecords, targetSession, prep));
+										if (!outcome.ok) { setRunResult(""); store.setError("执行：" + outcome.message); return; }
+										store.setError("");
+										setRunResult(outcome.message + "  运行编号：" + prep.runId);
+									}).catch(function (failure) {
+										setRunResult("");
+										store.setError("执行准备失败：" + (failure && failure.message ? failure.message : String(failure)));
+									});
+								},
+							}, "全部执行"),
+							h(Button, {
+								className: "dp-report-btn",
+								onClick: function () { setReportView(true); },
+								title: "查看已生成的测试报告"
+							}, "报告"),
+							h(Button, {
+								className: "dp-log-btn",
+								onClick: function () { setLogView({ record: null }); },
+								title: "查看本节全部用例的执行日志"
+							}, "日志")
+						)
 					),
+					// 勾选反馈放在表格下方（不占表格上方的空间）。
 					runResult ? h("div", { className: "dp-run-result" }, runResult) : null,
 					snap.error ? h("div", { className: "dp-alert" },
 						snap.error,
@@ -1586,129 +2266,290 @@ window.__ModuleLoader__.load({
 							onClick: function () { setConfirm({ kind: "clearDemo" }); }
 						}, "清空示例")
 					) : null,
-					h("div", { className: "dp-card" },
-						h("div", { className: "dp-card-scroll" },
-							waitingSession
-								? h("div", { className: "dp-empty" },
-									h("div", { className: "dp-empty-icon" }, h(Icon, { name: "time", size: 22 })),
-									h("h3", null, "正在取得当前会话"),
-									h("p", null, "用例按会话存储，拿到当前会话后会自动加载它自己的用例。稍等一下；如果一直停在这里，点「刷新」重试。")
-								)
-								: loading
-								? h(SkeletonTable)
-								: filtered.length === 0
-									? h(EmptyState, {
-										filtered: filtering,
-										onClear: function () { setQuery(""); setType("all"); },
-										onCreate: openCreate
-									})
-									: h("table", { className: "dp-table" },
-										h("colgroup", null,
-											h("col", { style: { width: "14%" } }),
-											h("col", { style: { width: "15%" } }),
-											h("col", { style: { width: "10%" } }),
-											h("col", { style: { width: "19%" } }),
-											h("col", { style: { width: "13%" } }),
-											h("col", { style: { width: "13%" } }),
-											h("col", { style: { width: "16%" } })
-										),
-										h("thead", null,
-											h("tr", null,
-												h("th", null, "用例标识"),
-												h("th", null, "用例名称"),
-												h("th", null, "测试类型"),
-												h("th", null, "测试说明"),
-												h("th", null, "输入"),
-												h("th", null, "预期输出"),
-												h("th", { className: "dp-right" }, "操作")
-											)
-										),
-										h("tbody", null, pageRecords.map(function (record) {
-											return h("tr", { key: record.id, className: "dp-row" },
-												h("td", null, h(CaseId, { caseId: record.caseId })),
+				// 左栏只与表格平齐：标题、统计卡、工具栏都在它上面。
+				h("div", { className: "dp-board" },
+					h("aside", { className: "dp-sidebar" },
+						h("div", { className: "dp-sidebar-head" },
+							h("span", { className: "dp-sidebar-title" }, "用例层级"),
+							h("div", { className: "dp-sidebar-tools" },
+								h(IconButton, { name: "plus", label: "新建层级", onClick: function () { setCategoryPrompt({ mode: "create" }); } })
+							)
+						),
+						// 勾选的引导文案统一放在表格下方的操作条里，左栏不再重复。
+						categoryRows.map(function (row) {
+							// 「默认」= 看全部用例。外观是分组标题，但可点击切回全部。
+							if (row.value === "") {
+								return h("button", {
+									key: row.key,
+									type: "button",
+									className: cn("dp-cat-group", activeCategory === "" ? "is-active" : ""),
+									title: "显示全部 " + row.count + " 条用例",
+									onClick: function () { setActiveCategory(""); },
+								},
+									h("span", { className: "dp-cat-group-name" }, row.label),
+									h("span", { className: "dp-cat-group-count" }, String(row.count))
+								);
+							}
+							return h("div", {
+								key: row.key,
+								className: cn("dp-cat", activeCategory === row.value ? "is-active" : ""),
+							},
+								h("button", {
+									type: "button",
+									className: "dp-cat-main",
+									title: row.label + "（" + row.count + " 条）",
+									onClick: function () { setActiveCategory(row.value); },
+								},
+									h("span", { className: "dp-cat-name" }, row.label),
+									h("span", { className: "dp-cat-count" }, String(row.count))
+								),
+								// 有勾选时，这个层级右侧出现「放入」；没有勾选时显示改名/删除。
+								picked.length > 0
+									? h("span", { className: "dp-cat-ops is-visible" },
+										h("span", {
+											role: "button",
+											className: "dp-icon-btn dp-cat-drop",
+											title: "把已选的 " + picked.length + " 条用例放入「" + row.label + "」",
+											onClick: function () { assignPicked(row.value); }
+										}, h(Icon, { name: "plus", size: 12 }))
+									)
+									: h("span", { className: "dp-cat-ops" },
+										h("span", { role: "button", className: "dp-icon-btn", title: "重命名层级", onClick: function () { setCategoryPrompt({ mode: "rename", from: row.value }); } }, h(Icon, { name: "edit", size: 12 })),
+										h("span", { role: "button", className: "dp-icon-btn danger", title: "删除层级（用例退回默认层）", onClick: function () { setConfirm({ kind: "deleteCategory", category: row.value }); } }, h(Icon, { name: "trash", size: 12 }))
+									)
+							);
+						})
+					),
+					h("div", { className: "dp-main" },
+						h("div", { className: "dp-card" },
+							h("div", { className: "dp-card-scroll" },
+								waitingSession
+									? h("div", { className: "dp-empty" },
+										h("div", { className: "dp-empty-icon" }, h(Icon, { name: "time", size: 22 })),
+										h("h3", null, "正在取得当前会话"),
+										h("p", null, "用例按会话存储，拿到当前会话后会自动加载它自己的用例。稍等一下；如果一直停在这里，点「刷新」重试。")
+									)
+									: loading
+									? h(SkeletonTable)
+									: filtered.length === 0
+										? h(EmptyState, {
+											filtered: filtering,
+											category: activeCategory,
+											onClear: function () { setQuery(""); setType("all"); },
+											onGoDefault: function () { setActiveCategory(""); setPicked([]); },
+											onCreate: openCreate
+										})
+										: h("table", { className: "dp-table" },
+											h("colgroup", null,
+												h("col", { style: { width: "30px" } }),
+										h("col", { style: { width: "14%" } }),
+												h("col", { style: { width: "15%" } }),
+												h("col", { style: { width: "10%" } }),
+												h("col", { style: { width: "19%" } }),
+												h("col", { style: { width: "13%" } }),
+												h("col", { style: { width: "13%" } }),
+												h("col", { style: { width: "16%" } })
+											),
+											h("thead", null,
+												h("tr", null,
+													h("th", { className: "dp-pick" },
+												h("input", {
+													type: "checkbox",
+													"aria-label": "全选当前页",
+													checked: pageRecords.length > 0 && pageRecords.every(function (record) { return pickedSet[record.id] === true; }),
+													onChange: function () { togglePickAll(pageRecords.map(function (record) { return record.id; })); }
+												})
+											),
+											h("th", null, "用例标识"),
+													h("th", null, "用例名称"),
+													h("th", null, "测试类型"),
+													h("th", null, "测试说明"),
+													h("th", null, "输入"),
+													h("th", null, "预期输出"),
+													h("th", { className: "dp-right" }, "操作")
+												)
+											),
+											h("tbody", null, pageRecords.map(function (record) {
+												var isOpen = expandedId === record.id;
+												return h(React.Fragment, { key: record.id },
+													h("tr", { className: cn("dp-row", isOpen ? "is-open" : "") },
+													h("td", { className: "dp-pick" },
+													h("input", {
+														type: "checkbox",
+														"aria-label": "选择 " + record.caseId,
+														checked: pickedSet[record.id] === true,
+														onChange: function () { togglePick(record.id); }
+													})
+												),
 												h("td", null,
 													h("div", { className: "dp-title-cell" },
 														h("button", {
 															type: "button",
-															className: "dp-title-link",
-															title: record.title,
-															onClick: function () { openDetail(record.id); }
-														},
-															h("span", { className: "dp-title-text" }, record.title)
-														),
-														record.demo ? h("span", { className: "dp-demo-tag" }, "示例") : null
+															className: "dp-expand-btn",
+															"data-open": expandedId === record.id ? "true" : "false",
+															title: expandedId === record.id ? "收起执行记录" : "展开执行记录",
+															"aria-label": (expandedId === record.id ? "收起 " : "展开 ") + record.caseId + " 的执行记录",
+															"aria-expanded": expandedId === record.id,
+															onClick: function () { setExpandedId(expandedId === record.id ? "" : record.id); }
+														}, h(Icon, { name: "chevron", size: 13 })),
+														h(CaseId, { caseId: record.caseId })
 													)
 												),
-												h("td", null, h(TypeTag, { testType: record.testType })),
-												h("td", null, h(CellText, { value: record.description })),
-												h("td", null, h(CellText, { value: record.input })),
-												h("td", null, h(CellText, { value: record.expected })),
-												h("td", null,
-													h("div", { className: "dp-actions" },
-														h(IconButton, {
-															name: record.codeRef ? "location" : "code",
-															label: (record.codeRef ? "查看源码 " : "查看代码 ") + record.title,
-															onClick: function () {
-																// 有用例源码位置就跳编辑器；没有则沿用弹窗看用例代码。
-														if (record.codeRef && typeof props.openCode === "function") props.openCode(record.codeRef, props.sessionId);
-																else setCodeRecord(record);
-															}
-														}),
-														h(IconButton, {
-															name: "external",
-															label: "执行 " + record.title,
-															onClick: function () {
-														// 点执行 = 宿主准备好命令，再预填到面板所属会话的输入框。
-														var targetSession2 = panelSessionId(props);
-														setRunResult("正在准备执行 " + record.caseId + "…");
-														prepareRun(targetSession2, "case", record.caseId).then(function (prep) {
-															var outcome = prefillDraft(targetSession2, runPrompt(record, targetSession2, prep));
-															if (!outcome.ok) { setRunResult(""); store.setError("执行：" + outcome.message); return; }
-															store.setError("");
-															setRunResult(outcome.message + "  运行编号：" + prep.runId);
-														}).catch(function (failure) {
-															setRunResult("");
-															store.setError("执行准备失败：" + (failure && failure.message ? failure.message : String(failure)));
-														});
-															}
-														}),
-														h(IconButton, {
-															name: "edit",
-															label: "编辑 " + record.title,
-															onClick: function () { openEdit(record); }
-														}),
-														h(IconButton, {
-															name: "trash",
-															label: "删除 " + record.title,
-															danger: true,
-															onClick: function () { setConfirm({ kind: "delete", record: record }); }
-														}),
-												// 单条用例的执行日志：读这条用例自己的那份。
-												h(LogButton, {
-													label: "日志 " + record.title,
-													onClick: function () { setLogView({ record: record }); }
-												})
+													h("td", null,
+														h("div", { className: "dp-title-cell" },
+															h("button", {
+																type: "button",
+																className: "dp-title-link",
+																title: record.title,
+																onClick: function () { openDetail(record.id); }
+															},
+																h("span", { className: "dp-title-text" }, record.title)
+															),
+															record.demo ? h("span", { className: "dp-demo-tag" }, "示例") : null
+														)
+													),
+													h("td", null, h(TypeTag, { testType: record.testType })),
+													h("td", null, h(CellText, { value: record.description, lines: 3 })),
+													h("td", null, h(CellText, { value: record.input, lines: 3 })),
+													h("td", null, h(CellText, { value: record.expected, lines: 3 })),
+													h("td", null,
+														h("div", { className: "dp-actions" },
+															h(IconButton, {
+																name: record.codeRef ? "location" : "code",
+																label: (record.codeRef ? "查看源码 " : "查看代码 ") + record.title,
+																onClick: function () {
+																	// 有用例源码位置就跳编辑器；没有则沿用弹窗看用例代码。
+															if (record.codeRef && typeof props.openCode === "function") props.openCode(record.codeRef, props.sessionId);
+																	else setCodeRecord(record);
+																}
+															}),
+															h(IconButton, {
+																name: "external",
+																label: "执行 " + record.title,
+																onClick: function () {
+															// 点执行 = 宿主准备好命令，再预填到面板所属会话的输入框。
+															var targetSession2 = panelSessionId(props);
+															setRunResult("正在准备执行 " + record.caseId + "…");
+															prepareRun(targetSession2, "case", record.caseId).then(function (prep) {
+																var outcome = prefillDraft(targetSession2, runPrompt(record, targetSession2, prep));
+																if (!outcome.ok) { setRunResult(""); store.setError("执行：" + outcome.message); return; }
+																store.setError("");
+																setRunResult(outcome.message + "  运行编号：" + prep.runId);
+															}).catch(function (failure) {
+																setRunResult("");
+																store.setError("执行准备失败：" + (failure && failure.message ? failure.message : String(failure)));
+															});
+																}
+															}),
+															h(IconButton, {
+																name: "edit",
+																label: "编辑 " + record.title,
+																onClick: function () { openEdit(record); }
+															}),
+															// 在某个层级里看时，这个按钮是「移出层级」——用例本身不删。
+															// 只有「默认」层（看全部）才是真的删用例。
+															activeCategory !== ""
+																? h(IconButton, {
+																	name: "minus",
+																	label: "从「" + activeCategory + "」移出 " + record.title,
+																	onClick: function () { setConfirm({ kind: "removeFromCategory", record: record }); }
+																})
+																: h(IconButton, {
+																	name: "trash",
+																	label: "删除 " + record.title,
+																	danger: true,
+																	onClick: function () { setConfirm({ kind: "delete", record: record }); }
+																}),
+													// 单条用例的执行日志：读这条用例自己的那份。
+													h(LogButton, {
+														label: "日志 " + record.title,
+														onClick: function () { setLogView({ record: record }); }
+													})
+														)
+													)
+											),
+											isOpen
+												? h("tr", { className: "dp-row-expand" },
+													h("td", { colSpan: 8, className: "dp-run-cell" },
+														h(RunRecords, {
+															record: record,
+															sessionId: panelSessionId(props),
+															onView: function (run) { setRunView({ record: record, run: run }); },
+															onRemove: function (runId, done) { setRemoveRun({ record: record, runId: runId, done: done }); }
+														})
 													)
 												)
-											);
+												: null
+										);
 										}))
+										)
+							),
+							// 勾选反馈放在表格下方，不顶在表格上方。
+							picked.length > 0 ? h("div", { className: "dp-pick-bar" },
+								// 文案从「已选 N 条」换成操作引导；条数在按钮里体现。
+								// 条数放在最前面，独立成块，一眼能看到。
+								h("span", { className: "dp-pick-count" }, "已选 ", h("b", null, String(picked.length)), " 条"),
+								h("span", { className: "dp-pick-hint" }, "在下方选择层级，点确定把选中的用例加入该层级"),
+								// 添加至层级：点开列出全部层级，选一个再确认。
+								h("div", { className: "dp-picker" },
+									h("button", {
+										type: "button",
+										className: cn("dp-picker-toggle", picker.open ? "is-open" : ""),
+										"aria-haspopup": "listbox",
+										"aria-expanded": picker.open,
+										onClick: function () { setPicker({ open: !picker.open, choice: picker.choice }); },
+									},
+										h("span", null, picker.choice === "" ? "添加至层级（" + picked.length + " 条）" : picker.choice + "（" + picked.length + " 条）"),
+										h("span", { className: "dp-picker-caret" }, h(Icon, { name: "chevron", size: 12 }))
+									),
+									picker.open ? h("div", { className: "dp-picker-menu", role: "listbox" },
+										// 只列自定义层级；「默认」= 全部用例，不是可归入的目标。
+										categoryRows.filter(function (row) { return row.value !== ""; }).length === 0
+											? h("p", { className: "dp-picker-empty" }, "还没有层级。先在左上角「用例层级」旁点 ＋ 新建一个。")
+											: categoryRows.filter(function (row) { return row.value !== ""; }).map(function (row) {
+												return h("button", {
+													key: row.key,
+													type: "button",
+													role: "option",
+													"aria-selected": picker.choice === row.value,
+													className: cn("dp-picker-item", picker.choice === row.value ? "is-active" : ""),
+													onClick: function () { setPicker({ open: true, choice: row.value }); },
+												},
+													h("span", { className: "dp-picker-item-name" }, row.label),
+													h("span", { className: "dp-picker-item-count" }, String(row.count)),
+													picker.choice === row.value ? h(Icon, { name: "check", size: 12 }) : null
+												);
+											})
+									) : null,
+									// 选中后才可确认。
+									h("div", { className: "dp-picker-foot" },
+										picker.open ? h(Button, {
+											size: "sm",
+											disabled: picker.choice === "" || busy,
+											onClick: function () { assignPicked(picker.choice); },
+										}, "确定") : null
 									)
-						),
-						loading || filtered.length === 0 ? null : h("div", { className: "dp-card-foot" },
-							h(Pager, {
-								total: filtered.length,
-								page: currentPage,
-								pageCount: pageCount,
-								pageSize: pageSize,
-								onPage: changePage,
-								onPageSize: changePageSize
-							})
-						)
-					)
+								),
+								h(Button, { variant: "ghost", size: "sm", onClick: function () { setPicked([]); setPicker({ open: false, choice: "" }); } }, "取消选择")
+							) : null,
+							loading || filtered.length === 0 ? null : h("div", { className: "dp-card-foot" },
+								h(Pager, {
+									total: filtered.length,
+									page: currentPage,
+									pageCount: pageCount,
+									pageSize: pageSize,
+									onPage: changePage,
+									onPageSize: changePageSize
+								})
+							)
+					),
+				)
+				)
 				),
 				form !== null ? h(RecordFormModal, {
 					mode: form.mode,
 					record: form.record,
+					categories: snap.categories || [],
 					busy: busy,
 					error: formError,
 					onClose: function () { if (!busy) setForm(null); },
@@ -1728,13 +2569,70 @@ window.__ModuleLoader__.load({
 					sessionId: panelSessionId(props),
 					onClose: function () { setReportView(false); }
 				}) : null,
+				// 某次执行的「查看」：宽弹窗，读 result.json 的 tests[] 与 run.log。
+				runView !== null ? h(RunReportModal, {
+					record: runView.record,
+					run: runView.run,
+					sessionId: panelSessionId(props),
+					onClose: function () { setRunView(null); }
+				}) : null,
+				// 新建 / 重命名层级。
+				categoryPrompt !== null ? h(CategoryPrompt, {
+					title: categoryPrompt.mode === "rename" ? "重命名层级" : "新建层级",
+					subtitle: categoryPrompt.mode === "rename" ? "当前：" + categoryPrompt.from : "从表格里勾选用例，再给它起个层级名。",
+					initialValue: categoryPrompt.mode === "rename" ? categoryPrompt.from : "",
+					onSubmit: submitCategoryName,
+					onClose: function () { setCategoryPrompt(null); }
+				}) : null,
+				// 删除执行记录：不可恢复，先确认（只删 runs/<runId>/，不动用例）。
+				removeRun !== null ? h(ConfirmDialog, {
+					title: "删除这次执行记录？",
+					message: "只会删掉这次执行的日志与结果（" + removeRun.runId + "），用例本身不受影响。",
+					detail: h("span", null, "删除后无法恢复：", h("b", null, removeRun.record.caseId)),
+					confirmLabel: "删除记录",
+					busy: busy,
+					onCancel: function () { setRemoveRun(null); },
+					onConfirm: function () {
+						var pending = removeRun;
+						if (pending === null) return;
+						setBusy(true);
+						deleteRun(panelSessionId(props), pending.runId).then(function () {
+							setRemoveRun(null);
+							store.setError("");
+							if (typeof pending.done === "function") pending.done(true);
+						}).catch(function (failure) {
+							store.setError("删除执行记录失败：" + (failure && failure.message ? failure.message : String(failure)));
+							setRemoveRun(null);
+						}).finally(function () {
+							setBusy(false);
+						});
+					}
+				}) : null,
 				confirm !== null ? h(ConfirmDialog, {
-					title: confirm.kind === "clearDemo" ? "清空示例用例？" : "删除这条用例？",
+					title: confirm.kind === "clearDemo"
+						? "清空示例用例？"
+						: (confirm.kind === "deleteCategory"
+							? "删除层级「" + confirm.category + "」？"
+							: (confirm.kind === "removeFromCategory"
+								? "把这条用例移出层级？"
+								: "删除这条用例？")),
 					message: confirm.kind === "clearDemo"
 						? "只会移除标记为示例的用例，你后来新建或编辑过的内容会保留。"
-						: "删除后无法恢复，右侧已打开的详情页也会变为空。",
-					detail: confirm.kind === "delete" ? h("span", null, "即将删除：", h("b", null, confirm.record.title)) : null,
-					confirmLabel: confirm.kind === "clearDemo" ? "清空示例" : "删除",
+						: (confirm.kind === "deleteCategory"
+							? "层级会消失，里面的用例退回「默认」层，一条都不会被删。"
+							: (confirm.kind === "removeFromCategory"
+								? "只是把它从这个层级移回「默认」，用例本身还在，不会被删除。"
+								: "删除后无法恢复，右侧已打开的详情页也会变为空。")),
+					detail: confirm.kind === "delete"
+						? h("span", null, "即将删除：", h("b", null, confirm.record.title))
+						: (confirm.kind === "removeFromCategory"
+							? h("span", null, "移出层级：", h("b", null, confirm.record.title), "（用例保留）")
+							: null),
+					confirmLabel: confirm.kind === "clearDemo"
+						? "清空示例"
+						: (confirm.kind === "deleteCategory"
+							? "删除层级"
+							: (confirm.kind === "removeFromCategory" ? "移出层级" : "删除")),
 					busy: busy,
 					onCancel: function () { if (!busy) setConfirm(null); },
 					onConfirm: confirmAction
@@ -3055,6 +3953,13 @@ window.__ModuleLoader__.load({
 			ReportModal: ReportModal,
 			LogButton: LogButton,
 			LogModal: LogModal,
+			LogButton: LogButton,
+			LogModal: LogModal,
+			ReportModal: ReportModal,
+			RunRecords: RunRecords,
+			RunReportModal: RunReportModal,
+			CategoryPrompt: CategoryPrompt,
+			runStateOf: runStateOf,
 			CodeModal: CodeModal,
 			Pager: Pager
 		};
