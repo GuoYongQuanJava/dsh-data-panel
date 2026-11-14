@@ -49930,6 +49930,101 @@ globalThis.__dshChunks__["editor"] = (require) => {
 		}, QUOTE_FLASH_MS);
 	}
 	/** Whether a view has been destroyed (its dom left the document). */
+	/** 跳转定位后的目标行高亮：整行着色，点别处 / 换行 / 输入即消失。 */
+	const targetLineEffect = StateEffect.define();
+	const targetLineField = StateField.define({
+		create: () => null,
+		update(value, tr) {
+			let next = value;
+			for (const effect of tr.effects) if (effect.is(targetLineEffect)) next = effect.value ?? null;
+			if (next === null) return null;
+			return { from: tr.changes.mapPos(next.from, -1), to: tr.changes.mapPos(next.to, 1) };
+		}
+	});
+	const targetLineHighlight = EditorView.decorations.compute([targetLineField], (state) => {
+		const range = state.field(targetLineField);
+		if (range === null) return Decoration.none;
+		const marks = [];
+		const first = state.doc.lineAt(range.from).number;
+		const last = state.doc.lineAt(range.to).number;
+		for (let number = first; number <= last; number++) marks.push(Decoration.line({ class: "cm-target-line" }).range(state.doc.line(number).from));
+		return Decoration.set(marks, true);
+	});
+	function ensureTargetLineStyle() {
+		if (typeof document === "undefined") return;
+		if (document.getElementById("dsh-target-line-style") !== null) return;
+		const accent = "var(--dsw-alias-state-business-primary, #4d6bfe)";
+		const style = document.createElement("style");
+		style.id = "dsh-target-line-style";
+		style.textContent = [
+			`.cm-line.cm-target-line{background-color:color-mix(in srgb, ${accent} 18%, transparent)!important;box-shadow:inset 2px 0 0 0 ${accent}!important;}`
+			,`body[data-ds-dark-theme] .cm-line.cm-target-line,html[data-ds-dark-theme] .cm-line.cm-target-line{background-color:color-mix(in srgb, ${accent} 30%, transparent)!important;}`
+		].join("");
+		document.head.appendChild(style);
+	}
+	function setTargetLine(view, line) {
+		const doc = view.state.doc;
+		const number = Math.min(Math.max(line, 1), doc.lines);
+		ensureTargetLineStyle();
+		clearTargetLine(view);
+		try { view.dispatch({ effects: targetLineEffect.of({ from: doc.line(number).from, to: doc.line(number).to }) }); } catch {}
+	}
+	function clearTargetLine(view) {
+		if (viewDestroyed(view)) return;
+		try { view.dispatch({ effects: targetLineEffect.of(void 0) }); } catch {}
+	}
+
+	/**
+	* 面板跳转后的收尾：目标行可见时钉住 900ms，用户一动手就停止并清掉高亮。
+	* 监听器只在这次跳转期间存在，循环结束或用户操作后立即移除（不累积）。
+	*/
+	function watchTargetLine(view) {
+		if (typeof window === "undefined" || typeof window.requestAnimationFrame !== "function") return;
+		let released = false;
+		const handlers = [];
+		const detach = () => {
+			for (const item of handlers) view.dom.removeEventListener(item.type, item.handler, item.options);
+			handlers.length = 0;
+		};
+		const onUserGesture = () => {
+			released = true;
+			clearTargetLine(view);
+			detach();
+		};
+		const attach = (type, options) => {
+			view.dom.addEventListener(type, onUserGesture, options);
+			handlers.push({ type, handler: onUserGesture, options });
+		};
+		attach("mousedown", void 0);
+		attach("wheel", { passive: true });
+		attach("keydown", void 0);
+		attach("touchstart", { passive: true });
+		const started = typeof performance !== "undefined" ? performance.now() : Date.now();
+		let frames = 0;
+		const keepInView = () => {
+			if (released || viewDestroyed(view)) {
+				detach();
+				return;
+			}
+			try {
+				const head = view.state.selection.main.head;
+				const sc = view.scrollDOM;
+				const block = view.lineBlockAt(head);
+				const top = sc.scrollTop;
+				const bottom = top + sc.clientHeight;
+				if (block.top < top || block.bottom > bottom) {
+					sc.scrollTop = Math.max(0, block.top - sc.clientHeight / 2 + (block.bottom - block.top) / 2);
+					view.requestMeasure();
+				}
+			} catch {}
+			frames += 1;
+			const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+			if (now - started < 900 && frames < 90) window.requestAnimationFrame(keepInView);
+			else detach();
+		};
+		window.requestAnimationFrame(keepInView);
+	}
+	
 	function viewDestroyed(view) {
 		return view.dom.isConnected === false;
 	}
@@ -55844,6 +55939,8 @@ globalThis.__dshChunks__["editor"] = (require) => {
 						cmSurfaceTheme,
 						quoteFlashField,
 						quoteFlashHighlight,
+						targetLineField,
+						targetLineHighlight,
 						themeComp.of(dark),
 						...cmSearchExtensions(),
 						searchPhrases.of(),
@@ -56008,6 +56105,41 @@ globalThis.__dshChunks__["editor"] = (require) => {
 		*  every store notification, so without this a reader would be yanked back to
 		*  the same line each time — while a NEW line on the SAME file must land. */
 		const landedAtRef = (0, react.useRef)(null);
+		/** 面板再次点“查看源码”时（哪怕同一行），重新定位并重放高亮。 */
+		(0, react.useEffect)(() => {
+			if (typeof window === "undefined" || typeof window.addEventListener !== "function") return;
+			const normalizePath = (value) => String(value == null ? "" : value).replace(/\\/g, "/");
+			const onRevealLine = (event) => {
+				const detail = event == null ? void 0 : event.detail;
+				if (detail == null || typeof detail.line !== "number") return;
+				const samePath = (() => {
+				const a = normalizePath(detail.path);
+				const b = normalizePath(path);
+				if (a === b) return true;
+				const baseOf = (value) => value.split("/").filter((part) => part !== "").pop() || "";
+				return baseOf(a) !== "" && baseOf(a) === baseOf(b);
+			})();
+			if (!samePath) return;
+				const view = viewRef.current;
+				if (view === null) return;
+				// 认领这次跳转：面板据此判断“已有代码页可复用”，不会再去新开面板。
+				try { window.__dshPanelRevealHandled = true; } catch {}
+				const doc = view.state.doc;
+				const number = Math.min(Math.max(detail.line, 1), doc.lines);
+				const target = doc.line(number).from;
+				editScrollRef.current = 0;
+				editScrollMemory.delete(previewScrollKey(scope, path));
+				view.dispatch({
+					selection: { anchor: target },
+					effects: EditorView.scrollIntoView(target, { y: "center" })
+				});
+				view.focus();
+				setTargetLine(view, number);
+				watchTargetLine(view);
+			};
+			window.addEventListener("dsh-data-panel:reveal-line", onRevealLine);
+			return () => window.removeEventListener("dsh-data-panel:reveal-line", onRevealLine);
+		}, [path, scope]);
 		(0, react.useEffect)(() => {
 			if (line === void 0) {
 				landedAtRef.current = null;
@@ -56028,22 +56160,67 @@ globalThis.__dshChunks__["editor"] = (require) => {
 				ratio: 0
 			};
 			const doc = view.state.doc;
-			const target = doc.line(Math.min(Math.max(line, 1), doc.lines)).from;
+			// 只有面板「查看源码」的跳转才做居中 / 高亮 / 清滚动记忆；
+			// 对话里的 file:12 链接、引用片段、文件树等其它来源保持原有行为。
+			const panelDriven = (() => {
+				try {
+					if (typeof window === "undefined") return false;
+					const pending = window.__dshPanelRevealPending;
+					if (pending == null) return false;
+					const normalize = (value) => String(value == null ? "" : value).replace(/\\/g, "/");
+					const baseOf = (value) => normalize(value).split("/").filter((part) => part !== "").pop() || "";
+					const a = normalize(pending);
+					const b = normalize(path);
+					return a === b || baseOf(a) !== "" && baseOf(a) === baseOf(b);
+				} catch {
+					return false;
+				}
+			})();
+			// 标志由面板侧 5 秒定时器回收（这里提前清会让“先切模式再落地”的文件丢掉增强）。
+			const clampLine = (n) => Math.min(Math.max(n, 1), doc.lines);
+			// 严格按 codeRef 的行号落地：不吸附、不修正，数据错了就应该看得见。
+			const lineNumber = clampLine(line);
+			if (panelDriven) {
+				// 清掉“上次读到哪儿”的记忆，否则挂载后的 RestoreObserver 会把视野拖回原处。
+				editScrollRef.current = 0;
+				editScrollMemory.delete(previewScrollKey(scope, path));
+			}
+			const target = doc.line(lineNumber).from;
 			view.requestMeasure();
-			view.dispatch({ selection: { anchor: target } });
+			if (panelDriven) {
+				// CodeMirror 自己的滚动效果：只滚编辑器容器，虚拟化视口也准。
+				view.dispatch({
+					selection: { anchor: target },
+					effects: EditorView.scrollIntoView(target, { y: "center" })
+				});
+			} else {
+				view.dispatch({ selection: { anchor: target } });
+			}
 			view.focus();
+			if (panelDriven) {
+				setTargetLine(view, lineNumber);
+				watchTargetLine(view);
+			}
 			if (props.lineEnd !== void 0 && props.lineEnd > line) {
 				if (flashTimerRef.current !== void 0) clearTimeout(flashTimerRef.current);
 				flashTimerRef.current = flashQuoteLines(view, line, props.lineEnd);
 			}
 			requestAnimationFrame(() => {
 				requestAnimationFrame(() => {
-					const block = view.lineBlockAt(target);
-					view.scrollDOM.scrollTop = Math.max(0, block.top - 8);
-					view.requestMeasure();
+					try {
+						const block = view.lineBlockAt(target);
+						if (panelDriven) {
+							const height = block.bottom - block.top;
+							view.scrollDOM.scrollTop = Math.max(0, block.top - view.scrollDOM.clientHeight / 2 + height / 2);
+						} else {
+							view.scrollDOM.scrollTop = Math.max(0, block.top - 8);
+						}
+						view.requestMeasure();
+					} catch {}
 				});
 			});
-			props.onLineConsumed?.();
+			
+						props.onLineConsumed?.();
 		}, [
 			content,
 			path,

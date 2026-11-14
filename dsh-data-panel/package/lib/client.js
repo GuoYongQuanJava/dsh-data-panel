@@ -3309,13 +3309,35 @@ window.__ModuleLoader__.load({
 				// 相对路径交给它自己按 scope.cwd 解析；本来就是绝对路径才原样传。
 				var path = isAbsoluteCodePath(toPosixPath(target.path)) ? toPosixPath(target.path) : target.path;
 
-				service.openTab({
-					type: "editor",
-					path: path,
-					line: target.line,
-					target: "side",
-					reveal: true
-				}, scope);
+				// 先用“同步握手”问一次已经挂着的编辑器：
+				//   已打开过同一文件 → 由编辑器认领并跳转，面板不再新开面板；
+				//   没人认领（该文件还没打开）→ 才用 target:"side" 落到右侧栏。
+				var revealHandled = false;
+				try {
+					if (typeof window !== "undefined" && typeof window.dispatchEvent === "function" && typeof CustomEvent === "function") {
+						window.__dshPanelRevealHandled = false;
+						window.dispatchEvent(new CustomEvent("dsh-data-panel:reveal-line", { detail: { path: path, line: target.line } }));
+						revealHandled = window.__dshPanelRevealHandled === true;
+					}
+				} catch (error) { revealHandled = false; }
+				if (!revealHandled) {
+					// 告诉编辑器这次是面板发起的（启用居中/高亮），5 秒后自动回收。
+					try { window.__dshPanelRevealPending = path; } catch (error) {}
+					service.openTab({
+						type: "editor",
+						path: path,
+						line: target.line,
+						target: "side",
+						reveal: true
+					}, scope);
+					try {
+						if (typeof setTimeout === "function") {
+							setTimeout(function () {
+								if (window.__dshPanelRevealPending === path) window.__dshPanelRevealPending = null;
+							}, 5000);
+						}
+					} catch (error) {}
+				}
 				// 成功就清掉可能残留的提示——这条路径以前会留一条红色横幅。
 				store.setError("");
 				return true;
