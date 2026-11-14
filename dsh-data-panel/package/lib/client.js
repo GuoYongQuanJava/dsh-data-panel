@@ -20,8 +20,11 @@ window.__ModuleLoader__.load({
 /* 主区 tab 行末尾的「面板」按钮：贴着「工作流」右边，视觉上像 tab 但不是 tab。 */
 .dp-tab-btn {
 	flex: 0 0 auto;
-	align-self: center;
+	align-self: flex-start;
+	display: inline-flex;
+	align-items: center;
 	height: 26px;
+	margin-top: -5px;
 	margin-left: 6px;
 	padding: 0 10px;
 	border: 1px solid transparent;
@@ -30,7 +33,7 @@ window.__ModuleLoader__.load({
 	color: var(--dsw-alias-label-secondary, #646a73);
 	font-family: var(--dsw-font-family, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif);
 	font-size: 13px;
-	line-height: 1;
+	line-height: 16px;
 	white-space: nowrap;
 	cursor: pointer;
 	transition: background .14s, color .14s, border-color .14s;
