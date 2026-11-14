@@ -3965,10 +3965,14 @@ window.__ModuleLoader__.load({
 					// 宿主 slot 的 inject 第一个参数就是会话 id（dsh-client-ui-renderer 的 runInject），
 					// 以前这里整个丢掉了，执行按钮就不知道该把指令填进哪个会话。
 					inject: function (sessionId) {
+						var ownSessionId = typeof sessionId === "string" ? sessionId : "";
 						return {
-							openDetail: function (id) { openDetail(id); },
+							// 详情 tab 必须带上本面板的会话：不带的话详情页拿到的 sessionId 是空串，
+							// 会被判成「另一个会话」，而那条分支在 sessionId === "" 时直接不发请求，
+							// 于是 record 恒为 null，界面上永远是「用例不存在」。
+							openDetail: function (id) { openDetail(id, ownSessionId); },
 							openCode: function (ref) { openCode(ref); },
-							sessionId: typeof sessionId === "string" ? sessionId : "",
+							sessionId: ownSessionId,
 							dock: true
 						};
 					}
