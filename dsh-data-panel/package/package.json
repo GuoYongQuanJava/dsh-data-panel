@@ -12,8 +12,8 @@
   },
   "files": [
     "lib/index.js",
-    "lib/run.js",
     "lib/client.js",
+    "assets/run_tests.py",
     "cordis.patch.yml",
     "README.md"
   ],

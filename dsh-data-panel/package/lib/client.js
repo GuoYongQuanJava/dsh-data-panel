@@ -418,6 +418,13 @@ window.__ModuleLoader__.load({
 				case "link":
 					children = [h("path", { key: "a", d: "M10 13a5 5 0 0 0 7 0l2-2a5 5 0 0 0-7-7l-1 1" }), h("path", { key: "b", d: "M14 11a5 5 0 0 0-7 0l-2 2a5 5 0 0 0 7 7l1-1" })];
 					break;
+				case "warning":
+					children = [
+						h("path", { key: "a", d: "M12 4 2.5 20h19z" }),
+						h("path", { key: "b", d: "M12 10v4" }),
+						h("path", { key: "c", d: "M12 17h.01" })
+					];
+					break;
 				default:
 					children = [h("circle", { key: "c", cx: 12, cy: 12, r: 8 })];
 			}
@@ -427,7 +434,15 @@ window.__ModuleLoader__.load({
 
 		//#region store
 		function createStore() {
+			var getSessionId = function () { return ""; };
 			var snapshot = { status: "idle", records: [], demoCount: 0, error: "" };
+			var loadGeneration = 0;
+			// 写次数**按会话**记：A 在加载时 B 详情页写入，不能把 A 的 GET 误判成过期。
+			var writeCounts = Object.create(null);
+			function writeCountOf(sid) { return writeCounts[sid] || 0; }
+			// 本次读取因“期间发生过写入”被丢弃时，置位并在 finally 里补一次重载。
+			var staleReloadPending = false;
+			var lastSessionId = "";
 			var listeners = new Set();
 			var inflight = null;
 
@@ -452,14 +467,35 @@ window.__ModuleLoader__.load({
 				});
 			}
 
-			function request(body) {
-				var init = body === undefined
-					? { method: "GET", headers: { accept: "application/json" } }
-					: {
-						method: "POST",
-						headers: { "content-type": "application/json", accept: "application/json" },
-						body: JSON.stringify(body)
-					};
+			/**
+			 * 一个 API 请求。
+			 *
+			 * @param body 省略 = GET；否则 POST。
+			 * @param forcedSessionId 指定会话（详情页可能属于别的会话，不能依赖“当前”）。
+			 */
+			function request(body, forcedSessionId) {
+				var sid = typeof forcedSessionId === "string" && forcedSessionId !== ""
+					? forcedSessionId
+					: (typeof getSessionId === "function" ? getSessionId() : "");
+				if (body === undefined) {
+					var url = "/data-panel/api";
+					if (sid) url += "?sessionId=" + encodeURIComponent(sid);
+					var init = { method: "GET", headers: { accept: "application/json" } };
+					return fetch(url, init).then(function (response) {
+						return response.json().catch(function () { return {}; }).then(function (data) {
+							if (!response.ok || data.ok === false) {
+								throw new Error(data && data.error ? data.error : "请求失败（HTTP " + response.status + "）");
+							}
+							return data;
+						});
+					});
+				}
+				var postBody = Object.assign({}, body, { sessionId: sid });
+				var init = {
+					method: "POST",
+					headers: { "content-type": "application/json", accept: "application/json" },
+					body: JSON.stringify(postBody)
+				};
 				return fetch("/data-panel/api", init).then(function (response) {
 					return response.json().catch(function () { return {}; }).then(function (data) {
 						if (!response.ok || data.ok === false) {
@@ -470,7 +506,111 @@ window.__ModuleLoader__.load({
 				});
 			}
 
+			/**
+			 * 写请求（新建 / 编辑 / 删除 / 清空示例）。
+			 *
+			 * 请求发出时就固定它属于哪个会话；响应回来时如果用户已经切到别的会话，
+			 * 就**不碰**当前快照 —— 否则 A 会话的写结果会被画到 B 会话的列表上。
+			 * 服务端写的本来就是 A 的文件，这里只负责不污染界面。
+			 *
+			 * @param body 请求体。
+			 * @param apply 只在本会话仍为当前会话时执行的快照更新。
+			 * @param forcedSessionId 指定会话（详情页用），默认取当前会话。
+			 */
+			function mutate(body, apply, forcedSessionId) {
+				var sid = typeof forcedSessionId === "string" && forcedSessionId !== ""
+					? forcedSessionId
+					: (typeof getSessionId === "function" ? getSessionId() : "");
+				if (sid === "") {
+					return Promise.reject(new Error("还没有取得当前会话，稍后再试"));
+				}
+				return request(body, sid).then(function (data) {
+					// 写成功了：只递增“这个会话”的写计数，让它的在途 GET 知道自己过期。
+					writeCounts[sid] = writeCountOf(sid) + 1;
+					if (sid === lastSessionId) apply(data);
+					return data;
+				});
+			}
+
+			/**
+			 * 加载当前会话的记录。
+			 *
+			 * 三件事：会话变了就清空并重拉；会话未就绪就不请求；读取期间本会话发生过
+			 * 写入就把结果丢掉并补一次重载（否则界面会停在 loading）。
+			 *
+			 * 写成具名函数是因为 `finally` 里要重新调它 —— 不能引用对象字面量里的键。
+			 */
+			function loadSession(force) {
+				var currentSid = typeof getSessionId === "function" ? getSessionId() : "";
+				// 会话还没就绪：不发请求，也不保留上一个会话的数据。
+				if (currentSid === "") {
+					if (lastSessionId !== "" || snapshot.status !== "waiting-session") {
+						lastSessionId = "";
+						loadGeneration += 1;
+						inflight = null;
+						publish({ status: "waiting-session", records: [], demoCount: 0, error: "" });
+					}
+					return Promise.resolve(snapshot);
+				}
+				var sessionChanged = currentSid !== lastSessionId;
+				if (sessionChanged) {
+					lastSessionId = currentSid;
+					// 切会话：先把 epoch 推上去，让旧会话的在途请求即使回来也被丢弃。
+					loadGeneration += 1;
+					inflight = null;
+					publish({ status: "idle", records: [], demoCount: 0, error: "" });
+					force = true;
+				}
+				if (!force && snapshot.status === "ready") return Promise.resolve(snapshot);
+				if (inflight !== null) return inflight;
+				publish({ status: snapshot.status === "ready" ? "refreshing" : "loading", error: "" });
+				var gen = loadGeneration;
+				var loadSid = currentSid;
+				// 记住“本会话”当时已完成多少次写入：刷新期间如果发生写入，
+				// 这份 GET 的结果就已经旧了（它可能拿到写之前的数据）。
+				var writesAtStart = writeCountOf(loadSid);
+				inflight = request()
+					.then(function (data) {
+						if (gen !== loadGeneration) return; // 会话已切，丢弃
+						if (writesAtStart !== writeCountOf(loadSid)) {
+							// 本会话在读取期间写了数据：结果已旧，丢弃并标记补拉。
+							staleReloadPending = true;
+							return;
+						}
+						commit(data.records || []);
+						return snapshot;
+					})
+					.catch(function (error) {
+						if (gen !== loadGeneration) return; // stale error, discard
+						publish({ status: snapshot.status === "refreshing" ? "ready" : "error", error: error.message });
+						throw error;
+					})
+					.finally(function () {
+						if (gen !== loadGeneration) return; // stale, don't touch inflight
+						inflight = null;
+						if (staleReloadPending) {
+							staleReloadPending = false;
+							// 异步再拉一次：不在 finally 里同步递归，避免重入。
+							setTimeout(function () { loadSession(true).catch(function () {}); }, 0);
+						}
+					});
+				return inflight;
+			}
+
 			return {
+				setSessionId: function (fn) {
+					if (typeof fn === "function") getSessionId = fn;
+				},
+				/** 当前快照对应的会话（尚未加载过时为 ""）。订阅回调据此判断要不要重载。 */
+				loadedSessionId: function () {
+					return lastSessionId;
+				},
+				/** 拉某个会话的记录（详情页属于别的会话时用它，不碰当前快照）。 */
+				fetchRecords: function (sessionId) {
+					return request(undefined, sessionId).then(function (data) {
+						return data.records || [];
+					});
+				},
 				subscribe: function (listener) {
 					listeners.add(listener);
 					return function () {
@@ -483,52 +623,116 @@ window.__ModuleLoader__.load({
 				setError: function (message) {
 					publish({ error: message || "" });
 				},
-				load: function (force) {
-					if (!force && snapshot.status === "ready") return Promise.resolve(snapshot);
-					if (inflight !== null) return inflight;
-					publish({ status: snapshot.status === "ready" ? "refreshing" : "loading", error: "" });
-					inflight = request()
-						.then(function (data) {
-							commit(data.records || []);
-							return snapshot;
-						})
-						.catch(function (error) {
-							publish({ status: snapshot.status === "refreshing" ? "ready" : "error", error: error.message });
-							throw error;
-						})
-						.finally(function () {
-							inflight = null;
-						});
-					return inflight;
-				},
-				create: function (record) {
-					return request({ op: "create", record: record }).then(function (data) {
+				load: loadSession,
+				/** @param forcedSessionId 详情页传它自己的会话，避免写到当前会话。 */
+				create: function (record, forcedSessionId) {
+					return mutate({ op: "create", record: record }, function (data) {
 						commit(snapshot.records.concat([data.record]));
+					}, forcedSessionId).then(function (data) {
 						return data.record;
 					});
 				},
-				update: function (id, patch) {
-					return request({ op: "update", id: id, patch: patch }).then(function (data) {
+				update: function (id, patch, forcedSessionId) {
+					return mutate({ op: "update", id: id, patch: patch }, function (data) {
 						commit(snapshot.records.map(function (record) {
 							return record.id === id ? data.record : record;
 						}));
+					}, forcedSessionId).then(function (data) {
 						return data.record;
 					});
 				},
-				remove: function (id) {
-					return request({ op: "delete", id: id }).then(function () {
+				remove: function (id, forcedSessionId) {
+					return mutate({ op: "delete", id: id }, function () {
 						commit(snapshot.records.filter(function (record) { return record.id !== id; }));
-					});
+					}, forcedSessionId);
 				},
-				clearDemo: function () {
-					return request({ op: "clearDemo" }).then(function () {
+				clearDemo: function (forcedSessionId) {
+					return mutate({ op: "clearDemo" }, function () {
 						commit(snapshot.records.filter(function (record) { return record.demo !== true; }));
-					});
+					}, forcedSessionId);
 				}
 			};
 		}
 
 		var store = createStore();
+
+		/** 调一个 /data-panel/* 的 JSON 接口（统一错误处理）。 */
+		function callApi(path, init) {
+			return fetch(path, init).then(function (response) {
+				return response.json().catch(function () { return {}; }).then(function (data) {
+					if (!response.ok || data.ok === false) {
+						throw new Error(data && data.error ? data.error : "请求失败（HTTP " + response.status + "）");
+					}
+					return data;
+				});
+			});
+		}
+
+		/** 某会话的项目目录（会话资产就在它下面）。 */
+		function cwdOf(sessionId) {
+			var cwd = sessionCwd(sessionId);
+			return typeof cwd === "string" ? cwd : "";
+		}
+
+		/**
+		 * 请宿主准备一次执行：导出用例、铺好 runner、分配 runId，返回可直接运行的命令。
+		 *
+		 * 面板不再让模型自己跑 pytest 再回传日志 —— 那样漏调/超时/超长都会丢。
+		 * 现在模型只负责执行返回的命令，输出由 runner 边跑边写进 run.log。
+		 */
+		function prepareRun(sessionId, scope, caseId) {
+			if (typeof sessionId !== "string" || sessionId === "") {
+				return Promise.reject(new Error("还没有取得当前会话"));
+			}
+			var cwd = cwdOf(sessionId);
+			if (cwd === "") {
+				return Promise.reject(new Error("无法确定当前会话的项目目录"));
+			}
+			// cwd 只作为兜底：宿主会用会话自身的项目目录，并校验它确实存在。
+			var body = { sessionId: sessionId, cwd: cwd, scope: scope };
+			if (scope === "case") body.caseId = caseId || "";
+			return callApi("/data-panel/run/prepare", {
+				method: "POST",
+				headers: { "content-type": "application/json", accept: "application/json" },
+				body: JSON.stringify(body),
+			});
+		}
+
+		/** 该会话/该用例最近一次执行（exists=false 表示还没跑过）。 */
+		function fetchLatestRun(sessionId, scope, caseId) {
+			var params = new URLSearchParams();
+			params.set("sessionId", sessionId);
+			params.set("cwd", cwdOf(sessionId));
+			params.set("scope", scope);
+			if (scope === "case") params.set("caseId", caseId || "");
+			return callApi("/data-panel/run/latest?" + params.toString(), { method: "GET", headers: { accept: "application/json" } });
+		}
+
+		/** 某次执行的原始日志。 */
+		function fetchRunLog(sessionId, runId) {
+			var params = new URLSearchParams();
+			params.set("sessionId", sessionId);
+			params.set("cwd", cwdOf(sessionId));
+			params.set("runId", runId);
+			return callApi("/data-panel/run/log?" + params.toString(), { method: "GET", headers: { accept: "application/json" } });
+
+		/** 本会话各 runId 下的报告文件（只读）。 */
+		function fetchReportList(sessionId) {
+			var params = new URLSearchParams();
+			params.set("sessionId", sessionId);
+			params.set("cwd", cwdOf(sessionId));
+			return callApi("/data-panel/run/report?" + params.toString(), { method: "GET", headers: { accept: "application/json" } });
+		}
+
+		/** 某次 run 的报告数据与文件列表。 */
+		function fetchReportOf(sessionId, runId) {
+			var params = new URLSearchParams();
+			params.set("sessionId", sessionId);
+			params.set("cwd", cwdOf(sessionId));
+			params.set("runId", runId);
+			return callApi("/data-panel/run/report?" + params.toString(), { method: "GET", headers: { accept: "application/json" } });
+		}
+		}
 		//#endregion
 
 		//#region primitives
@@ -721,25 +925,234 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
-		 * 执行日志弹窗：目前只占位，内容留空，先保证「点得开、关得掉」。
-		 * props.record 为空 = 工具栏那一个（整批日志），否则是某条用例的操作列打开的。
-		 * 后面对接真实日志（执行输出 / 结果文件）时只改这里，不动调用方。
+		 * 执行日志弹窗。
+		 *
+		 * 日志由 runner 在执行时写进会话目录的 runs/<runId>/run.log：
+		 *   props.record 为空 → 工具栏那一个，读本会话最近一次「整体执行」；
+		 *   props.record 有值 → 某条用例，读它最近一次执行。
+		 * 找不到就明确说「还没有执行过」，不再用空白弹窗冒充“日志丢了”。
 		 */
 		function LogModal(props) {
 			var record = props.record || null;
+			var sessionId = typeof props.sessionId === "string" ? props.sessionId : "";
+			var state = useState({ status: "loading", content: "", error: "", updatedAt: "", result: null, runId: "" });
+			var view = state[0];
+			var setView = state[1];
+			var copyState = useState("复制日志");
+			var copyLabel = copyState[0];
+			var setCopyLabel = copyState[1];
+
+			useEffect(function () {
+				if (sessionId === "") {
+					setView({ status: "error", content: "", error: "还没拿到当前会话，稍后再试。", updatedAt: "", result: null, runId: "" });
+					return undefined;
+				}
+				var alive = true;
+				setView({ status: "loading", content: "", error: "", updatedAt: "", result: null, runId: "" });
+				var scope = record ? "case" : "all";
+				fetchLatestRun(sessionId, scope, record ? record.caseId : "").then(function (latest) {
+					if (!alive) return;
+					if (!latest || latest.exists !== true || !latest.runId) {
+						setView({ status: "empty", content: "", error: "", updatedAt: "", result: null, runId: "" });
+						return null;
+					}
+					return fetchRunLog(sessionId, latest.runId).then(function (log) {
+						if (!alive) return;
+						setView({
+							status: "ready",
+							content: log && log.exists ? (log.content || "") : "",
+							error: "",
+							updatedAt: (log && log.updatedAt) || "",
+							result: latest.result || null,
+							runId: latest.runId || "",
+						});
+					});
+				}).catch(function (failure) {
+					if (!alive) return;
+					setView({ status: "error", content: "", error: failure && failure.message ? failure.message : "读取日志失败", updatedAt: "", result: null, runId: "" });
+				});
+				return function () {
+					alive = false;
+				};
+			}, [sessionId, record ? record.id : "", record ? record.caseId : ""]);
+
+			function copy() {
+				try {
+					if (typeof navigator === "undefined" || !navigator.clipboard) {
+						setCopyLabel("请手动选中复制");
+						return;
+					}
+					navigator.clipboard.writeText(view.content).then(function () {
+						setCopyLabel("已复制");
+					}, function () {
+						setCopyLabel("复制失败");
+					});
+				} catch (error) {
+					setCopyLabel("复制失败");
+				}
+			}
+
+			var body = null;
+			if (view.status === "loading") {
+				body = h("div", { className: "dp-log-empty" },
+					h("span", { className: "dp-log-empty-icon" }, h(Icon, { name: "refresh", size: 26 })),
+					h("p", null, "正在读取日志…")
+				);
+			} else if (view.status === "error") {
+				body = h("div", { className: "dp-log-empty" },
+					h("span", { className: "dp-log-empty-icon" }, h(Icon, { name: "warning", size: 26 })),
+					h("p", null, view.error)
+				);
+			} else if (view.status === "empty") {
+				body = h("div", { className: "dp-log-empty" },
+					h("span", { className: "dp-log-empty-icon" }, h(Icon, { name: "log", size: 26 })),
+					h("p", null, record
+						? "这条用例还没有执行过。点它的「执行」按钮，run 完再回来看。"
+						: "还没有整体执行记录。点「全部执行」跑一次就会有了。")
+				);
+			} else {
+				var summary = summarizeRun(view.result);
+				body = h("div", null,
+					summary ? h("div", { className: "dp-run-result" }, summary) : null,
+					h("div", { className: "dp-code-meta" },
+						view.runId ? h("span", null, "运行 ", h("code", null, view.runId)) : null,
+						view.updatedAt ? h("span", null, " · 日志时间 ", h("code", null, fmtFull(view.updatedAt))) : null
+					),
+					view.content
+						? h("pre", { className: "dp-code-body" }, view.content)
+						: h("div", { className: "dp-log-empty" }, h("p", null, "这次执行没有产生输出。"))
+				);
+			}
+
 			return h(Modal, {
 				title: "执行日志",
 				subtitle: record
 					? (record.caseId ? record.caseId + " · " : "") + (record.title || "")
-					: "全部用例",
+					: "全部用例（最近一次整体执行）",
 				onClose: props.onClose,
-				footer: h(Button, { onClick: props.onClose }, "关闭")
-			},
-				h("div", { className: "dp-log-empty" },
-					h("span", { className: "dp-log-empty-icon" }, h(Icon, { name: "log", size: 26 })),
-					h("p", null, "暂无日志")
-				)
-			);
+				footer: [
+					view.status === "ready" ? h(Button, { key: "copy", onClick: copy }, copyLabel) : null,
+					h(Button, { key: "close", variant: "primary", onClick: props.onClose }, "关闭")
+				]
+			}, body);
+		}
+
+		/**
+		 * 报告弹窗（只读）。
+		 *
+		 * 报告由 Skill / 命令行调 bridge.py 生成，落在会话目录的 reports/<runId>/。
+		 * 面板不生成报告，只负责列出来并展示摘要，避免两处逻辑各算一次。
+		 */
+		function ReportModal(props) {
+			var sessionId = typeof props.sessionId === "string" ? props.sessionId : "";
+			var state = useState({ status: "loading", error: "", runs: [], detail: null });
+			var view = state[0];
+			var setView = state[1];
+
+			useEffect(function () {
+				if (sessionId === "") {
+					setView({ status: "error", error: "还没拿到当前会话，稍后再试。", runs: [], detail: null });
+					return undefined;
+				}
+				var alive = true;
+				setView({ status: "loading", error: "", runs: [], detail: null });
+				fetchReportList(sessionId).then(function (data) {
+					if (!alive) return;
+					var runs = (data && data.runs) || [];
+					if (runs.length === 0) {
+						setView({ status: "empty", error: "", runs: [], detail: null });
+						return null;
+					}
+					// 默认展开最新一份。
+					return fetchReportOf(sessionId, runs[0].runId).then(function (detail) {
+						if (!alive) return;
+						setView({ status: "ready", error: "", runs: runs, detail: detail });
+					});
+				}).catch(function (failure) {
+					if (!alive) return;
+					setView({ status: "error", error: failure && failure.message ? failure.message : "读取报告失败", runs: [], detail: null });
+				});
+				return function () {
+					alive = false;
+				};
+			}, [sessionId]);
+
+			function openRun(runId) {
+				fetchReportOf(sessionId, runId).then(function (detail) {
+					setView(function (previous) { return Object.assign({}, previous, { detail: detail }); });
+				}).catch(function () {
+					store.setError("读取该次报告失败");
+				});
+			}
+
+			var body = null;
+			if (view.status === "loading") {
+				body = h("div", { className: "dp-log-empty" },
+					h("span", { className: "dp-log-empty-icon" }, h(Icon, { name: "refresh", size: 26 })),
+					h("p", null, "正在读取报告…")
+				);
+			} else if (view.status === "error") {
+				body = h("div", { className: "dp-log-empty" },
+					h("span", { className: "dp-log-empty-icon" }, h(Icon, { name: "warning", size: 26 })),
+					h("p", null, view.error)
+				);
+			} else if (view.status === "empty") {
+				body = h("div", { className: "dp-log-empty" },
+					h("span", { className: "dp-log-empty-icon" }, h(Icon, { name: "doc", size: 26 })),
+					h("p", null, "还没有生成过报告。执行完测试后，按 Skill 的步骤跑 bridge.py 就会出现在这里。")
+				);
+			} else {
+				var detail = view.detail;
+				var data = detail && detail.data;
+				var summary = data && data.summary ? data.summary : null;
+				var meta = data && data.meta ? data.meta : null;
+				body = h("div", null,
+					h("div", { className: "dp-code-meta" },
+						view.runs.map(function (run) {
+							var active = detail && detail.runId === run.runId;
+							return h("button", {
+								key: run.runId,
+								type: "button",
+								className: "dp-pager-btn",
+								style: active ? { borderColor: "var(--dp-brand)", color: "var(--dp-brand)" } : null,
+								onClick: function () { openRun(run.runId); },
+							}, run.runId)
+						})
+					),
+					summary ? h("div", { className: "dp-run-result" },
+						"runId " + (meta ? meta.runId : "")
+						+ "　状态 " + (meta ? meta.statusText : "—")
+						+ "　共 " + summary.total
+						+ " 条，通过 " + summary.passed
+						+ "，失败 " + summary.failed
+						+ "，未执行 " + summary.notRun
+						+ (typeof summary.unconfirmed === "number" ? "，未确认 " + summary.unconfirmed : "")
+					) : null,
+					summary ? null : h("p", { className: "dp-hint" }, "这次 run 还没有 report-data.json（只生成了报告文件）。"),
+					detail && detail.files && detail.files.length > 0
+						? h("div", { className: "dp-code-meta" }, detail.files.map(function (file) {
+							return h("span", { key: file.name, style: { display: "inline-flex", alignItems: "center", gap: "6px" } },
+								h("code", null, file.name + "  (" + Math.round(file.size / 1024) + " KB)"),
+								// 只对确实存在的文件才给“打开”；用系统默认程序（Word）打开。
+								file.path ? h("button", {
+									type: "button",
+									className: "dp-icon-btn",
+									title: "用系统默认程序打开",
+									"aria-label": "用系统默认程序打开 " + file.name,
+									onClick: function () { openReportFile(file.path); },
+								}, h(Icon, { name: "external", size: 14 })) : null
+							);
+						}))
+						: null
+				);
+			}
+
+			return h(Modal, {
+				title: "测试报告",
+				subtitle: "只读：由 bridge.py 生成在 reports/<runId>/",
+				onClose: props.onClose,
+				footer: h(Button, { variant: "primary", onClick: props.onClose }, "关闭"),
+			}, body);
 		}
 		//#endregion
 
@@ -967,8 +1380,15 @@ window.__ModuleLoader__.load({
 			var logState = useState(null);
 			var logView = logState[0];
 			var setLogView = logState[1];
+			// 报告弹窗（只读）。
+			var reportState = useState(false);
+			var reportView = reportState[0];
+			var setReportView = reportState[1];
 
 			useEffect(function () {
+				// 面板打开是一个明确信号：至少此刻要确保会话订阅已经建立，
+				// 否则用户切换会话时这里不会自动刷新（重启后曾出现过）。
+				ensureSessionSubscription(true);
 				store.load().catch(function () {});
 			}, []);
 
@@ -1013,7 +1433,8 @@ window.__ModuleLoader__.load({
 					store.setError("右侧栏服务尚未就绪，请刷新页面后再试。");
 					return;
 				}
-				props.openDetail(id);
+				// 带上本面板自己的会话：详情页要用它解析相对路径、并且只能改它自己的数据。
+				props.openDetail(id, props.sessionId);
 			}
 
 			function openCreate() {
@@ -1065,6 +1486,8 @@ window.__ModuleLoader__.load({
 			}
 
 			var loading = (snap.status === "idle" || snap.status === "loading") && records.length === 0;
+			// 还没拿到当前会话：不能去读任何数据，界面直接说清楚在等什么。
+			var waitingSession = snap.status === "waiting-session";
 			var filtering = query.trim() !== "" || type !== "all";
 
 			// 面板只作为右侧栏的「测试用例」tab 存在（见 apply 里的注册）。
@@ -1114,12 +1537,23 @@ window.__ModuleLoader__.load({
 							snap.status === "refreshing" ? "刷新中…" : "刷新"
 						),
 						h(Button, { variant: "ghost", onClick: function () {
-							// 不再自己跑 pytest（文件名写死必 ENOENT）：把指令预填到当前会话的输入框，
-							// 由对话里的模型自己找文件、执行、贴结果。见 prefillDraft()。
-							var outcome = prefillDraft(panelSessionId(props), runAllPrompt());
-							if (!outcome.ok) { store.setError("执行：" + outcome.message); return; }
-							store.setError("");
-							setRunResult(outcome.message);
+							// 先让宿主准备（导出用例 + 生成 runId + 给命令），再把命令预填到面板所属会话。
+							var currentRecords = snap.records || [];
+							var targetSession = panelSessionId(props);
+							if (currentRecords.length === 0) {
+								store.setError("当前面板里还没有用例，先新增或生成用例后再执行。");
+								return;
+							}
+							setRunResult("正在准备执行…");
+							prepareRun(targetSession, "all", "").then(function (prep) {
+								var outcome = prefillDraft(targetSession, runAllPrompt(currentRecords, targetSession, prep));
+								if (!outcome.ok) { setRunResult(""); store.setError("执行：" + outcome.message); return; }
+								store.setError("");
+								setRunResult(outcome.message + "  运行编号：" + prep.runId);
+							}).catch(function (failure) {
+								setRunResult("");
+								store.setError("执行准备失败：" + (failure && failure.message ? failure.message : String(failure)));
+							});
 						}, disabled: snap.status === "refreshing" },
 							h(Icon, { name: "code", size: 15 }),
 							"全部执行"
@@ -1128,12 +1562,16 @@ window.__ModuleLoader__.load({
 							h(Icon, { name: "plus", size: 15 }),
 							"新增用例"
 						),
-						// 整批执行日志：先只加按钮，内容留待后续实现。
+						// 整批执行日志 + 报告（只读）。
 						h(Button, {
 							className: "dp-log-btn",
 							onClick: function () { setLogView({ record: null }); },
-							title: "查看全部用例的执行日志"
-						}, "日志")
+							title: "查看本节全部用例的执行日志"
+						}, "日志"),
+						h(Button, {
+							onClick: function () { setReportView(true); },
+							title: "查看已生成的测试报告"
+						}, "报告")
 					),
 					runResult ? h("div", { className: "dp-run-result" }, runResult) : null,
 					snap.error ? h("div", { className: "dp-alert" },
@@ -1150,7 +1588,13 @@ window.__ModuleLoader__.load({
 					) : null,
 					h("div", { className: "dp-card" },
 						h("div", { className: "dp-card-scroll" },
-							loading
+							waitingSession
+								? h("div", { className: "dp-empty" },
+									h("div", { className: "dp-empty-icon" }, h(Icon, { name: "time", size: 22 })),
+									h("h3", null, "正在取得当前会话"),
+									h("p", null, "用例按会话存储，拿到当前会话后会自动加载它自己的用例。稍等一下；如果一直停在这里，点「刷新」重试。")
+								)
+								: loading
 								? h(SkeletonTable)
 								: filtered.length === 0
 									? h(EmptyState, {
@@ -1206,7 +1650,7 @@ window.__ModuleLoader__.load({
 															label: (record.codeRef ? "查看源码 " : "查看代码 ") + record.title,
 															onClick: function () {
 																// 有用例源码位置就跳编辑器；没有则沿用弹窗看用例代码。
-																if (record.codeRef && typeof props.openCode === "function") props.openCode(record.codeRef);
+														if (record.codeRef && typeof props.openCode === "function") props.openCode(record.codeRef, props.sessionId);
 																else setCodeRecord(record);
 															}
 														}),
@@ -1214,11 +1658,18 @@ window.__ModuleLoader__.load({
 															name: "external",
 															label: "执行 " + record.title,
 															onClick: function () {
-																// 点执行 = 把这条用例的指令预填到当前会话的输入框，由对话里的模型去跑。
-																var outcome = prefillDraft(panelSessionId(props), runPrompt(record));
-																if (!outcome.ok) { store.setError("执行：" + outcome.message); return; }
-																store.setError("");
-																setRunResult(outcome.message);
+														// 点执行 = 宿主准备好命令，再预填到面板所属会话的输入框。
+														var targetSession2 = panelSessionId(props);
+														setRunResult("正在准备执行 " + record.caseId + "…");
+														prepareRun(targetSession2, "case", record.caseId).then(function (prep) {
+															var outcome = prefillDraft(targetSession2, runPrompt(record, targetSession2, prep));
+															if (!outcome.ok) { setRunResult(""); store.setError("执行：" + outcome.message); return; }
+															store.setError("");
+															setRunResult(outcome.message + "  运行编号：" + prep.runId);
+														}).catch(function (failure) {
+															setRunResult("");
+															store.setError("执行准备失败：" + (failure && failure.message ? failure.message : String(failure)));
+														});
 															}
 														}),
 														h(IconButton, {
@@ -1232,11 +1683,11 @@ window.__ModuleLoader__.load({
 															danger: true,
 															onClick: function () { setConfirm({ kind: "delete", record: record }); }
 														}),
-														// 单条用例的执行日志：内容暂空，先占位。
-														h(LogButton, {
-															label: "日志 " + record.title,
-															onClick: function () { setLogView({ record: record }); }
-														})
+												// 单条用例的执行日志：读这条用例自己的那份。
+												h(LogButton, {
+													label: "日志 " + record.title,
+													onClick: function () { setLogView({ record: record }); }
+												})
 													)
 												)
 											);
@@ -1269,7 +1720,13 @@ window.__ModuleLoader__.load({
 				}) : null,
 				logView !== null ? h(LogModal, {
 					record: logView.record,
+					// 日志按面板所属会话读，不跟着主区会话飘。
+					sessionId: panelSessionId(props),
 					onClose: function () { setLogView(null); }
+				}) : null,
+				reportView ? h(ReportModal, {
+					sessionId: panelSessionId(props),
+					onClose: function () { setReportView(false); }
 				}) : null,
 				confirm !== null ? h(ConfirmDialog, {
 					title: confirm.kind === "clearDemo" ? "清空示例用例？" : "删除这条用例？",
@@ -1500,9 +1957,43 @@ window.__ModuleLoader__.load({
 			var error = errorState[0];
 			var setError = errorState[1];
 
+			// 详情页可能属于“另一个会话”（右侧栏 keepMounted，用户已切走）。
+			// 这时不能读当前共享 store 的记录，否则会显示成别会话的记录。
+			var ownState = useState(null);
+			// 重试按钮要能真的重新拉取：effect 的依赖里必须有它。
+			var reloadState = useState(0);
+			var reloadKey = reloadState[0];
+			var setReloadKey = reloadState[1];
+			var own = ownState[0];
+			var setOwn = ownState[1];
+			var loadedSid = store.loadedSessionId();
+			var sameSession = sessionId !== "" && sessionId === loadedSid;
+
 			useEffect(function () {
+				// 进详情页时确保会话订阅已建立，并拉一次当前会话数据（供会话一致时复用）。
+				ensureSessionSubscription(true);
 				store.load().catch(function () {});
 			}, []);
+
+			// 详情页所属会话 ≠ 当前会话时，单独把这个会话的记录拉一遍。
+			useEffect(function () {
+				if (sessionId === "" || sameSession) {
+					setOwn(null);
+					return undefined;
+				}
+				var alive = true;
+				setOwn({ status: "loading", records: [], error: "" });
+				store.fetchRecords(sessionId).then(function (records) {
+					if (!alive) return;
+					setOwn({ status: "ready", records: records, error: "" });
+				}).catch(function (failure) {
+					if (!alive) return;
+					setOwn({ status: "error", records: [], error: failure && failure.message ? failure.message : "加载失败" });
+				});
+				return function () {
+					alive = false;
+				};
+			}, [sessionId, sameSession, reloadKey]);
 
 			useEffect(function () {
 				setEditing(false);
@@ -1510,7 +2001,8 @@ window.__ModuleLoader__.load({
 				setError("");
 			}, [id]);
 
-			var record = snap.records.find(function (item) { return item.id === id; }) || null;
+			var records = sameSession ? (snap.records || []) : (own && own.records ? own.records : []);
+			var record = records.find(function (item) { return item.id === id; }) || null;
 
 			function closeTab() {
 				try {
@@ -1525,8 +2017,17 @@ window.__ModuleLoader__.load({
 			function save(values) {
 				setBusy(true);
 				setError("");
-				store.update(id, values)
-					.then(function () {
+				store.update(id, values, sessionId)
+					.then(function (updated) {
+						// 会话不一致时 store 不会动快照，这里补一份本地更新，界面才不会显得没保存。
+						if (!sameSession && updated) {
+							setOwn(function (previous) {
+								if (previous === null || !previous.records) return previous;
+								return Object.assign({}, previous, {
+									records: previous.records.map(function (item) { return item.id === id ? updated : item; })
+								});
+							});
+						}
 						setEditing(false);
 					})
 					.catch(function (failure) {
@@ -1540,7 +2041,7 @@ window.__ModuleLoader__.load({
 			function remove() {
 				setBusy(true);
 				setError("");
-				store.remove(id)
+				store.remove(id, sessionId)
 					.then(function () {
 						setConfirm(false);
 						closeTab();
@@ -1562,7 +2063,11 @@ window.__ModuleLoader__.load({
 				);
 			}
 
-			if ((snap.status === "idle" || snap.status === "loading") && record === null) {
+			// 当前会话还在加载，或者这条详情属于自己的另一个会话且还在拉取。
+			var stillLoading = sameSession
+				? (snap.status === "idle" || snap.status === "loading" || snap.status === "waiting-session")
+				: (own !== null && own.status === "loading");
+			if (stillLoading && record === null) {
 				return h("div", { className: "dp-detail" },
 					h("div", { className: "dp-skeleton-wrap" },
 						[0, 1, 2].map(function (index) {
@@ -1574,12 +2079,20 @@ window.__ModuleLoader__.load({
 				);
 			}
 
-			if (record === null && snap.error) {
+			var loadError = sameSession ? snap.error : (own && own.error ? own.error : "");
+			if (record === null && loadError) {
 				return h("div", { className: "dp-detail" },
 					h("div", { className: "dp-detail-empty" },
 						h("h3", null, "加载失败"),
-						h("p", null, snap.error),
-						h(Button, { size: "sm", onClick: function () { store.load(true).catch(function () {}); } }, "重试")
+						h("p", null, loadError),
+						h(Button, {
+							size: "sm",
+							onClick: function () {
+								if (sameSession) { store.load(true).catch(function () {}); return; }
+								// 换个 key 让负责请求的 effect 重新跑一遗（只 setOwn(null) 不会触发它）。
+								setReloadKey(function (n) { return n + 1; });
+							}
+						}, "重试")
 					)
 				);
 			}
@@ -1667,22 +2180,119 @@ window.__ModuleLoader__.load({
 		 * 取 dsh-better-sidebar 的客户端服务。
 		 * 它不是 DSH 核心服务，未安装时 ctx.get 可能抛错，按需探测且不缓存，
 		 * 这样插件后于本插件加载也能被接上。
+		 *
+		 * @param quiet 探测性质（比如等它加载完再订阅）时传 true：
+		 *   此时不应往界面写红色错误，否则重试会反复弹“服务未注册”。
 		 */
-		function betterSidebarService() {
+		function betterSidebarService(quiet) {
+			var trace = quiet === true ? function () {} : codeTrace;
 			if (clientCtx === null || typeof clientCtx.get !== "function") {
-				codeTrace("客户端上下文未就绪");
+				trace("客户端上下文未就绪");
 				return null;
 			}
 			try {
 				var service = clientCtx.get("betterSidebar");
-				if (!service || typeof service.openTab !== "function") {
-					codeTrace("better-sidebar 服务未注册（可能未启用）");
+				// 订阅只需要 subscribeState；openTab 是打开标签用的，
+				// 只暴露订阅能力的服务也算可用。
+				if (!service || (typeof service.openTab !== "function" && typeof service.subscribeState !== "function")) {
+					trace("better-sidebar 服务未注册（可能未启用）");
 					return null;
 				}
 				return service;
 			} catch (error) {
-				codeTrace("读取 betterSidebar 失败: " + (error instanceof Error ? error.message : String(error)));
+				trace("读取 betterSidebar 失败: " + (error instanceof Error ? error.message : String(error)));
 				return null;
+			}
+		}
+
+		/**
+		 * 当前活跃会话 ID（拿不到就返回空串）。
+		 * 每次都现取，不缓存 —— 插件加载顺序不确定，缓存会把“还没就绪”冻住。
+		 */
+		function activeSessionIdOf() {
+			var service = betterSidebarService(true);
+			if (service !== null && typeof service.getSnapshot === "function") {
+				try {
+					return service.getSnapshot().sessionId || "";
+				} catch {
+					// 快照读不到就按空处理。
+				}
+			}
+			return "";
+		}
+
+		/** 会话订阅句柄（一个客户端实例只需一份）。 */
+		var sessionSubscription = null;
+		var sessionSubscribeTimer = null;
+		var sessionSubscribeDeadline = 0;
+		var SESSION_SUBSCRIBE_RETRY_MS = 400;
+		var SESSION_SUBSCRIBE_WINDOW_MS = 30000;
+
+		/**
+		 * 幂等地建立“会话切换 → 重新加载”的订阅。
+		 *
+		 * better-sidebar 不是 DSH 核心服务，插件加载顺序不保证：它可能晚于本插件
+		 * 注册，重启后尤其容易变。所以这里在拿不到服务时按短间隔重试一段窗口，
+		 * 而不是探测一次就放弃（探测一次会让切会话静默地不再刷新）。
+		 *
+		 * @param retry 显式触发（比如用户打开面板）时传 true：重置重试窗口。
+		 * @returns 是否已建立订阅。
+		 */
+		function ensureSessionSubscription(retry) {
+			if (sessionSubscription !== null) return true;
+			if (retry === true) {
+				sessionSubscribeDeadline = 0;
+				if (sessionSubscribeTimer !== null) {
+					clearTimeout(sessionSubscribeTimer);
+					sessionSubscribeTimer = null;
+				}
+			}
+			var service = betterSidebarService(true);
+			if (service === null || typeof service.subscribeState !== "function") {
+				var now = Date.now();
+				if (sessionSubscribeDeadline === 0) sessionSubscribeDeadline = now + SESSION_SUBSCRIBE_WINDOW_MS;
+				if (sessionSubscribeTimer === null && now < sessionSubscribeDeadline) {
+					sessionSubscribeTimer = setTimeout(function () {
+						sessionSubscribeTimer = null;
+						ensureSessionSubscription();
+					}, SESSION_SUBSCRIBE_RETRY_MS);
+				}
+				return false;
+			}
+			try {
+				var reconcile = function () {
+					// 状态变化也包括开关标签、改设置，只有会话真变了才重拉，
+					// 否则每次点标签都会打一次全量请求。
+					if (activeSessionIdOf() !== store.loadedSessionId()) {
+						store.load(true).catch(function () {});
+					}
+				};
+				sessionSubscription = service.subscribeState(reconcile);
+				// 订阅刚建立时立即对账一次：之前可能因为服务未就绪而停在等待态，
+				// 不能只等下一次状态变化才把数据拉回来。
+				reconcile();
+			} catch (error) {
+				return false;
+			}
+			sessionSubscribeDeadline = 0;
+			return true;
+		}
+
+		/** 退订并清掉重试定时器（插件卸载时调）。 */
+		function stopSessionSubscription() {
+			if (sessionSubscribeTimer !== null) {
+				clearTimeout(sessionSubscribeTimer);
+				sessionSubscribeTimer = null;
+			}
+			sessionSubscribeDeadline = 0;
+			if (sessionSubscription !== null) {
+				var dispose = sessionSubscription;
+				sessionSubscription = null;
+				try {
+					if (typeof dispose === "function") dispose();
+				} catch {
+					// 已经拆掉就算了。
+				}
 			}
 		}
 
@@ -1810,15 +2420,15 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
-		 * 执行指令要填进哪个会话：**主区正在看的那个**。
-		 * 面板在右侧栏、对话在主区，正常是同一个会话；万一用户切了会话而旧面板实例还留着
-		 * （宿主 TabSlot 的 keepMounted），按活跃会话填才不会「填了但眼前看不见」。
-		 * 拿不到活跃会话时退回宿主给 slot 的 inject 第一个参数（runInject 传的就是会话 id）。
+		 * 执行指令要填进哪个会话：**面板自己所属的那个**。
+		 *
+		 * 面板显示的是哪个会话的用例，指令就要进哪个会话 —— 否则 A 会话的用例
+		 * 会被填进 B 会话的对话，模型在 B 的工作区里跑，跑的就不是这些用例了。
+		 * 面板所属会话取宿主 slot 注入的 sessionId；拿不到时才退回活跃会话。
 		 */
 		function panelSessionId(props) {
-			var active = activeSessionId();
-			if (active !== "") return active;
-			return props && typeof props.sessionId === "string" ? props.sessionId : "";
+			if (props && typeof props.sessionId === "string" && props.sessionId !== "") return props.sessionId;
+			return activeSessionId();
 		}
 
 		/**
@@ -1849,8 +2459,8 @@ window.__ModuleLoader__.load({
 			return null;
 		}
 
-		var DRAFT_FILLED = "已把执行指令填到对话输入框，切到对话按回车发送。";
-		var DRAFT_APPENDED = "输入框里原有内容已保留，执行指令追加在后面；切到对话按回车发送。";
+		var DRAFT_FILLED = "已把执行指令填进对话输入框（原有草稿会被替换），切到对话按回车发送。";
+		var DRAFT_APPENDED = "已把执行指令追加到输入框末尾；切到对话按回车发送。";
 
 		/**
 		 * 把一段指令预填进会话输入框，**不发送**。
@@ -1870,75 +2480,116 @@ window.__ModuleLoader__.load({
 			var hub = draftHubOf(sessionId);
 			if (hub === null) return { ok: false, message: "当前会话还没就绪，切到对话再点一次。" };
 
-			if (sessions !== null && typeof hub.requestDraftInitialization === "function" && typeof sessions.binding === "function") {
-				try {
-					var binding = sessions.binding(sessionId);
-					if (binding) {
-						var outcome = hub.requestDraftInitialization(binding, { prompt: text, whenDraftExists: "keep" });
-						if (outcome === "applied") return { ok: true, message: DRAFT_FILLED };
-						if (outcome === "blocked") return { ok: false, message: "输入框正在发送中，等这一轮结束再点。" };
-						// "preserved" = 用户已经写了草稿，这里不覆盖，继续往下追加。
-					}
-				} catch {
-					// 版本差异或 scope 不匹配，落到下一级。
-				}
-			}
-
+			// 先走官方预填接口：它会在“输入框正在发送”时返回 blocked —— 这是覆盖行为的闸门。
+			// 只有它说“已有草稿（preserved）”时，才接着用 setDraft 覆盖。
 			var shell = null;
 			try {
 				if (typeof hub.shell === "function") shell = hub.shell(sessionId);
 			} catch {
 				shell = null;
 			}
-			if (shell === null) return { ok: false, message: "定位不到当前会话的输入框。" };
 
-			try {
-				var draft = shell.snapshot && typeof shell.snapshot.draft === "string" ? shell.snapshot.draft : "";
-				var hadContent = draft.trim() !== "";
-				if (typeof shell.appendDraft === "function" && hadContent) {
-					shell.appendDraft("\n\n" + text);
-				} else if (typeof shell.setDraft === "function") {
-					shell.setDraft(text);
-				} else if (typeof shell.appendDraft === "function") {
-					shell.appendDraft(text);
-				} else {
-					return { ok: false, message: "当前 DSH 版本不支持把指令填进输入框。" };
+			// 官方「程序化预填草稿」入口：它负责“正在发送”的闸门（返回 blocked）。
+			// 拿不到这个入口就不能确定当前是否在发送 —— 这时候不强行覆盖，
+			// 否则可能在用户发消息的瞬间把草稿改掉。
+			var officialUsable = false;
+			if (sessions !== null && typeof hub.requestDraftInitialization === "function" && typeof sessions.binding === "function") {
+				try {
+					var binding = sessions.binding(sessionId);
+					if (binding) {
+						officialUsable = true;
+						var outcome = hub.requestDraftInitialization(binding, { prompt: text, whenDraftExists: "keep" });
+						if (outcome === "applied") return { ok: true, message: DRAFT_FILLED };
+						if (outcome === "blocked") return { ok: false, message: "输入框正在发送中，等这一轮结束再点。" };
+						// "preserved" = 用户已经写了草稿。按约定这里要覆盖，走下面的 setDraft。
+					}
+				} catch {
+					officialUsable = false;
 				}
-				return { ok: true, message: hadContent ? DRAFT_APPENDED : DRAFT_FILLED };
-			} catch (error) {
-				return { ok: false, message: "填进输入框失败：" + (error instanceof Error ? error.message : String(error)) };
 			}
+
+			// 覆盖写：执行指令会替掉原有草稿（这是约定好的行为）。
+			// 但只有在官方接口确认过“不在发送中”后才允许 —— 没有这个闸门就不覆盖。
+			if (officialUsable && shell !== null && typeof shell.setDraft === "function") {
+				try {
+					shell.setDraft(text);
+					return { ok: true, message: DRAFT_FILLED };
+				} catch (error) {
+					return { ok: false, message: "填进输入框失败：" + (error instanceof Error ? error.message : String(error)) };
+				}
+			}
+
+			// 拿不到“是否在发送”的闸门就不写，把原因说清楚，而不是冒险改用户草稿。
+			if (!officialUsable) {
+				return { ok: false, message: "当前 DSH 版本不支持安全地预填草稿（拿不到发送状态），请手动复制指令后再发送。" };
+			}
+
+			return { ok: false, message: "当前 DSH 版本不支持把指令填进输入框。" };
 		}
 
-		/** 单条用例的执行指令：把用例信息交代清楚，让模型自己找文件、跑、贴结果。 */
-		function runPrompt(record) {
+		/**
+		 * 执行指令里“怎么跑”的那一段。
+		 *
+		 * 关键：命令由宿主生成（已含项目目录、会话资产目录、runId），模型只需原样执行。
+		 * 日志由 runner 边跑边写，不再靠模型回传 —— 漏调/超时/超长都会丢。
+		 */
+		function runInstruction(prep) {
+			var lines = [
+				"执行方式（只需要跑下面这一条命令，不要自己另拼 pytest 命令）：",
+				"",
+				"    " + prep.command,
+				"",
+				"这条命令会自己做完下面几件事，不需要你另外处理：",
+				"1. 把 pytest 的原始输出实时打印出来（我能直接看到）；",
+				"2. 把完整输出写进本会话的 runs/" + prep.runId + "/run.log；",
+				"3. 结束时写 result.json（退出码 / 通过失败数 / 耗时 / 状态）。",
+				"",
+				"要求：",
+				"1. 原样执行上面的命令，不要新建或修改测试文件，也不要改成跑别的用例。",
+				"2. 跑完后用一两句话总结：通过还是失败、失败的是哪条用例、失败原因是什么。",
+				"3. 如果命令本身起不来（找不到 python、测试文件缺失、权限问题），把报错原文告诉我，不要自己另找测试文件重跑。",
+				"4. 如果命令告诉你“测试文件在准备后被修改”，停下来告诉我要重新点一次执行，不要自己重跑。"
+			];
+			if (Array.isArray(prep.missingTestFunc) && prep.missingTestFunc.length > 0) {
+				lines.push("5. 注意：以下用例没有关联测试函数，这次不会被执行：" + prep.missingTestFunc.join("、"));
+			}
+			return lines.join("\n");
+		}
+		/** 单条用例的执行指令：说清是什么用例，然后给出宿主编好的命令。 */
+		function runPrompt(record, sessionId, prep) {
 			var typeLabel = TEST_TYPES[record.testType] ? TEST_TYPES[record.testType].label : "测试";
 			var lines = ["请执行测试用例 " + record.caseId + "（" + record.title + "）这条" + typeLabel + "用例。", ""];
 			if (record.description) lines.push("用例说明：" + record.description);
 			if (record.input) lines.push("输入：" + record.input);
 			if (record.expected) lines.push("预期输出：" + record.expected);
 			if (lines.length > 2) lines.push("");
-			lines.push(
-				"执行要求：",
-				"1. 先在当前工作区找到这条用例对应的测试函数：看 .dsh/testcases/cases.json 里该用例的 testFunc，没登记就从用例代码里认函数名；测试文件通常位于 tests/test_generated.py，以实际存在的为准。",
-				"2. 只跑这一个用例，例如 python -m pytest <测试文件> -k <测试函数> -v --tb=short。",
-				"3. 不要新建或改写测试文件；找不到测试文件或测试函数就把缺什么告我。",
-				"4. 把执行的命令、实际输出和通过/失败结论贴在对话里。"
-			);
+			lines.push(runInstruction(prep));
 			return lines.join("\n");
 		}
 
-		/** 「全部执行」的执行指令。 */
-		function runAllPrompt() {
+		/**
+		 * 「全部执行」的执行指令。
+		 *
+		 * 范围就是**本会话用例面板里的这些用例**；命令由宿主拼好，只跑这些测试函数。
+		 *
+		 * @param records 本会话面板里的用例。
+		 * @param prep 宿主准备的结果（含命令与 runId）。
+		 */
+		function runAllPrompt(records, sessionId, prep) {
+			var list = Array.isArray(records) ? records : [];
+			if (list.length === 0) {
+				return ["当前面板里还没有用例，先新增或用工作流生成用例后再执行。"].join("\n");
+			}
+			var named = list.map(function (record) {
+				return "- " + record.caseId + "（" + record.title + "）";
+			});
 			return [
-				"请执行当前工作区里的全部测试用例。",
+				"请执行本会话用例面板里的全部用例（共 " + list.length + " 条）：",
+				""
+			].concat(named).concat([
 				"",
-				"执行要求：",
-				"1. 测试文件以 .dsh/testcases/cases.json 里登记的为准，通常位于 tests/test_generated.py，以实际存在的为准。",
-				"2. 用 pytest 跑整个文件，例如 python -m pytest <测试文件> -v --tb=short。",
-				"3. 不要新建或改写测试文件；找不到就直接说缺什么。",
-				"4. 把执行的命令、输出和通过/失败统计贴在对话里。"
-			].join("\n");
+				runInstruction(prep)
+			]).join("\n");
 		}
 
 		/** 相对路径补上工作区目录；拿不到工作区时返回空串。 */
@@ -1967,6 +2618,58 @@ window.__ModuleLoader__.load({
 				+ "/" + relative.split("/").map(encodeAddressSegment).join("/");
 		}
 
+
+		/** 把 result.json 摘要成一句可读的话（状态 / 通过失败 / 耗时）。 */
+
+		/**
+		 * 用系统默认程序打开一个已存在的文件（报告）。
+		 *
+		 * 面板不内联渲染 docx：交给宿主打开。打不开就把原因说清楚，
+		 * 而不是“点了没反应”。
+		 */
+		function openReportFile(path) {
+			if (typeof path !== "string" || path === "") {
+				store.setError("报告文件路径为空");
+				return;
+			}
+			if (workspaces === null || typeof workspaces.openPath !== "function") {
+				store.setError("当前环境不支持用系统默认程序打开：" + path);
+				return;
+			}
+			try {
+				workspaces.openPath(path);
+				store.setError("");
+			} catch (error) {
+				store.setError("打开失败：" + (error instanceof Error ? error.message : String(error)));
+			}
+		}
+		function summarizeRun(result) {
+			if (!result || typeof result !== "object") return "";
+			var statusText = {
+				passed: "全部通过",
+				failed: "有失败",
+				timeout: "执行超时",
+				interrupted: "执行被中断",
+				"no-cases": "本会话没有用例",
+				"no-case": "找不到这条用例",
+				"no-test-file": "找不到测试代码",
+				"no-tests": "没有收集到测试",
+				running: "执行中",
+			}[result.status] || String(result.status || "未知");
+			var parts = [statusText];
+			if (typeof result.passed === "number" || typeof result.failed === "number") {
+				parts.push("通过 " + (result.passed || 0) + " / 失败 " + (result.failed || 0));
+			}
+			if (typeof result.durationMs === "number") {
+				parts.push((result.durationMs / 1000).toFixed(1) + " 秒");
+			}
+			if (typeof result.startedAt === "string" && result.startedAt) {
+				parts.push(result.startedAt);
+			}
+			var line = parts.join(" · ");
+			if (typeof result.note === "string" && result.note) line += "\n" + result.note;
+			return line;
+		}
 		/**
 		 * 侧栏是否具备打开文件的能力。
 		 *
@@ -2200,6 +2903,22 @@ window.__ModuleLoader__.load({
 				};
 			}, "dsh-data-panel: client context");
 
+			// 会话跟踪：订阅 better-sidebar 的状态变化，
+			// 用户切换会话时自动清空旧数据并加载新会话的用例。
+			//
+			// 关键：apply 执行时 better-sidebar 很可能还没注册（插件加载顺序不固定，
+			// 重启后尤其明显）。早期版本在这里只探测一次，拿不到就不订阅 ——
+			// 于是切会话不再自动刷新，旧会话的用例一直被当成当前会话的。
+			// 现在改成可重试的幂等订阅，面板挂载时也会再催一次。
+			ctx.effect(function () {
+				ensureSessionSubscription();
+				return function () {
+					stopSessionSubscription();
+				};
+			}, "dsh-data-panel: session subscription");
+			// getSessionId 是动态取值：哪个服务实例在、哪个会话就是真的，不受加载顺序影响。
+			store.setSessionId(activeSessionIdOf);
+
 			// tab 行的「面板」按钮：挂载时插、卸载时收。
 			ctx.effect(function () {
 				startPanelButton();
@@ -2333,6 +3052,7 @@ window.__ModuleLoader__.load({
 			DetailView: DetailView,
 			DetailBody: DetailBody,
 			RecordFormModal: RecordFormModal,
+			ReportModal: ReportModal,
 			LogButton: LogButton,
 			LogModal: LogModal,
 			CodeModal: CodeModal,
