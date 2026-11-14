@@ -1048,23 +1048,12 @@ window.__ModuleLoader__.load({
 							snap.status === "refreshing" ? "刷新中…" : "刷新"
 						),
 						h(Button, { variant: "ghost", onClick: function () {
-							var cwd = runWorkspaceCwd();
-							if (!cwd) { store.setError("无法确定当前会话的项目目录"); return; }
-							setRunResult("正在执行全部测试…");
-							console.log('[dsh-data-panel] run all tests');
-							fetch('/data-panel/run', {
-								method: 'POST',
-								headers: { 'Content-Type': 'application/json' },
-								body: JSON.stringify({ caseId: '__ALL__', testFile: 'tests/test_generated.py', cwd: cwd })
-							}).then(function (r) { return r.json(); }).then(function (data) {
-								if (!data.ok) throw new Error(data.error || "执行失败");
-								console.log('[dsh-data-panel] all tests done:', data);
-								setRunResult(data.passed ? "全部测试通过" : "测试未全部通过：" + data.output);
-								refresh();
-							}).catch(function (e) {
-								console.error('[dsh-data-panel] run all failed', e);
-								setRunResult("执行失败：" + e.message);
-							});
+							// 不再自己跑 pytest（文件名写死必 ENOENT）：把指令预填到当前会话的输入框，
+							// 由对话里的模型自己找文件、执行、贴结果。见 prefillDraft()。
+							var outcome = prefillDraft(panelSessionId(props), runAllPrompt());
+							if (!outcome.ok) { store.setError("执行：" + outcome.message); return; }
+							store.setError("");
+							setRunResult(outcome.message);
 						}, disabled: snap.status === "refreshing" },
 							h(Icon, { name: "code", size: 15 }),
 							"全部执行"
@@ -1153,21 +1142,11 @@ window.__ModuleLoader__.load({
 															name: "external",
 															label: "执行 " + record.title,
 															onClick: function () {
-													var cwd = runWorkspaceCwd();
-													if (!cwd) { store.setError("无法确定当前会话的项目目录"); return; }
-													setRunResult("正在执行 " + record.caseId + "…");
-																console.log('[dsh-data-panel] run test', record.caseId);
-													fetch('/data-panel/run', {
-																	method: 'POST',
-																	headers: { 'Content-Type': 'application/json' },
-														body: JSON.stringify({ caseId: record.caseId, testFile: 'tests/test_generated.py', cwd: cwd })
-													}).then(function (r) { return r.json(); }).then(function (data) {
-														if (!data.ok) throw new Error(data.error || "执行失败");
-																	console.log('[dsh-data-panel] run result', data.caseId, data.passed ? 'PASS' : 'FAIL');
-														setRunResult(record.caseId + (data.passed ? " 执行通过" : " 执行失败：" + data.output));
-												}).catch(function (e) {
-														setRunResult("执行失败：" + e.message);
-																});
+																// 点执行 = 把这条用例的指令预填到当前会话的输入框，由对话里的模型去跑。
+																var outcome = prefillDraft(panelSessionId(props), runPrompt(record));
+																if (!outcome.ok) { store.setError("执行：" + outcome.message); return; }
+																store.setError("");
+																setRunResult(outcome.message);
 															}
 														}),
 														h(IconButton, {
@@ -1708,6 +1687,11 @@ window.__ModuleLoader__.load({
 			}
 		}
 
+		/**
+		 * 当前会话的工作区目录。
+		 * 执行入口改成「把指令填进对话」以后，前端暂时没有调用点；
+		 * 但执行结果要回流面板（读 .dsh/testcases/results.json）时还得靠它定位项目，故先保留。
+		 */
 		function runWorkspaceCwd() {
 			var service = betterSidebarService();
 			if (service !== null && typeof service.getSnapshot === "function") {
@@ -1729,6 +1713,151 @@ window.__ModuleLoader__.load({
 			} catch {
 				return "";
 			}
+		}
+
+		/** 主区正在看的会话 id（better-sidebar 记录的当前会话）；没装该插件时为空。 */
+		function activeSessionId() {
+			if (clientCtx === null || typeof clientCtx.get !== "function") return "";
+			try {
+				var service = clientCtx.get("betterSidebar");
+				if (!service || typeof service.getSnapshot !== "function") return "";
+				var snapshot = service.getSnapshot();
+				return snapshot && typeof snapshot.sessionId === "string" ? snapshot.sessionId : "";
+			} catch {
+				return "";
+			}
+		}
+
+		/**
+		 * 执行指令要填进哪个会话：**主区正在看的那个**。
+		 * 面板在右侧栏、对话在主区，正常是同一个会话；万一用户切了会话而旧面板实例还留着
+		 * （宿主 TabSlot 的 keepMounted），按活跃会话填才不会「填了但眼前看不见」。
+		 * 拿不到活跃会话时退回宿主给 slot 的 inject 第一个参数（runInject 传的就是会话 id）。
+		 */
+		function panelSessionId(props) {
+			var active = activeSessionId();
+			if (active !== "") return active;
+			return props && typeof props.sessionId === "string" ? props.sessionId : "";
+		}
+
+		/**
+		 * 取某个会话的输入框服务（conversation.input）。
+		 * conversation 是**会话作用域**服务，必须先经 sessions.scope(id) 拿到该会话的上下文。
+		 */
+		function draftHubOf(sessionId) {
+			if (typeof sessionId !== "string" || sessionId === "") return null;
+			// ① 会话作用域：conversation 是按会话取的服务，正常路径走这条。
+			if (sessions !== null && typeof sessions.scope === "function") {
+				try {
+					var actx = sessions.scope(sessionId);
+					var scoped = actx && typeof actx.get === "function" ? actx.get("conversation") : null;
+					if (scoped && scoped.input) return scoped.input;
+				} catch {
+					// 落到下一级。
+				}
+			}
+			// ② 根上下文兜底：input.shell(id) 内部自己按 id 找 binding，不依赖调用方作用域。
+			if (clientCtx !== null && typeof clientCtx.get === "function") {
+				try {
+					var root = clientCtx.get("conversation");
+					if (root && root.input) return root.input;
+				} catch {
+					return null;
+				}
+			}
+			return null;
+		}
+
+		var DRAFT_FILLED = "已把执行指令填到对话输入框，切到对话按回车发送。";
+		var DRAFT_APPENDED = "输入框里原有内容已保留，执行指令追加在后面；切到对话按回车发送。";
+
+		/**
+		 * 把一段指令预填进会话输入框，**不发送**。
+		 *
+		 * 为什么不再自己跑 pytest：测试文件与测试函数原先靠 client.js 里写死的
+		 * `tests/test_generated.py` 猜，文件不存在就直接 ENOENT。交给会话里的模型，
+		 * 它自己能找到文件、决定跑哪个用例、缺什么也能直接说。
+		 *
+		 * 两条通道都在插件边界内：
+		 *   ① conversation.input.requestDraftInitialization(binding, { prompt })
+		 *      官方「程序化预填草稿」入口，已有草稿默认保留（dsh-client-ui-workspace 同款）
+		 *   ② shell.appendDraft(text)  直接写输入框 shell，草稿为空时它内部等价 setDraft
+		 * 服务未就绪或版本不同就逐级退让，最后给一句能读懂的失败原因，
+		 * 不要变成「点了没反应」。
+		 */
+		function prefillDraft(sessionId, text) {
+			var hub = draftHubOf(sessionId);
+			if (hub === null) return { ok: false, message: "当前会话还没就绪，切到对话再点一次。" };
+
+			if (sessions !== null && typeof hub.requestDraftInitialization === "function" && typeof sessions.binding === "function") {
+				try {
+					var binding = sessions.binding(sessionId);
+					if (binding) {
+						var outcome = hub.requestDraftInitialization(binding, { prompt: text, whenDraftExists: "keep" });
+						if (outcome === "applied") return { ok: true, message: DRAFT_FILLED };
+						if (outcome === "blocked") return { ok: false, message: "输入框正在发送中，等这一轮结束再点。" };
+						// "preserved" = 用户已经写了草稿，这里不覆盖，继续往下追加。
+					}
+				} catch {
+					// 版本差异或 scope 不匹配，落到下一级。
+				}
+			}
+
+			var shell = null;
+			try {
+				if (typeof hub.shell === "function") shell = hub.shell(sessionId);
+			} catch {
+				shell = null;
+			}
+			if (shell === null) return { ok: false, message: "定位不到当前会话的输入框。" };
+
+			try {
+				var draft = shell.snapshot && typeof shell.snapshot.draft === "string" ? shell.snapshot.draft : "";
+				var hadContent = draft.trim() !== "";
+				if (typeof shell.appendDraft === "function" && hadContent) {
+					shell.appendDraft("\n\n" + text);
+				} else if (typeof shell.setDraft === "function") {
+					shell.setDraft(text);
+				} else if (typeof shell.appendDraft === "function") {
+					shell.appendDraft(text);
+				} else {
+					return { ok: false, message: "当前 DSH 版本不支持把指令填进输入框。" };
+				}
+				return { ok: true, message: hadContent ? DRAFT_APPENDED : DRAFT_FILLED };
+			} catch (error) {
+				return { ok: false, message: "填进输入框失败：" + (error instanceof Error ? error.message : String(error)) };
+			}
+		}
+
+		/** 单条用例的执行指令：把用例信息交代清楚，让模型自己找文件、跑、贴结果。 */
+		function runPrompt(record) {
+			var typeLabel = TEST_TYPES[record.testType] ? TEST_TYPES[record.testType].label : "测试";
+			var lines = ["请执行测试用例 " + record.caseId + "（" + record.title + "）这条" + typeLabel + "用例。", ""];
+			if (record.description) lines.push("用例说明：" + record.description);
+			if (record.input) lines.push("输入：" + record.input);
+			if (record.expected) lines.push("预期输出：" + record.expected);
+			if (lines.length > 2) lines.push("");
+			lines.push(
+				"执行要求：",
+				"1. 先在当前工作区找到这条用例对应的测试函数：看 .dsh/testcases/cases.json 里该用例的 testFunc，没登记就从用例代码里认函数名；测试文件通常位于 tests/test_generated.py，以实际存在的为准。",
+				"2. 只跑这一个用例，例如 python -m pytest <测试文件> -k <测试函数> -v --tb=short。",
+				"3. 不要新建或改写测试文件；找不到测试文件或测试函数就把缺什么告我。",
+				"4. 把执行的命令、实际输出和通过/失败结论贴在对话里。"
+			);
+			return lines.join("\n");
+		}
+
+		/** 「全部执行」的执行指令。 */
+		function runAllPrompt() {
+			return [
+				"请执行当前工作区里的全部测试用例。",
+				"",
+				"执行要求：",
+				"1. 测试文件以 .dsh/testcases/cases.json 里登记的为准，通常位于 tests/test_generated.py，以实际存在的为准。",
+				"2. 用 pytest 跑整个文件，例如 python -m pytest <测试文件> -v --tb=short。",
+				"3. 不要新建或改写测试文件；找不到就直接说缺什么。",
+				"4. 把执行的命令、输出和通过/失败统计贴在对话里。"
+			].join("\n");
 		}
 
 		/** 相对路径补上工作区目录；拿不到工作区时返回空串。 */
@@ -2081,10 +2210,13 @@ window.__ModuleLoader__.load({
 				return ctx.slots.register({
 					name: "sidebar.right.pane.tab",
 					key: "data-panel-board",
-					inject: function () {
+					// 宿主 slot 的 inject 第一个参数就是会话 id（dsh-client-ui-renderer 的 runInject），
+					// 以前这里整个丢掉了，执行按钮就不知道该把指令填进哪个会话。
+					inject: function (sessionId) {
 						return {
 							openDetail: function (id) { openDetail(id); },
 							openCode: function (ref) { openCode(ref); },
+							sessionId: typeof sessionId === "string" ? sessionId : "",
 							dock: true
 						};
 					}
@@ -2099,6 +2231,10 @@ window.__ModuleLoader__.load({
 			store: store,
 			parseCodeRef: parseCodeRef,
 			openCode: openCode,
+			prefillDraft: prefillDraft,
+			runPrompt: runPrompt,
+			runAllPrompt: runAllPrompt,
+			panelSessionId: panelSessionId,
 			/** Test-only: 注入打开代码所需的服务替身（生产路径由 ctx.inject 填充）。 */
 			setCodeServices: function (next) {
 				var source = next || {};
@@ -2107,9 +2243,12 @@ window.__ModuleLoader__.load({
 				sessions = source.sessions === undefined ? null : source.sessions;
 				workspaces = source.workspaces === undefined ? null : source.workspaces;
 				// betterSidebar 走 ctx.get 动态取，替身挂在假上下文上。
-				clientCtx = source.betterSidebar === undefined ? null : {
+				var noStub = source.betterSidebar === undefined ? source.conversation === undefined : false;
+				clientCtx = noStub ? null : {
 					get: function (name) {
-						return name === "betterSidebar" ? source.betterSidebar : undefined;
+						if (name === "betterSidebar") return source.betterSidebar;
+						if (name === "conversation") return source.conversation;
+						return undefined;
 					}
 				};
 			},
