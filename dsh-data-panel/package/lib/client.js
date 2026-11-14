@@ -151,8 +151,13 @@ window.__ModuleLoader__.load({
 .dp-cell-text { display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 2; margin: 0; color: var(--dp-text2); font-size: 12px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
 /* 要 3 行的列（测试说明 / 输入 / 预期输出）加这个类。 */
 .dp-cell-text.dp-cell-3 { -webkit-line-clamp: 3; }
-/* 行首展开箭头：收起朝右，展开转 90 度朝下。 */
-.dp-expand-btn { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: var(--dp-text3); cursor: pointer; transition: background .12s, color .12s, transform .14s; }
+/*
+ * 行首展开箭头：收起朝右，展开转 90 度朝下。
+ * 尺寸比一行文字（12px × 1.45 ≈ 17.4px）大一些，所以用负 margin-top 把按钮中心
+ * 抬到首行文字的中线上 —— 表格单元格是 flex-start 顶对齐，不补偿的话箭头会偏下。
+ * 只对齐首行：用例标识最多两行，箭头跟着第一行走，不随整块居中。
+ */
+.dp-expand-btn { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; width: 26px; height: 26px; margin-top: -5px; padding: 0; border: 0; border-radius: 7px; background: transparent; color: var(--dp-text3); cursor: pointer; transition: background .12s, color .12s, transform .14s; }
 .dp-expand-btn:hover { background: var(--dp-bg3); color: var(--dp-text); }
 .dp-expand-btn[data-open="true"] { color: var(--dp-text); transform: rotate(90deg); }
 .dp-expand-btn:focus-visible { outline: 2px solid var(--dp-brand); outline-offset: 1px; }
@@ -1197,6 +1202,22 @@ window.__ModuleLoader__.load({
 				}
 				var alive = true;
 				setView({ status: "loading", content: "", error: "", updatedAt: "", result: null, runId: "" });
+				// 指定了 runId（从执行记录进来的）就直接读那一次；
+				// 否则退回「最近一次」：record 为空读整体执行，有值读该用例。
+				var pinnedRunId = typeof props.runId === "string" ? props.runId : "";
+				if (pinnedRunId !== "") {
+					return fetchRunLog(sessionId, pinnedRunId).then(function (log) {
+						if (!alive) return;
+						setView({
+							status: "ready",
+							content: log && log.exists ? (log.content || "") : "",
+							error: "",
+							updatedAt: (log && log.updatedAt) || "",
+							result: null,
+							runId: pinnedRunId,
+						});
+					});
+				}
 				var scope = record ? "case" : "all";
 				fetchLatestRun(sessionId, scope, record ? record.caseId : "").then(function (latest) {
 					if (!alive) return;
@@ -1222,7 +1243,7 @@ window.__ModuleLoader__.load({
 				return function () {
 					alive = false;
 				};
-			}, [sessionId, record ? record.id : "", record ? record.caseId : ""]);
+			}, [sessionId, record ? record.id : "", record ? record.caseId : "", typeof props.runId === "string" ? props.runId : ""]);
 
 			function copy() {
 				try {
@@ -1274,9 +1295,14 @@ window.__ModuleLoader__.load({
 
 			return h(Modal, {
 				title: "执行日志",
-				subtitle: record
-					? (record.caseId ? record.caseId + " · " : "") + (record.title || "")
-					: "全部用例（最近一次整体执行）",
+				subtitle: (function () {
+					var head = record
+						? (record.caseId ? record.caseId + " · " : "") + (record.title || "")
+						: "全部用例";
+					// 从某条执行记录点进来：说明读的是那一次，不是「最近一次」。
+					var pinned = typeof props.runId === "string" && props.runId !== "";
+					return pinned ? head + "　第 " + (props.runLabel || "") + " 次执行" : head + "（最近一次整体执行）";
+				})(),
 				onClose: props.onClose,
 				footer: [
 					view.status === "ready" ? h(Button, { key: "copy", onClick: copy }, copyLabel) : null,
@@ -1417,6 +1443,11 @@ window.__ModuleLoader__.load({
 										name: "eye",
 										label: "查看 " + record.caseId + " 第 " + (view.runs.length - index) + " 次执行的报告",
 										onClick: function () { props.onView(run); }
+									}),
+									// 这一次执行自己的原始日志（不是「最近一次」）。
+									h(LogButton, {
+										label: "查看 " + record.caseId + " 第 " + (view.runs.length - index) + " 次执行的日志",
+										onClick: function () { props.onLog(run, view.runs.length - index); }
 									}),
 									h(IconButton, {
 										name: "trash",
@@ -1912,10 +1943,10 @@ window.__ModuleLoader__.load({
 			var reportState = useState(false);
 			var reportView = reportState[0];
 			var setReportView = reportState[1];
-			// 当前展开执行记录的用例 id（一次只展开一行）。
-			var expandedState = useState("");
-			var expandedId = expandedState[0];
-			var setExpandedId = expandedState[1];
+			// 当前展开执行记录的用例 id 集合（可同时展开多条，互不影响）。
+			var expandedState = useState([]);
+			var expandedIds = expandedState[0];
+			var setExpandedIds = expandedState[1];
 			// 正在查看的那次执行（{ record, run }）。
 			var runViewState = useState(null);
 			var runView = runViewState[0];
@@ -1986,6 +2017,13 @@ window.__ModuleLoader__.load({
 				picked.forEach(function (id) { map[id] = true; });
 				return map;
 			}, [picked]);
+
+			// 已展开执行记录的用例 id 集合：逐行判断 isOpen 时 O(1)。
+			var expandedIdSet = useMemo(function () {
+				var map = Object.create(null);
+				expandedIds.forEach(function (id) { map[id] = true; });
+				return map;
+			}, [expandedIds]);
 
 			var functionalCount = records.filter(function (record) { return record.testType === "functional"; }).length;
 			var boundaryCount = records.filter(function (record) { return record.testType === "boundary"; }).length;
@@ -2082,7 +2120,19 @@ window.__ModuleLoader__.load({
 			}
 
 			function refresh() {
+				// 刷新会重置整张表，顺手把展开的执行记录一起收齐，
+				// 免得刷新后下面挂着一堆旧数据的展开行。
+				setExpandedIds([]);
 				store.load(true).catch(function () {});
+			}
+
+			/** 展开 / 收起某条用例的执行记录：只动这一条，不影响其它已展开的。 */
+			function toggleExpand(id) {
+				setExpandedIds(function (previous) {
+					var at = previous.indexOf(id);
+					if (at === -1) return previous.concat([id]);
+					return previous.filter(function (item) { return item !== id; });
+				});
 			}
 
 			function togglePick(id) {
@@ -2378,7 +2428,8 @@ window.__ModuleLoader__.load({
 												)
 											),
 											h("tbody", null, pageRecords.map(function (record) {
-												var isOpen = expandedId === record.id;
+												// 每条用例各自独立展开，点开一条不会关掉别条。
+												var isOpen = expandedIdSet[record.id] === true;
 												return h(React.Fragment, { key: record.id },
 													h("tr", { className: cn("dp-row", isOpen ? "is-open" : "") },
 													h("td", { className: "dp-pick" },
@@ -2394,12 +2445,12 @@ window.__ModuleLoader__.load({
 														h("button", {
 															type: "button",
 															className: "dp-expand-btn",
-															"data-open": expandedId === record.id ? "true" : "false",
-															title: expandedId === record.id ? "收起执行记录" : "展开执行记录",
-															"aria-label": (expandedId === record.id ? "收起 " : "展开 ") + record.caseId + " 的执行记录",
-															"aria-expanded": expandedId === record.id,
-															onClick: function () { setExpandedId(expandedId === record.id ? "" : record.id); }
-														}, h(Icon, { name: "chevron", size: 13 })),
+															"data-open": isOpen ? "true" : "false",
+															title: isOpen ? "收起执行记录" : "展开执行记录",
+															"aria-label": (isOpen ? "收起 " : "展开 ") + record.caseId + " 的执行记录",
+															"aria-expanded": isOpen,
+															onClick: function () { toggleExpand(record.id); }
+														}, h(Icon, { name: "chevron", size: 16 })),
 														h(CaseId, { caseId: record.caseId })
 													)
 												),
@@ -2467,12 +2518,7 @@ window.__ModuleLoader__.load({
 																	label: "删除 " + record.title,
 																	danger: true,
 																	onClick: function () { setConfirm({ kind: "delete", record: record }); }
-																}),
-													// 单条用例的执行日志：读这条用例自己的那份。
-													h(LogButton, {
-														label: "日志 " + record.title,
-														onClick: function () { setLogView({ record: record }); }
-													})
+																})
 														)
 													)
 											),
@@ -2483,6 +2529,10 @@ window.__ModuleLoader__.load({
 															record: record,
 															sessionId: panelSessionId(props),
 															onView: function (run) { setRunView({ record: record, run: run }); },
+															// 日志按钮挂在每条执行记录上：读那一次自己的 run.log。
+															onLog: function (run, ordinal) {
+																setLogView({ record: record, runId: run.runId, runLabel: String(ordinal) });
+															},
 															onRemove: function (runId, done) { setRemoveRun({ record: record, runId: runId, done: done }); }
 														})
 													)
@@ -2569,6 +2619,9 @@ window.__ModuleLoader__.load({
 				}) : null,
 				logView !== null ? h(LogModal, {
 					record: logView.record,
+					// 从执行记录进来的那一次；为空则退回「最近一次」。
+					runId: logView.runId || "",
+					runLabel: logView.runLabel || "",
 					// 日志按面板所属会话读，不跟着主区会话飘。
 					sessionId: panelSessionId(props),
 					onClose: function () { setLogView(null); }
