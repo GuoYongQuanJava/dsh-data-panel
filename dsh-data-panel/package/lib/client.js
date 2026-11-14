@@ -154,6 +154,11 @@ window.__ModuleLoader__.load({
 .dp-icon-btn.danger:hover { background: color-mix(in srgb, var(--dp-danger) 10%, transparent); color: var(--dp-danger); }
 .dp-icon-btn:focus-visible { outline: 2px solid var(--dp-brand); outline-offset: 1px; }
 .dp-icon-btn:disabled { opacity: .5; cursor: not-allowed; }
+/* 工具栏的「日志」按钮：深底浅字的强调色，并推到这一行最右侧。 */
+.dp-log-btn { margin-left: auto; background: #FF8800; border-color: #FF8800; color: #F9FAFB; font-weight: 600; }
+.dp-log-btn:hover { background: #FF9A26; border-color: #FF9A26; color: #F9FAFB; }
+.dp-log-btn:focus-visible { outline: 2px solid #FF8800; outline-offset: 2px; }
+.dp-log-btn:active { background: #E67A00; border-color: #E67A00; }
 .dp-empty { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 72px 24px; text-align: center; }
 .dp-empty-icon { display: flex; align-items: center; justify-content: center; width: 48px; height: 48px; margin-bottom: 14px; border-radius: 14px; background: var(--dp-bg2); color: var(--dp-text3); }
 .dp-empty h3 { margin: 0 0 6px; font-size: 15px; font-weight: 600; }
@@ -175,6 +180,9 @@ window.__ModuleLoader__.load({
 .dp-pager-size select { height: 32px; padding: 0 26px 0 10px; border: 1px solid var(--dp-border); border-radius: 9px; background: var(--dp-bg); color: var(--dp-text); font: inherit; font-size: 12.5px; letter-spacing: .04em; outline: none; cursor: pointer; }
 .dp-code-body { margin: 0; padding: 14px 16px; max-height: 56vh; overflow: auto; border: 1px solid var(--dp-border); border-radius: 10px; background: var(--dp-bg2); color: var(--dp-text); font-family: ui-monospace, SFMono-Regular, "Cascadia Code", Consolas, monospace; font-size: 12.5px; line-height: 1.7; white-space: pre; tab-size: 2; }
 .dp-code-empty { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 34px 16px; border: 1px dashed var(--dp-border); border-radius: 10px; color: var(--dp-text3); font-size: 12px; text-align: center; }
+.dp-log-empty { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; min-height: 150px; border: 1px dashed var(--dp-border); border-radius: 10px; color: var(--dp-text3); font-size: 12.5px; text-align: center; }
+.dp-log-empty p { margin: 0; }
+.dp-log-empty-icon { display: flex; align-items: center; justify-content: center; color: var(--dp-text3); }
 .dp-code-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; color: var(--dp-text3); font-size: 11px; }
 .dp-code-meta code { font-family: ui-monospace, SFMono-Regular, "Cascadia Code", Consolas, monospace; }
 .dp-mask { position: fixed; inset: 0; z-index: 80; display: flex; align-items: center; justify-content: center; padding: 24px; background: rgba(15, 18, 24, .36); backdrop-filter: blur(2px); animation: dp-fade .14s ease; }
@@ -239,7 +247,14 @@ window.__ModuleLoader__.load({
 
 		function ensureStyles() {
 			if (typeof document === "undefined") return;
-			if (document.getElementById("dsh-data-panel-style") !== null) return;
+			var existing = document.getElementById("dsh-data-panel-style");
+			if (existing !== null) {
+				// 面板 tab 是 keepMounted 的，旧 <style> 会一直挂在 head 里。
+				// 只看「有没有」就 return 的话，插件热更新后是「新 JS + 旧 CSS」，
+				// 新加的类名永远不生效（表现为按钮有了但样式没跟上）。所以这里同步一次内容。
+				if (existing.textContent !== CSS) existing.textContent = CSS;
+				return;
+			}
 			var style = document.createElement("style");
 			style.id = "dsh-data-panel-style";
 			style.textContent = CSS;
@@ -388,6 +403,15 @@ window.__ModuleLoader__.load({
 				case "doc":
 					children = [h("path", { key: "a", d: "M6 3h8l4 4v14H6z" }), h("path", { key: "b", d: "M14 3v5h5" }), h("path", { key: "c", d: "M9 13h6M9 17h4" })];
 					break;
+				// 执行日志：一本合起来的书（书脊 + 封面 + 两条内容线），
+				// 线宽与颜色沿用 common，和 doc/link 等图标同一套视觉。
+				case "log":
+					children = [
+						h("path", { key: "a", d: "M5 4h3v16H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z" }),
+						h("path", { key: "b", d: "M8 4h11v16H8z" }),
+						h("path", { key: "c", d: "M11 9h5M11 13h5" })
+					];
+					break;
 				case "link":
 					children = [h("path", { key: "a", d: "M10 13a5 5 0 0 0 7 0l2-2a5 5 0 0 0-7-7l-1 1" }), h("path", { key: "b", d: "M14 11a5 5 0 0 0-7 0l-2 2a5 5 0 0 0 7 7l1-1" })];
 					break;
@@ -525,6 +549,19 @@ window.__ModuleLoader__.load({
 				title: props.label,
 				"aria-label": props.label
 			}, h(Icon, { name: props.name, size: 15 }));
+		}
+
+		/**
+		 * 操作列的日志按钮。
+		 * 直接复用 IconButton + "log" 图标，尺寸/悬停/线条风格与源码、执行、编辑、删除四个按钮完全一致——
+		 * 不用 emoji 是因为彩色字形和这套 1.7px stroke 图标不是一套视觉。
+		 */
+		function LogButton(props) {
+			return h(IconButton, {
+				name: "log",
+				label: props.label,
+				onClick: props.onClick
+			});
 		}
 
 		function Field(props) {
@@ -677,6 +714,28 @@ window.__ModuleLoader__.load({
 						h(Icon, { name: "code", size: 22 }),
 						"这条用例还没有关联代码，点「编辑」补充。"
 					)
+			);
+		}
+
+		/**
+		 * 执行日志弹窗：目前只占位，内容留空，先保证「点得开、关得掉」。
+		 * props.record 为空 = 工具栏那一个（整批日志），否则是某条用例的操作列打开的。
+		 * 后面对接真实日志（执行输出 / 结果文件）时只改这里，不动调用方。
+		 */
+		function LogModal(props) {
+			var record = props.record || null;
+			return h(Modal, {
+				title: "执行日志",
+				subtitle: record
+					? (record.caseId ? record.caseId + " · " : "") + (record.title || "")
+					: "全部用例",
+				onClose: props.onClose,
+				footer: h(Button, { onClick: props.onClose }, "关闭")
+			},
+				h("div", { className: "dp-log-empty" },
+					h("span", { className: "dp-log-empty-icon" }, h(Icon, { name: "log", size: 26 })),
+					h("p", null, "暂无日志")
+				)
 			);
 		}
 		//#endregion
@@ -901,6 +960,10 @@ window.__ModuleLoader__.load({
 			var runResultState = useState("");
 			var runResult = runResultState[0];
 			var setRunResult = runResultState[1];
+			// 执行日志弹窗：null = 关闭；{ record: null } = 工具栏整批日志；{ record } = 某条用例。
+			var logState = useState(null);
+			var logView = logState[0];
+			var setLogView = logState[1];
 
 			useEffect(function () {
 				store.load().catch(function () {});
@@ -1061,7 +1124,13 @@ window.__ModuleLoader__.load({
 						h(Button, { variant: "primary", onClick: openCreate },
 							h(Icon, { name: "plus", size: 15 }),
 							"新增用例"
-						)
+						),
+						// 整批执行日志：先只加按钮，内容留待后续实现。
+						h(Button, {
+							className: "dp-log-btn",
+							onClick: function () { setLogView({ record: null }); },
+							title: "查看全部用例的执行日志"
+						}, "日志")
 					),
 					runResult ? h("div", { className: "dp-run-result" }, runResult) : null,
 					snap.error ? h("div", { className: "dp-alert" },
@@ -1159,6 +1228,11 @@ window.__ModuleLoader__.load({
 															label: "删除 " + record.title,
 															danger: true,
 															onClick: function () { setConfirm({ kind: "delete", record: record }); }
+														}),
+														// 单条用例的执行日志：内容暂空，先占位。
+														h(LogButton, {
+															label: "日志 " + record.title,
+															onClick: function () { setLogView({ record: record }); }
 														})
 													)
 												)
@@ -1189,6 +1263,10 @@ window.__ModuleLoader__.load({
 				codeRecord !== null ? h(CodeModal, {
 					record: codeRecord,
 					onClose: function () { setCodeRecord(null); }
+				}) : null,
+				logView !== null ? h(LogModal, {
+					record: logView.record,
+					onClose: function () { setLogView(null); }
 				}) : null,
 				confirm !== null ? h(ConfirmDialog, {
 					title: confirm.kind === "clearDemo" ? "清空示例用例？" : "删除这条用例？",
@@ -2018,18 +2096,11 @@ window.__ModuleLoader__.load({
 		function syncPanelButton() {
 			if (typeof document === "undefined") return 0;
 			var rows = [];
-			// 优先用宿主自己的标记；再补上 role=tablist（要求确实含 tab 子元素，
-			// 避免误伤设置页里其它 tablist）。两条都收集并去重，这样多栏/多会话
-			// 场景下哪一行都能覆盖到。
+			// 只认宿主给会话 tab 行打的标记，app.asar 的 viewTabs 同时带 role="tablist" 和
+			// data-conversation-tabs，一个选择器就够。
+			// 原先还兜底收集所有 [role="tablist"]，结果把按钮也插进了设置页/插件市场那排 tab，故删除。
 			var marked = document.querySelectorAll("[data-conversation-tabs]");
 			for (var m = 0; m < marked.length; m += 1) rows.push(marked[m]);
-			var lists = document.querySelectorAll('[role="tablist"]');
-			for (var l = 0; l < lists.length; l += 1) {
-				var candidate = lists[l];
-				if (rows.indexOf(candidate) !== -1) continue;
-				if (candidate.querySelector('[role="tab"]') === null) continue;
-				rows.push(candidate);
-			}
 			var inserted = 0;
 			for (var i = 0; i < rows.length; i += 1) {
 				var row = rows[i];
@@ -2259,6 +2330,8 @@ window.__ModuleLoader__.load({
 			DetailView: DetailView,
 			DetailBody: DetailBody,
 			RecordFormModal: RecordFormModal,
+			LogButton: LogButton,
+			LogModal: LogModal,
 			CodeModal: CodeModal,
 			Pager: Pager
 		};
