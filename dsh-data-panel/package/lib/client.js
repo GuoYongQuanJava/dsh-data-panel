@@ -156,8 +156,11 @@ window.__ModuleLoader__.load({
  * 尺寸比一行文字（12px × 1.45 ≈ 17.4px）大一些，所以用负 margin-top 把按钮中心
  * 抬到首行文字的中线上 —— 表格单元格是 flex-start 顶对齐，不补偿的话箭头会偏下。
  * 只对齐首行：用例标识最多两行，箭头跟着第一行走，不随整块居中。
+ *
+ * 上一版是 26px / -5px，用户反馈「再往下放、再大一点」，所以：
+ * 按钮放大到 30px、图标放大到 19px，负 margin 收到 -2px（整体比原来低 3px）。
  */
-.dp-expand-btn { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; width: 26px; height: 26px; margin-top: -5px; padding: 0; border: 0; border-radius: 7px; background: transparent; color: var(--dp-text3); cursor: pointer; transition: background .12s, color .12s, transform .14s; }
+.dp-expand-btn { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; width: 30px; height: 30px; margin-top: -2px; padding: 0; border: 0; border-radius: 8px; background: transparent; color: var(--dp-text3); cursor: pointer; transition: background .12s, color .12s, transform .14s; }
 .dp-expand-btn:hover { background: var(--dp-bg3); color: var(--dp-text); }
 .dp-expand-btn[data-open="true"] { color: var(--dp-text); transform: rotate(90deg); }
 .dp-expand-btn:focus-visible { outline: 2px solid var(--dp-brand); outline-offset: 1px; }
@@ -166,26 +169,71 @@ window.__ModuleLoader__.load({
 .dp-run-panel { padding: 10px 12px 12px; }
 .dp-run-title { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 8px; color: var(--dp-text2); font-size: 12px; }
 .dp-run-title b { margin-left: 6px; color: var(--dp-text); font-weight: 600; }
-.dp-run-table { width: 100%; border-collapse: collapse; font-size: 12px; }
 .dp-run-table th { padding: 5px 8px; border-bottom: 1px solid var(--dp-border); color: var(--dp-text3); font-weight: 500; text-align: center; white-space: nowrap; }
-.dp-run-table td { padding: 5px 8px; border-bottom: 1px solid var(--dp-border2); color: var(--dp-text2); vertical-align: middle; }
+/*
+ * 表头与内容对齐：
+ *   短列（# / 时间 / 结果 / 操作）：th 和 td 都居中，天然对齐。
+ *   「实际输出」：**表头居中、内容靠左** —— 长文本左对齐才好读，
+ *     而表头只有四个字，放在这一列（很宽）的正中间才像正常表头。
+ *     两者对齐基准不同是刻意的，不是 bug。
+ *
+ * 宽度策略（实测四种写法后的结论）：
+ * 表格整体 width:100% 铺满整行，配合 table-layout:fixed 让各列严格按
+ * 指定宽度分配。之前不给「实际输出」设宽、靠 width:1% 想「按内容取宽」
+ * 是无效的 —— 表格剩余空间仍会全部塞给它，内容一短右侧就是一大片空白。
+ * fixed 布局下必须显式给百分比，剩余空间才按比例摊开。
+ */
+.dp-run-table { width: 100%; table-layout: fixed; border-collapse: collapse; font-size: 12px; }
+.dp-run-table th.dp-grow { width: 42%; }
+/*
+ * 报告弹窗那张表（测试函数 / 说明）仍然整列左对齐 —— 两列都是长文本，
+ * 表头也左对齐才不会和内容错开。
+ * 执行记录表的「实际输出」不用这条：按用户要求是「表头居中、内容靠左」。
+ */
+.dp-run-table th.dp-left { text-align: left; }
+.dp-run-table td { padding: 5px 8px; border-bottom: 1px solid var(--dp-border2); color: var(--dp-text2); vertical-align: middle; text-align: center; }
+.dp-run-table td.dp-left { text-align: left; }
 .dp-run-table tr:last-child td { border-bottom: 0; }
-.dp-run-ops { display: flex; justify-content: flex-end; gap: 2px; }
-.dp-run-output pre { margin: 0; max-height: 72px; overflow: auto; white-space: pre-wrap; word-break: break-all; font-family: ui-monospace, SFMono-Regular, "Cascadia Code", Consolas, monospace; font-size: 11px; line-height: 1.5; color: var(--dp-text2); }
+/* 操作列内容也居中，和它的表头对齐（表头已经是 text-align:center）。 */
+.dp-run-ops { display: flex; justify-content: center; gap: 2px; }
+/* 「实际输出」单元格里的原始文本。挂在 dp-left 上，和表头的对齐类保持一致。 */
+.dp-run-table td.dp-left pre { margin: 0; max-height: 72px; overflow: auto; white-space: pre-wrap; word-break: break-all; font-family: ui-monospace, SFMono-Regular, "Cascadia Code", Consolas, monospace; font-size: 11px; line-height: 1.5; color: var(--dp-text2); }
 .dp-run-state { display: inline-block; padding: 0 7px; border-radius: 5px; font-size: 11px; line-height: 18px; }
 .dp-run-state[data-tone="ok"] { background: color-mix(in srgb, #16a34a 14%, transparent); color: #16a34a; }
 .dp-run-state[data-tone="bad"] { background: color-mix(in srgb, var(--dp-danger) 12%, transparent); color: var(--dp-danger); }
 .dp-run-state[data-tone="idle"] { background: var(--dp-bg3); color: var(--dp-text3); }
 .dp-run-empty { padding: 14px 10px; color: var(--dp-text3); font-size: 12px; text-align: center; }
+/*
+ * 「等这一轮对话出结果」的提示条。
+ * 面板不再按固定间隔轮询，只在会话 running 从 true 变 false 时读一次，
+ * 所以这段时间要靠这条会走的计时告诉用户「还在跑」，否则看起来像没反应。
+ */
+.dp-run-wait { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; padding: 7px 10px; border: 1px solid color-mix(in srgb, var(--dp-brand) 30%, transparent); border-radius: 9px; background: color-mix(in srgb, var(--dp-brand) 6%, transparent); color: var(--dp-text); font-size: 12px; font-variant-numeric: tabular-nums; }
+.dp-run-wait-dot { flex: 0 0 auto; width: 7px; height: 7px; border-radius: 50%; background: var(--dp-brand); animation: dp-pulse 1.1s ease-in-out infinite; }
+.dp-run-wait-note { color: var(--dp-text3); font-size: 11px; }
+@keyframes dp-pulse { 0%, 100% { opacity: .35; transform: scale(.85); } 50% { opacity: 1; transform: scale(1); } }
 .dp-run-hint { margin: 8px 0 0; color: var(--dp-text3); font-size: 11px; }
 /* 「查看」弹窗要更宽：报告是长文本 + 表格。 */
 .dp-modal.dp-modal-wide { width: min(1080px, 92vw); max-width: none; height: 80vh; display: flex; flex-direction: column; }
 .dp-modal.dp-modal-wide .dp-modal-body { flex: 1 1 auto; overflow: auto; }
 /* ── 用例层级：左栏 + 右侧内容 ── */
+/*
+ * 左栏高度跟着表格走：行数多时被压到表格高度并内部滚动，行数少时就是内容高度。
+ * max-height 由 JS 量出来写进 style（见 CategorySidebar），这里只给一个兜底值。
+ * 底部固定一条 .dp-cat-pager，列表区自己滚动，两者互不影响。
+ */
 .dp-board { display: flex; align-items: flex-start; gap: 12px; margin-top: 4px; }
-.dp-sidebar { flex: 0 0 auto; width: 128px; max-height: 62vh; overflow: auto; padding: 8px 6px; border: 1px solid var(--dp-border); border-radius: 12px; background: var(--dp-bg); transition: width .16s ease, padding .16s ease; }
+.dp-sidebar { display: flex; flex-direction: column; flex: 0 0 auto; width: 128px; max-height: 62vh; padding: 8px 6px; border: 1px solid var(--dp-border); border-radius: 12px; background: var(--dp-bg); transition: width .16s ease, padding .16s ease; }
+/* 层级列表：唯一可滚动区，撑满除表头/分页外的剩余高度。 */
+.dp-cat-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; }
+/* 分页条：不分页时整条不渲染，所以不会留空。 */
+.dp-cat-pager { display: flex; flex: 0 0 auto; align-items: center; justify-content: space-between; gap: 4px; margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--dp-border2); }
+.dp-cat-pager-btn { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: var(--dp-text3); cursor: pointer; transition: background .12s, color .12s; }
+.dp-cat-pager-btn:hover:not(:disabled) { background: var(--dp-bg3); color: var(--dp-text); }
+.dp-cat-pager-btn:disabled { opacity: .4; cursor: not-allowed; }
+.dp-cat-pager-page { flex: 1 1 auto; color: var(--dp-text3); font-size: 11px; font-variant-numeric: tabular-nums; text-align: center; white-space: nowrap; }
+.dp-sidebar-head { display: flex; flex: 0 0 auto; align-items: center; justify-content: space-between; gap: 6px; margin-bottom: 4px; }
 .dp-main { flex: 1 1 auto; min-width: 0; }
-.dp-sidebar-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin-bottom: 4px; }
 .dp-sidebar-title { color: var(--dp-text3); font-size: 11px; font-weight: 650; letter-spacing: .08em; text-transform: uppercase; white-space: nowrap; }
 .dp-sidebar-tools { display: flex; align-items: center; gap: 2px; }
 /* 「默认」是分组标题：纯文字，不是按钮，也不响应 hover。 */
@@ -243,9 +291,12 @@ window.__ModuleLoader__.load({
 .dp-root.dp-docked .dp-cat-main { padding: 5px 6px; font-size: 12px; }
 .dp-cell-text.empty { color: var(--dp-text3); }
 .dp-type { display: inline-block; max-width: 100%; overflow: hidden; padding: 1px 8px; border: 1px solid color-mix(in srgb, var(--dp-brand) 34%, transparent); border-radius: 6px; background: color-mix(in srgb, var(--dp-brand) 5%, transparent); color: var(--dp-brand); font-size: 12px; line-height: 18px; text-overflow: ellipsis; white-space: nowrap; vertical-align: middle; }
+/*
+ * 只有「性能测试」保留一点暖色（和功能类区分），其余类型统一走上面的品牌色。
+ * 之前「异常测试」是红框（data-tone="exception"）、兼容性是灰框，
+ * 一列标签里颜色杂且红色像报错，用户要求改回去，所以那两条规则已删除。
+ */
 .dp-type[data-tone="perf"] { border-color: color-mix(in srgb, var(--dp-warning) 36%, transparent); background: color-mix(in srgb, var(--dp-warning) 7%, transparent); color: var(--dp-warning); }
-.dp-type[data-tone="exception"] { border-color: color-mix(in srgb, var(--dp-danger) 34%, transparent); background: color-mix(in srgb, var(--dp-danger) 6%, transparent); color: var(--dp-danger); }
-.dp-type[data-tone="compat"] { border-color: var(--dp-border); background: var(--dp-bg2); color: var(--dp-text2); }
 .dp-owner { color: var(--dp-text2); }
 .dp-time { color: var(--dp-text3); font-size: 12px; white-space: nowrap; }
 .dp-actions { display: flex; justify-content: flex-end; align-items: center; gap: 0; }
@@ -314,6 +365,8 @@ window.__ModuleLoader__.load({
 .dp-empty-icon { display: flex; align-items: center; justify-content: center; width: 48px; height: 48px; margin-bottom: 14px; border-radius: 14px; background: var(--dp-bg2); color: var(--dp-text3); }
 .dp-empty h3 { margin: 0 0 6px; font-size: 15px; font-weight: 600; }
 .dp-empty p { max-width: 380px; margin: 0 0 18px; color: var(--dp-text2); font-size: 13px; }
+/* 末尾的补充说明：跟在按钮后面，语气更轻，不再吃 18px 的下边距。 */
+.dp-empty .dp-empty-note { margin: 14px 0 0; color: var(--dp-text3); font-size: 12px; }
 .dp-skeleton-wrap { padding: 6px 0; }
 .dp-skeleton-row { display: flex; align-items: center; gap: 24px; padding: 14px 16px; border-bottom: 1px solid var(--dp-border2); }
 .dp-skeleton-row:last-child { border-bottom: 0; }
@@ -414,14 +467,25 @@ window.__ModuleLoader__.load({
 		//#endregion
 
 		//#region helpers
-		var TEST_TYPES = {
-			functional: { label: "功能测试", tone: "func" },
-			boundary: { label: "边界测试", tone: "boundary" },
-			performance: { label: "性能测试", tone: "perf" },
-			exception: { label: "异常测试", tone: "exception" },
-			compat: { label: "兼容性测试", tone: "compat" }
-		};
-		var TEST_TYPE_KEYS = Object.keys(TEST_TYPES);
+		// 测试类型。顺序即下拉框的展示顺序，按用户要求固定为：
+//   功能测试 → 接口测试 → 边界测试 → 逻辑测试 → 性能测试
+//
+// exception / compat 是历史值：现有数据里还有（当前有 535 条 exception），
+// 它们不再出现在下拉框里，但必须保留映射，否则这些用例的标签会退化成
+// 兜底文案。它们的 tone 统一成 "func"，跟其它类型长得一样 ——
+// 之前 exception 是红框，在一列标签里格外刺眼，用户要求改回普通样式。
+var TEST_TYPES = {
+	functional: { label: "功能测试", tone: "func" },
+	api: { label: "接口测试", tone: "func" },
+	boundary: { label: "边界测试", tone: "func" },
+	logic: { label: "逻辑测试", tone: "func" },
+	performance: { label: "性能测试", tone: "perf" },
+	// 以下两项仅用于显示旧数据，不进下拉框。
+	exception: { label: "异常测试", tone: "func" },
+	compat: { label: "兼容性测试", tone: "func" }
+};
+// 下拉框可选值：只列新的五项，且保持上面的顺序。
+var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 
 		function cn() {
 			var parts = [];
@@ -460,6 +524,20 @@ window.__ModuleLoader__.load({
 			return records.slice().sort(function (left, right) {
 				return String(right.updatedAt).localeCompare(String(left.updatedAt));
 			});
+		}
+
+		/**
+		 * 毫秒转「人话」时长：0.8s / 12.3s / 1m04s / 12m30s。
+		 * 整轮耗时常见是几十秒到几分钟，固定一位小数在分钟级就不好读了。
+		 */
+		function fmtDuration(ms) {
+			var value = Number(ms);
+			if (!Number.isFinite(value) || value <= 0) return "—";
+			if (value < 60000) return (value / 1000).toFixed(1) + "s";
+			var total = Math.round(value / 1000);
+			var minutes = Math.floor(total / 60);
+			var seconds = total % 60;
+			return minutes + "m" + (seconds < 10 ? "0" : "") + seconds + "s";
 		}
 
 		/**
@@ -519,6 +597,8 @@ window.__ModuleLoader__.load({
 				"aria-hidden": "true",
 				focusable: "false"
 			};
+			// 允许调用方叠一点内联样式（例如把箭头翻个方向）。
+			if (props.style) common.style = props.style;
 			var children = null;
 			switch (props.name) {
 				case "search":
@@ -541,6 +621,22 @@ window.__ModuleLoader__.load({
 					break;
 				case "code":
 					children = [h("path", { key: "a", d: "m9 8-5 4 5 4" }), h("path", { key: "b", d: "m15 8 5 4-5 4" }), h("path", { key: "c", d: "m13 5-2 14" })];
+					break;
+				// 查看源码：带文件框的代码符号（文件轮廓 + 内部 <>）。
+				// 原来这里用的是 "location"（一个十字准星），用户反馈看不出是「看源码」。
+				// 与纯括号的 "code" 区分：这一个是「打开某个源文件」，那一个是「看这段代码内容」。
+				case "source":
+					children = [
+						h("path", { key: "a", d: "M6 3h8l4 4v14H6z" }),
+						h("path", { key: "b", d: "M14 3v5h5" }),
+						h("path", { key: "c", d: "m11 12-2 2.5 2 2.5" }),
+						h("path", { key: "d", d: "m15 12 2 2.5-2 2.5" })
+					];
+					break;
+				// 执行：播放三角。原先用 "external"（外链箭头），看着像「在新窗口打开」而不是「跑起来」。
+				// 用描边闭合三角形，线宽与其它图标一致，不是实心块。
+				case "play":
+					children = [h("path", { key: "a", d: "M8 4.8 19 12 8 19.2z" })];
 					break;
 				case "copy":
 					children = [h("rect", { key: "a", x: 9, y: 9, width: 11, height: 11, rx: 2 }), h("path", { key: "b", d: "M5 15V5a1 1 0 0 1 1-1h9" })];
@@ -1393,19 +1489,63 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
+		 * 判断一份执行记录是不是「被中断 / 被终止」而不是正常跑完。
+		 *
+		 * 依据是 runner（assets/run_tests.py）写进 result.json 的状态：
+		 *   finish(130, "interrupted", "执行被中断")  ← 用户终止 / 进程被杀
+		 * 后端 /run/list 把这个 status 原样透出来，所以这里能直接认。
+		 * aborted 是宿主侧对同一件事的叫法，一并认。
+		 */
+		function runWasInterrupted(run) {
+			if (!run || typeof run !== "object") return false;
+			var status = typeof run.status === "string" ? run.status : "";
+			var outcome = typeof run.caseOutcome === "string" ? run.caseOutcome : "";
+			return status === "interrupted" || status === "aborted" || outcome === "interrupted" || outcome === "aborted";
+		}
+
+		function runWasInterruptedIn(list) {
+			if (!Array.isArray(list)) return false;
+			for (var i = 0; i < list.length; i += 1) {
+				if (runWasInterrupted(list[i])) return true;
+			}
+			return false;
+		}
+
+		// 轮询间隔：2 秒一次。只读一个 JSON 列表，开销很小。
+		var POLL_MS = 2000;
+		// 单次执行最长等 10 分钟。2314 条全量可能更久，但那种场景不看单条展开。
+		var MAX_WAIT_MS = 10 * 60 * 1000;
+
+		/**
 		 * 表格行展开出来的「执行记录」。
 		 * 数据来自 /data-panel/run/list（只读会话资产目录里已有的 runs/），
 		 * 一次执行一条，最新在前；查看/删除都只影响这一条记录，不动用例。
+		 *
+		 * props.awaiting：这条用例刚点过「执行」，正在等结果。
+		 * 为 true 时每 2 秒读一次 /run/list，一发现「最新 runId 变了」就收工。
+		 * 计时起点是 props.clickedAt（点执行那一刻）。
 		 */
 		function RunRecords(props) {
 			var record = props.record;
 			var sessionId = typeof props.sessionId === "string" ? props.sessionId : "";
+			var awaiting = props.awaiting === true;
 			var state = useState({ status: "loading", runs: [], error: "" });
 			var view = state[0];
 			var setView = state[1];
 			var reloadState = useState(0);
 			var reloadTick = reloadState[0];
 			var setReloadTick = reloadState[1];
+			// 上次读到的第一条 runId：判断「有没有新的执行记录」。
+			// 比条数可靠——删一条再跑一条，条数不变但记录已经变了。
+			var firstRunRef = useRef("");
+			// 用户手动刷新时回到 loading 态；结束后的重读保持旧内容，避免表格闪一下。
+			var quietRef = useRef(false);
+
+			function applyRuns(runs, quiet) {
+				firstRunRef.current = runs.length > 0 ? String(runs[0].runId || "") : "";
+				if (quiet) quietRef.current = true;
+				setView({ status: runs.length === 0 ? "empty" : "ready", runs: runs, error: "" });
+			}
 
 			useEffect(function () {
 				if (sessionId === "") {
@@ -1413,11 +1553,11 @@ window.__ModuleLoader__.load({
 					return undefined;
 				}
 				var alive = true;
-				setView({ status: "loading", runs: [], error: "" });
+				if (!quietRef.current) setView({ status: "loading", runs: [], error: "" });
+				quietRef.current = false;
 				fetchRunList(sessionId, "case", record.caseId).then(function (data) {
 					if (!alive) return;
-					var runs = (data && data.runs) || [];
-					setView({ status: runs.length === 0 ? "empty" : "ready", runs: runs, error: "" });
+					applyRuns((data && data.runs) || [], false);
 				}).catch(function (failure) {
 					if (!alive) return;
 					setView({ status: "error", runs: [], error: failure && failure.message ? failure.message : "读取执行记录失败" });
@@ -1427,6 +1567,94 @@ window.__ModuleLoader__.load({
 				};
 			}, [sessionId, record.caseId, reloadTick]);
 
+			/**
+			 * 等这次执行的结果落到 runs/<runId>/。
+			 *
+			 * 方案：定时轮询 /run/list，一发现「最新一条 runId 变了」就收工。
+			 *
+			 * 为什么用轮询而不是监听会话状态：
+			 * 之前试过读 `sessions.list.byId[id].running` 判断对话是否结束，
+			 * 但在实际环境里拿到的值不稳定，等不到 true→false 的边沿，
+			 * 结果就是面板一直没反应。轮询虽然笨，但它只依赖一个东西：
+			 * /run/list 到底有没有新记录 —— 这是唯一真实的判据。
+			 *
+			 * 时机：
+			 *   点「执行」时就开始计时（props.clickedAt），不等用户按回车；
+			 *   每 POLL_MS 读一次，读到新记录就停，最长等 MAX_WAIT_MS。
+			 */
+			useEffect(function () {
+				if (!awaiting || sessionId === "") return undefined;
+				var alive = true;
+				var stopped = false;
+				var pollTimer = null;
+				var deadline = Date.now() + MAX_WAIT_MS;
+				// 基线：点「执行」那一刻最新的一条 runId（父组件传进来的）。
+				// null 表示没拿到基线，这时退化成「读到任何记录即算」。
+				var baseline = typeof props.baselineRunId === "string" ? props.baselineRunId : null;
+				var baselineKnown = typeof props.baselineRunId === "string";
+				var firstRead = true;
+
+				function costNow() {
+					var from = Number(props.clickedAt) || 0;
+					return from > 0 ? Date.now() - from : 0;
+				}
+
+				function settleWith(runs) {
+					if (stopped || !alive) return;
+					stopped = true;
+					if (pollTimer !== null) { clearInterval(pollTimer); pollTimer = null; }
+					applyRuns(runs, true);
+					var interrupted = runWasInterruptedIn(runs);
+					if (typeof props.onSettled === "function") {
+						props.onSettled(firstRunRef.current, interrupted ? 0 : costNow(), interrupted);
+					}
+				}
+
+				function poll() {
+					if (!alive || stopped) return;
+					if (Date.now() > deadline) {
+						// 等太久了：停下来，让用户自己刷新。
+						if (pollTimer !== null) { clearInterval(pollTimer); pollTimer = null; }
+						if (typeof props.onSettled === "function") {
+							props.onSettled(firstRunRef.current, 0, false);
+						}
+						return;
+					}
+					fetchRunList(sessionId, "case", record.caseId).then(function (data) {
+						if (!alive || stopped) return;
+						var runs = (data && data.runs) || [];
+						var latest = runs.length > 0 ? String(runs[0].runId || "") : "";
+
+						// 首次：如果还没拿到基线，就把当前最新一条当作基线。
+						if (firstRead && !baselineKnown) {
+							firstRead = false;
+							baseline = latest;
+							baselineKnown = true;
+							// 但这次执行还没产出记录时，需继续等；
+							// 若已经有记录且和刚取的基线相同，也算「还没新记录」。
+							return;
+						}
+						firstRead = false;
+
+						var landed = latest !== "" && latest !== baseline;
+						if (landed) { settleWith(runs); return; }
+
+						// 还没新记录：保持旧内容可见，别让面板空着。
+						if (runs.length > 0) applyRuns(runs, true);
+					}).catch(function () {
+						// 轮询期间的失败不打扰用户，下一轮接着试。
+					});
+				}
+
+				poll();
+				pollTimer = setInterval(poll, POLL_MS);
+
+				return function () {
+					alive = false;
+					if (pollTimer !== null) { clearInterval(pollTimer); pollTimer = null; }
+				};
+			}, [awaiting, sessionId, record.caseId, props.awaitTick, props.baselineRunId, props.clickedAt]);
+
 			function remove(runId) {
 				props.onRemove(runId, function (done) {
 					if (done) setReloadTick(function (n) { return n + 1; });
@@ -1434,12 +1662,30 @@ window.__ModuleLoader__.load({
 			}
 
 			var body = null;
+			/*
+			 * 等结果期间的提示。
+			 * 计时起点是「点执行」那一刻（props.clickedAt），不再等用户按回车 ——
+			 * 之前想精确到「消息发出去」，但拿不到稳定信号，反而让面板毫无反应。
+			 */
+			var waitingHint = null;
+			if (awaiting) {
+				var clickedAt = Number(props.clickedAt) || 0;
+				waitingHint = h("div", { className: "dp-run-wait" },
+					h("span", { className: "dp-run-wait-dot" }),
+					clickedAt > 0
+						? "正在执行…已用 " + fmtDuration(Date.now() - clickedAt)
+						: "正在执行…",
+					h("span", { className: "dp-run-wait-note" }, "跑完会自动刷新，不用点刷新。")
+				);
+			}
 			if (view.status === "loading") {
 				body = h("div", { className: "dp-run-empty" }, "正在读取执行记录…");
 			} else if (view.status === "error") {
 				body = h("div", { className: "dp-run-empty" }, view.error);
 			} else if (view.status === "empty") {
-				body = h("div", { className: "dp-run-empty" }, "这条用例还没有执行过。点它的「执行」按钮，跑完再回来看。");
+				body = h("div", { className: "dp-run-empty" }, awaiting
+					? "指令已经填进对话，跑完后这里会自动出现记录。"
+					: "这条用例还没有执行过。点它的「执行」按钮，跑完再回来看。");
 			} else {
 				var outcomeLabels = { passed: "通过", failed: "未通过", error: "错误", skipped: "跳过", unknown: "未确认" };
 				var outcomeTones = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", unknown: "idle" };
@@ -1448,10 +1694,12 @@ window.__ModuleLoader__.load({
 						h("tr", null,
 							h("th", { style: { width: "42px" } }, "#"),
 							h("th", { style: { width: "150px" } }, "执行时间"),
+							// 耗时列先注释掉：整轮耗时口径还在调整，先不展示。
+							// 数据仍在算（roundCost / run.durationMs），取消注释即可恢复。
+							// h("th", { style: { width: "78px" } }, "耗时"),
+							h("th", { className: "dp-grow" }, "实际输出"),
 							h("th", { style: { width: "82px" } }, "结果"),
-							h("th", { style: { width: "70px" } }, "耗时"),
-							h("th", null, "实际输出"),
-							h("th", { className: "dp-right", style: { width: "112px" } }, "操作")
+							h("th", { style: { width: "112px" } }, "操作")
 						)
 					),
 					h("tbody", null, view.runs.map(function (run, index) {
@@ -1459,14 +1707,21 @@ window.__ModuleLoader__.load({
 						var label = outcomeLabels[outcome] || outcome || "—";
 						var tone = outcomeTones[outcome] || "idle";
 						var actualText = run.actual || run.message || "未记录实际值";
+						// 耗时优先用「面板自己记的整轮耗时」（发出 → 出结果）；
+						// 没有就回落到 result.json 里 runner 跑测试的时间。
+						// 列被注释掉了，但这里保留计算：恢复列时不用再改一遍。
+						var costMap = props.roundCost || {};
+						var roundMs = costMap[run.runId];
+						var costText = roundMs > 0 ? fmtDuration(roundMs) : fmtDuration(run.durationMs);
 						return h("tr", { key: run.runId },
 							h("td", null, String(view.runs.length - index)),
 							h("td", { title: run.runId }, fmtFull(run.startedAt)),
-							h("td", null, h("span", { className: "dp-run-state", "data-tone": tone }, label)),
-							h("td", null, run.durationMs > 0 ? (run.durationMs / 1000).toFixed(1) + "s" : "—"),
-							h("td", { className: "dp-run-output" },
+							// 耗时列已注释：
+							// h("td", { title: roundMs > 0 ? "从点执行到对话出结果的总时长" : "测试框架报告的耗时" }, costText),
+							h("td", { className: "dp-left" },
 								h("pre", { title: actualText }, actualText)
 							),
+							h("td", null, h("span", { className: "dp-run-state", "data-tone": tone }, label)),
 							h("td", null,
 								h("div", { className: "dp-run-ops" },
 									h(IconButton, {
@@ -1504,6 +1759,8 @@ window.__ModuleLoader__.load({
 						})
 					)
 				),
+				// 等结果时把计时提示放最上面，一眼能看到「还在跑、已经跑了多久」。
+				waitingHint,
 				body
 			);
 		}
@@ -1571,15 +1828,15 @@ window.__ModuleLoader__.load({
 					tests.length > 0
 						? h("table", { className: "dp-run-table" },
 							h("thead", null, h("tr", null,
-								h("th", { style: { width: "45%" } }, "测试函数"),
+								h("th", { className: "dp-left", style: { width: "32%" } }, "测试函数"),
 								h("th", { style: { width: "80px" } }, "结果"),
-								h("th", null, "说明")
+								h("th", { className: "dp-left" }, "说明")
 							)),
 							h("tbody", null, tests.map(function (item, index) {
 								return h("tr", { key: String(index) },
-									h("td", { style: { fontFamily: "ui-monospace, Consolas, monospace" } }, item.func || "—"),
+									h("td", { className: "dp-left", style: { fontFamily: "ui-monospace, Consolas, monospace" } }, item.func || "—"),
 									h("td", null, h("span", { className: "dp-run-state", "data-tone": outcomeTone[item.outcome] || "idle" }, outcomeLabel[item.outcome] || item.outcome || "—")),
-									h("td", null, item.message || "—")
+									h("td", { className: "dp-left" }, item.message || "—")
 								);
 							}))
 						)
@@ -1772,24 +2029,25 @@ window.__ModuleLoader__.load({
 		 * 空状态。三种情形分开说清楚：
 		 *   category — 当前层级里没有用例 → 引导去「默认」挑用例加进来
 		 *   filtered — 有筛选条件但没命中 → 清筛选
-		 *   都没有   — 面板里一条用例都没有 → 新增
+		 *   都没有   — 面板里一条用例都没有 → 「暂时还没有用例」+ 新增入口
 		 */
 		function EmptyState(props) {
 			var filtered = props.filtered;
 			var category = typeof props.category === "string" ? props.category : "";
 			var inCategory = category !== "" && !filtered;
+			var total = typeof props.total === "number" ? props.total : 0;
 			return h("div", { className: "dp-empty" },
 				h("div", { className: "dp-empty-icon" },
 					h(Icon, { name: inCategory ? "folder" : "doc", size: 23 })
 				),
 				h("h3", null, inCategory
 					? "「" + category + "」层级还是空的"
-					: (filtered ? "没有匹配的用例" : "还没有用例")),
+					: (filtered ? "没有匹配的用例" : "暂时还没有用例")),
 				h("p", null, inCategory
 					? "去「默认」层级勾选要放进这个层级的用例，再用下方的「添加至层级」归入。"
 					: (filtered
 						? "换个关键词或清除筛选条件试试。"
-						: "把需要跟踪的测试用例放进面板，点击用例名称即可在右侧查看详情。")),
+						: "这个会话还没有导入或新建任何用例。可以点下面的按钮手动新增一条，也可以让 AI 按 Skill 生成测试用例后自动落到这里。")),
 				inCategory
 					? h(Button, { variant: "primary", onClick: props.onGoDefault },
 						h(Icon, { name: "folder", size: 15 }),
@@ -1800,7 +2058,11 @@ window.__ModuleLoader__.load({
 						: h(Button, { variant: "primary", onClick: props.onCreate },
 							h(Icon, { name: "plus", size: 15 }),
 							"新增用例"
-						))
+						)),
+				// 真的一条都没有时，补一句「不是加载失败」，避免用户以为面板坏了。
+				(!inCategory && !filtered && total === 0)
+					? h("p", { className: "dp-empty-note" }, "面板会监听当前会话，AI 生成用例后这里会自动出现。")
+					: null
 			);
 		}
 
@@ -1811,6 +2073,128 @@ window.__ModuleLoader__.load({
 					return h("div", { className: "dp-skeleton", key: column, style: { width: width } });
 				}));
 			}));
+		}
+
+		/**
+		 * 左栏「用例层级」。
+		 *
+		 * 两条约束来自用户反馈：
+		 *   1. 左栏高度跟着表格走 —— 表格矮而层级多时不能无限拉长，
+		 *      高度到表格为止，剩下的靠分页翻；
+		 *   2. 表格高、层级少时不分页，保持原样。
+		 * 高度由父组件量好（props.boardHeight）传进来，这里只负责按行高反算每页几条。
+		 * 自己量自己的话会陷入「内容变高 → 自己更高 → 又能放更多」的循环。
+		 */
+		function CategorySidebar(props) {
+			var rows = props.rows;
+			var activeCategory = props.activeCategory;
+			var pickedCount = props.pickedCount;
+			var docked = props.docked === true;
+			var boardHeight = Number(props.boardHeight) || 0;
+			var pageState = useState(1);
+			var page = pageState[0];
+			var setPage = pageState[1];
+
+			var headHeight = 30;
+			var pagerHeight = 33;
+			var rowHeight = docked ? 29 : 31;
+			// 能放下几条层级：先减掉表头和分页条，再按行高除。
+			var capacity = boardHeight > 0
+				? Math.max(1, Math.floor((boardHeight - headHeight - pagerHeight) / rowHeight))
+				: 0;
+			// 还没量到高度（首帧）就别分页，宁可不折也不能把行藏起来。
+			var needPager = capacity > 0 && rows.length > capacity;
+			var totalPages = needPager ? Math.ceil(rows.length / capacity) : 1;
+			var currentPage = Math.min(Math.max(1, page), totalPages);
+			var visibleRows = needPager
+				? rows.slice((currentPage - 1) * capacity, currentPage * capacity)
+				: rows;
+
+			// 行数变少（删层级 / 换会话）时把页码收回到合法范围，否则会停在空页上。
+			useEffect(function () {
+				if (page > totalPages) setPage(totalPages);
+			}, [page, totalPages]);
+
+			return h("aside", {
+				className: "dp-sidebar",
+				// 高度跟表格走：有量到值就锁死上限，量不到用 CSS 里的兜底 62vh。
+				style: boardHeight > 0 ? { maxHeight: boardHeight + "px" } : null,
+			},
+				h("div", { className: "dp-sidebar-head" },
+					h("span", { className: "dp-sidebar-title" }, "用例层级"),
+					h("div", { className: "dp-sidebar-tools" },
+						h(IconButton, { name: "plus", label: "新建层级", onClick: props.onCreate })
+					)
+				),
+				h("div", { className: "dp-cat-scroll" },
+					// 勾选的引导文案统一放在表格下方的操作条里，左栏不再重复。
+					visibleRows.map(function (row) {
+						// 「默认」= 看全部用例。外观是分组标题，但可点击切回全部。
+						if (row.value === "") {
+							return h("button", {
+								key: row.key,
+								type: "button",
+								className: cn("dp-cat-group", activeCategory === "" ? "is-active" : ""),
+								// 条数本来就常驻显示，tooltip 里不再重复（用户反馈 hover 时多冒一个数字）。
+								title: "显示全部用例",
+								onClick: function () { props.onSelect(""); },
+							},
+								h("span", { className: "dp-cat-group-name" }, row.label),
+								h("span", { className: "dp-cat-group-count" }, String(row.count))
+							);
+						}
+						return h("div", {
+							key: row.key,
+							className: cn("dp-cat", activeCategory === row.value ? "is-active" : ""),
+						},
+							h("button", {
+								type: "button",
+								className: "dp-cat-main",
+								// 同上：条数已常驻显示，tooltip 只留名字。
+								title: row.label,
+								onClick: function () { props.onSelect(row.value); },
+							},
+								h("span", { className: "dp-cat-name" }, row.label),
+								h("span", { className: "dp-cat-count" }, String(row.count))
+							),
+							// 有勾选时，这个层级右侧出现「放入」；没有勾选时显示改名/删除。
+							pickedCount > 0
+								? h("span", { className: "dp-cat-ops is-visible" },
+									h("span", {
+										role: "button",
+										className: "dp-icon-btn dp-cat-drop",
+										title: "把已选的 " + pickedCount + " 条用例放入「" + row.label + "」",
+										onClick: function () { props.onAssign(row.value); }
+									}, h(Icon, { name: "plus", size: 12 }))
+								)
+								: h("span", { className: "dp-cat-ops" },
+									h("span", { role: "button", className: "dp-icon-btn", title: "重命名层级", onClick: function () { props.onRename(row.value); } }, h(Icon, { name: "edit", size: 12 })),
+									h("span", { role: "button", className: "dp-icon-btn danger", title: "删除层级（用例退回默认层）", onClick: function () { props.onDelete(row.value); } }, h(Icon, { name: "trash", size: 12 }))
+								)
+						);
+					})
+				),
+				// 放不下才分页；放得下就整条不渲染，不留空条。
+				needPager ? h("div", { className: "dp-cat-pager" },
+					h("button", {
+						type: "button",
+						className: "dp-cat-pager-btn",
+						disabled: currentPage <= 1,
+						title: "上一页层级",
+						"aria-label": "上一页层级",
+						onClick: function () { if (currentPage > 1) setPage(currentPage - 1); }
+					}, h(Icon, { name: "chevron", size: 12, style: { transform: "rotate(180deg)" } })),
+					h("span", { className: "dp-cat-pager-page" }, currentPage + "/" + totalPages),
+					h("button", {
+						type: "button",
+						className: "dp-cat-pager-btn",
+						disabled: currentPage >= totalPages,
+						title: "下一页层级",
+						"aria-label": "下一页层级",
+						onClick: function () { if (currentPage < totalPages) setPage(currentPage + 1); }
+					}, h(Icon, { name: "chevron", size: 12 }))
+				) : null
+			);
 		}
 
 		function RecordFormModal(props) {
@@ -2017,10 +2401,38 @@ window.__ModuleLoader__.load({
 			var setReportView = reportState[1];
 			// 报告列表入口暂时隐藏（代码保留，改回 true 即可恢复）。
 			var SHOW_REPORT_LIST = false;
-			// 当前展开执行记录的用例 id（一次只展开一行）。
-			var expandedState = useState("");
-			var expandedId = expandedState[0];
-			var setExpandedId = expandedState[1];
+			// 当前展开了执行记录的用例 id 集合（可以同时展开多行）。
+			// 同事 d57e506 把它退回了单值 expandedId，这里恢复成多行展开。
+			var expandedState = useState([]);
+			var expandedIds = expandedState[0];
+			var setExpandedIds = expandedState[1];
+			// 已经点了「执行」、正在等结果的用例。
+			// 结构：{ [recordId]: { caseId, clickedAt, runId, baseline } }
+			//   clickedAt —— 点「执行」的时间，**耗时从这里算起**
+			//   runId     —— 宿主准备阶段分配的运行编号
+			//   baseline  —— 点执行那一刻 /run/list 里最新的一条 runId。
+			//                轮询时用它判断「这次的新记录出来没有」；
+			//                null 表示还没取到，RunRecords 会自己补一次。
+			var awaitingState = useState({});
+			var awaiting = awaitingState[0];
+			var setAwaiting = awaitingState[1];
+			// 每点一次「执行」自增。同一条用例再跑一次时，靠它让监听重新挂上
+			// （awaiting 的键没变，光看它不会触发 useEffect 重跑）。
+			var awaitTickState = useState(0);
+			var awaitTick = awaitTickState[0];
+			var setAwaitTick = awaitTickState[1];
+			// 本轮「整轮耗时」：{ [runId]: 毫秒 }。
+			// 与 result.json 里的 durationMs 不是一回事：
+			//   durationMs  —— runner 跑测试的那几秒（常见 0.5s）
+			//   这里记的   —— 从点「执行」到对话出结果的总时长
+			// 只有面板自己发起的执行才有这个值，历史记录仍回落到 durationMs。
+			var roundCostState = useState({});
+			var roundCost = roundCostState[0];
+			var setRoundCost = roundCostState[1];
+			// 等结果期间每 0.5 秒重渲染一次，让「已用 Xs」自己往上走。
+			var clockState = useState(0);
+			var clock = clockState[0];
+			var setClock = clockState[1];
 			// 正在查看的那次执行（{ record, run }）。
 			var runViewState = useState(null);
 			var runView = runViewState[0];
@@ -2046,6 +2458,36 @@ window.__ModuleLoader__.load({
 			var categoryPromptState = useState(null);
 			var categoryPrompt = categoryPromptState[0];
 			var setCategoryPrompt = categoryPromptState[1];
+			// 右栏表格卡片的实测高度：左栏用它决定能放几层、要不要分页。
+			var boardHeightState = useState(0);
+			var boardHeight = boardHeightState[0];
+			var setBoardHeight = boardHeightState[1];
+			var boardRef = useRef(null);
+
+			// 量表格卡片高度。窗口缩放、行数变化、分页条出现/消失都会触发。
+			useEffect(function () {
+				if (typeof ResizeObserver === "undefined") return undefined;
+				var node = boardRef.current;
+				if (!node) return undefined;
+				var observer = new ResizeObserver(function (entries) {
+					var entry = entries[0];
+					var height = entry && entry.contentRect ? entry.contentRect.height : 0;
+					setBoardHeight(Math.round(height));
+				});
+				observer.observe(node);
+				return function () { observer.disconnect(); };
+			}, []);
+
+			// 有用例在等结果时，让「已用 Xs」每 0.5 秒往前走一格。
+			// 没有等待项就不挂定时器，避免面板闲着也在跳。
+			var awaitingCount = Object.keys(awaiting).length;
+			useEffect(function () {
+				if (awaitingCount === 0) return undefined;
+				var timer = setInterval(function () {
+					setClock(function (n) { return n + 1; });
+				}, 500);
+				return function () { clearInterval(timer); };
+			}, [awaitingCount]);
 
 			function openLatestReport(scope, caseId, noDocMessage, noRunMessage) {
 				var sid = panelSessionId(props);
@@ -2246,7 +2688,21 @@ window.__ModuleLoader__.load({
 			}
 
 			function refresh() {
+				// 刷新后把展开的执行记录全部折起：数据可能整批变了，留着旧展开行没意义。
+				setExpandedIds([]);
 				store.load(true).catch(function () {});
+			}
+
+			/**
+			 * 展开 / 收起某条用例的执行记录。
+			 * 多行可同时展开；刷新时整页折起（见 refresh 的调用点）。
+			 */
+			function toggleExpand(id) {
+				setExpandedIds(function (previous) {
+					var at = previous.indexOf(id);
+					if (at === -1) return previous.concat([id]);
+					return previous.filter(function (item) { return item !== id; });
+				});
 			}
 
 			function togglePick(id) {
@@ -2443,61 +2899,22 @@ window.__ModuleLoader__.load({
 						}, "清空示例")
 					) : null,
 				// 左栏只与表格平齐：标题、统计卡、工具栏都在它上面。
+				// 表格卡片的高度由 boardRef 量出来，交给左栏算每页能放几层。
 				h("div", { className: "dp-board" },
-					h("aside", { className: "dp-sidebar" },
-						h("div", { className: "dp-sidebar-head" },
-							h("span", { className: "dp-sidebar-title" }, "用例层级"),
-							h("div", { className: "dp-sidebar-tools" },
-								h(IconButton, { name: "plus", label: "新建层级", onClick: function () { setCategoryPrompt({ mode: "create" }); } })
-							)
-						),
-						// 勾选的引导文案统一放在表格下方的操作条里，左栏不再重复。
-						categoryRows.map(function (row) {
-							// 「默认」= 看全部用例。外观是分组标题，但可点击切回全部。
-							if (row.value === "") {
-								return h("button", {
-									key: row.key,
-									type: "button",
-									className: cn("dp-cat-group", activeCategory === "" ? "is-active" : ""),
-									title: "显示全部 " + row.count + " 条用例",
-									onClick: function () { setActiveCategory(""); },
-								},
-									h("span", { className: "dp-cat-group-name" }, row.label),
-									h("span", { className: "dp-cat-group-count" }, String(row.count))
-								);
-							}
-							return h("div", {
-								key: row.key,
-								className: cn("dp-cat", activeCategory === row.value ? "is-active" : ""),
-							},
-								h("button", {
-									type: "button",
-									className: "dp-cat-main",
-									title: row.label + "（" + row.count + " 条）",
-									onClick: function () { setActiveCategory(row.value); },
-								},
-									h("span", { className: "dp-cat-name" }, row.label),
-									h("span", { className: "dp-cat-count" }, String(row.count))
-								),
-								// 有勾选时，这个层级右侧出现「放入」；没有勾选时显示改名/删除。
-								picked.length > 0
-									? h("span", { className: "dp-cat-ops is-visible" },
-										h("span", {
-											role: "button",
-											className: "dp-icon-btn dp-cat-drop",
-											title: "把已选的 " + picked.length + " 条用例放入「" + row.label + "」",
-											onClick: function () { assignPicked(row.value); }
-										}, h(Icon, { name: "plus", size: 12 }))
-									)
-									: h("span", { className: "dp-cat-ops" },
-										h("span", { role: "button", className: "dp-icon-btn", title: "重命名层级", onClick: function () { setCategoryPrompt({ mode: "rename", from: row.value }); } }, h(Icon, { name: "edit", size: 12 })),
-										h("span", { role: "button", className: "dp-icon-btn danger", title: "删除层级（用例退回默认层）", onClick: function () { setConfirm({ kind: "deleteCategory", category: row.value }); } }, h(Icon, { name: "trash", size: 12 }))
-									)
-							);
-						})
-					),
+					h(CategorySidebar, {
+						rows: categoryRows,
+						activeCategory: activeCategory,
+						pickedCount: picked.length,
+						docked: docked,
+						boardHeight: boardHeight,
+						onSelect: function (value) { setActiveCategory(value); },
+						onCreate: function () { setCategoryPrompt({ mode: "create" }); },
+						onAssign: function (value) { assignPicked(value); },
+						onRename: function (from) { setCategoryPrompt({ mode: "rename", from: from }); },
+						onDelete: function (category) { setConfirm({ kind: "deleteCategory", category: category }); }
+					}),
 					h("div", { className: "dp-main" },
-						h("div", { className: "dp-card" },
+						h("div", { className: "dp-card", ref: boardRef },
 							h("div", { className: "dp-card-scroll" },
 								waitingSession
 									? h("div", { className: "dp-empty" },
@@ -2511,6 +2928,7 @@ window.__ModuleLoader__.load({
 										? h(EmptyState, {
 											filtered: filtering,
 											category: activeCategory,
+											total: records.length,
 											onClear: function () { setQuery(""); setType("all"); },
 											onGoDefault: function () { setActiveCategory(""); setPicked([]); },
 											onCreate: openCreate
@@ -2546,7 +2964,7 @@ window.__ModuleLoader__.load({
 												)
 											),
 											h("tbody", null, pageRecords.map(function (record) {
-												var isOpen = expandedId === record.id;
+												var isOpen = expandedIds.indexOf(record.id) !== -1;
 												return h(React.Fragment, { key: record.id },
 													h("tr", { className: cn("dp-row", isOpen ? "is-open" : "") },
 													h("td", { className: "dp-pick" },
@@ -2566,8 +2984,8 @@ window.__ModuleLoader__.load({
 															title: isOpen ? "收起执行记录" : "展开执行记录",
 															"aria-label": (isOpen ? "收起 " : "展开 ") + record.caseId + " 的执行记录",
 															"aria-expanded": isOpen,
-															onClick: function () { setExpandedId(expandedId === record.id ? "" : record.id); }
-														}, h(Icon, { name: "chevron", size: 16 })),
+															onClick: function () { toggleExpand(record.id); }
+														}, h(Icon, { name: "chevron", size: 19 })),
 														h(CaseId, { caseId: record.caseId })
 													)
 												),
@@ -2591,7 +3009,7 @@ window.__ModuleLoader__.load({
 													h("td", null,
 														h("div", { className: "dp-actions" },
 															h(IconButton, {
-																name: record.codeRef ? "location" : "code",
+																name: record.codeRef ? "source" : "code",
 																label: (record.codeRef ? "查看源码 " : "查看代码 ") + record.title,
 																onClick: function () {
 																	// 有用例源码位置就跳编辑器；没有则沿用弹窗看用例代码。
@@ -2600,7 +3018,7 @@ window.__ModuleLoader__.load({
 																}
 															}),
 															h(IconButton, {
-																name: "external",
+																name: "play",
 																label: "执行 " + record.title,
 																onClick: function () {
 															// 点执行 = 宿主准备好命令，再预填到面板所属会话的输入框。
@@ -2611,11 +3029,40 @@ window.__ModuleLoader__.load({
 												return;
 											}
 															setRunResult("正在准备执行 " + record.caseId + "…");
+															// 先取一次基线：点执行这一刻最新的一条 runId。
+															// 之后轮询只要看到「最新变了」，就说明这次的新记录落盘了。
+															var baselineReq = fetchRunList(targetSession2, "case", record.caseId)
+																.then(function (data) {
+																	var runs = (data && data.runs) || [];
+																	return runs.length > 0 ? String(runs[0].runId || "") : "";
+																})
+																.catch(function () { return null; });
 															prepareRun(targetSession2, "case", record.caseId).then(function (prep) {
-																var outcome = prefillDraft(targetSession2, runPrompt(record, targetSession2, prep));
+																var promptText = runPrompt(record, targetSession2, prep);
+																var outcome = prefillDraft(targetSession2, promptText);
 																if (!outcome.ok) { setRunResult(""); store.setError("执行：" + outcome.message); return; }
 																store.setError("");
 																setRunResult(outcome.message + "  运行编号：" + prep.runId + "  框架：" + (prep.framework || prep.frameworkId || "未知"));
+																// 计时从点执行这一刻开始，并展开它的执行记录。
+																// RunRecords 会每 2 秒读一次 /run/list，等新记录落盘后自动更新。
+																var clickedAt = Date.now();
+																baselineReq.then(function (baseline) {
+																	setAwaiting(function (previous) {
+																		var next = {};
+																		Object.keys(previous).forEach(function (id) { next[id] = previous[id]; });
+																		next[record.id] = {
+																			caseId: record.caseId,
+																			clickedAt: clickedAt,
+																			runId: prep.runId || "",
+																			baseline: baseline
+																		};
+																		return next;
+																	});
+																	setAwaitTick(function (n) { return n + 1; });
+																});
+																setExpandedIds(function (previous) {
+																	return previous.indexOf(record.id) === -1 ? previous.concat([record.id]) : previous;
+																});
 															}).catch(function (failure) {
 																setRunResult("");
 																store.setError("执行准备失败：" + (failure && failure.message ? failure.message : String(failure)));
@@ -2650,9 +3097,47 @@ window.__ModuleLoader__.load({
 														h(RunRecords, {
 															record: record,
 															sessionId: panelSessionId(props),
+															// 这条用例刚点过「执行」→ 开始轮询 /run/list 等新记录。
+															awaiting: awaiting[record.id] !== undefined,
+															awaitTick: awaitTick,
+															// 计时起点 = 点执行那一刻。
+															clickedAt: awaiting[record.id] !== undefined ? (awaiting[record.id].clickedAt || 0) : 0,
+															// 点执行那一刻的最新 runId，用来判断新记录有没有落盘。
+															baselineRunId: awaiting[record.id] !== undefined ? awaiting[record.id].baseline : null,
+															clockTick: clock,
+															// 已记录的整轮耗时：{ runId: ms }
+															roundCost: roundCost,
 											onReport: function (run) { openRunReport(record, run); },
 											onLog: function (run) { setLogView({ record: record, runId: run.runId }); },
-															onRemove: function (runId, done) { setRemoveRun({ record: record, runId: runId, done: done }); }
+															onRemove: function (runId, done) { setRemoveRun({ record: record, runId: runId, done: done }); },
+															// 这一轮结束、记录已刷新：记下整轮耗时，并把这条用例从「等结果」里摘掉。
+															// cost 由 RunRecords 算好传回来（它就记着 clickedAt），这里只负责落账。
+															// interrupted=true 表示这一轮被终止：不记耗时（按约定「终止就彻底清掉」）。
+															onSettled: function (firstRunId, cost, interrupted) {
+																var pending = awaiting[record.id];
+																if (pending !== undefined && interrupted !== true) {
+																	var elapsed = Number(cost) || 0;
+																	// 优先挂在本次运行的 runId 上；
+																	// 宿主没给 runId 时退到列表里最新那条。
+																	var key = pending.runId || firstRunId || "";
+																	if (key !== "" && elapsed > 0) {
+																		setRoundCost(function (previous) {
+																			var next = {};
+																			Object.keys(previous).forEach(function (id) { next[id] = previous[id]; });
+																			next[key] = elapsed;
+																			return next;
+																		});
+																	}
+																}
+																setAwaiting(function (previous) {
+																	if (previous[record.id] === undefined) return previous;
+																	var next = {};
+																	Object.keys(previous).forEach(function (id) {
+																		if (id !== record.id) next[id] = previous[id];
+																	});
+																	return next;
+																});
+															}
 														})
 													)
 												)
@@ -3465,7 +3950,9 @@ window.__ModuleLoader__.load({
 			}
 		}
 
-		/** 会话工作区目录（相对路径要拼它才能交给编辑器）。 */
+		/**
+		 * 会话工作区目录（相对路径要拼它才能交给编辑器）。
+		 */
 		function sessionCwd(sessionId) {
 			if (sessions === null || typeof sessionId !== "string" || !sessionId) return "";
 			try {
@@ -4266,7 +4753,12 @@ window.__ModuleLoader__.load({
 			ReportModal: ReportModal,
 			RunRecords: RunRecords,
 			RunReportModal: RunReportModal,
+			CategorySidebar: CategorySidebar,
 			CategoryPrompt: CategoryPrompt,
+			EmptyState: EmptyState,
+			fmtDuration: fmtDuration,
+			runWasInterrupted: runWasInterrupted,
+			runWasInterruptedIn: runWasInterruptedIn,
 			runStateOf: runStateOf,
 			CodeModal: CodeModal,
 			Pager: Pager
