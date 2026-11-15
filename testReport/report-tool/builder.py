@@ -237,6 +237,13 @@ def build(
         if element is general_heading:
             after = True
 
+    # 模板目录页的空内容控件会显示“单击此处输入文字”，不能留在正式报告。
+    for control in list(body.iter(qn("w:sdt"))):
+        if control.find(".//" + qn("w:showingPlcHdr")) is not None:
+            parent = control.getparent()
+            if parent is not None:
+                parent.remove(control)
+
     total = passed = not_run = 0
     modules: List[dict] = data["modules"]
 
@@ -249,9 +256,12 @@ def build(
         ok = sum(1 for c in module_cases if c.get("status", "passed") == "passed")
         bad = sum(1 for c in module_cases if c.get("status") == "failed")
         skipped = sum(1 for c in module_cases if c.get("status") == "notRun")
+        unconfirmed = sum(1 for c in module_cases if c.get("status") == "unconfirmed")
         summary_line = f"共 {len(module_cases)} 条用例，通过 {ok} 条，未通过 {bad} 条"
         if skipped:
             summary_line += f"，未执行 {skipped} 条"
+        if unconfirmed:
+            summary_line += f"，未确认 {unconfirmed} 条"
         _insert_before_sectpr(body, _make_paragraph(issue_para, summary_line + "。"))
 
         # Cases
@@ -276,9 +286,9 @@ def build(
 
         # Per-module notes
         _insert_before_sectpr(body, _make_paragraph(sub_heading, "遇到的问题"))
-        _insert_before_sectpr(body, _make_paragraph(issue_para, module.get("issues", "无。")))
+        _insert_before_sectpr(body, _make_paragraph(issue_para, module.get("issues", "未记录异常。")))
         _insert_before_sectpr(body, _make_paragraph(sub_heading, "与测试用例/规程的不一致"))
-        _insert_before_sectpr(body, _make_paragraph(issue_para, module.get("inconsistent", "无。")))
+        _insert_before_sectpr(body, _make_paragraph(issue_para, module.get("inconsistent", "未核查。")))
 
     # ── clean the stale table of contents ──
     # The template's TOC still lists the sample modules; drop the cached text so
@@ -308,7 +318,7 @@ def build(
 
     print(
         f"modules={len(modules)}  cases={total}  passed={passed}  "
-        f"failed={total - passed - not_run}  notRun={not_run}  "
+        f"failed={data['summary']['failed']}  notRun={not_run}  unconfirmed={data['summary']['unconfirmed']}  "
         f"removed={removed}  toc_cleared={cleared}"
     )
     print(f"目录：{toc_note}")

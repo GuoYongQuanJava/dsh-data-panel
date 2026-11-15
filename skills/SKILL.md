@@ -9,6 +9,59 @@ description: 通用单元测试工作流：识别项目语言和测试框架，�
 
 本 Skill 面向**不同语言和项目**：先识别被测代码的语言、构建系统与测试框架，再按该项目适用的方式生成与运行测试。用例分析、人工审查、会话归属、面板台账、执行与日志、报告桥接都是通用流程；面板的「执行 / 全部执行」不绑定 Python，它按会话资产目录里的 `runner.json`（或自动识别的内置框架）选择命令。
 
+## 工具链发现（通用，适用于任何语言）
+
+这门工作流要支持任意语言，所以**没有任何“特殊语言”**：Python、Node、Go、Rust、Java、.NET、C/C++、Ruby、PHP 一律走同一条搜索阶梯。
+
+**一次命令失败不代表没装工具**（尤其是 DSH 自带的 Python / Node，它们不在系统 PATH 里）。
+
+### 第一步：调接口看机器能力
+
+```powershell
+Invoke-RestMethod "$env:DSH_WEB_URL/data-panel/tools?project=$PWD" | ConvertTo-Json -Depth 6
+```
+
+返回结构（每个框架需要哪些工具由 `lib/runners.js` 的 `tools: [...]` 声明）：
+
+```json
+{ "ok": true, "detected": "pytest", "detectedAvailable": true,
+  "tools": { "python": "C:\\…\\python.exe", "go": "", "cargo": "C:\\…\\cargo.exe" },
+  "presets": { "pytest": { "available": true, "missing": [] }, "go": { "available": false, "missing": ["go"] } },
+  "searched": ["env", "project", "sdk-home", "dsh-runtimes", "path", "common-install-dirs"] }
+```
+
+**`tools` 里空串的含义**：这 6 个层级都找过了，它确实不在常用位置。不等于项目不能用这门语言（可能没装、装在非标准位置，或用项目自带 wrapper）。
+
+### 第二步：找不到就继续找（阶梯，命中即停）
+
+| 顺序 | 去哪找 | 具体做法 |
+| --- | --- | --- |
+| 1 | 显式指定 | `$env:DSH_<TOOL>_PATH` 直接指向可执行文件或目录 |
+| 2 | 项目自带 wrapper | `./mvnw`、`./gradlew`、`node_modules/.bin`、`.venv/Scripts`、`.venv/bin`、`build/install/bin`、`target/debug`、`target/release` |
+| 3 | SDK 根变量 | `%M2_HOME%\bin`、`%JAVA_HOME%\bin`、`%GOROOT%\bin`、`%DOTNET_ROOT%`、`%CARGO_HOME%\bin`、`%PYENV_ROOT%\shims` |
+| 4 | DSH 自带运行时 | `$env:DSH_HOME\dsh-runtimes\**`（限深扫描）—— Python / Node 就在这里 |
+| 5 | PATH | `Get-Command <tool>` / `where.exe <tool>` / `which <tool>` |
+| 6 | 常见安装位置 | 版本管理器：nvm、volta、pyenv、sdkman、rustup、scoop、chocolatey、Homebrew；或 `Get-ChildItem -Path <候选根> -Recurse -Filter <tool>*.exe -Depth 3` |
+
+找到候选后先验证它真的能跑：
+
+```powershell
+& "<找到的可执行文件>" --version    # go version / java -version / mvn -v / cargo --version
+```
+
+有的工具没有 `--version`，能启动就是找到了，不要因为版本命令报错就当没装。
+
+### 第三步：仍然找不到时
+
+- **不要默不作声地少生成**。在对话里明确写：「X 语言没找到 <工具名>，按阶梯找过 env / 项目 wrapper / SDK 变量 / DSH 运行时 / PATH / 常见安装目录，均未命中」，并给出用户可执行的解法（装工具、设 `DSH_<TOOL>_PATH`、提供项目自带 wrapper）。
+- 其他语言**照常生成**，不要因为一个语言卡住就把整次任务停掉。
+- 绝不允许把「某次命令失败」当成「该语言不支持」，从而跳过它的全部用例。
+
+### 铁律
+
+- 项目里有哪种语言，就要为那种语言生成用例和测试代码。
+- 工具探测失败 → 按阶梯继续找 → 真找不到才报告；**不允许静默跳过整门语言**。
+- 新增语言不需要改面板：往 `lib/runners.js` 的 `PRESETS` 加一项并写 `tools: [...]` 即可。
 ## 进度：用 `todo_write` 固定在输入框上方
 
 用户说的「输入框上方的任务气泡」是 **DSH 原生 `todo_write`** 渲染的固定任务列表（不是 genUI 卡片，也不会随对话滚走）。它是本工作流进度的**唯一权威来源**。
@@ -63,11 +116,28 @@ description: 通用单元测试工作流：识别项目语言和测试框架，�
 
 输出：可测试单元清单。
 
+#### Step 1.5: 确认被测语言与工具（必做，不要跳过）
+
+按上文「工具链发现」那节执行。最短路径：
+
+```powershell
+Invoke-RestMethod "$env:DSH_WEB_URL/data-panel/tools?project=$PWD" | ConvertTo-Json -Depth 6
+```
+
+重点看 `detected` / `detectedAvailable` 和 `presets.<框架>.missing`：
+
+- `detectedAvailable: true` → 直接进入 Step 2，不需要再自己跑任何版本命令。
+- `missing` 非空 → 按阶梯继续找（项目 wrapper → SDK 变量 → DSH 运行时 → PATH → 常见安装目录），每条候选都用 `--version` 验一次。
+- 阶梯走完仍找不到 → 先交付其他语言的用例，并**在对话里明确报告缺哪个语言的什么工具**，不允许静默少生成。
+- 无论哪种语言（含 Go / Rust / Java / .NET / C++ / Ruby / PHP），判断标准一致：只看阶梯结果，不凭一次命令失败下结论。
+
 ### Step 2: 生成测试用例
-为每个可测试单元生成覆盖以下类型的用例：
-- **功能测试（functional）**：正常输入，期望输出
-- **边界测试（boundary）**：边界值（0、-1、最大值、空值）
-- **异常测试（exception）**：无效输入、错误条件
+按被测单元的实际特性，从以下五种测试类型中选择；不要求每个单元都凑齐五类：
+- **功能测试（functional）**：正常业务行为与预期输出
+- **接口测试（api）**：接口参数、返回值、协议约定与错误响应
+- **边界测试（boundary）**：0、-1、最大值、空值等边界输入
+- **逻辑测试（logic）**：条件分支、状态转换与业务规则
+- **性能测试（performance）**：有明确指标时验证耗时、吞吐量或资源使用
 
 **Step 2 的第一步：取当前会话 ID 和会话资产目录**
 
@@ -98,6 +168,8 @@ echo "$DSH_SESSION_ID"                                       # bash
 1. `<项目>/.dsh/test-sessions/<SID>/cases.json` — 规范文件（**不要再写项目共享的 `.dsh/testcases/cases.json`**）
 2. 数据面板 API — POST 到 `$env:DSH_WEB_URL/data-panel/api`，body 必须带 `"sessionId": "<SID>"`
 
+`inputVariables` 和 `expectedOutputs` 必须同时写入这两处；面板导出时会沿用面板记录，只有面板未提供结构化变量时才保留 `cases.json` 中原有的结构化字段。编辑用例后再次核对导出结果，避免报告读到旧变量。
+
 ### Step 2.5: 声明运行器（runner.json）
 面板不认识具体语言，它只认一份运行器描述。请先判断项目用什么测试方式，然后在 `<会话资产>/runner.json` 写明：
 
@@ -124,6 +196,22 @@ echo "$DSH_SESSION_ID"                                       # bash
 - `mode`：能产出 JUnit XML 的框架用 `batch`（一条命令跑完，逐条结果来自 JUnit）；否则用 `per-case`（一条用例一条命令，退出码即证据，默认）。
 - Java / Go / C# / Rust / C++ 的测试文件通常必须位于项目源码树内，用 `project:` 写实际路径。
 - C++ / GoogleTest：用 preset `gtest`，`binary` 指向**已构建**的测试可执行文件（`Suite.Name` 会作为 `--gtest_filter`）；需要面板先构建就把构建命令写进 `preCommand`（如 `cmake --build {project}/build`）。
+- `targetExtract` 只用于从面板用例的 `code` 推断测试名；在 `runner.json` 中自定义时会**替换**内置提取规则，可用字符串或字符串数组兼容多种写法。`targetDeclare` 是**单个正则字符串**，准备执行时用它检查测试文件是否声明了目标；自定义它也会替换内置规则。两项不能代替核对实际注册的测试名。
+- **C/C++ 专用（内网常见）**：
+  - 先看 `GET /data-panel/tools?project=<项目>` 里 `ctest` / `gtest` 的 `missing`；缺的通常是 `cmake` 或编译器。
+  - 编译器是**三选一**（`g++` / `clang++` / `cl`），装了任一个就行；`missing` 里写的是整组 `g++|clang++|cl`。
+  - Windows 上 `cmake.exe` / `ctest.exe` / `cl.exe` 大多数时候**不在 PATH**（Visual Studio 自带）。面板会自动去 VS / CMake / LLVM / MSYS2 的常见落点扫，不用你手动找。
+  - 装在非标准位置（内网离线包解压到 D 盘等）：`$env:DSH_TOOL_SEARCH_DIRS = 'D:\tools\cmake-3.29\bin;D:\tools\msys64\mingw64\bin'`，支持 `*`；单个工具也可以用 `$env:DSH_CMAKE_PATH`。
+  - `gtest` 必须写 `binary`（已构建的可执行文件）和构建步骤，例如：
+    ```json
+    { "preset": "gtest",
+      "testFile": "project:tests/generated_test.cpp",
+      "binary": "project:build/tests/generated_test",
+      "preCommand": ["cmake", "--build", "build"] }
+    ```
+    `preCommand` 只是一条命令（argv 数组），所以 configure 要先单独做完：`cmake -S . -B build` 跑一次（或在项目里写个 build 脚本，`preCommand` 调它）。
+  - CTest 项目不需要 `binary`：测试注册进 CTest 后，面板直接 `ctest -R ^名字$`；同样建议把构建写进 `preCommand`。
+  - 项目只有 `Makefile` / `*.vcxproj`、既没有 `CMakeLists.txt` 也没有 `meson.build` 时，面板无法自动识别；不要硬编，直接写 `runner.json` 声明命令，或者先问用户是否同意加一个 CMake 构建入口。
 - 没有 `runner.json` 时面板会按 `go.mod` / `pom.xml` / `package.json` / Python 测试迹象等自动识别；识别不出来会直接报错，不要靠猜。
 - 内置命令只是常见默认值。第一次接入项目时，请核对项目真实的测试命令；不一致就覆盖。
 
@@ -138,12 +226,21 @@ echo "$DSH_SESSION_ID"                                       # bash
 
 `testFunc` 可以写进 `<会话资产>/cases.json` 的对应用例；面板导出时会按 `caseId` 保留它。没写时面板会按运行器声明的 `targetExtract` 从用例 `code` 里推断。
 
+**写完测试代码后核对目标关联，再进入人工审查：**
+
+1. 逐条核对 `cases.json` 中的 `caseId`、`testFunc` 与测试框架实际注册的测试名。`testFunc` 应填写真实测试名，不能不经核对就批量设为 `caseId`。面板执行前会重新导出用例：若面板记录的 `code` 能推断出测试名，该推断值优先；否则才保留 `cases.json` 中已有的 `testFunc`。因此还要核对面板用例代码与最终测试文件是否一致。
+2. 按当前运行器的 `targetDeclare` 检查测试文件能否声明这些目标。静态写出的 `test('名字', …)`、`def test_xxx()` 等通常可直接检查；循环或数据表动态注册的测试名即使写了 `testFunc`，也可能过不了默认的静态检查。遇到这种情况，优先生成可静态识别的声明；确需动态注册时，为该项目配置能核对实际用例数据的 `targetDeclare`，并确认运行器能检测“未匹配到测试”。
+3. 汇报用例总数、缺少测试名的条数、声明检查未命中的条数。后两项要逐条说明并修正；不要用只搜索测试名字符串是否出现的脚本代替运行器的声明检查。
+
 **测试代码编写规范：**
 - 遵循项目本身的语言、构建方式和测试框架，不把其他语言的项目强行改为 Python。
 - 不写入项目共享的测试输出路径；多个会话共用会互相覆盖。
 - **每个用例必须打印实际输出**：统一用 `ACTUAL[<caseId>]: <值>` 标记，通过/失败都打印；面板「实际输出」列只认这个标记，没打印就显示「未记录实际值」。
+  报告中的变量表另需真实的结构化证据：在用例中按实际测试代码填写 `inputVariables: [{"name":"参数名","value":"调用时的值"}]`、`expectedOutputs: [{"name":"结果名","value":"断言期望值"}]`，并从测试代码打印单行 `ACTUAL_JSON[<caseId>]: {"结果名":"运行得到的值"}`。变量名必须对应代码里的真实参数或结果；无法确定时留空数组，报告保留原始输入和预期文字，不得写“输入”“预期输出”当变量名。多个输出都必须逐个打印。值为数字、布尔或 null 时使用合法 JSON；文本值需要 JSON 转义。不要从预期值复制实际值。
   - Python：`print(f"ACTUAL[{case_id}]: {actual!r}")`
+    结构化输出示例：`print(f"ACTUAL_JSON[{case_id}]: " + json.dumps({"discount": actual_discount}, ensure_ascii=False))`。
   - JS/TS：`console.log("ACTUAL[" + caseId + "]:", JSON.stringify(actual))`
+    结构化输出示例：`console.log("ACTUAL_JSON[" + caseId + "]: " + JSON.stringify({ discount: actualDiscount }))`。
   - 其他语言：用对应语言的 stdout 打印同样格式。
 - 生成后先自检（见下方「源码一致性规则」）。
 
@@ -165,6 +262,18 @@ echo "$DSH_SESSION_ID"                                       # bash
 
 如果准备接口报错（没有测试代码、识别不到框架、没有可执行目标），按错误里的框架和路径补齐；不要绕过 runner 自己跑测试再把结果回传。
 
+#### 执行准备失败速查
+
+| 报错或返回内容 | 含义与处理 |
+| --- | --- |
+| `用例没有关联测试函数/测试名` | 该用例的 `testFunc` 为空，且无法从面板用例 `code` 提取测试名；核对实际注册名并补齐关联。整体执行时先将这条记为未执行；只有本次没有任何可执行目标才拒绝准备。 |
+| `测试文件里找不到 <名字>` | 测试名已取得，但 `targetDeclare` 未在测试文件中匹配；核对名称、测试声明及 `runner.json` 的规则。该条会记为未执行。 |
+| `这次没有可执行的用例` | 本次所有目标都缺少测试名或未通过声明检查；按括号中的逐条原因修复后重新点「执行」。 |
+| `本会话还没有测试代码（...）` | `runner.json` 的 `testFile` 指向的文件不存在；生成测试文件或修正路径。 |
+| `无法识别项目的测试框架` | 自动识别失败；核对项目实际测试方式，并按 Step 2.5 写 `runner.json`。 |
+
+准备成功后还要核对返回的 `targetCount`、`missingTestFunc`；需要逐条复查时查看本次 `runs/<runId>/request.json` 的 `targets` 与 `notRun`，不要把“准备成功”当成所有用例都能执行。
+
 > 每次执行（包括面板里单条用例的「执行」）都必须生成报告；单条执行只包含这一条用例，报告文件名带 caseId。
 
 ### Step 6: 生成 Word 报告
@@ -173,10 +282,32 @@ echo "$DSH_SESSION_ID"                                       # bash
 - **每次执行都要生成报告，包括单条用例的「执行」**。单条执行的 snapshot/cases.json 只含该条用例，报告就只写这一条；文件名建议 `<项目>-<caseId>-测试报告.docx`。
 - 报告必须落在 `reports/<runId>/`，否则面板工具栏「报告」和每行的「报告」按钮找不到它。
 
+**先定位报告工具（Windows / PowerShell）**：报告工具独立部署在当前用户目录的 `.dsh\tools\testReport`，不从项目目录或 `DSH_HOME` 查找。把下面的占位值替换为本次执行的会话资产目录和 runId；找不到工具就明确报“报告工具未部署”，不要猜测其他位置。
+
+```powershell
+$reportRoot = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.dsh\tools\testReport'
+$sessionAssets = '<本次会话资产绝对路径>'
+$runId = '<本次 runId>'
+$bridge = Join-Path $reportRoot 'report-tool\bridge.py'
+$builder = Join-Path $reportRoot 'report-tool\cmd.py'
+$dshRoot = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path ([Environment]::GetFolderPath('UserProfile')) '.dsh' }
+$reportPython = Join-Path $dshRoot 'dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe'
+$runResult = Join-Path $sessionAssets "runs\$runId\result.json"
+$reportDir = Join-Path $sessionAssets "reports\$runId"
+if (-not (Test-Path -LiteralPath $bridge -PathType Leaf) -or
+    -not (Test-Path -LiteralPath $builder -PathType Leaf)) {
+  throw "报告工具未部署：$reportRoot"
+}
+if (-not (Test-Path -LiteralPath $reportPython -PathType Leaf)) {
+  throw "DSH 自带 Python 3 未找到：$reportPython"
+}
+& $reportPython -c 'import sys; sys.exit(0 if sys.version_info.major == 3 else 1)'
+if ($LASTEXITCODE -ne 0) { throw "报告工具需要 DSH 自带 Python 3：$reportPython" }
+```
+
 **6.1 桥接数据**：
-```bash
-python <报告工具目录>/report-tool/bridge.py \
-  --run <会话资产>/runs/<runId>/result.json
+```powershell
+& $reportPython $bridge --run $runResult
 ```
 
 不传 `--cases` 时 bridge 会自动读 `runs/<runId>/snapshot/cases.json`（本次执行的冻结用例）—— 这很重要：根目录的 `cases.json` 之后可能被改，快照不会。
@@ -184,21 +315,37 @@ python <报告工具目录>/report-tool/bridge.py \
 `--run` 必须是**已经跑过的那次** runId 的 result.json。bridge.py：
 - **不会**重跑测试；
 - **不会**编造覆盖率（没真实数据就写「未采集」）；
+- 变量表只写用例快照中的 `inputVariables`、`expectedOutputs` 和本次运行记录中的 `ACTUAL_JSON`；缺少结构化证据时保留原始文字并标明“未采集/未提供”，不能猜变量名或把预期当实际。
+- 覆盖率**只读** result.json 里的 `coverage` 统计（runner 采到的真实数字）；采不到就写「未采集（原因）」，绝不编一个百分比。
+
+**覆盖率怎么才有数字**（不是模型手填，是 runner 采的）：
+
+- 每个 preset 已自带 coverage 配置（pytest / vitest / jest / go / maven / dotnet），runner 会在**用例跑完后额外跑一次采集**，解析报告后写进 result.json；
+- 所以报告里总是「未采集」时，先看 `result.json` 的 `coverage.reason`，常见的两种：
+  1. **没装采集插件** —— reason 里会直接给安装命令（如 `python -m pip install coverage pytest-cov`、`npm i -D @vitest/coverage-v8`）；**让用户装好再重跑**，不要自己编数据；
+  2. **框架默认不采覆盖率**（C/C++ 的 ctest/gtest/meson）—— 在 `runner.json` 里写 `coverage` 接上 gcov/gcovr/lcov，例如：
+     ```json
+     { "coverage": { "command": ["gcovr", "-r", ".", "--xml", "{coverageFile}"],
+                     "format": "cobertura", "file": "coverage.xml" } }
+     ```
+- 支持的 `format`：`coveragepy-json` / `istanbul-summary` / `go-cover` / `lcov` / `cobertura` / `jacoco`；
+- 覆盖率采集失败**不会**把执行判成失败，不要因为它失败就把这次执行说成失败。
 - 逐条结论**只认** result.json 里 `tests` 的逐条结果——`batch` 来自 JUnit，`per-case` 来自每条命令的退出码；找不到证据就标「未确认」，绝不用整体状态推断通过。
 
 **6.2 生成报告**：
-```bash
-python <报告工具目录>/report-tool/cmd.py \
-  --template <报告工具目录>/templates/<适用的报告模板>.docx \
-  --data <会话资产>/reports/<runId>/report-data.json \
-  --skill <报告工具目录>/skills/<项目名> \
-  -o <会话资产>/reports/<runId>/<项目名>-测试报告.docx
+```powershell
+$template = Join-Path $reportRoot 'templates\<适用的报告模板>.docx'
+$reportSkill = Join-Path $reportRoot 'skills\<项目名>'
+if (-not (Test-Path -LiteralPath $template -PathType Leaf)) { throw "报告模板不存在：$template" }
+if (-not (Test-Path -LiteralPath $reportSkill -PathType Container)) { throw "项目报告 Skill 不存在：$reportSkill" }
+& $reportPython $builder --template $template --data (Join-Path $reportDir 'report-data.json') `
+  --skill $reportSkill -o (Join-Path $reportDir '<项目名>-测试报告.docx')
 ```
 
 > 报告中间文件按 `reports/<runId>/` 存放，不同次执行不会互相覆盖。生成后面板工具栏「报告」就能看到。
 先确认模板文件与该项目的报告 Skill 目录真实存在；不要把 RingBuffer 示例模板直接用于任意项目。
 
-报告工具目录：本仓库根目录下的 `testReport/`。
+报告工具目录固定为当前用户目录下的 `.dsh\tools\testReport\`。
 SKILL.md 的 frontmatter 写 `designer` / `reviewer` / `tester` 三个人员字段。
 
 ---
@@ -209,10 +356,12 @@ SKILL.md 的 frontmatter 写 `designer` / `reviewer` / `tester` 三个人员字�
 {
   "caseId": "TC-XXX-001",
   "title": "用例名称",
-  "testType": "functional|boundary|exception|performance|compat",
+  "testType": "functional|api|boundary|logic|performance",
   "description": "测试说明",
   "input": "输入",
   "expected": "预期输出",
+  "inputVariables": [{"name": "真实输入参数名", "value": "本用例取值"}],
+  "expectedOutputs": [{"name": "真实结果名", "value": "断言期望值"}],
   "codeRef": "测试文件绝对路径#L行号",
   "code": "测试代码内容",
   "testFunc": "测试函数名或测试名",
@@ -311,4 +460,5 @@ GET $env:DSH_WEB_URL/data-panel/api?sessionId=<SID>
 - **codeRef 指向本会话实际生成的测试代码**；不要指向被测源码或项目共享测试输出
 - **生成测试后先自检源码一致性**：重读源码，对比 API（函数签名、属性名），不一致则同步修正
 - **进度必须用 `todo_write` 固定任务气泡**：开工先写 6 步，每完成一步立即更新；TinySteps 卡片只是可选留档，不能替代
+- **不能因为工具探测失败就整语言跳过**：任何语言都先按「工具链发现」的阶梯（env → 项目 wrapper → SDK 变量 → DSH 运行时 → PATH → 常见安装目录）继续找，找不到也要报告，不得静默少生成
 - **Step 2 完成后自动弹出用例面板**：在生成用例的卡片中加 `lifeCycles.onMounted`，JSFunction 里调用 `window.__dshOpenDataPanel()` 自动弹出右侧数据面板；同时卡片里放一个「📋 打开用例面板」按钮作为备用

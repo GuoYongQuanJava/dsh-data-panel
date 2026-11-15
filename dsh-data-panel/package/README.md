@@ -6,7 +6,7 @@
 - **表格列**：用例标识 / 用例名称 / 测试类型 / 测试说明 / 输入 / 预期输出 / 操作。
 - **分页**：表格右下角有分页栏，可选每页 5 / 10 / 20 / 50 条，上一页 / 下一页 / 页码。
 - **增删改查**：搜索（名称、标识、说明、输入、输出）、按测试类型筛选、新增、编辑、删除。
-- **查看代码**：操作列最左侧的「</>」按钮打开用例代码弹窗，可一键复制。
+- **查看测试代码**：用例按钮按本会话运行器的 `testFile` 和用例 `testFunc` 定位实际测试文件；旧 `codeRef` 指错路径时只提示，不会跳到源码。
 - **点击用例名称 → 右侧栏详情**：右侧栏展示输入、预期输出与代码，可继续编辑或删除。
 - **执行（一键就绪）**：工具栏「全部执行」和每行「执行」会先让宿主**准备这次执行**（导出当前面板用例 → 分配 runId → 生成命令），再把命令预填进**面板所属会话**的输入框。切到对话按回车即可。
 - **执行不绑定语言**：面板只认一份「运行器描述」——测试文件在哪、命令怎么拼、逐条结果从哪来。内置 pytest / Vitest / Jest / Node test / go test / cargo / dotnet / Maven / Gradle / CTest / GoogleTest，项目也可以用 `runner.json` 完全自定义。
@@ -51,10 +51,39 @@
 | `gradle` | Java / Kotlin | per-case | `<项目>/src/test/java/GeneratedTest.java` |
 | `ctest` | C / C++ | per-case | `<项目>/tests/generated_test.cpp` |
 | `gtest` | C / C++ | per-case | `<项目>/tests/generated_test.cpp`（`binary` 指向已构建的测试可执行文件） |
+| `meson` | C / C++ | per-case | `<项目>/tests/generated_test.cpp`（`meson test -C build`） |
 
-没有 `runner.json` 时，宿主按项目标记识别：`go.mod` / `Cargo.toml` / `pom.xml` / `build.gradle*` / `*.csproj|*.sln` / `CMakeLists.txt`（内容引了 GoogleTest 就用 gtest，否则 CTest）/ `package.json` 依赖 / Python 测试迹象。识别不出来会明确报错，让你写 `runner.json`，**不会**默默按 Python 猜。
+没有 `runner.json` 时，宿主按项目标记识别：`go.mod` / `Cargo.toml` / `pom.xml` / `build.gradle*` / `*.csproj|*.sln` / `CMakeLists.txt`（内容引了 GoogleTest 就用 gtest，否则 CTest）/ `meson.build` / `package.json` 依赖 / Python 测试迹象。识别不出来会明确报错，让你写 `runner.json`，**不会**默默按 Python 猜。
 
 > 内置命令是**常见默认值**，不是对所有项目都保证正确。第一次接入某个项目时，应由 Skill 核对项目实际的测试命令；不一致就写 `runner.json` 覆盖。
+
+### 每个 preset 需要什么工具
+
+`tools` 是运行已有测试必需的工具；`buildTools` 只描述需要重新构建时的工具。每项可以是工具名，也可以是**任选其一**的数组：
+
+| preset | `tools`（运行） | `buildTools`（构建） |
+| --- | --- | --- |
+| `ctest` | `['ctest']` | `['cmake', ['g++', 'clang++', 'cl']]` |
+| `gtest` | `[]`，但必须有 `binary` | `['cmake', ['g++', 'clang++', 'cl']]` |
+| `meson` | `['meson', 'ninja']` | — |
+
+C/C++ 没有“必须装 g++”这回事：MSVC（`cl`）、GCC（`g++`）、Clang（`clang++`）任选一个就行，缺的时候报的是整组 `g++|clang++|cl`。
+
+Windows 上这些工具**通常不在 PATH**（尤其是 Visual Studio 自带的 `cl.exe` / `cmake.exe`），所以解析器会额外扫这些固定落点：
+
+- `%ProgramFiles%\CMake\bin`、`%LOCALAPPDATA%\Programs\CMake\bin`、`%ProgramFiles%\LLVM\bin`；
+- `%ProgramFiles%\Microsoft Visual Studio\<年>\<版>\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin`（VS 自带 cmake/ctest）；
+- `…\VC\Tools\MSVC\<版本>\bin\Hostx64\x64`（`cl.exe`）、`…\MSBuild\Current\Bin`；
+- `C:\msys64\mingw64\bin`、`C:\msys64\usr\bin`、`C:\MinGW\bin` 等 MinGW/MSYS2 常见位置；
+- `VCPKG_ROOT` / `VCINSTALLDIR` / `VCToolsInstallDir` / `VSINSTALLDIR` / `CMAKE_ROOT` 这些环境变量指到的目录。
+
+装在别处（内网很常见）时不用改代码，也不用改 PATH：
+
+```powershell
+$env:DSH_TOOL_SEARCH_DIRS = 'D:\tools\cmake-3.29\bin;D:\tools\msys64\mingw64\bin'
+```
+
+支持 `*` 通配（如 `D:\tools\cmake-*\bin`），也可以只给单个工具：`$env:DSH_CMAKE_PATH = 'D:\tools\cmake\bin\cmake.exe'`。
 
 ## runner.json
 
@@ -116,10 +145,75 @@ C++ / GoogleTest 项目：`binary` 指向构建产物，`preCommand` 可选地�
 | `targetEscape` | 为 `true` 时把 `{target}` 当正则字面量转义（`-t`、`-run` 这类正则过滤参数） |
 | `notRunPattern` | 退出码 0 但输出命中该正则 → 该条记为「未确认」 |
 | `timeoutSec` | 整次执行超时，默认 1800 |
+| `coverage` | 覆盖率采集配置，见下节「覆盖率」 |
 
 命令占位符（宿主解析）：`{python}` `{node}` `{npx}` `{gradlew}` `{binary}` `{project}` `{root}` `{runId}` `{runDir}` `{file}` `{junit}`；`{target}` / `{targets}` 由 runner 解析。
 
 **用例的 `testFunc`**：可以是测试函数名（pytest/go/JUnit）或测试名（Vitest/Jest/Node test）。Skill 生成用例时应把它写进 `cases.json`；没写时面板会按 `targetExtract` 从用例代码里推断。
+
+## 覆盖率（为什么以前总是「未采集」）
+
+旧版本有两个断点，缺一个都出不来数字：
+
+1. **执行器根本不采集**：`run_tests.py` 只跑测试、解析 JUnit，没有任何覆盖率命令；
+2. **桥接写死**：`bridge.py` 把每个模块的 `coverage` 固定为字符串 `未采集`。
+
+所以那时的「未采集」**不是模型忘了填**，而是链路两端都不存在。现在两端都通了。
+
+### 现在怎么采
+
+```
+preset/runner.json 的 coverage 配置
+   → run_tests.py 额外跑一次采集命令（失败不影响用例结论）
+   → 解析报告 → result.json 的 coverage 统计
+   → bridge.py 写成 `-S 行% -B 分支%`
+   → Word 模板「覆盖率记录：」那一行
+```
+
+`coverage` 的形状：
+
+```json
+{ "coverage": {
+    "command": ["{python}", "-m", "pytest", "--cov=.", "--cov-report=json:{coverageFile}"],
+    "format": "coveragepy-json",
+    "file": "coverage.json",
+    "hint": "需要 coverage.py 与 pytest-cov",
+    "timeoutSec": 900 } }
+```
+
+- `command`：一条 argv 数组（**元素必须是字符串**），可用 `{coverageFile}` / `{coverageDir}`；
+- `file`：报告文件，相对 runDir，或 `project:` / `root:` / 绝对路径；支持 `*` 通配（取最新一份）；
+- `format`：解析器名，支持 `coveragepy-json` / `istanbul-summary` / `go-cover` / `lcov` / `cobertura` / `jacoco`；
+- `hint`：采不到时写进报告原因里，告诉用户装什么。
+
+### 各语言默认怎么配
+
+| preset | 采集命令 | 需要准备什么 |
+| --- | --- | --- |
+| `pytest` | `pytest --cov=. --cov-branch --cov-report=json` | `python -m pip install coverage pytest-cov` |
+| `vitest` | `vitest run --coverage --coverage.reporter=json-summary` | `npm i -D @vitest/coverage-v8` |
+| `jest` | `jest --coverage --coverageReporters=json-summary` | `jest` 自带；需可插桩源码 |
+| `go` | `go test -coverprofile=coverage.out ./...` | 自带，无需插件 |
+| `maven` | `mvn test jacoco:report` | `pom.xml` 配 `jacoco-maven-plugin` |
+| `dotnet` | `dotnet test --collect:"XPlat Code Coverage"` | `coverlet.collector` 包 |
+| `ctest` / `gtest` / `meson` | 默认不采，用 `runner.json` 接 gcov/lcov | 如 `gcovr --xml -o coverage.xml` → `format: cobertura` |
+
+C/C++ 的例子（接 lcov/gcovr 后就能出数字）：
+
+```json
+{ "preset": "gtest",
+  "coverage": {
+    "command": ["gcovr", "-r", ".", "--xml", "{coverageFile}"],
+    "format": "cobertura",
+    "file": "coverage.xml" } }
+```
+
+### 采不到时会怎样
+
+- 用例的通过/失败**不受影响**，执行不失败；
+- `result.json` 写 `coverage.available = false` + `reason`；
+- 报告里显示 `未采集（<原因>）`，例如 `未采集（没生成覆盖率报告（coverage.json）；需要 coverage.py 与 pytest-cov：python -m pip install coverage pytest-cov）`；
+- 绝不自己编一个百分比。
 
 ## 会话资产目录
 
@@ -183,7 +277,7 @@ type TestCase = {
   id: string                                          // rec_xxxxxxxxxxxx
   caseId: string                                      // 用例标识（≤80，留空时后端生成 TC-xxxxxxxx）
   title: string                                       // 用例名称（必填，≤200）
-  testType: 'functional' | 'boundary' | 'performance' | 'exception' | 'compat'
+  testType: 'functional' | 'api' | 'boundary' | 'logic' | 'performance'
   description: string                                 // 测试说明（≤2000）
   input: string                                       // 输入（≤4000，按换行原样展示）
   expected: string                                    // 预期输出（≤4000，按换行原样展示）
@@ -194,7 +288,7 @@ type TestCase = {
 }
 ```
 
-测试类型的中文标签：功能测试 / 边界测试 / 性能测试 / 异常测试 / 兼容性测试。
+测试类型的中文标签：功能测试 / 接口测试 / 边界测试 / 逻辑测试 / 性能测试。
 
 ## 数据存储
 
@@ -222,6 +316,8 @@ Host 半在 `ctx.webServer` 上注册同源路由：
 ```
 GET  /data-panel/api?sessionId=<会话ID>
 POST /data-panel/api   { "sessionId": "<会话ID>", "op": "create" | "update" | "delete" | "clearDemo", … }
+GET  /data-panel/test-code?sessionId=<会话ID>&cwd=<项目>&caseId=TC-001
+  → { ok, caseId, testFile, testFunc, line, warning }
 
 POST /data-panel/run/prepare  { "sessionId": "<会话ID>", "scope": "case"|"all", "caseId": "TC-001" }
   → { ok, runId, root, command, targetCount, testFile,
@@ -232,9 +328,33 @@ GET  /data-panel/run/result?…&runId=<runId>
 GET  /data-panel/run/report?…[&runId=<runId>]
 GET  /data-panel/run/report/latest?sessionId=<会话ID>&cwd=<项目>&scope=all|case[&caseId=TC-001]
 POST /data-panel/open   { "sessionId": "<会话ID>", "cwd": "<项目>", "path": "<报告绝对路径>" }
+
+GET  /data-panel/tools
 ```
 
 `sessionId` 必填。缺失或为空时接口返回 `400`，不会再回退到任何共享文件。
+
+`GET /data-panel/tools?project=<项目路径>` **不需要 `sessionId`**，是给 Skill / 模型用的工具探活入口，**与语言无关**：
+
+```json
+{ "ok": true, "project": "E:\\proj", "detected": "pytest", "detectedAvailable": true,
+  "tools": { "python": "C:\\…\\python.exe", "go": "", "cargo": "C:\\…\\cargo.exe" },
+  "presets": { "pytest": { "label": "pytest", "language": "python", "available": true, "tools": { "python": "C:\\…" }, "missing": [], "buildAvailable": true, "buildMissing": [] },
+               "go": { "available": false, "missing": ["go"] } },
+  "searched": ["env", "project", "sdk-home", "dsh-runtimes", "path", "common-install-dirs"] }
+```
+
+- 需要哪些工具**不在接口里写死**：每个 preset 用 `tools: [...]` 声明运行所需工具，可用 `buildTools: [...]` 声明构建所需工具；`available` 与 `buildAvailable` 分开报告。只有配置了 `preCommand` 才检查它实际调用的构建命令。
+- 解析器是 `lib/toolchain.js` 的 `resolveTool`，按以下顺序搜索（命中即返回）：
+  1. `DSH_<TOOL>_PATH` 显式指定；
+  2. `DSH_TOOL_SEARCH_DIRS` 自定义目录；
+  3. 项目内 wrapper / 本地依赖：`mvnw`、`gradlew`、`node_modules/.bin`、`.venv/Scripts`、`.venv/bin`、`build/install/bin`、`target/debug|release`；
+  4. SDK 根变量：`<TOOL>_HOME` / `<TOOL>_ROOT`（如 `M2_HOME`、`JAVA_HOME`、`GOROOT`、`DOTNET_ROOT`、`CARGO_HOME`）；
+  5. DSH 自带运行时：`$DSH_HOME/dsh-runtimes/**` 限深扫描（Python / Node 就在这里，**不写死路径**）；
+  6. `PATH`；
+  7. 常见安装目录 + 版本管理器（nvm / volta / pyenv / sdkman / rustup / scoop / chocolatey / Homebrew…），支持一层 `*` 通配。
+- `tools` 里的空串含义是「上述层级都找过，没找到」，**不代表项目不能用这门语言**（可能没装、装在非标准位置，或用项目自带 wrapper）。所以要报告缺什么，而不是静默跳过。
+- 全部是纯文件系统探测，不 spawn 子进程：响应快，也不会被装坏的工具卡住。
 
 `sessionId` 决定读写哪个会话的数据文件，它是唯一的数据归属依据。
 
@@ -257,6 +377,7 @@ POST /data-panel/open   { "sessionId": "<会话ID>", "cwd": "<项目>", "path": 
 ```
 lib/index.js          Host 半：会话存储 + API + 执行准备/日志读取
 lib/runners.js        运行器适配层：框架识别、runner.json 校验、目标提取与命令渲染
+lib/toolchain.js       工具链发现：任意工具名的多层搜索阶梯（与语言无关）
 lib/client.js         Client 半：「面板」按钮 + 右侧栏看板和详情
 assets/run_tests.py   通用执行器：按 request.runner 执行并产生日志与结构化结果
 test/                 适配层单测 + pytest / Node test 端到端测试（node --test test）
@@ -269,7 +390,7 @@ cordis.patch.yml      Bundle 挂载行
 - 右侧栏详情类型：`ctx.sidebarRightTabs.register({ id: 'data-panel-detail', kind: 'data-panel-detail' })`
 - 详情正文：`ctx.slots.register({ name: 'sidebar.right.pane.tab', key: 'data-panel-detail' })`
 - 打开详情：`ctx.sidebarRight.openTab('data-panel-detail', { params: { id } })`
-- 新增语言/框架：往 `lib/runners.js` 的 `PRESETS` 加一项，或让项目写 `runner.json`
+- 新增语言/框架：往 `lib/runners.js` 的 `PRESETS` 加一项并写 `tools: [...]`（工具探活会自动覆盖它），或让项目写 `runner.json`
 
 ## 已知边界（v0.4）
 

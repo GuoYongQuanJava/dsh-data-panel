@@ -112,7 +112,7 @@
       ]
     },
     {
-      "name": "边界与异常测试",
+      "name": "边界测试",
       "trace": "calculator.py 函数 multiply / divide / subtract",
       "driver": "无",
       "coverage": "-S 91.8% -B 85.1%",

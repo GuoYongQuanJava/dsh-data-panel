@@ -13,7 +13,7 @@ TYPE_OPTIONS = {"功能测试", "接口测试", "边界测试", "逻辑测试", 
 #   passed  → 执行情况[√]执行   执行结果[√]通过  □ 未通过
 #   failed  → 执行情况[√]执行   执行结果 □ 通过  [√]未通过
 #   notRun  → 执行情况 □ 执行   [√]未执行   执行结果 □ 通过  □ 未通过
-STATUS_OPTIONS = {"passed", "failed", "notRun"}
+STATUS_OPTIONS = {"passed", "failed", "notRun", "unconfirmed"}
 
 
 class SchemaError(ValueError):
@@ -97,7 +97,7 @@ def _outputs(value: Any, path: str = "outputs") -> List[_Output]:
         out.append(
             (
                 _str(item[0], 120, f"{item_path}[0]"),
-                _str(item[1], 2000, f"{item_path}[1]"),
+                _opt_str(item[1], "", 2000, f"{item_path}[1]"),
                 # the actual value is legitimately empty for a case that never
                 # ran — "not measured" is not the same as "measured as blank"
                 _opt_str(item[2], "", 2000, f"{item_path}[2]"),
@@ -132,7 +132,7 @@ def validate(raw: Any, skill_meta: Optional[Dict[str, str]] = None) -> Dict[str,
     _check(isinstance(meta, dict), "meta 必须是 JSON 对象")
     project = _str(meta.get("project"), 200, "meta.project")
     executed_at = _iso_date(meta.get("executedAt", ""), "meta.executedAt")
-    executor = _opt_str(meta.get("executor"), "dsh-test-harness", 200, "meta.executor")
+    executor = _opt_str(meta.get("executor"), "未记录执行器", 200, "meta.executor")
 
     # ── summary ──
     # ``notRun`` is optional so existing payloads (total = passed + failed)
@@ -143,6 +143,7 @@ def validate(raw: Any, skill_meta: Optional[Dict[str, str]] = None) -> Dict[str,
     passed = summary.get("passed")
     failed = summary.get("failed")
     not_run_total = summary.get("notRun", 0)
+    unconfirmed_total = summary.get("unconfirmed", 0)
     _check(isinstance(total, int) and total >= 0, "summary.total 必须是非负整数")
     _check(isinstance(passed, int) and passed >= 0, "summary.passed 必须是非负整数")
     _check(isinstance(failed, int) and failed >= 0, "summary.failed 必须是非负整数")
@@ -150,13 +151,15 @@ def validate(raw: Any, skill_meta: Optional[Dict[str, str]] = None) -> Dict[str,
         isinstance(not_run_total, int) and not_run_total >= 0,
         "summary.notRun 必须是非负整数",
     )
+    _check(isinstance(unconfirmed_total, int) and unconfirmed_total >= 0,
+           "summary.unconfirmed 必须是非负整数")
     _check(
-        passed + failed + not_run_total == total,
+        passed + failed + not_run_total + unconfirmed_total == total,
         f"summary.passed ({passed}) + summary.failed ({failed})"
-        f" + summary.notRun ({not_run_total}) ≠ summary.total ({total})",
+        f" + summary.notRun ({not_run_total}) + summary.unconfirmed ({unconfirmed_total}) ≠ summary.total ({total})",
     )
     if not_run_total:
-        executed = passed + failed
+        executed = passed + failed + unconfirmed_total
         coverage_rate = round(executed / total * 100, 1) if total else 0.0
     else:
         coverage_rate = 100.0 if total else 0.0
@@ -173,12 +176,13 @@ def validate(raw: Any, skill_meta: Optional[Dict[str, str]] = None) -> Dict[str,
         mod_name = _str(mod.get("name"), 200, f"{prefix}.name")
         # Every header field below is technical output of the run and must be
         # supplied by the producing system — none of it comes from the skill.
-        # ``unitId`` defaults to the module name, ``trace``/``coverage`` to "-"
-        # and ``driver`` to "无" so a minimal payload still renders.
-        unit_id = _opt_str(mod.get("unitId"), mod_name, 200, f"{prefix}.unitId")
-        trace = _opt_str(mod.get("trace"), "-", 300, f"{prefix}.trace")
-        driver = _opt_str(mod.get("driver"), "无", 200, f"{prefix}.driver")
-        coverage = _opt_str(mod.get("coverage"), "-", 200, f"{prefix}.coverage")
+        # Missing header values fall back to explicit "not recorded / not measured"
+        # wording (never a fabricated placeholder such as "-" or "无"), so a minimal
+        # payload still renders without pretending the data exists.
+        unit_id = _opt_str(mod.get("unitId"), "未记录单元标识", 200, f"{prefix}.unitId")
+        trace = _opt_str(mod.get("trace"), "未提供设计追溯", 300, f"{prefix}.trace")
+        driver = _opt_str(mod.get("driver"), "未记录驱动模块", 200, f"{prefix}.driver")
+        coverage = _opt_str(mod.get("coverage"), "未采集", 200, f"{prefix}.coverage")
         # designer / reviewer / tester default to the skill file, which records who
         # owns this procedure; a module or case may override any of them.
         mod_designer = _opt_str(
@@ -214,10 +218,10 @@ def validate(raw: Any, skill_meta: Optional[Dict[str, str]] = None) -> Dict[str,
                 f"测试类型 {case_type!r} 不在 {sorted(TYPE_OPTIONS)} 内",
             )
 
-            desc = _str(case.get("description"), 4000, f"{cprefix}.description")
+            desc = _str(case.get("description"), 12000, f"{cprefix}.description")
             func_desc = _opt_str(case.get("funcDesc"), case_name, 200, f"{cprefix}.funcDesc")
-            stub = _opt_str(case.get("stub"), "无", 200, f"{cprefix}.stub")
-            inserted = _opt_str(case.get("inserted"), "无", 200, f"{cprefix}.inserted")
+            stub = _opt_str(case.get("stub"), "未记录", 200, f"{cprefix}.stub")
+            inserted = _opt_str(case.get("inserted"), "未记录", 200, f"{cprefix}.inserted")
             inp = _inputs(case.get("inputs"), f"{cprefix}.inputs")
             out = _outputs(case.get("outputs"), f"{cprefix}.outputs")
 
@@ -259,8 +263,8 @@ def validate(raw: Any, skill_meta: Optional[Dict[str, str]] = None) -> Dict[str,
 
             not_run_reason = _opt_str(case.get("notRunReason"), "", 500, f"{cprefix}.notRunReason")
 
-            issue = _opt_str(case.get("issue"), "无", 4000, f"{cprefix}.issue")
-            bug_id = _opt_str(case.get("bugId"), "无", 80, f"{cprefix}.bugId")
+            issue = _opt_str(case.get("issue"), "未记录异常", 4000, f"{cprefix}.issue")
+            bug_id = _opt_str(case.get("bugId"), "未记录", 80, f"{cprefix}.bugId")
             designer = _opt_str(case.get("designer"), mod_designer, 80, f"{cprefix}.designer")
             reviewer = _opt_str(case.get("reviewer"), mod_reviewer, 80, f"{cprefix}.reviewer")
             tester = _opt_str(case.get("tester"), mod_tester, 80, f"{cprefix}.tester")
@@ -297,9 +301,9 @@ def validate(raw: Any, skill_meta: Optional[Dict[str, str]] = None) -> Dict[str,
                 "driver": driver,
                 "coverage": coverage,
                 "caseCount": len(cases),
-                "issues": _opt_str(mod.get("issues"), "无。", 4000, f"{prefix}.issues"),
+                "issues": _opt_str(mod.get("issues"), "未记录异常。", 4000, f"{prefix}.issues"),
                 "inconsistent": _opt_str(
-                    mod.get("inconsistent"), "无。", 4000, f"{prefix}.inconsistent"
+                    mod.get("inconsistent"), "未核查。", 4000, f"{prefix}.inconsistent"
                 ),
                 "cases": cases,
             }
@@ -309,7 +313,7 @@ def validate(raw: Any, skill_meta: Optional[Dict[str, str]] = None) -> Dict[str,
     _check(actual == total, f"modules 用例总数 ({actual}) ≠ summary.total ({total})")
 
     # The per-case statuses are the source of truth; summary must agree.
-    counted = {"passed": 0, "failed": 0, "notRun": 0}
+    counted = {"passed": 0, "failed": 0, "notRun": 0, "unconfirmed": 0}
     for module in modules:
         for case in module["cases"]:
             counted[case["status"]] += 1
@@ -328,6 +332,8 @@ def validate(raw: Any, skill_meta: Optional[Dict[str, str]] = None) -> Dict[str,
         f"用例中 status=notRun 的有 {counted['notRun']} 条，"
         f"但 summary.notRun={not_run_total}",
     )
+    _check(counted["unconfirmed"] == unconfirmed_total,
+           f"用例中 status=unconfirmed 的有 {counted['unconfirmed']} 条，但 summary.unconfirmed={unconfirmed_total}")
 
     return {
         "meta": {"project": project, "executedAt": executed_at, "executor": executor},
@@ -336,6 +342,7 @@ def validate(raw: Any, skill_meta: Optional[Dict[str, str]] = None) -> Dict[str,
             "passed": passed,
             "failed": failed,
             "notRun": not_run_total,
+            "unconfirmed": unconfirmed_total,
             "executedRate": coverage_rate,
         },
         "modules": modules,

@@ -21,7 +21,21 @@ from builder import BuilderError, build
 from schema import SchemaError
 
 
+def _force_utf8_output() -> None:
+    """强制 stdout/stderr 用 UTF-8。
+
+    中文 Windows 下 stdout/stderr 被管道接住时默认用 cp936，调用方按 UTF-8
+    解码就会报 UnicodeDecodeError（表现为 stderr 变成 None，直接看不清诊断信息）。
+    """
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 def main(argv: list = None):
+    _force_utf8_output()
     parser = argparse.ArgumentParser(
         description="Fill a test-report template with execution results.",
     )

@@ -12,7 +12,7 @@
  * 执行按钮、日志、结果、报告的链路一个字都不用改。
  */
 import { existsSync, readFileSync, readdirSync } from 'node:fs'
-import { join, isAbsolute, resolve } from 'node:path'
+import { dirname, isAbsolute, join, resolve } from 'node:path'
 
 export const RUNNER_PROFILE_FILE = 'runner.json'
 
@@ -20,6 +20,8 @@ export const RUNNER_PROFILE_FILE = 'runner.json'
 export const PRESETS = Object.freeze({
   pytest: {
     id: 'pytest',
+    // 这个框架跑起来需要哪些可执行文件（由 lib/toolchain.js 通用解析，找不到会继续换层级找）。
+    tools: ['python'],
     label: 'pytest',
     language: 'python',
     testFile: 'tests/test_generated.py',
@@ -34,9 +36,18 @@ export const PRESETS = Object.freeze({
     env: { PYTHONPATH: '{project}', PYTHONIOENCODING: 'utf-8', PYTHONUNBUFFERED: '1' },
     targetExtract: ['\\bdef\\s+(test_[A-Za-z0-9_]+)\\s*\\('],
     targetDeclare: '\\bdef\\s+{target}\\s*\\(',
+    // 覆盖率：pytest-cov 产出 JSON（带行/分支统计）。没装 coverage.py 时 runner 会记下原因，不中断执行。
+    coverage: {
+      // cwd 已切到项目根，所以 `.` 就是被测源码范围；需要只测算某些目录就写 --cov=src。
+      command: ['{python}', '-m', 'pytest', '-q', '--cov=.', '--cov-branch', '--cov-report=json:{coverageFile}', '{targets}'],
+      format: 'coveragepy-json',
+      file: 'coverage.json',
+      hint: '需要 coverage.py 与 pytest-cov：python -m pip install coverage pytest-cov',
+    },
   },
   vitest: {
     id: 'vitest',
+    tools: ['node', 'npx'],
     label: 'Vitest',
     language: 'javascript',
     testFile: 'tests/test_generated.test.mjs',
@@ -48,9 +59,17 @@ export const PRESETS = Object.freeze({
       "\\b(?:it|test)(?:\\.(?:each|skip|only|concurrent|todo))?\\s*\\(\\s*['\"`]([^'\"`\\n]+)['\"`]",
     ],
     targetDeclare: '[\'"`]\\s*{target}\\s*[\'"`]',
+    // 需要 @vitest/coverage-v8（或 istanbul）；未安装时降级为“未采集 + 原因”。
+    coverage: {
+      command: ['{npx}', 'vitest', 'run', '--coverage', '--coverage.reporter=json-summary', '--coverage.reportsDirectory={coverageDir}'],
+      format: 'istanbul-summary',
+      file: 'coverage/coverage-summary.json',
+      hint: '需要 @vitest/coverage-v8：npm i -D @vitest/coverage-v8',
+    },
   },
   jest: {
     id: 'jest',
+    tools: ['node', 'npx'],
     label: 'Jest',
     language: 'javascript',
     testFile: 'tests/test_generated.test.js',
@@ -62,9 +81,17 @@ export const PRESETS = Object.freeze({
       "\\b(?:it|test)(?:\\.(?:each|skip|only|concurrent|todo))?\\s*\\(\\s*['\"`]([^'\"`\\n]+)['\"`]",
     ],
     targetDeclare: '[\'"`]\\s*{target}\\s*[\'"`]',
+    // 需要 @jest/coverage；未安装时降级为“未采集 + 原因”。
+    coverage: {
+      command: ['{npx}', 'jest', '--coverage', '--coverageReporters=json-summary', '--coverageDirectory={coverageDir}'],
+      format: 'istanbul-summary',
+      file: 'coverage/coverage-summary.json',
+      hint: 'Jest 自带覆盖率，但项目里需要有可插桩的源码；也可以用 nyc',
+    },
   },
   'node-test': {
     id: 'node-test',
+    tools: ['node'],
     label: 'Node test runner',
     language: 'javascript',
     testFile: 'tests/test_generated.test.mjs',
@@ -80,6 +107,7 @@ export const PRESETS = Object.freeze({
   },
   go: {
     id: 'go',
+    tools: ['go'],
     label: 'go test',
     language: 'go',
     testFile: 'project:tests/test_generated_test.go',
@@ -88,9 +116,17 @@ export const PRESETS = Object.freeze({
     targetEscape: true,
     targetExtract: ['\\bfunc\\s+(Test[A-Za-z0-9_]+)\\s*\\('],
     targetDeclare: '\\bfunc\\s+{target}\\s*\\(',
+    // go 自带 -coverprofile，不需要插件；一次跑完全部包。
+    coverage: {
+      command: ['go', 'test', '-coverprofile={coverageFile}', './...'],
+      format: 'go-cover',
+      file: 'coverage.out',
+      hint: 'go test 自带覆盖率，无需额外插件',
+    },
   },
   cargo: {
     id: 'cargo',
+    tools: ['cargo'],
     label: 'cargo test',
     language: 'rust',
     testFile: 'project:tests/generated.rs',
@@ -101,6 +137,7 @@ export const PRESETS = Object.freeze({
   },
   dotnet: {
     id: 'dotnet',
+    tools: ['dotnet'],
     label: 'dotnet test',
     language: 'csharp',
     testFile: 'project:GeneratedTests.cs',
@@ -108,9 +145,17 @@ export const PRESETS = Object.freeze({
     command: ['dotnet', 'test', '--filter', 'Name~{target}', '--nologo'],
     targetExtract: ['\\b(?:void|Task)\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*\\('],
     targetDeclare: '\\b{target}\\s*\\(',
+    // coverlet.collector 产 cobertura XML（.NET 8 起需显式引用该包）。
+    coverage: {
+      command: ['dotnet', 'test', '--collect:XPlat Code Coverage', '--results-directory', '{coverageDir}'],
+      format: 'cobertura',
+      file: 'coverage/**/coverage.cobertura.xml',
+      hint: '需要 coverlet.collector（dotnet add package coverlet.collector）',
+    },
   },
   maven: {
     id: 'maven',
+    tools: ['mvn'],
     label: 'Maven Surefire',
     language: 'java',
     testFile: 'project:src/test/java/GeneratedTest.java',
@@ -119,9 +164,17 @@ export const PRESETS = Object.freeze({
     shell: 'win32',
     targetExtract: ['\\bvoid\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*\\('],
     targetDeclare: '\\b{target}\\s*\\(',
+    // JaCoCo 需要 pom.xml 里已配置 jacoco-maven-plugin。
+    coverage: {
+      command: ['mvn', '-q', 'test', 'jacoco:report'],
+      format: 'jacoco',
+      file: 'project:target/site/jacoco/jacoco.xml',
+      hint: '需要 pom.xml 配置 jacoco-maven-plugin',
+    },
   },
   gradle: {
     id: 'gradle',
+    tools: ['gradle'],
     label: 'Gradle Test',
     language: 'java',
     testFile: 'project:src/test/java/GeneratedTest.java',
@@ -133,6 +186,9 @@ export const PRESETS = Object.freeze({
   },
   ctest: {
     id: 'ctest',
+    // 已构建的项目只需 ctest；构建工具由实际 preCommand 决定。
+    tools: ['ctest'],
+    buildTools: ['cmake', ['g++', 'clang++', 'cl']],
     label: 'CTest',
     language: 'cpp',
     testFile: 'project:tests/generated_test.cpp',
@@ -144,6 +200,9 @@ export const PRESETS = Object.freeze({
   },
   gtest: {
     id: 'gtest',
+    // 直接执行已构建的 binary；构建工具由实际 preCommand 决定。
+    tools: [],
+    buildTools: ['cmake', ['g++', 'clang++', 'cl']],
     label: 'GoogleTest',
     language: 'cpp',
     testFile: 'project:tests/generated_test.cpp',
@@ -161,7 +220,35 @@ export const PRESETS = Object.freeze({
     targetDeclare: '\\bTEST(?:_F|_P)?\\s*\\(\\s*{target}\\s*\\)',
     targetDotted: true,
   },
+  meson: {
+    id: 'meson',
+    // Meson 构建 + `meson test` 跑。测试名用 TEST(...) 提取（与 gtest 一致）。
+    tools: ['meson', 'ninja'],
+    label: 'Meson test',
+    language: 'cpp',
+    testFile: 'project:tests/generated_test.cpp',
+    mode: 'per-case',
+    // {project} 是占位符，cwd 已切到项目根，所以 build/ 指项目的构建目录。
+    command: ['meson', 'test', '-C', 'build', '{target}'],
+    targetExtract: ['\\bTEST(?:_F)?\\s*\\(\\s*([A-Za-z0-9_]+)\\s*,'],
+    targetDeclare: '\\bTEST(?:_F)?\\s*\\(\\s*{target}\\s*,',
+  },
 })
+
+/**
+ * 所有 preset 声明过的工具名（去重）。
+ *
+ * 面板的 /data-panel/tools 按这个清单逐项探测，所以新增 preset 时只要写了
+ * `tools: [...]`，探活接口就自动覆盖它 —— 不用再改探测代码。
+ */
+export const PRESET_TOOLS = Object.freeze(
+  [...new Set(
+    Object.values(PRESETS)
+      .flatMap((preset) => [...(preset.tools || []), ...(preset.buildTools || [])])
+      // tools 的每一项可能是名字，也可能是「任选其一」的组；这里展开成扁平的名字清单。
+      .flatMap((spec) => (Array.isArray(spec) ? spec : [spec])),
+  )].sort(),
+)
 
 /** 把正则里的字面量转义，用户写的用例名/函数名可以安全拼进 pattern。 */
 export function escapeRegExp(value) {
@@ -246,6 +333,7 @@ export function detectPreset({ project }) {
     }
     return 'ctest'
   }
+  if (has('meson.build')) return 'meson'
 
   const deps = packageDeps(project)
   if (deps !== null) {
@@ -277,6 +365,55 @@ export function resolveSpecPath(value, { project, root }) {
   if (/^root:/i.test(raw)) return resolve(root, raw.slice('root:'.length))
   if (isAbsolute(raw)) return resolve(raw)
   return resolve(root, raw)
+}
+/**
+ * `tools` 的校验：每项是工具名，或是「任选其一」的工具名数组。
+ *
+ * 为什么允许数组：C/C++ 编译器可能是 g++ / clang++ / cl 任一种，
+ * 要求三个都装才是错的。runner.json 自定义时也能这样写。
+ */
+function toolSpecs(value, field) {
+  if (value === undefined) return []
+  if (!Array.isArray(value)) throw new Error(`runner.json 的 ${field} 必须是数组`)
+  return value.map((item) => {
+    if (typeof item === 'string') return item
+    if (Array.isArray(item) && item.length > 0 && item.every((name) => typeof name === 'string')) {
+      return item.slice()
+    }
+    throw new Error(`runner.json 的 ${field} 每项必须是工具名，或「任选其一」的工具名数组`)
+  })
+}
+
+/**
+ * 覆盖率采集配置。
+ *
+ * 形状（runner.json 可覆盖）：
+ *   { command: [...], format: 'cobertura', file: 'coverage.xml', timeoutSec: 900 }
+ *
+ * - command：跑一次全量测试并产出覆盖率报告；可用 {coverageFile} / {coverageDir} 占位符
+ * - format ：解析器名，见 run_tests.py 的 COVERAGE_PARSERS
+ * - file   ：报告文件（相对 runDir，或 project: / root: / 绝对路径；支持 `*` 通配）
+ *
+ * 声明了但工具没装时，runner 会把原因写进 result.json，报告里显示「未采集（原因）」，
+ * 不会因为它失败就整个执行失败。
+ */
+function normalizeCoverage(value) {
+  if (value === undefined || value === null) return null
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('runner.json 的 coverage 必须是对象')
+  }
+  const command = stringList(value.command, 'coverage.command')
+  if (command.length === 0) throw new Error('coverage.command 不能为空')
+  const format = typeof value.format === 'string' ? value.format.trim() : ''
+  if (format === '') throw new Error('coverage.format 不能为空（如 cobertura / lcov / jacoco / coveragepy-json / go-cover / istanbul-summary）')
+  const file = typeof value.file === 'string' ? value.file.trim() : ''
+  if (file === '') throw new Error('coverage.file 不能为空（覆盖率报告文件路径）')
+  const timeoutSec = Number.isFinite(value.timeoutSec) && value.timeoutSec > 0
+    ? Math.floor(value.timeoutSec)
+    : 900
+  // 采不到时告诉用户“装什么”，比只说“没报告”有用。
+  const hint = typeof value.hint === 'string' ? value.hint.trim() : ''
+  return { command, format, file, timeoutSec, hint }
 }
 
 function stringList(value, field) {
@@ -402,6 +539,10 @@ export function resolveRunner({ project, root }) {
       : (typeof merged.targetExtract === 'string' ? [merged.targetExtract] : []),
     targetDeclare: typeof merged.targetDeclare === 'string' ? merged.targetDeclare : '',
     notRunPattern: typeof merged.notRunPattern === 'string' ? merged.notRunPattern : '',
+    // 这个运行器需要哪些可执行文件；找不到时面板要能说清楚缺哪个（而不是笼统地说“环境不对”）。
+    tools: toolSpecs(merged.tools, 'tools'),
+    // 覆盖率采集（可选）：一条命令 + 一个报告文件 + 解析格式。没有就是“不采集”。
+    coverage: normalizeCoverage(merged.coverage),
     source: profile !== null ? 'runner.json' : (`auto:${presetId}`),
   }
 }
@@ -437,6 +578,20 @@ export function targetOf(record, runner) {
 }
 
 /** 测试文件里是否真的有这个目标；runner.json 没给规则时不做判断。 */
+export function targetLine(testText, target, runner) {
+  if (!runner.targetDeclare) return 0
+  const replacement = runner.targetDotted
+    ? String(target).split('.').map((part) => escapeRegExp(part)).join('\\s*,\\s*')
+    : escapeRegExp(target)
+  const pattern = runner.targetDeclare.split('{target}').join(replacement)
+  try {
+    const match = new RegExp(pattern, 'm').exec(testText)
+    return match ? testText.slice(0, match.index).split('\n').length : 0
+  } catch {
+    return 0
+  }
+}
+
 export function targetDeclared(testText, target, runner) {
   if (!runner.targetDeclare) return true
   const replacement = runner.targetDotted
@@ -452,7 +607,7 @@ export function targetDeclared(testText, target, runner) {
 
 function fillPlaceholders(value, ctx) {
   return String(value).replace(
-    /\{(python|node|npx|gradlew|binary|project|root|runId|runDir|file|junit)\}/g,
+    /\{(python|node|npx|gradlew|binary|project|root|runId|runDir|file|junit|coverageFile|coverageDir)\}/g,
     (whole, key) => (typeof ctx[key] === 'string' ? ctx[key] : whole),
   )
 }
@@ -475,15 +630,49 @@ export function renderRunnerSpec(runner, ctx) {
   }
   const binary = typeof ctx.binary === 'string' && ctx.binary !== '' ? ctx.binary : (runner.binary || '')
   const mergedCtx = { ...ctx, binary, file: runner.testFile, junit }
+  const command = fillList(runner.command, mergedCtx)
+  const preCommand = fillList(runner.preCommand || [], mergedCtx)
+  // 探测到的工具必须真正用于执行；只替换 argv 的可执行文件，不改参数文本。
+  const useResolvedExecutable = (argv) => {
+    if (argv.length === 0) return argv
+    const found = ctx.tools && ctx.tools[argv[0]]
+    return found ? [found, ...argv.slice(1)] : argv
+  }
+  const renderedCommand = useResolvedExecutable(command)
+  const renderedPreCommand = useResolvedExecutable(preCommand)
   let shell = runner.shell === true
   if (runner.shellOnlyWindows && process.platform !== 'win32') shell = false
+  if (process.platform === 'win32' && [renderedCommand[0], renderedPreCommand[0]].some((file) => /\.(?:cmd|bat)$/i.test(file || ''))) shell = true
+
+  // ── 覆盖率：把报告路径先落到 runDir 下，再渲染命令 ──
+  let coverage = null
+  if (runner.coverage !== null && runner.coverage !== undefined) {
+    const raw = String(runner.coverage.file || '').trim()
+    let coverageFile = ''
+    if (raw !== '') {
+      if (/^project:/i.test(raw)) coverageFile = resolve(ctx.project, raw.slice('project:'.length))
+      else if (/^root:/i.test(raw)) coverageFile = resolve(ctx.root, raw.slice('root:'.length))
+      else if (isAbsolute(raw)) coverageFile = resolve(raw)
+      else coverageFile = resolve(ctx.runDir, raw)
+    }
+    const coverageCtx = { ...mergedCtx, coverageFile, coverageDir: coverageFile === '' ? '' : dirname(coverageFile) }
+    const coverageCommand = useResolvedExecutable(fillList(runner.coverage.command || [], coverageCtx))
+    // 通配符不展开：由 runner 在报告生成后再去找文件（不同框架落盘时间不同）。
+    coverage = {
+      command: coverageCommand,
+      format: String(runner.coverage.format || ''),
+      file: coverageFile,
+      timeoutSec: runner.coverage.timeoutSec,
+      hint: runner.coverage.hint || '',
+    }
+  }
   return {
     id: runner.id,
     label: runner.label,
     language: runner.language,
     mode: runner.mode,
     cwd: fillPlaceholders(runner.cwd, mergedCtx),
-    command: fillList(runner.command, mergedCtx),
+    command: renderedCommand,
     targetArg: runner.targetArg,
     targetEscape: runner.targetEscape,
     junit,
@@ -493,7 +682,8 @@ export function renderRunnerSpec(runner, ctx) {
     notRunPattern: runner.notRunPattern,
     testFile: runner.testFile,
     binary,
-    preCommand: fillList(runner.preCommand || [], mergedCtx),
+    preCommand: renderedPreCommand,
+    coverage,
     source: runner.source || '',
   }
 }

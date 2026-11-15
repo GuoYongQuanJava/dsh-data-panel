@@ -1,6 +1,6 @@
 {
   "name": "dsh-data-panel",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "A test-case panel for DeepSeek Harness: a conversation-view tab with a case table (閺嶅洩鐦?/ 閸氬秶袨 / 缁鐎?/ 鐠囧瓨妲?/ 鏉堟挸鍙?/ 妫板嫭婀℃潏鎾冲毉) and a right-sidebar case detail.",
   "type": "module",
   "main": "lib/index.js",
@@ -14,12 +14,13 @@
     "lib/index.js",
     "lib/client.js",
     "lib/runners.js",
+    "lib/toolchain.js",
     "assets/run_tests.py",
     "cordis.patch.yml",
     "README.md"
   ],
   "scripts": {
-    "test": "node --test test/runners.test.mjs"
+    "test": "node --test test/"
   },
   "engines": {
     "node": ">=20"

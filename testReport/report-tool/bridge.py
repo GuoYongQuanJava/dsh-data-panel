@@ -25,10 +25,10 @@ from pathlib import Path
 
 TYPE_MAP = {
     "functional": "功能测试",
+    "api": "接口测试",
     "boundary": "边界测试",
-    "exception": "接口测试",
+    "logic": "逻辑测试",
     "performance": "性能测试",
-    "compat": "接口测试",
     "接口测试": "接口测试",
     "功能测试": "功能测试",
     "边界测试": "边界测试",
@@ -39,16 +39,50 @@ TYPE_MAP = {
 MODULE_NAMES = {
     "功能测试": "功能测试用例",
     "边界测试": "边界测试用例",
-    "接口测试": "接口与异常测试用例",
+    "接口测试": "接口测试用例",
     "性能测试": "性能测试用例",
     "逻辑测试": "逻辑测试用例",
 }
 
 COVERAGE_UNAVAILABLE = "未采集"
 
+
+def _force_utf8_output() -> None:
+    """中文 Windows 下 stderr 被管道接住时默认 cp936，调用方按 UTF-8 解码会炸。"""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+def coverage_text(result: dict) -> str:
+    """把 result.json 里的真实覆盖率统计写成模板那一行（`-S … -B …`）。
+
+    数据来源：runner 执行时解析出来并写进 result["coverage"] 的统计块。
+    没有数据就写「未采集」并附上原因 —— 绝不自己编一个数字。
+    """
+    cov = result.get("coverage")
+    if not isinstance(cov, dict) or not cov.get("available"):
+        reason = ""
+        if isinstance(cov, dict):
+            reason = str(cov.get("reason") or "").strip()
+        text = f"{COVERAGE_UNAVAILABLE}（{reason}）" if reason else COVERAGE_UNAVAILABLE
+        # schema 对 coverage 字段限长 200，超了会直接扇回整个报告。
+        return text[:200]
+
+    parts = []
+    line = cov.get("line") or {}
+    branch = cov.get("branch") or {}
+    if line.get("total"):
+        parts.append(f"-S {line.get('percent')}%")
+    if branch.get("total"):
+        parts.append(f"-B {branch.get('percent')}%")
+    return (" ".join(parts) if parts else COVERAGE_UNAVAILABLE)[:200]
+
 STATUS_TEXT = {
     "passed": "通过",
-    "partial": "部分通过（有未执行用例）",
+    "partial": "部分通过（有未执行或未确认用例）",
     "failed": "失败",
     "build-failed": "构建失败",
     "timeout": "超时",
@@ -93,20 +127,45 @@ def case_project_name(result: dict, run_path: Path) -> str:
     project = result.get("project")
     if isinstance(project, str) and project:
         return Path(project).name
-    return "项目"
+    return "未记录项目"
 
 
 def build_test_index(result: dict) -> dict:
-    """func -> outcome，只来自 runner 从 junit 解析的逐条结果。"""
-    index = {}
+    """优先用 caseId 定位逐条证据；旧结果才用唯一的测试函数名。"""
+    by_id, by_func = {}, {}
     for item in result.get("tests") or []:
+        case_id = str(item.get("caseId") or "")
         func = str(item.get("func") or "")
+        if case_id:
+            by_id[case_id] = item
         if func:
-            index[func] = item
-    return index
+            by_func.setdefault(func, []).append(item)
+    return by_id, by_func
+
+
+def named_values(value: object) -> list:
+    """只接受用例里明确声明的变量名和值，不从自由文本猜测。"""
+    if not isinstance(value, list):
+        return []
+    return [[item["name"], item["value"]] for item in value
+            if isinstance(item, dict) and isinstance(item.get("name"), str)
+            and item["name"] and isinstance(item.get("value"), str)]
+
+
+def actual_outputs(case: dict, evidence: dict | None) -> list:
+    expected = named_values(case.get("expectedOutputs"))
+    values = evidence.get("actualOutputs") if isinstance(evidence, dict) else None
+    if not isinstance(values, dict):
+        values = {}
+    # 旧 ACTUAL 标记只是一条未命名原始值；仅当用例明确只有一个输出变量时才能对应。
+    if len(expected) == 1 and expected[0][0] not in values and evidence and isinstance(evidence.get("actual"), str):
+        values = {**values, expected[0][0]: evidence["actual"]}
+    return [[name, wanted, values[name] if isinstance(values.get(name), str) else "未采集"]
+            for name, wanted in expected]
 
 
 def main() -> int:
+    _force_utf8_output()
     parser = argparse.ArgumentParser(description="把一次真实执行的结果桥接成报告数据")
     parser.add_argument("--cases", default="", help="用例文件；默认用 runs/<runId>/snapshot/cases.json")
     parser.add_argument("--run", required=True, help="该次执行的 runs/<runId>/result.json")
@@ -131,19 +190,25 @@ def main() -> int:
     run_id = str(result.get("runId") or run_path.parent.name)
     overall_status = str(result.get("status") or "")
     executed = set(result.get("cases") or [])
-    test_index = build_test_index(result)
+    by_id, by_func = build_test_index(result)
     not_run_reasons = {
         str(item.get("caseId") or ""): str(item.get("reason") or "未执行")
         for item in (result.get("notRun") or [])
     }
 
+    # 覆盖率在本次执行里只采一次（整批），所以每个模块写同一份统计。
+    coverage_value = coverage_text(result)
     out_path = Path(args.out) if args.out else default_out(run_path)
     log_file = Path(args.log) if args.log else (run_path.parent / "run.log")
 
     # ── 按类型分组 ──
     modules: dict[str, list] = {}
     for case in cases:
-        ctype = TYPE_MAP.get(case.get("testType", ""), "功能测试")
+        raw_type = case.get("testType", "")
+        ctype = TYPE_MAP.get(raw_type)
+        if ctype is None:
+            print(f"错误：用例 {case.get('caseId', '')} 的测试类型 {raw_type!r} 不在当前五类中，请先重新分类", file=sys.stderr)
+            return 2
         modules.setdefault(ctype, []).append(case)
 
     module_list = []
@@ -155,6 +220,7 @@ def main() -> int:
             case_id = str(case.get("caseId") or "")
             func = str(case.get("testFunc") or "")
             total += 1
+            evidence = None
 
             if case_id in not_run_reasons:
                 status = "notRun"
@@ -163,7 +229,9 @@ def main() -> int:
                 status = "notRun"
                 reason = "本次执行未包含该用例"
             else:
-                evidence = test_index.get(func) if func else None
+                evidence = by_id.get(case_id)
+                if evidence is None and func and len(by_func.get(func, [])) == 1 and not by_func[func][0].get("caseId"):
+                    evidence = by_func[func][0]
                 if evidence is None:
                     # 没有逐条证据：宁可标“未确认”，也不推断通过。
                     status = "unconfirmed"
@@ -189,31 +257,48 @@ def main() -> int:
             else:
                 not_run_count += 1
 
+            inputs = named_values(case.get("inputVariables"))
+            outputs = actual_outputs(case, evidence if case_id in executed and status != "notRun" else None)
+            if status == "notRun":
+                for output in outputs:
+                    output[2] = "未执行"
+            notes = [str(case.get("description") or "")]
+            if not inputs and case.get("input"):
+                notes.append("输入条件（原始记录）：" + str(case["input"]))
+            if not outputs and case.get("expected"):
+                notes.append("预期结果（原始记录）：" + str(case["expected"]))
+            if not outputs and evidence and evidence.get("actual") and status != "notRun":
+                notes.append("实际输出（原始记录）：" + str(evidence["actual"]))
+            if evidence and isinstance(evidence.get("actualOutputs"), dict) and status != "notRun":
+                extra_actuals = {name: value for name, value in evidence["actualOutputs"].items()
+                                 if name not in {output[0] for output in outputs}}
+                if extra_actuals:
+                    notes.append("其他实际输出（运行记录）：" + json.dumps(extra_actuals, ensure_ascii=False))
             cases_out.append({
                 "id": case_id,
                 "name": case.get("title", case_id),
-                "type": TYPE_MAP.get(case.get("testType", ""), "功能测试"),
-                "description": case.get("description", ""),
-                "funcDesc": (case.get("codeRef", "").split("#")[0].split("/")[-1] if case.get("codeRef") else case_id),
+                "type": ctype,
+                "description": "\n".join(part for part in notes if part) or "未提供测试说明",
+                "funcDesc": case.get("title") or case_id,
                 "testFunc": func,
-                "stub": "无",
-                "inserted": "无",
-                "inputs": [["输入", case.get("input", "见用例描述")]],
-                "outputs": [["预期输出", case.get("expected", ""), case.get("expected", "")]],
+                "stub": "未记录",
+                "inserted": "未记录",
+                "inputs": inputs,
+                "outputs": outputs,
                 "passed": status == "passed",
                 "status": status,
-                "issue": reason or "无",
-                "bugId": "无",
-                "executedAt": result.get("startedAt", ""),
+                "issue": reason or "未记录异常",
+                "bugId": "未记录",
+                "executedAt": evidence.get("startedAt", "") if evidence and status != "notRun" else "",
             })
 
         module_list.append({
             "name": MODULE_NAMES.get(ctype, f"{ctype}用例"),
-            "trace": f"runs/{run_id}/run.log",
-            "driver": runner_label(result),
-            "coverage": COVERAGE_UNAVAILABLE,
-            "issues": "无。" if all(c["status"] == "passed" for c in cases_out) else "存在未通过 / 未执行 / 未确认用例。",
-            "inconsistent": "无。",
+            "trace": "未提供设计追溯",
+            "driver": "未记录驱动模块",
+            "coverage": coverage_value,
+            "issues": "本次执行未记录异常。" if all(c["status"] == "passed" for c in cases_out) else "存在未通过、未执行或未确认用例，详见逐条结果。",
+            "inconsistent": "未核查与测试用例或规程的一致性。",
             "cases": cases_out,
         })
 

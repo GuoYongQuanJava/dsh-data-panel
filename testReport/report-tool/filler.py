@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 
 from docx.oxml.ns import qn
 from docx.table import Table
+from docx.shared import Pt
 
 # ---------------------------------------------------------------------------
 # The template draws a ticked box with a Word EQ field:
@@ -204,11 +205,11 @@ def _fill_header_block(table: Table, case: Dict[str, Any], module: Optional[Dict
     module = module or {}
     lines = [
         f"单元标识：{module.get('unitId') or case.get('name', '')}",
-        f"设计追溯：{module.get('trace') or '-'}",
+        f"设计追溯：{module.get('trace') or '未提供设计追溯'}",
         f"功能描述：{case.get('funcDesc') or case.get('name', '')}",
-        f"驱动模块：{module.get('driver') or '无'}",
-        f"打桩模块：{case.get('stub') or '无'}",
-        f"覆盖率记录：{module.get('coverage') or '-'}",
+        f"驱动模块：{module.get('driver') or '未记录驱动模块'}",
+        f"打桩模块：{case.get('stub') or '未记录'}",
+        f"覆盖率记录：{module.get('coverage') or '未采集'}",
         f"备注：本单元共有{module.get('caseCount', 0)}个测试用例",
     ]
     cell = _cell_at(table, 0, 0)
@@ -254,8 +255,8 @@ def fill_table(
     case_id = case.get("id") or _cell_text(_cell_at(table, 1, 7)).strip()
     case_type = case.get("type", "功能测试")
     desc = case.get("description") or ""
-    stub = case.get("stub") or "无"
-    inserted = case.get("inserted") or "无"
+    stub = case.get("stub") or "未记录"
+    inserted = case.get("inserted") or "未记录"
     # "passed" / "failed" / "notRun"; fall back to the boolean when the caller
     # did not normalise the case through schema.validate()
     status = case.get("status") or ("passed" if case.get("passed", True) else "failed")
@@ -313,16 +314,22 @@ def fill_table(
         if status == "notRun" and not actual and var_out:
             actual = "未执行"
 
-        set_cell_text(_cell_at(table, row_idx, 0), var_in)
-        set_cell_text(_cell_at(table, row_idx, 3), val_in)
-        set_cell_text(_cell_at(table, row_idx, 4), var_out)
-        set_cell_text(_cell_at(table, row_idx, 8), expected)
-        set_cell_text(_cell_at(table, row_idx, 10), actual)
+        for column, value in ((0, var_in), (3, val_in), (4, var_out), (8, expected), (10, actual)):
+            cell = _cell_at(table, row_idx, column)
+            set_cell_text(cell, value)
+            # 模板的窄值列原本使用正文大字号，长值会逐字换行。
+            for paragraph in cell.paragraphs:
+                paragraph.paragraph_format.space_before = Pt(0)
+                paragraph.paragraph_format.space_after = Pt(0)
+                for run in paragraph.runs:
+                    run.font.size = Pt(9)
+
+    set_cell_text(_cell_at(table, pass_row, 2), "测试断言满足用例预期时判通过；实际值缺少采集证据时按原样标明。")
 
     # ── outcome block ──
-    issue = case.get("issue") or "无"
-    bug_id = case.get("bugId") or "无"
-    if status == "notRun" and case.get("notRunReason") and issue == "无":
+    issue = case.get("issue") or "未记录异常"
+    bug_id = case.get("bugId") or "未记录"
+    if status == "notRun" and case.get("notRunReason") and issue == "未记录异常":
         issue = "未执行：" + case["notRunReason"]
 
     row = _find_row(table, "异常现象描述")
@@ -337,6 +344,9 @@ def fill_table(
             set_cell_text(_cell_at(table, row, 2), "□ 执行  " + CHECK + " 未执行")
             # no result at all: both boxes stay empty
             set_cell_text(_cell_at(table, row, 9), "□ 通过    □ 未通过")
+        elif status == "unconfirmed":
+            set_cell_text(_cell_at(table, row, 2), "□ 执行  □ 未执行（未确认）")
+            set_cell_text(_cell_at(table, row, 9), "□ 通过    □ 未通过（未确认）")
         else:
             set_cell_text(_cell_at(table, row, 2), CHECK + " 执行  □ 未执行")
             if status == "passed":
@@ -346,15 +356,13 @@ def fill_table(
 
     row = _find_row(table, "测试人员")
     if row >= 0:
-        set_cell_text(_cell_at(table, row, 2), case.get("tester") or "")
-        set_cell_text(_cell_at(table, row, 9), case.get("executedAt") or "")
+        set_cell_text(_cell_at(table, row, 2), case.get("tester") or "未记录")
+        set_cell_text(_cell_at(table, row, 9), case.get("executedAt") or "未记录")
 
     row = _find_row(table, "设计者")
     if row >= 0:
-        if case.get("designer"):
-            set_cell_text(_cell_at(table, row, 2), case["designer"])
-        if case.get("reviewer"):
-            set_cell_text(_cell_at(table, row, 9), case["reviewer"])
+        set_cell_text(_cell_at(table, row, 2), case.get("designer") or "未记录")
+        set_cell_text(_cell_at(table, row, 9), case.get("reviewer") or "未记录")
 
     return True
 

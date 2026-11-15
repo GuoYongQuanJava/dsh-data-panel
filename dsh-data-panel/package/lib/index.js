@@ -21,7 +21,8 @@ import { existsSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { PRESETS, renderRunnerSpec, resolveRunner, targetDeclared, targetOf } from './runners.js'
+import { PRESET_TOOLS, PRESETS, detectPreset, renderRunnerSpec, resolveRunner, targetDeclared, targetLine, targetOf } from './runners.js'
+import { resolveSpecs, resolveTool, resolveTools, searchLayers } from './toolchain.js'
 
 
 export const name = 'dsh-data-panel'
@@ -29,6 +30,7 @@ export const inject = ['webServer', 'sessions']
 
 const PLUGIN = 'dsh-data-panel'
 const API_PATH = '/data-panel/api'
+const TOOLS_PATH = '/data-panel/tools'
 
 /** apply 时保存的宿主上下文（拿 workingDirectory 这类可选服务用）。 */
 let ctxRef = null
@@ -53,11 +55,12 @@ const MAX_CATEGORY = 60
 /** 内置层级名：固定存在、含全部用例，不能改名/删除。 */
 const DEFAULT_CATEGORY = '默认'
 
-const TEST_TYPES = new Set(['functional', 'boundary', 'performance', 'exception', 'compat'])
+const TEST_TYPES = new Set(['functional', 'api', 'boundary', 'logic', 'performance'])
 
 /** 会话资产（用例 / 测试代码 / 日志 / 报告）在项目内的位置。 */
 const SESSION_ASSET_DIR = join('.dsh', 'test-sessions')
 const RUN_PREPARE_PATH = '/data-panel/run/prepare'
+const TEST_CODE_PATH = '/data-panel/test-code'
 const RUN_LATEST_PATH = '/data-panel/run/latest'
 const RUN_LIST_PATH = '/data-panel/run/list'
 const RUN_LOG_PATH = '/data-panel/run/log'
@@ -178,106 +181,19 @@ function parseStore(raw) {
   return JSON.parse(raw.replace(/^\uFEFF/, ''))
 }
 
-/**
- * Covered source each demo case exercises, in the `path:line` shape the
- * client's "查看代码" parses. Kept beside the rows below so the fixtures stay
- * readable as plain case text.
- */
-const DEMO_CODE_REFS = [
-  'RingBuffer.h:24',
-  'RingBuffer.h:31',
-  'RingBuffer.h:48',
-  'RingBuffer.h:52',
-  'RingBuffer.h:71',
-  'RingBuffer.h:63',
-  'RingBuffer.h:88',
-]
 
 /** First-run test cases, marked `demo` so the UI can label them visibly. */
 function seedRecords() {
-  const rows = [
-    [
-      'GN-ZZKZ-RINGBUFF-T001',
-      'RingBuffer功能测试',
-      'functional',
-      '初始化一个新的环形缓冲区对象，验证初始状态下 size、head、tail 是否符合预期。',
-      'm_totalCapacity=5',
-      'm_size=0',
-      'TEST(RingBufferTest, InitState) {\n  RingBuffer<int> buf(5);\n  EXPECT_EQ(buf.size(), 0);\n  EXPECT_EQ(buf.head(), 0);\n  EXPECT_EQ(buf.tail(), 0);\n}',
-    ],
-    [
-      'BJ-ZZKZ-RINGBUFF-T001',
-      'RingBuffer边界测试',
-      'boundary',
-      '容量取 0 初始化，验证边界条件下对象的处理策略是否给出明确报错。',
-      'm_totalCapacity=0',
-      'm_size=编译报错',
-      'TEST(RingBufferTest, ZeroCapacityRejected) {\n  // 容量 0 在编译期或构造期即被拒绝\n  static_assert(RingBuffer<int>::minCapacity > 0);\n  EXPECT_THROW(RingBuffer<int> buf(0), std::invalid_argument);\n}',
-    ],
-    [
-      'GN-ZZKZ-PUSH-T001',
-      'push功能测试',
-      'functional',
-      '将元素存入缓冲区，验证插入后的状态变化和容量计数是否正确。',
-      'm_totalCapacity=2, p_id=0, p_value=Test0',
-      'm_size=1, m_head=2, m_tail=1',
-      'TEST(RingBufferTest, PushOne) {\n  RingBuffer<std::string> buf(2);\n  buf.push(0, "Test0");\n  EXPECT_EQ(buf.size(), 1);\n  EXPECT_EQ(buf.head(), 2);\n  EXPECT_EQ(buf.tail(), 1);\n}',
-    ],
-    [
-      'JK-ZZKZ-PUSH-T002',
-      'push满容量测试',
-      'boundary',
-      '缓冲区已满后继续 push，验证满容量时的覆盖顺序与读写指针推进。',
-      'm_totalCapacity=2，已存 2 个元素',
-      'm_size=2, m_head=1, m_tail=1',
-      'TEST(RingBufferTest, PushWhenFull) {\n  RingBuffer<std::string> buf(2);\n  buf.push(0, "A");\n  buf.push(1, "B");\n  buf.push(2, "C");  // 覆盖最旧的 A\n  EXPECT_EQ(buf.size(), 2);\n  EXPECT_EQ(buf.head(), 1);\n  EXPECT_EQ(buf.tail(), 1);\n}',
-    ],
-    [
-      'GN-ZZKZ-CLEAR-T001',
-      'clearAll功能测试',
-      'functional',
-      '清空缓冲区，验证头部、尾部与长度归零且内存不被释放。',
-      'clearAll()',
-      'm_size=0, m_head=0, m_tail=0',
-      'TEST(RingBufferTest, ClearAll) {\n  RingBuffer<int> buf(4);\n  buf.push(0, 1);\n  buf.clearAll();\n  EXPECT_EQ(buf.size(), 0);\n  EXPECT_EQ(buf.head(), 0);\n  EXPECT_EQ(buf.tail(), 0);\n}',
-    ],
-    [
-      'BJ-ZZKZ-POP-T001',
-      'pop边界测试',
-      'boundary',
-      '空缓冲区执行 pop，验证下溢时不再修改状态。',
-      'm_totalCapacity=3, m_size=0',
-      '返回失败，m_size 保持 0',
-      'TEST(RingBufferTest, PopEmpty) {\n  RingBuffer<int> buf(3);\n  EXPECT_FALSE(buf.pop());\n  EXPECT_EQ(buf.size(), 0);\n}',
-    ],
-    [
-      'GN-ZZKZ-ITER-T001',
-      '迭代器遍历测试',
-      'functional',
-      '遍历缓冲区中的全部元素，验证顺序与写入顺序一致。',
-      'm_totalCapacity=4，依次 push A、B、C',
-      '遍历输出 A → B → C',
-      'TEST(RingBufferTest, IterateInPushOrder) {\n  RingBuffer<char> buf(4);\n  buf.push(0, \'A\');\n  buf.push(1, \'B\');\n  buf.push(2, \'C\');\n  std::string seen;\n  for (const auto& ch : buf) seen += ch;\n  EXPECT_EQ(seen, "ABC");\n}',
-    ],
-  ]
-  return rows.map(function (row, index) {
-    return {
-      id: `demo-${index + 1}`,
-      caseId: row[0],
-      title: row[1],
-      testType: row[2],
-      description: row[3],
-      input: row[4],
-      expected: row[5],
-      code: row[6],
-      // Covered source in the demo repository, in the `path:line` shape the
-      // client's "查看代码" parses. Kept beside `rows` so the fixtures above
-      // stay readable as plain case text.
-      codeRef: DEMO_CODE_REFS[index] || '',
-      demo: true,
-      createdAt: isoAgo(36 + index * 2),
-      updatedAt: isoAgo(8 + index * 2),
-    }
+  return [];
+}
+
+function namedValues(value, valueKey) {
+  if (!Array.isArray(value)) return []
+  return value.slice(0, 50).flatMap((item) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return []
+    const name = text(item.name, 120)
+    if (!name || typeof item[valueKey] !== 'string') return []
+    return [{ name, [valueKey]: item[valueKey].slice(0, 2000) }]
   })
 }
 
@@ -287,10 +203,14 @@ function normalizeStored(input) {
     id: input.id.slice(0, 120),
     caseId: text(input.caseId, MAX_CASE_ID),
     title: text(input.title, MAX_TITLE) || '未命名用例',
-    testType: TEST_TYPES.has(input.testType) ? input.testType : 'functional',
+    // 旧记录的原值只读保留；不在读取时悄悄改成「功能测试」。
+    // 新建或编辑时由 normalizePatch 限定为当前五类。
+    testType: typeof input.testType === 'string' ? input.testType : '',
     description: text(input.description, MAX_DESCRIPTION),
     input: text(input.input, MAX_INPUT),
     expected: text(input.expected, MAX_EXPECTED),
+    ...(Array.isArray(input.inputVariables) ? { inputVariables: namedValues(input.inputVariables, 'value') } : {}),
+    ...(Array.isArray(input.expectedOutputs) ? { expectedOutputs: namedValues(input.expectedOutputs, 'value') } : {}),
     code: text(input.code, MAX_CODE),
     codeRef: text(input.codeRef, MAX_CODE_REF),
     // 用例层级：空串 = 默认层级。旧数据没有这个字段，读出来就是空串，
@@ -305,14 +225,17 @@ function normalizeStored(input) {
 function normalizePatch(input, existing) {
   const title = text(input.title, MAX_TITLE)
   if (!title) throw bad(400, '用例名称不能为空')
+  if (!TEST_TYPES.has(input.testType)) throw bad(400, '测试类型只能是功能、接口、边界、逻辑或性能测试')
   return {
     ...existing,
     caseId: text(input.caseId, MAX_CASE_ID),
     title,
-    testType: TEST_TYPES.has(input.testType) ? input.testType : existing.testType,
+    testType: input.testType,
     description: text(input.description, MAX_DESCRIPTION),
     input: text(input.input, MAX_INPUT),
     expected: text(input.expected, MAX_EXPECTED),
+    ...(Array.isArray(input.inputVariables) ? { inputVariables: namedValues(input.inputVariables, 'value') } : {}),
+    ...(Array.isArray(input.expectedOutputs) ? { expectedOutputs: namedValues(input.expectedOutputs, 'value') } : {}),
     code: text(input.code, MAX_CODE),
     codeRef: text(input.codeRef, MAX_CODE_REF),
     category: text(input.category, MAX_CATEGORY),
@@ -692,35 +615,68 @@ async function handle(req, res) {
   }
 }
 
-/** 当前可用的 Python 解释器（DSH 自带优先）。 */
+/**
+ * 运行时工具的统一解释。
+ *
+ * 具体怎么找交给 lib/toolchain.js（任意工具名都走同一条搜索阶梯），这里只负责
+ * “面板自己的约定”：DSH_*_PATH 优先，最后退回命令名让 shell 自己找。
+ */
 function pythonPath() {
-  if (process.env.DSH_PYTHON_PATH) return process.env.DSH_PYTHON_PATH
-  const bundled = join(dshHome(), 'dsh-runtimes', 'dsh-primary-runtime', 'dependencies', 'python', 'python.exe')
-  return existsSyncSafe(bundled) ? bundled : 'python'
+  return process.env.DSH_PYTHON_PATH || resolveTool('python') || 'python'
 }
 
-/** 当前可用的 Node 解释器（DSH 自带优先，用于 node --test / vitest 等预设）。 */
+/** 当前进程自己就是 node 时直接用 process.execPath，避免又去扫目录。 */
 function nodePath() {
   if (process.env.DSH_NODE_PATH) return process.env.DSH_NODE_PATH
   const exec = typeof process.execPath === 'string' ? process.execPath : ''
   if (/(^|[\\/])node(\.exe)?$/i.test(exec)) return exec
-  const exe = process.platform === 'win32' ? 'node.exe' : 'node'
-  for (const dir of ['bin', '']) {
-    const candidate = join(dshHome(), 'dsh-runtimes', 'dsh-primary-runtime', 'dependencies', 'node', dir, exe)
-    if (existsSyncSafe(candidate)) return candidate
-  }
-  return 'node'
+  return resolveTool('node') || 'node'
 }
 
 /** npx 在 Windows 上是 npx.cmd，需要由 shell 启动。 */
 function npxPath() {
-  if (process.env.DSH_NPX_PATH) return process.env.DSH_NPX_PATH
-  return process.platform === 'win32' ? 'npx.cmd' : 'npx'
+  return process.env.DSH_NPX_PATH || resolveTool('npx') || (process.platform === 'win32' ? 'npx.cmd' : 'npx')
+}
+
+/**
+ * 某个运行器缺哪些工具（用来把错误说清楚，而不是笼统地说“环境不对”）。
+ * 与语言无关：需要什么全看 runner.tools（来自 preset 或 runner.json）。
+ */
+function missingTools(runner, project) {
+  const need = Array.isArray(runner?.tools) ? runner.tools.slice() : []
+  // 已构建的测试不需要编译器；只有声明了预执行命令才检查它的入口。
+  const buildExecutable = Array.isArray(runner?.preCommand) ? runner.preCommand[0] : ''
+  if (typeof buildExecutable === 'string' && buildExecutable !== '' && !buildExecutable.includes('{')) {
+    if (isAbsolute(buildExecutable)) {
+      if (!existsSyncSafe(buildExecutable)) return { need, resolved: {}, missing: [buildExecutable] }
+    } else if (!buildExecutable.includes('/') && !buildExecutable.includes('\\')) {
+      need.push(buildExecutable.replace(/\.(exe|cmd|bat)$/i, ''))
+    } else if (!existsSyncSafe(resolve(project, buildExecutable))) {
+      return { need, resolved: {}, missing: [buildExecutable] }
+    }
+  }
+  if (need.length === 0) return { need, resolved: {}, missing: [] }
+  // resolveSpecs 支持「任选其一」的组（如 g++|clang++|cl）。
+  const { resolved, missing } = resolveSpecs(need, { project })
+  return { need, resolved, missing }
+}
+
+/** 工具链一句话总结，拼进报错里。 */
+function describeToolchain(runner, project) {
+  const { resolved, missing } = missingTools(runner, project)
+  const names = Object.keys(resolved)
+  if (names.length === 0) return ''
+  const parts = names.map((tool) => `${tool}=${resolved[tool] || '未找到'}`)
+  if (missing.length === 0) return `运行器需要的工具：${parts.join('，')}。`
+  return `运行器需要的工具：${parts.join('，')}。`
+    + `缺少 ${missing.join(' / ')}：它可能装在非 PATH 目录 —— 请检查环境变量、项目内 wrapper（mvnw/gradlew）`
+    + '或版本管理器（pyenv/nvm/sdkman/rustup/volta），或用 DSH_<TOOL>_PATH 显式指定。'
 }
 
 /** Gradle 包一层 wrapper：优先用项目自带的 gradlew / gradlew.bat。 */
 function gradlewPath(project) {
-  return join(project, process.platform === 'win32' ? 'gradlew.bat' : 'gradlew')
+  const wrapper = join(project, process.platform === 'win32' ? 'gradlew.bat' : 'gradlew')
+  return existsSyncSafe(wrapper) ? wrapper : (resolveTool('gradle', { project }) || wrapper)
 }
 
 function existsSyncSafe(file) {
@@ -760,6 +716,8 @@ async function exportCases(store, file, runner) {
       description: record.description,
       input: record.input,
       expected: record.expected,
+      inputVariables: record.inputVariables === undefined ? namedValues(old?.inputVariables, 'value') : record.inputVariables,
+      expectedOutputs: record.expectedOutputs === undefined ? namedValues(old?.expectedOutputs, 'value') : record.expectedOutputs,
       code: record.code,
       codeRef: record.codeRef,
       // 测试函数名：**当前用例代码推导优先**，推导不出才用旧值。
@@ -779,6 +737,17 @@ async function exportCases(store, file, runner) {
 /** 从用例代码里认测试函数名（面板没存 testFunc，靠这里推导）。 */
 function testFuncOf(record, runner) {
   return targetOf(record, runner || { targetExtract: PRESETS.pytest.targetExtract })
+}
+
+async function savedTestFunc(root, caseId) {
+  try {
+    const parsed = JSON.parse((await readFile(join(root, 'cases.json'), 'utf8')).replace(/^\uFEFF/, ''))
+    const cases = Array.isArray(parsed) ? parsed : parsed?.cases
+    const match = Array.isArray(cases) ? cases.find((item) => item?.caseId === caseId) : null
+    return typeof match?.testFunc === 'string' ? match.testFunc.trim() : ''
+  } catch {
+    return ''
+  }
 }
 
 /** 每个会话记一份“资产根”列表：切了 working directory 后，旧 run 仍能找回来。 */
@@ -960,7 +929,7 @@ function requireRunId(raw) {
  */
 
 /** 从用例 codeRef 反推项目目录：codeRef 通常指向 <project>/.dsh/test-sessions/<sid>/tests/... */
-function projectFromCodeRef(store, scope, caseId) {
+function projectFromCodeRef(store, scope, caseId, sessionId) {
   const records = store && Array.isArray(store.records) ? store.records : []
   const record = scope === 'case'
     ? records.find((item) => item && item.caseId === caseId)
@@ -972,33 +941,121 @@ function projectFromCodeRef(store, scope, caseId) {
   const marker = '/.dsh/test-sessions/'
   const index = normalized.toLowerCase().indexOf(marker)
   if (index <= 0) return ''
+  if (normalized.slice(index + marker.length).split('/')[0] !== sanitizeSessionId(sessionId)) return ''
   const project = normalized.slice(0, index)
   return isAbsolute(project) ? resolve(project) : ''
 }
-async function prepareRun({ sessionId, cwd, scope, caseId, store }) {
-  const preferred = await resolveSessionCwd(sessionId, cwd)
-  const codeProject = projectFromCodeRef(store, scope, caseId)
-  const candidates = codeProject !== '' && resolve(codeProject) !== preferred
-    ? [preferred, codeProject]
-    : [preferred]
-  let project = preferred
-  let root = ''
-  let runner = null
-  let lastError = null
-  for (const candidate of candidates) {
-    const candidateRoot = sessionAssetRoot(candidate, sessionId)
-    try {
-      runner = resolveRunner({ project: candidate, root: candidateRoot })
-      project = candidate
-      root = candidateRoot
-      break
-    } catch (error) {
-      lastError = error
+
+/** 在会话 cwd 的近邻项目中找同一个 sessionId 的资产目录，不依赖用例 codeRef。 */
+async function nearbySessionProjects(cwd, sessionId) {
+  const found = []
+  const queue = [{ dir: cwd, depth: 0 }]
+  let visited = 0
+  while (queue.length > 0 && visited < 200) {
+    const { dir, depth } = queue.shift()
+    visited += 1
+    if (existsSyncSafe(sessionAssetRoot(dir, sessionId))) found.push(dir)
+    if (depth >= 2) continue
+    let entries = []
+    try { entries = await readdir(dir, { withFileTypes: true }) } catch { continue }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.name.startsWith('.') || entry.name === 'node_modules') continue
+      queue.push({ dir: join(dir, entry.name), depth: depth + 1 })
     }
   }
-  if (runner === null) {
-    throw bad(400, lastError instanceof Error ? lastError.message : String(lastError || '无法识别项目的测试框架'))
+  return found
+}
+
+/** 查看代码与执行准备共用同一个项目和运行器选择规则。 */
+async function resolveProjectRunner({ sessionId, cwd, scope, caseId, store }) {
+  const preferred = resolve(cwd)
+  const normalized = (path) => process.platform === 'win32' ? resolve(path).toLowerCase() : resolve(path)
+  let lastError = null
+  const examine = (project) => {
+    const root = sessionAssetRoot(project, sessionId)
+    try {
+      const runner = resolveRunner({ project, root })
+      if (!existsSyncSafe(runner.testFile)) throw new Error(`预期测试文件不存在：${runner.testFile}。请检查 runner.json 的 testFile。`)
+      return { project, root, runner }
+    } catch (error) {
+      lastError = error
+      return null
+    }
   }
+  const direct = examine(preferred)
+  if (direct !== null) return direct
+
+  const candidates = []
+  for (const root of await knownAssetRoots(sessionId)) {
+    const project = dirname(dirname(dirname(root)))
+    if (normalized(sessionAssetRoot(project, sessionId)) === normalized(root)) candidates.push(project)
+  }
+  candidates.push(...await nearbySessionProjects(preferred, sessionId))
+  const codeProject = projectFromCodeRef(store, scope, caseId, sessionId)
+  if (codeProject !== '') candidates.push(codeProject)
+
+  const seen = new Set([normalized(preferred)])
+  const matches = []
+  for (const project of candidates) {
+    const key = normalized(project)
+    if (seen.has(key)) continue
+    seen.add(key)
+    const match = examine(project)
+    if (match !== null) matches.push(match)
+  }
+  if (matches.length === 1) return matches[0]
+  if (matches.length > 1) {
+    throw bad(400, `本会话找到多个可执行项目：${matches.map((item) => item.project).join('；')}。请切换到目标项目的工作目录后重试。`)
+  }
+  throw bad(400, lastError instanceof Error ? lastError.message : '无法识别本会话的测试框架')
+}
+
+/** 与执行准备使用同一运行器来定位真实测试文件和目标。只读，不导出或改写用例。 */
+async function resolveTestCode({ sessionId, cwd, caseId, store }) {
+  const record = store.records.find((item) => item.caseId === caseId && item.demo !== true)
+  if (!record) throw bad(404, `本会话找不到用例 ${caseId}`)
+  const { project, root, runner } = await resolveProjectRunner({ sessionId, cwd, scope: 'case', caseId, store })
+  if (!existsSyncSafe(runner.testFile)) {
+    throw bad(400, `预期测试文件不存在：${runner.testFile}。请检查 runner.json 的 testFile。`)
+  }
+  const target = testFuncOf(record, runner) || await savedTestFunc(root, caseId)
+  if (!target) throw bad(400, `用例 ${caseId} 未关联测试函数或测试名，请补充 testFunc。`)
+  const testText = await readFile(runner.testFile, 'utf8')
+  if (!targetDeclared(testText, target, runner)) {
+    throw bad(400, `测试文件 ${runner.testFile} 中找不到目标 ${target}。请核对用例与测试代码的关联。`)
+  }
+  const line = targetLine(testText, target, runner) || 1
+  const refPath = String(record.codeRef || '').trim().replace(/#L\d+(?:[-~]\d+)?$/, '').replace(/:\d+(?::\d+)?$/, '')
+  const refFile = refPath ? (isAbsolute(refPath) ? resolve(refPath) : resolve(project, refPath)) : ''
+  return {
+    caseId,
+    testFile: runner.testFile,
+    testFunc: target,
+    line,
+    warning: refFile && refFile !== runner.testFile
+      ? `原 codeRef 指向 ${refPath}；已按实际测试文件打开。`
+      : '',
+  }
+}
+
+async function handleTestCode(req, res) {
+  try {
+    if (req.method !== 'GET') throw bad(405, '仅支持 GET')
+    const query = runQueryOf(req)
+    if (!query.sessionId || !query.caseId) throw bad(400, '缺少会话 ID 或用例 ID')
+    const cwd = await resolveSessionCwd(query.sessionId, query.cwd)
+    const store = await serial(() => readStore(query.sessionId))
+    const result = await resolveTestCode({ sessionId: query.sessionId, cwd, caseId: query.caseId, store })
+    send(res, 200, { ok: true, ...result })
+  } catch (error) {
+    send(res, Number.isInteger(error?.status) ? error.status : 500,
+      { ok: false, error: error instanceof Error ? error.message : '服务内部错误' })
+  }
+}
+
+async function prepareRun({ sessionId, cwd, scope, caseId, store }) {
+  const preferred = await resolveSessionCwd(sessionId, cwd)
+  const { project, root, runner } = await resolveProjectRunner({ sessionId, cwd: preferred, scope, caseId, store })
   await mkdir(join(root, 'tests'), { recursive: true })
   await mkdir(join(root, 'runs'), { recursive: true })
   await mkdir(join(root, 'reports'), { recursive: true })
@@ -1028,11 +1085,29 @@ async function prepareRun({ sessionId, cwd, scope, caseId, store }) {
   // 准备时记 SHA256，runner 执行前重算，不一致就拒绝执行。
   const liveTestFile = runner.testFile
   if (!existsSyncSafe(liveTestFile)) {
+    // 缺测试代码时顺带把工具链情况说清楚：模型接下来要么补代码，要么发现工具不在手上。
+    const toolHint = describeToolchain(runner, project)
     throw bad(
       400,
       `本会话还没有测试代码（${liveTestFile}）。当前测试框架：${runner.label}（${runner.language}）。`
-      + '请先生成测试代码，或在会话资产目录的 runner.json 里用 testFile 指向实际测试文件。',
+      + '请先生成测试代码，或在会话资产目录的 runner.json 里用 testFile 指向实际测试文件。'
+      + toolHint,
     )
+  }
+
+  // 框架的工具都没在手上时，早报错：等拼好命令再让子进程报 spawn 失败，
+  // 模型只会看到一句“找不到命令”，不知道去找什么。这里直接说清楚缺哪个、去哪找。
+  const toolStatus = missingTools(runner, project)
+  if (toolStatus.missing.length > 0) {
+    throw bad(
+      400,
+      `当前测试框架 ${runner.label}（${runner.language}）需要的工具没找到：${toolStatus.missing.join(' / ')}。`
+      + '已按 env / 项目内 wrapper / SDK 根变量 / DSH 自带运行时 / PATH / 常见安装目录 逐层找过。'
+      + '请安装该工具，或用 DSH_<TOOL>_PATH 指向它的可执行文件；项目自带 wrapper（mvnw / gradlew）也会被优先使用。',
+    )
+  }
+  if (runner.command[0] === '{binary}' && (!runner.binary || (runner.preCommand.length === 0 && !existsSyncSafe(runner.binary)))) {
+    throw bad(400, `测试可执行文件不存在：${runner.binary || 'runner.json 未配置 binary'}。请先构建，或修正 runner.json 的 binary。`)
   }
   const liveTestBytes = await readFile(liveTestFile)
   const testFileSha256 = createHash('sha256').update(liveTestBytes).digest('hex')
@@ -1085,6 +1160,7 @@ async function prepareRun({ sessionId, cwd, scope, caseId, store }) {
     root,
     runId,
     runDir,
+    tools: toolStatus.resolved,
   })
   // 冻结本次输入：执行与报告都只看 snapshot/ 里的副本。
   const request = {
@@ -1130,6 +1206,8 @@ async function prepareRun({ sessionId, cwd, scope, caseId, store }) {
     frameworkId: runner.id,
     runnerMode: runner.mode,
     language: runner.language,
+    // 本次执行用到的工具（绝对路径），面板/日志里能看出到底用哪个运行时跑的。
+    tools: toolStatus.resolved,
   }
 }
 
@@ -1602,6 +1680,91 @@ async function handleRunReportLatest(req, res) {
   }
 }
 
+/**
+ * 工具探活入口（与语言无关）。
+ *
+ * 模型在生成用例前用它确认「这台机器能跑哪些测试框架」。
+ * 每个 preset 需要哪些工具是 `lib/runners.js` 声明的（`tools: [...]`），
+ * 这里只负责按预设清单逐个解析并报告缺什么 —— 新增语言不需要改这个接口。
+ *
+ * 查询参数：
+ *   project=<项目绝对路径>  可选。给了就把项目内 wrapper / venv / node_modules/.bin
+ *                            也纳入搜索，并跑一遍框架自动识别。
+ */
+function handleTools(req, res) {
+  try {
+    if (req.method !== 'GET') {
+      send(res, 405, { ok: false, error: '仅支持 GET' })
+      return
+    }
+    let project = ''
+    try {
+      const url = new URL(req.url || '/', 'http://localhost')
+      const raw = url.searchParams.get('project')
+      project = typeof raw === 'string' ? raw.trim() : ''
+    } catch {
+      project = ''
+    }
+
+    // 所有 preset 声明过的工具一次解析完：同一份清单同时服务“逐个 preset 判断”和“列出全部工具”。
+    const resolved = resolveTools(PRESET_TOOLS, { project })
+    const fromResolved = (specs) => {
+      const found = {}
+      const missing = []
+      for (const spec of specs) {
+        const names = Array.isArray(spec) ? spec : [spec]
+        const label = names.join('|')
+        const hit = names.map((name) => resolved[name] || '').find(Boolean) || ''
+        if (hit) found[label] = hit
+        else missing.push(label)
+      }
+      return { resolved: found, missing }
+    }
+
+    const presets = {}
+    for (const [id, preset] of Object.entries(PRESETS)) {
+      const need = Array.isArray(preset.tools) ? preset.tools : []
+      // 支持「任选其一」的组：C++ 编译器装 g++ / clang++ / cl 任一个都算可用。
+      const specResult = fromResolved(need)
+      const buildResult = fromResolved(preset.buildTools || [])
+      presets[id] = {
+        label: preset.label,
+        language: preset.language,
+        // 没有任何工具要求（纯自定义命令）也算可用，不能因为没声明 tools 就报不可用。
+        available: specResult.missing.length === 0,
+        tools: specResult.resolved,
+        missing: specResult.missing,
+        buildAvailable: buildResult.missing.length === 0,
+        buildTools: buildResult.resolved,
+        buildMissing: buildResult.missing,
+      }
+    }
+
+    // 项目给了才自动识别，避免对空路径做无意义的目录扫描。
+    let detected = ''
+    if (project !== '') {
+      try {
+        detected = detectPreset({ project })
+      } catch {
+        detected = ''
+      }
+    }
+
+    send(res, 200, {
+      ok: true,
+      project,
+      detected,
+      detectedAvailable: detected !== '' && presets[detected] ? presets[detected].available : null,
+      tools: resolved,
+      presets,
+      // 解释“为什么没找到”——这些层级都找过了，再找不到就是真不在机器上。
+      searched: searchLayers(),
+    })
+  } catch (error) {
+    send(res, 500, { ok: false, error: error instanceof Error ? error.message : '服务内部错误' })
+  }
+}
+
 export function apply(ctx) {
   ctx.effect(
     () =>
@@ -1613,6 +1776,7 @@ export function apply(ctx) {
     'dsh-data-panel: records api',
   )
   const runRoutes = [
+    [TEST_CODE_PATH, handleTestCode, 'dsh-data-panel: test code'],
     [RUN_PREPARE_PATH, handleRunPrepare, 'dsh-data-panel: run prepare'],
     [RUN_LATEST_PATH, handleRunLatest, 'dsh-data-panel: run latest'],
     [RUN_LIST_PATH, handleRunList, 'dsh-data-panel: run list'],
@@ -1622,6 +1786,7 @@ export function apply(ctx) {
     [RUN_DELETE_PATH, handleRunDelete, 'dsh-data-panel: run delete'],
     [RUN_REPORT_LATEST_PATH, handleRunReportLatest, 'dsh-data-panel: run report latest'],
     [OPEN_PATH, handleOpenFile, 'dsh-data-panel: open file'],
+    [TOOLS_PATH, handleTools, 'dsh-data-panel: tools'],
   ]
   for (const [path, handler, label] of runRoutes) {
     ctx.effect(
@@ -1657,6 +1822,13 @@ export function applySessions(service) {
 
 /** Test-only surface (not part of the plugin contract). */
 export const __test = {
+  handleTools,
+  pythonPath,
+  nodePath,
+  npxPath,
+  describeToolchain,
+  missingTools,
+  PRESETS,
   seedRecords,
   normalizeStored,
   categoryList,
@@ -1669,6 +1841,8 @@ export const __test = {
   exportCases,
   testFuncOf,
   prepareRun,
+  resolveTestCode,
+  handleTestCode,
   handleRunReportLatest,
   handleOpenFile,
   listRuns,

@@ -28,10 +28,21 @@ process.env.DSH_PYTHON_PATH = existsSync(BUNDLED_PYTHON)
   : (process.env.DSH_PYTHON_PATH || (process.platform === 'win32' ? 'python' : 'python3'))
 
 const { __test } = await import('../lib/index.js')
-const { PRESETS, detectPreset, targetOf, targetDeclared, resolveRunner, renderRunnerSpec, escapeRegExp } =
+const { PRESETS, detectPreset, targetOf, targetDeclared, targetLine, resolveRunner, renderRunnerSpec, escapeRegExp } =
   await import('../lib/runners.js')
 
 const tempDirs = []
+test('结构化变量在面板保存和导出时保持真实名称及取值', async () => {
+  const record = __test.normalizeStored(makeRecord({
+    inputVariables: [{ name: 'member_level', value: 'Platinum' }],
+    expectedOutputs: [{ name: 'discount', value: '50.0' }],
+  }))
+  const patched = __test.normalizePatch({ ...record, title: '更新后的用例' }, record)
+  const file = join(makeDir('dsh-report-vars-'), 'cases.json')
+  const cases = await __test.exportCases({ records: [patched] }, file)
+  assert.deepEqual(cases[0].inputVariables, [{ name: 'member_level', value: 'Platinum' }])
+  assert.deepEqual(cases[0].expectedOutputs, [{ name: 'discount', value: '50.0' }])
+})
 function makeDir(prefix) {
   const dir = mkdtempSync(join(tmpdir(), prefix))
   tempDirs.push(dir)
@@ -143,6 +154,7 @@ test('gtest：TEST(Suite, Name) 组合成 Suite.Name，并按逗号形式校验'
   assert.equal(targetOf({ code: 'TEST_F(Fixture, Works) {}' }, gtest), 'Fixture.Works')
   assert.equal(targetDeclared('TEST(Suite, Pass) {}', 'Suite.Pass', gtest), true)
   assert.equal(targetDeclared('TEST(Suite, Pass) {}', 'Suite.Other', gtest), false)
+  assert.equal(targetLine('// generated\nTEST(Suite, Pass) {}', 'Suite.Pass', gtest), 2)
 })
 
 test('resolveRunner：runner.json 可以覆盖预置，也可以完全自定义', () => {
@@ -361,6 +373,115 @@ test('单条执行：scope=case 只冻结这一条目标', async () => {
   const request = JSON.parse(readFileSync(join(prep.root, 'runs', prep.runId, 'request.json'), 'utf8'))
   assert.deepEqual(request.targets.map((item) => item.caseId), ['TC-2'])
   assert.equal(request.scope, 'case')
+})
+
+test('查看测试代码与执行使用同一测试文件和目标，忽略指向源码的旧 codeRef', async () => {
+  const project = makeDir('panel-test-code-')
+  const root = writePytestProject(project)
+  const store = { records: [makeRecord({
+    caseId: 'TC-2',
+    code: 'def test_add_bad():\n    pass',
+    codeRef: join(project, 'calc.py') + '#L1',
+  })] }
+  const view = await __test.resolveTestCode({ sessionId: 'test-session-1', cwd: project, caseId: 'TC-2', store })
+  assert.equal(view.testFile, join(root, 'tests', 'test_generated.py'))
+  assert.equal(view.testFunc, 'test_add_bad')
+  assert.equal(view.line, 11)
+  assert.match(view.warning, /codeRef/)
+  const prep = await __test.prepareRun({ sessionId: 'test-session-1', cwd: project, scope: 'case', caseId: 'TC-2', store })
+  const request = JSON.parse(readFileSync(join(root, 'runs', prep.runId, 'request.json'), 'utf8'))
+  assert.equal(request.testFile, view.testFile)
+  assert.deepEqual(request.targets, [{ caseId: 'TC-2', func: view.testFunc }])
+})
+
+test('查看测试代码明确区分缺测试文件与缺目标', async () => {
+  const project = makeDir('panel-test-code-missing-')
+  write(join(project, 'pyproject.toml'), '[tool.pytest.ini_options]\n')
+  const store = { records: [makeRecord({ caseId: 'TC-1', code: 'def test_real():\n    pass' })] }
+  await assert.rejects(
+    () => __test.resolveTestCode({ sessionId: 's1', cwd: project, caseId: 'TC-1', store }),
+    /预期测试文件不存在/,
+  )
+  write(join(project, '.dsh', 'test-sessions', 's1', 'tests', 'test_generated.py'), 'def test_other():\n    pass\n')
+  await assert.rejects(
+    () => __test.resolveTestCode({ sessionId: 's1', cwd: project, caseId: 'TC-1', store }),
+    /找不到目标 test_real/,
+  )
+})
+
+test('面板代码文本为空时，查看测试代码沿用 cases.json 的 testFunc', async () => {
+  const project = makeDir('panel-test-code-saved-')
+  const root = writePytestProject(project)
+  write(join(root, 'cases.json'), JSON.stringify({ cases: [{ caseId: 'TC-1', testFunc: 'test_add_ok' }] }))
+  const store = { records: [makeRecord({ caseId: 'TC-1', code: '', codeRef: '' })] }
+  const view = await __test.resolveTestCode({ sessionId: 'test-session-1', cwd: project, caseId: 'TC-1', store })
+  assert.equal(view.testFunc, 'test_add_ok')
+  assert.equal(view.line, 6)
+  assert.equal(view.warning, '')
+})
+
+test('父工作区下首次执行：codeRef 留空仍找到嵌套项目的同会话资产', async () => {
+  const workspace = makeDir('panel-nested-workspace-')
+  const project = join(workspace, 'test', 'ut-demo')
+  const sessionId = 'nested-first-run'
+  const root = join(project, '.dsh', 'test-sessions', sessionId)
+  write(join(root, 'runner.json'), JSON.stringify({ preset: 'pytest' }))
+  write(join(root, 'tests', 'test_generated.py'), 'def test_nested():\n    assert True\n')
+  const store = { records: [makeRecord({ code: 'def test_nested():\n    assert True', codeRef: '' })] }
+  const view = await __test.resolveTestCode({ sessionId, cwd: workspace, caseId: 'TC-1', store })
+  assert.equal(view.testFile, join(root, 'tests', 'test_generated.py'))
+  const prep = await __test.prepareRun({ sessionId, cwd: workspace, scope: 'case', caseId: 'TC-1', store })
+  assert.equal(prep.root, root)
+  assert.equal(prep.frameworkId, 'pytest')
+})
+
+test('同会话对应多个有效项目时拒绝猜测执行目录', async () => {
+  const workspace = makeDir('panel-ambiguous-workspace-')
+  const sessionId = 'ambiguous-first-run'
+  for (const name of ['first', 'second']) {
+    const root = join(workspace, name, '.dsh', 'test-sessions', sessionId)
+    write(join(root, 'runner.json'), JSON.stringify({ preset: 'pytest' }))
+    write(join(root, 'tests', 'test_generated.py'), 'def test_shared():\n    assert True\n')
+  }
+  const store = { records: [makeRecord({ code: 'def test_shared():\n    assert True', codeRef: '' })] }
+  await assert.rejects(
+    () => __test.resolveTestCode({ sessionId, cwd: workspace, caseId: 'TC-1', store }),
+    /多个可执行项目/,
+  )
+})
+
+test('非 PATH 的 Go 工具路径写入本次执行命令', async () => {
+  const project = makeDir('panel-go-path-')
+  const root = join(project, '.dsh', 'test-sessions', 'go-path-test')
+  const tool = join(project, process.platform === 'win32' ? 'go.exe' : 'go')
+  write(tool, 'fake tool')
+  write(join(root, 'runner.json'), JSON.stringify({ preset: 'go' }))
+  write(join(project, 'tests', 'test_generated_test.go'), 'func TestThing(t *testing.T) {}\n')
+  const previous = process.env.DSH_GO_PATH
+  process.env.DSH_GO_PATH = tool
+  try {
+    const store = { records: [makeRecord({ code: 'func TestThing(t *testing.T) {}' })] }
+    const prep = await __test.prepareRun({ sessionId: 'go-path-test', cwd: project, scope: 'case', caseId: 'TC-1', store })
+    const request = JSON.parse(readFileSync(join(root, 'runs', prep.runId, 'request.json'), 'utf8'))
+    assert.equal(request.runner.command[0], tool)
+  } finally {
+    if (previous === undefined) delete process.env.DSH_GO_PATH
+    else process.env.DSH_GO_PATH = previous
+  }
+})
+
+test('GoogleTest 允许 preCommand 先生成 binary，未配置构建时要求 binary 已存在', async () => {
+  const project = makeDir('panel-gtest-build-')
+  const root = join(project, '.dsh', 'test-sessions', 'gtest-build-test')
+  const profile = { preset: 'gtest', binary: 'project:build/generated_test', preCommand: [process.execPath, '--version'] }
+  write(join(root, 'runner.json'), JSON.stringify(profile))
+  write(join(project, 'tests', 'generated_test.cpp'), 'TEST(Suite, Works) {}\n')
+  const store = { records: [makeRecord({ code: 'TEST(Suite, Works) {}' })] }
+  const args = { sessionId: 'gtest-build-test', cwd: project, scope: 'case', caseId: 'TC-1', store }
+  const prep = await __test.prepareRun(args)
+  assert.equal(prep.frameworkId, 'gtest')
+  write(join(root, 'runner.json'), JSON.stringify({ ...profile, preCommand: [] }))
+  await assert.rejects(() => __test.prepareRun(args), /测试可执行文件不存在/)
 })
 
 test('目标缺失：没有 testFunc 且代码认不出时计入 notRun', async () => {

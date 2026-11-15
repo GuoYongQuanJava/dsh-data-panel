@@ -233,7 +233,7 @@ def main():
                 else:
                     check("□ 通过" in result_cell.text, f"{tag} 勾选在未通过侧（{result_cell.text!r}）")
 
-            if case.get("issue") and case["issue"] != "无":
+            if case.get("issue") and not str(case["issue"]).startswith("未记录"):
                 issue_row = table.rows[pass_row + 1]
                 check(case["issue"][:10] in cell_text(issue_row.cells[2]), f"{tag} 异常描述写入")
 
@@ -241,7 +241,7 @@ def main():
     print("\n== 可选字段 ==")
     if len(doc.tables) == len(all_cases):
         for idx, (table, case) in enumerate(zip(doc.tables, all_cases)):
-            if not case.get("bugId") or case["bugId"] == "无":
+            if not case.get("bugId") or str(case["bugId"]).startswith("未记录"):
                 continue
             issue_row = table.rows[
                 next(

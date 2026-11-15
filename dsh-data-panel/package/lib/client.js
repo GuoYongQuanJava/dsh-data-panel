@@ -291,11 +291,7 @@ window.__ModuleLoader__.load({
 .dp-root.dp-docked .dp-cat-main { padding: 5px 6px; font-size: 12px; }
 .dp-cell-text.empty { color: var(--dp-text3); }
 .dp-type { display: inline-block; max-width: 100%; overflow: hidden; padding: 1px 8px; border: 1px solid color-mix(in srgb, var(--dp-brand) 34%, transparent); border-radius: 6px; background: color-mix(in srgb, var(--dp-brand) 5%, transparent); color: var(--dp-brand); font-size: 12px; line-height: 18px; text-overflow: ellipsis; white-space: nowrap; vertical-align: middle; }
-/*
- * 只有「性能测试」保留一点暖色（和功能类区分），其余类型统一走上面的品牌色。
- * 之前「异常测试」是红框（data-tone="exception"）、兼容性是灰框，
- * 一列标签里颜色杂且红色像报错，用户要求改回去，所以那两条规则已删除。
- */
+/* 只有「性能测试」保留一点暖色，其余测试类型统一使用品牌色。 */
 .dp-type[data-tone="perf"] { border-color: color-mix(in srgb, var(--dp-warning) 36%, transparent); background: color-mix(in srgb, var(--dp-warning) 7%, transparent); color: var(--dp-warning); }
 .dp-owner { color: var(--dp-text2); }
 .dp-time { color: var(--dp-text3); font-size: 12px; white-space: nowrap; }
@@ -467,25 +463,22 @@ window.__ModuleLoader__.load({
 		//#endregion
 
 		//#region helpers
-		// 测试类型。顺序即下拉框的展示顺序，按用户要求固定为：
-//   功能测试 → 接口测试 → 边界测试 → 逻辑测试 → 性能测试
-//
-// exception / compat 是历史值：现有数据里还有（当前有 535 条 exception），
-// 它们不再出现在下拉框里，但必须保留映射，否则这些用例的标签会退化成
-// 兜底文案。它们的 tone 统一成 "func"，跟其它类型长得一样 ——
-// 之前 exception 是红框，在一列标签里格外刺眼，用户要求改回普通样式。
+		// 测试类型及下拉框顺序：功能 → 接口 → 边界 → 逻辑 → 性能。
 var TEST_TYPES = {
 	functional: { label: "功能测试", tone: "func" },
 	api: { label: "接口测试", tone: "func" },
 	boundary: { label: "边界测试", tone: "func" },
 	logic: { label: "逻辑测试", tone: "func" },
-	performance: { label: "性能测试", tone: "perf" },
-	// 以下两项仅用于显示旧数据，不进下拉框。
-	exception: { label: "异常测试", tone: "func" },
-	compat: { label: "兼容性测试", tone: "func" }
+	performance: { label: "性能测试", tone: "perf" }
 };
-// 下拉框可选值：只列新的五项，且保持上面的顺序。
 var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
+		function testTypeOptions(value) {
+			var options = TEST_TYPE_KEYS.map(function (key) {
+				return h("option", { key: key, value: key }, TEST_TYPES[key].label);
+			});
+			if (value === "") options.unshift(h("option", { key: "empty", value: "", disabled: true }, "请选择测试类型"));
+			return options;
+		}
 
 		function cn() {
 			var parts = [];
@@ -1018,6 +1011,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 			if (cwd === "") {
 				return Promise.reject(new Error("无法确定当前会话的项目目录"));
 			}
+
 			// cwd 只作为兜底：宿主会用会话自身的项目目录，并校验它确实存在。
 			var body = { sessionId: sessionId, cwd: cwd, scope: scope };
 			if (scope === "case") body.caseId = caseId || "";
@@ -1027,6 +1021,16 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 				body: JSON.stringify(body),
 			});
 		}
+
+			function fetchTestCode(sessionId, caseId) {
+				var params = new URLSearchParams();
+				params.set("sessionId", sessionId);
+				params.set("caseId", caseId);
+				params.set("cwd", cwdOf(sessionId));
+				return callApi("/data-panel/test-code?" + params.toString(), {
+					method: "GET", headers: { accept: "application/json" }
+				});
+			}
 
 		/** 该会话/该用例最近一次执行（exists=false 表示还没跑过）。 */
 		function fetchLatestRun(sessionId, scope, caseId) {
@@ -1148,7 +1152,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 		}
 
 		function TypeTag(props) {
-			var meta = TEST_TYPES[props.testType] || TEST_TYPES.functional;
+			var meta = TEST_TYPES[props.testType] || { label: "待重新分类", tone: "func" };
 			return h("span", { className: "dp-type", "data-tone": meta.tone }, meta.label);
 		}
 
@@ -2203,7 +2207,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 				return {
 					caseId: initial.caseId || "",
 					title: initial.title || "",
-					testType: initial.testType || "functional",
+					testType: TEST_TYPE_KEYS.indexOf(initial.testType) !== -1 ? initial.testType : (props.mode === "edit" ? "" : "functional"),
 					description: initial.description || "",
 					input: initial.input || "",
 					expected: initial.expected || "",
@@ -2235,6 +2239,10 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 				if (event) event.preventDefault();
 				if (!values.title.trim()) {
 					setLocalError("用例名称不能为空");
+					return;
+				}
+				if (TEST_TYPE_KEYS.indexOf(values.testType) === -1) {
+					setLocalError("请选择测试类型");
 					return;
 				}
 				setLocalError("");
@@ -2282,9 +2290,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 							className: "dp-select",
 							value: values.testType,
 							onChange: function (event) { set("testType", event.target.value); }
-						}, TEST_TYPE_KEYS.map(function (key) {
-							return h("option", { key: key, value: key }, TEST_TYPES[key].label);
-						}))
+						}, testTypeOptions(values.testType))
 					),
 					// 层级：选了就归到那一层，但用例本身永远在「默认」里可见。
 					h(Field, { label: "所属层级", hint: "留空表示只在「默认」层；选一个层级会同时把它归到那一层。" },
@@ -2330,19 +2336,19 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 						})
 					),
 					h(Field, {
-						label: "被测源码",
+						label: "测试代码位置（可选）",
 						full: true,
-						hint: "这条用例覆盖的源文件位置，形如 src/RingBuffer.h:42（也接受 #L42、#L42-58）。表格操作列的定位按钮据此跳到编辑器。"
+						hint: "旧数据兼容字段。查看测试代码会按运行器的测试文件和用例目标定位，不依赖此路径。"
 					},
 						h("input", {
 							className: "dp-input mono",
 							value: values.codeRef,
 							maxLength: 200,
-							placeholder: "src/RingBuffer.h:42",
+							placeholder: "测试文件#L行号（可留空）",
 							onChange: function (event) { set("codeRef", event.target.value); }
 						})
 					),
-					h(Field, { label: "代码", full: true, hint: "这条用例的测试代码。填了「被测源码」后表格的定位按钮会跳原件，这里的代码仍可用「</>」按钮查看。" },
+						h(Field, { label: "代码", full: true, hint: "这条用例的测试代码文本；实际执行仍以测试文件中的代码为准。" },
 						h("textarea", {
 							className: "dp-textarea mono",
 							rows: 8,
@@ -3009,12 +3015,10 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 													h("td", null,
 														h("div", { className: "dp-actions" },
 															h(IconButton, {
-																name: record.codeRef ? "source" : "code",
-																label: (record.codeRef ? "查看源码 " : "查看代码 ") + record.title,
+																name: "source",
+																label: "查看测试代码 " + record.title,
 																onClick: function () {
-																	// 有用例源码位置就跳编辑器；没有则沿用弹窗看用例代码。
-															if (record.codeRef && typeof props.openCode === "function") props.openCode(record.codeRef, props.sessionId);
-																	else setCodeRecord(record);
+																if (typeof props.openTestCode === "function") props.openTestCode(record.caseId, props.sessionId);
 																}
 															}),
 															h(IconButton, {
@@ -3311,7 +3315,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 				return {
 					caseId: record.caseId || "",
 					title: record.title || "",
-					testType: record.testType || "functional",
+					testType: TEST_TYPE_KEYS.indexOf(record.testType) !== -1 ? record.testType : "",
 					description: record.description || "",
 					input: record.input || "",
 					expected: record.expected || "",
@@ -3337,6 +3341,10 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 				if (event) event.preventDefault();
 				if (!values.title.trim()) {
 					setLocalError("用例名称不能为空");
+					return;
+				}
+				if (TEST_TYPE_KEYS.indexOf(values.testType) === -1) {
+					setLocalError("请选择测试类型");
 					return;
 				}
 				setLocalError("");
@@ -3369,9 +3377,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 							className: "dp-select",
 							value: values.testType,
 							onChange: function (event) { set("testType", event.target.value); }
-						}, TEST_TYPE_KEYS.map(function (key) {
-							return h("option", { key: key, value: key }, TEST_TYPES[key].label);
-						}))
+						}, testTypeOptions(values.testType))
 					),
 					h(Field, { label: "测试说明" },
 						h("textarea", {
@@ -3400,12 +3406,12 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 							onChange: function (event) { set("expected", event.target.value); }
 						})
 					),
-					h(Field, { label: "被测源码", hint: "形如 src/RingBuffer.h:42" },
+							h(Field, { label: "测试代码位置（可选）", hint: "旧数据兼容字段；查看测试代码按测试文件和目标定位" },
 						h("input", {
 							className: "dp-input mono",
 							value: values.codeRef,
 							maxLength: 200,
-							placeholder: "src/RingBuffer.h:42",
+							placeholder: "测试文件#L行号（可留空）",
 							onChange: function (event) { set("codeRef", event.target.value); }
 						})
 					),
@@ -3442,10 +3448,10 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 					)
 				),
 				h("div", { className: "dp-detail-actions" },
-					record.codeRef ? h(Button, { size: "sm", onClick: props.onOpenCode },
+					h(Button, { size: "sm", onClick: props.onOpenCode },
 						h(Icon, { name: "location", size: 14 }),
-						"查看源码"
-					) : null,
+						"查看测试代码"
+						),
 					h(Button, { size: "sm", onClick: props.onEdit }, h(Icon, { name: "edit", size: 14 }), "编辑"),
 					h(Button, { size: "sm", variant: "danger", onClick: props.onDelete }, h(Icon, { name: "trash", size: 14 }), "删除")
 				),
@@ -3468,10 +3474,10 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 						: h("p", { className: "dp-summary", style: { color: "var(--dp-text3)" } }, "未填写预期输出。")
 				),
 				h("div", { className: "dp-section" },
-					h("h4", null, "被测源码"),
+						h("h4", null, "旧代码位置"),
 					record.codeRef
 						? h("p", { className: "dp-summary" }, h("code", { className: "dp-chip-mono" }, record.codeRef))
-						: h("p", { className: "dp-summary", style: { color: "var(--dp-text3)" } }, "未记录代码位置，点击「编辑」补充这条用例覆盖的源文件与行号。")
+						: h("p", { className: "dp-summary", style: { color: "var(--dp-text3)" } }, "未填写；查看测试代码会按测试目标定位。")
 				),
 				h("div", { className: "dp-section" },
 					h("h4", null, "代码"),
@@ -3675,7 +3681,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 					onEdit: function () { setEditing(true); setError(""); },
 					onDelete: function () { setConfirm(true); setError(""); },
 					onOpenCode: function () {
-						if (typeof props.openCode === "function") props.openCode(record.codeRef, sessionId);
+						if (typeof props.openTestCode === "function") props.openTestCode(record.caseId, sessionId);
 					}
 				}),
 				editing ? h(DetailEditor, {
@@ -3732,7 +3738,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 		 */
 		function codeTrace(message) {
 			try {
-				store.setError("查看源码：" + message);
+				store.setError("查看测试代码：" + message);
 			} catch {
 				// store 不可用时不至于再抛。
 			}
@@ -4355,21 +4361,21 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 		}
 
 		/**
-		 * 打开用例覆盖的被测源码并定位到行。
+		 * 打开宿主已校验的测试文件并定位到目标行。
 		 *
 		 * 四级降级，逐级丢失一点精度而不是直接失败：
 		 *   ① dsh-better-sidebar 编辑器 —— 定位到行，可编辑，能落到并排的第二栏
 		 *   ② dsh-vscode-mode 编辑器 —— 定位到行/列，可编辑
 		 *   ③ 官方 file 资源预览 —— 只读，但能把行号交给查看器
 		 *   ④ 系统默认程序 openPath —— 只能打开文件，丢失行号
-		 * @param ref 记录里的 codeRef（`path:line` 等形态）
+		 * @param ref 宿主返回的测试文件路径与目标行（`path#Lline`）
 		 * @param sessionId 记录所属会话，用于解析相对路径
 		 * @returns 是否成功发起了一次打开
 		 */
 		function openCode(ref, sessionId) {
 			var target = parseCodeRef(ref);
 			if (target === null) {
-				store.setError("这条用例还没有填代码位置。编辑用例，在「被测源码」里填 src/…:行号。");
+				store.setError("测试代码位置无效。");
 				return false;
 			}
 			var absolute = absoluteCodePath(target.path, sessionId);
@@ -4434,6 +4440,19 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 			return false;
 		}
 
+			function openTestCode(caseId, sessionId) {
+				if (!sessionId || !caseId) {
+					store.setError("查看测试代码：缺少会话或用例 ID。");
+					return;
+				}
+				fetchTestCode(sessionId, caseId).then(function (data) {
+					var opened = openCode(data.testFile.replace(/\\/g, "/") + "#L" + data.line, sessionId);
+					if (opened && data.warning) store.setError("查看测试代码：" + data.warning);
+				}).catch(function (error) {
+					store.setError("查看测试代码：" + (error && error.message ? error.message : String(error)));
+				});
+			}
+
 		/**
 		 * 主区 tab 行右边的「面板」按钮。
 		 *
@@ -4454,6 +4473,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 				store.setError("右侧栏服务尚未就绪，请刷新页面后再试。");
 				return false;
 			}
+
 			try {
 				sidebarRight.openTab("data-panel-board", { params: {} });
 				store.setError("");
@@ -4681,7 +4701,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 					name: "sidebar.right.pane.tab",
 					key: "data-panel-detail",
 					inject: function () {
-						return { store: store, openCode: openCode };
+						return { store: store, openTestCode: openTestCode };
 					}
 				}, DetailBody);
 			});
@@ -4701,7 +4721,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 							// 会被判成「另一个会话」，而那条分支在 sessionId === "" 时直接不发请求，
 							// 于是 record 恒为 null，界面上永远是「用例不存在」。
 							openDetail: function (id) { openDetail(id, ownSessionId); },
-							openCode: function (ref, refSessionId) { openCode(ref, refSessionId || ownSessionId); },
+							openTestCode: function (caseId, refSessionId) { openTestCode(caseId, refSessionId || ownSessionId); },
 							sessionId: ownSessionId,
 							dock: true
 						};

@@ -58,10 +58,17 @@ def read_json(path: Path) -> dict:
 
 
 def parse_junit(path: Path) -> list:
-    """读 junit.xml，得到逐条测试的真实结果。
+    """读 junit.xml **或 GoogleTest 的 xml**，得到逐条测试的真实结果。
 
-    返回 [{name, classname, outcome, message}]，outcome ∈ passed/failed/error/skipped。
+    返回 [{name, classname, outcome, message, detail, timeMs}]，
+    outcome ∈ passed/failed/error/skipped。
     这是 batch 模式唯一的逐条证据来源；解析不出就返回空，调用方据此标“未确认”。
+
+    为什么能一把吃两种：
+    * 两者都是 `<testcase>` 元素，失败都写 `<failure>`，异常都写 `<error>`；
+    * gtest 额外用 `status="notrun"` / `result="suppressed"` 表示被禁用或没跑，
+      这两个属性在 JUnit 里不存在，所以按属性判断只影响 gtest 分支；
+    * gtest 1.10+ 会写 `classname="套件名"`，正好能还原成 `套件.用例`。
     """
     if not path.is_file():
         return []
@@ -75,11 +82,29 @@ def parse_junit(path: Path) -> list:
         classname = case.get("classname") or ""
         outcome = "passed"
         message = ""
+        detail = ""
+        # gtest：禁用的用例(result="suppressed")和没跑的用例(status="notrun")
+        # 都不写子元素，只在属性里表态 —— 不认这两个属性就会把它们算成“通过”。
+        status_attr = (case.get("status") or "").strip().lower()
+        result_attr = (case.get("result") or "").strip().lower()
+        if status_attr == "notrun" or result_attr in ("suppressed", "skipped", "notrun"):
+            outcome = "skipped"
+            message = status_attr or result_attr
+        time_text = case.get("time") or ""
+        time_ms = None
+        try:
+            if time_text:
+                time_ms = int(float(time_text) * 1000)
+        except (TypeError, ValueError):
+            time_ms = None
         for child in case:
             tag = child.tag.split("}")[-1]
             if tag in ("failure", "error"):
                 outcome = "failed" if tag == "failure" else "error"
                 message = (child.get("message") or (child.text or "")).strip()
+                # gtest 把断言细节放在 CDATA 正文里，message 属性只有一行摘要；
+                # 面板要展示「Expected/Actual」就得把正文也留下。
+                detail = (child.text or "").strip()
                 break
             if tag == "skipped":
                 outcome = "skipped"
@@ -90,10 +115,13 @@ def parse_junit(path: Path) -> list:
             "classname": classname,
             "outcome": outcome,
             "message": message[:CAPTURE_LIMIT],
+            "detail": detail[:CAPTURE_LIMIT],
+            "timeMs": time_ms,
         })
     return results
 
 ACTUAL_LINE = re.compile(r'ACTUAL(?:\[([^\]]+)\])?\s*:\s*(.*)$')
+ACTUAL_JSON_LINE = re.compile(r'ACTUAL_JSON\[([^\]]+)\]\s*:\s*(\{.*\})\s*$')
 
 
 def parse_actuals(text: str) -> dict:
@@ -104,7 +132,20 @@ def parse_actuals(text: str) -> dict:
     """
     tagged = {}
     untagged = []
+    named = {}
     for line in (text or "").splitlines():
+        structured = ACTUAL_JSON_LINE.search(line)
+        if structured:
+            try:
+                values = json.loads(structured.group(2))
+            except (ValueError, TypeError):
+                values = None
+            if isinstance(values, dict) and all(isinstance(key, str) for key in values):
+                named[structured.group(1).strip()] = {
+                    key: value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+                    for key, value in values.items()
+                }
+            continue
         match = ACTUAL_LINE.search(line)
         if not match:
             continue
@@ -114,19 +155,36 @@ def parse_actuals(text: str) -> dict:
             tagged[key] = value
         else:
             untagged.append(value)
-    return {"tagged": tagged, "untagged": untagged}
+    return {"tagged": tagged, "untagged": untagged, "named": named}
 
 
 def match_test(entries: list, func: str):
-    """把用例的测试函数/测试名对应到 junit 里的一条记录。"""
+    """把用例的测试函数/测试名对应到 junit / gtest 里的一条记录。
+
+    命名差异是 C++ 接不进来的真正原因：Python 的 `pytest` 节点是
+    `test_generated.py::test_xxx`，而 gtest 的用例名天然是两段
+    `TEST(套件, 用例)` —— 面板里 `testFunc` 写哪一种都可能：
+    `CouponNeverNegative` 或 `OrderTotal.CouponNeverNegative`。
+    两种写法都要认得，否则每条用例都会落到「未确认」。
+    """
+    target = (func or "").strip()
+    if not target:
+        return None
     for entry in entries:
         name = entry.get("name") or ""
         classname = entry.get("classname") or ""
-        if name == func or classname.endswith("." + func):
+        qualified = f"{classname}.{name}" if (classname and name) else name
+        if name == target or qualified == target:
             return entry
-        if name.split("[")[0] == func:
+        if classname and classname.endswith("." + target):
             return entry
-        if name.endswith("." + func):
+        if name.split("[")[0] == target:
+            return entry
+        if name.endswith("." + target):
+            return entry
+        # 老版本 gtest 不写 classname：只有拿不到套件名时才退到「套件.用例」的末段，
+        # 避免两个套件同名用例之间串证据。
+        if not classname and "." in target and name == target.rsplit(".", 1)[-1]:
             return entry
     return None
 
@@ -136,11 +194,18 @@ def render_target_arg(template: str, target: str, test_file: str) -> str:
 
 
 def prepare_argv(spec: dict, targets: list, target: str) -> list:
-    """把 request.runner.command 展开成可执行的 argv。"""
+    """把 request.runner.command 展开成可执行的 argv。
+
+    `targetsSeparator`（默认空格）决定多个目标拼进同一个参数时用什么分隔：
+    * pytest 走 `{targets}` 独占一个参数 → 每个目标一个 argv，用不到它；
+    * gtest 必须写成 `--gtest_filter=A:B`，重复给 `--gtest_filter` 只有最后一个生效，
+      所以配置 `"targetsSeparator": ":"` 把多个用例拼成一条过滤表达式。
+    """
     argv = []
     mode = spec.get("mode") or "per-case"
     target_arg = str(spec.get("targetArg") or "{target}")
     test_file = str(spec.get("testFile") or "")
+    targets_sep = str(spec.get("targetsSeparator") or " ")
     escaped = re.escape(target) if spec.get("targetEscape") else target
     for token in spec.get("command") or []:
         token = str(token)
@@ -149,7 +214,9 @@ def prepare_argv(spec: dict, targets: list, target: str) -> list:
                 argv.append(render_target_arg(target_arg, item.get("func") or "", test_file))
             continue
         if "{targets}" in token and mode == "batch":
-            rendered = " ".join(render_target_arg(target_arg, t.get("func") or "", test_file) for t in targets)
+            rendered = targets_sep.join(
+                render_target_arg(target_arg, t.get("func") or "", test_file) for t in targets
+            )
             argv.append(token.replace("{targets}", rendered))
             continue
         if "{target}" in token:
@@ -206,6 +273,7 @@ def kill_tree(process) -> None:
 
 def pump(stream, log_file, capture):
     """把子进程输出同时送到终端和日志文件，逐行 flush。"""
+    captured_size = 0
     try:
         for line in iter(stream.readline, ""):
             if line == "":
@@ -214,8 +282,9 @@ def pump(stream, log_file, capture):
             sys.stdout.flush()
             log_file.write(line)
             log_file.flush()
-            if capture is not None and len("".join(capture)) < CAPTURE_LIMIT:
+            if capture is not None and (captured_size < CAPTURE_LIMIT or "ACTUAL[" in line or "ACTUAL_JSON[" in line):
                 capture.append(line)
+                captured_size += len(line)
     finally:
         try:
             stream.close()
@@ -286,6 +355,225 @@ def tail(text: str, limit: int = CAPTURE_LIMIT) -> str:
     return "…(仅保留失败输出末尾)\n" + text[-limit:]
 
 
+# ══════════════════════════════════════════════════════════════
+# 覆盖率：解析各种主流报告格式 → 统一的 {line, branch} 统计
+# ══════════════════════════════════════════════════════════════
+#
+# 面板不偏向任何语言：format 是字符串，新增框架只要加一个分支即可。
+# 解析失败不抛到调用方之外，由 collect_coverage 统一变成“未采集 + 原因”。
+
+def _pct(covered: int, total: int) -> float:
+    if total <= 0:
+        return 0.0
+    return round(covered / total * 100, 1)
+
+
+def _stat(covered, total):
+    """统一的行/分支统计块；无法得到总数时返回 None（而不是 0%）。"""
+    try:
+        covered_i = int(covered or 0)
+        total_i = int(total or 0)
+    except (TypeError, ValueError):
+        return None
+    if total_i <= 0:
+        return None
+    return {"covered": covered_i, "total": total_i, "percent": _pct(covered_i, total_i)}
+
+
+def _read_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8-sig", errors="replace")
+
+
+def parse_coverage_report(path: Path, fmt: str) -> dict:
+    """解析覆盖率报告，返回 {"line": stat|None, "branch": stat|None}。"""
+    fmt = (fmt or "").strip().lower()
+    line = branch = None
+
+    if fmt == "coveragepy-json":
+        data = json.loads(_read_text(path))
+        totals = data.get("totals") or {}
+        line = _stat(totals.get("covered_lines"), totals.get("num_statements"))
+        branch = _stat(totals.get("covered_branches"), totals.get("num_branches"))
+
+    elif fmt == "istanbul-summary":
+        data = json.loads(_read_text(path))
+        totals = data.get("total") or data
+        lines = totals.get("lines") or {}
+        branches = totals.get("branches") or {}
+        line = _stat(lines.get("covered"), lines.get("total"))
+        branch = _stat(branches.get("covered"), branches.get("total"))
+
+    elif fmt == "go-cover":
+        covered = total = 0
+        for raw in _read_text(path).splitlines():
+            text = raw.strip()
+            if not text or text.startswith("mode:"):
+                continue
+            match = re.match(r"^.+:\d+\.\d+,\d+\.\d+\s+(\d+)\s+(\d+)$", text)
+            if not match:
+                continue
+            statements = int(match.group(1))
+            hits = int(match.group(2))
+            total += statements
+            if hits > 0:
+                covered += statements
+        line = _stat(covered, total)
+
+    elif fmt == "lcov":
+        lf = lh = brf = brh = 0
+        for raw in _read_text(path).splitlines():
+            text = raw.strip()
+            try:
+                if text.startswith("LF:"):
+                    lf += int(text[3:])
+                elif text.startswith("LH:"):
+                    lh += int(text[3:])
+                elif text.startswith("BRF:"):
+                    brf += int(text[4:])
+                elif text.startswith("BRH:"):
+                    brh += int(text[4:])
+            except ValueError:
+                continue
+        line = _stat(lh, lf)
+        branch = _stat(brh, brf)
+
+    elif fmt in ("cobertura", "jacoco"):
+        root = ET.parse(str(path)).getroot()
+        if fmt == "cobertura":
+            # cobertura 通常在根节点给出 lines-valid / lines-covered（新版本还会有 branch 属性）
+            valid = root.get("lines-valid") or root.get("lines-valid".upper())
+            covered = root.get("lines-covered")
+            if valid is not None and covered is not None:
+                line = _stat(covered, valid)
+                branch = _stat(root.get("branches-covered"), root.get("branches-valid"))
+            else:
+                # 退而求其次：统计所有 <line> 元素（按 class 的文件名 + 行号去重）
+                seen = {}
+                for cls in root.iter("class"):
+                    filename = cls.get("filename") or ""
+                    # cobertura 的 <line> 在 <lines> 里，不一定是 class 的直接子节点。
+                    for item in cls.iter("line"):
+                        try:
+                            number = int(item.get("number") or 0)
+                            hits = int(float(item.get("hits") or 0))
+                        except (TypeError, ValueError):
+                            continue
+                        key = (filename, number)
+                        seen[key] = max(seen.get(key, 0), hits)
+                line = _stat(sum(1 for hits in seen.values() if hits > 0), len(seen))
+        else:
+            counters = {item.get("type"): item for item in root.findall("counter")}
+            line_counter = counters.get("LINE")
+            branch_counter = counters.get("BRANCH")
+            if line_counter is not None:
+                covered = int(line_counter.get("covered") or 0)
+                missed = int(line_counter.get("missed") or 0)
+                line = _stat(covered, covered + missed)
+            if branch_counter is not None:
+                covered = int(branch_counter.get("covered") or 0)
+                missed = int(branch_counter.get("missed") or 0)
+                branch = _stat(covered, covered + missed)
+
+    else:
+        raise ValueError(f"不认识的覆盖率格式「{fmt}」（可用：coveragepy-json / istanbul-summary / go-cover / lcov / cobertura / jacoco）")
+
+    if line is None and branch is None:
+        raise ValueError("报告里没有任何可用的行/分支统计")
+    return {"line": line, "branch": branch}
+
+
+def locate_coverage_file(spec_file: str, project: Path) -> Path | None:
+    """找到覆盖率报告；支持 `*` 通配（取最新的一份）。"""
+    import glob
+
+    target = (spec_file or "").strip()
+    if not target:
+        return None
+    pattern = target if os.path.isabs(target) else str((project / target).resolve())
+    matches = glob.glob(pattern, recursive=True) if "*" in pattern else ([pattern] if os.path.isfile(pattern) else [])
+    files = [Path(item) for item in matches if os.path.isfile(item)] if matches else []
+    if not files:
+        return None
+    return max(files, key=lambda item: item.stat().st_mtime)
+
+def collect_coverage(cfg, *, spec: dict, targets: list, run_dir: Path, project: Path, cwd, env, use_shell: bool, log_file, say) -> dict:
+    """按 request.runner.coverage 跑一次覆盖率采集，返回统一结构。
+
+    无论成功与否都返回一个 dict（available=False 时带 reason），
+    调用方只把它写进 result.json，不影响本次执行的通过/失败结论。
+    """
+    if not isinstance(cfg, dict) or not cfg.get("command"):
+        return {"available": False, "reason": "本次未配置覆盖率采集"}
+
+    raw_command = cfg.get("command") or []
+    # 每个元素必须是一段参数；出现 list 说明配置写错了（曾经把它 str() 成 "['…']" 然后静默失败）。
+    bad = [part for part in raw_command if not isinstance(part, str)]
+    if bad:
+        return {"available": False, "reason": "coverage.command 里有非字符串项（应为一维 argv 字符串数组）"}
+    # 覆盖率命令和正式执行共用目标展开规则，避免把 {targets} 原样传给 pytest。
+    argv = prepare_argv({**spec, "command": raw_command}, targets, "")
+    fmt = str(cfg.get("format") or "")
+    report = str(cfg.get("file") or "")
+    timeout = cfg.get("timeoutSec")
+    hint = str(cfg.get("hint") or "").strip()
+    if not isinstance(timeout, int) or timeout <= 0:
+        timeout = 900
+
+    say("")
+    say("── 覆盖率采集 ──")
+    say("$ " + " ".join(shlex.quote(part) for part in argv))
+    started = time.time()
+    deadline = started + timeout
+    run = run_command(argv, cwd, env, use_shell, deadline, log_file, capture=True)
+
+    if run["error"]:
+        reason = run["error"] if not hint else f"{run['error']}；{hint}"
+        say(f"[覆盖率未采集] {reason}")
+        return {"available": False, "reason": reason[:300]}
+    if run["timedOut"]:
+        reason = f"覆盖率采集超时（{timeout} 秒）"
+        say(f"[覆盖率未采集] {reason}")
+        return {"available": False, "reason": reason}
+    if run["code"] != 0:
+        # 很多框架在用例失败时仍会写出覆盖率；不能因为退出码不是 0 就放弃读数。
+        say(f"[覆盖率命令退出码 {run['code']}，继续尝试读取报告]")
+
+    path = locate_coverage_file(report, project)
+    if path is None:
+        reason = f"没生成覆盖率报告（{os.path.basename(report) or report}）"
+        if hint:
+            reason += f"；{hint}"
+        else:
+            reason += "；可能没装覆盖率插件，或没命中测试"
+        say(f"[覆盖率未采集] {reason}")
+        return {"available": False, "reason": reason[:300]}
+
+    try:
+        stats = parse_coverage_report(path, fmt)
+    except Exception as error:
+        reason = f"覆盖率报告解析失败（{fmt}）：{error}"
+        say(f"[覆盖率未采集] {reason}")
+        return {"available": False, "reason": reason[:300]}
+
+    line = stats.get("line") or {}
+    branch = stats.get("branch") or {}
+    summary = []
+    if line:
+        summary.append(f"行 {line['covered']}/{line['total']} = {line['percent']}%")
+    if branch:
+        summary.append(f"分支 {branch['covered']}/{branch['total']} = {branch['percent']}%")
+    say(f"[覆盖率] {'；'.join(summary)}（{path.name}）")
+    say(f"[覆盖率] 采集耗时 {int((time.time() - started) * 1000)}ms")
+
+    return {
+        "available": True,
+        "format": fmt,
+        "source": str(path),
+        "line": stats.get("line"),
+        "branch": stats.get("branch"),
+        "durationMs": int((time.time() - started) * 1000),
+    }
+
 def main() -> int:
     import argparse
 
@@ -335,6 +623,10 @@ def main() -> int:
     }
 
     log_file = open(log_path, "w", encoding="utf-8", errors="replace")
+    # 早退路径（缺 request.json 等）也会走到 finish()，覆盖率代码需要这些值存在。
+    cwd = str(project)
+    env = dict(os.environ)
+    use_shell = False
 
     def say(line: str = "") -> None:
         print(line)
@@ -354,6 +646,29 @@ def main() -> int:
         result["errors"] = sum(1 for item in result["tests"] if item["outcome"] == "error")
         result["skipped"] = sum(1 for item in result["tests"] if item["outcome"] == "skipped")
         result["unconfirmed"] = sum(1 for item in result["tests"] if item["outcome"] == "unknown")
+        # ── 覆盖率（可选）：作为“额外证据”采集，失败不影响本次执行结论 ──
+        if "coverage" not in result and status in ("passed", "partial", "failed"):
+            try:
+                coverage_cfg = (request.get("runner") or {}).get("coverage")
+            except Exception:
+                coverage_cfg = None
+            try:
+                result["coverage"] = collect_coverage(
+                    coverage_cfg,
+                    spec=spec,
+                    targets=targets,
+                    run_dir=run_dir,
+                    project=project,
+                    cwd=cwd,
+                    env=env,
+                    use_shell=use_shell,
+                    log_file=log_file,
+                    say=say,
+                )
+            except Exception as error:  # 覆盖率永远不能把一次执行搞崩
+                result["coverage"] = {"available": False, "reason": f"覆盖率采集异常：{error}"}
+        elif "coverage" not in result:
+            result["coverage"] = {"available": False, "reason": f"执行状态为 {status}，未采集覆盖率"}
         result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
         try:
             log_file.close()
@@ -499,7 +814,7 @@ def main() -> int:
         try:
             actuals = parse_actuals(log_path.read_text(encoding="utf-8", errors="replace"))
         except Exception:
-            actuals = {"tagged": {}, "untagged": []}
+            actuals = {"tagged": {}, "untagged": [], "named": {}}
         for item in targets:
             func = item.get("func") or ""
             case_id = item.get("caseId", "")
@@ -521,7 +836,10 @@ def main() -> int:
                     "func": func,
                     "outcome": hit["outcome"],
                     "message": hit.get("message") or "",
+                    "detail": hit.get("detail") or "",
                     "actual": actual,
+                    "actualOutputs": actuals["named"].get(case_id, {}),
+                    "durationMs": hit.get("timeMs"),
                 })
 
         if run["timedOut"]:
@@ -591,6 +909,7 @@ def main() -> int:
             "func": func,
             "outcome": outcome,
             "actual": actual,
+            "actualOutputs": actuals["named"].get(item.get("caseId", ""), {}),
             "message": message,
             "exitCode": run["code"],
             "durationMs": run["durationMs"],
