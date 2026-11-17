@@ -52,6 +52,7 @@ const MAX_CODE = 20000
 const MAX_CODE_REF = 200
 /** 用例层级（分类）名长度上限；空串表示「默认」层级。 */
 const MAX_CATEGORY = 60
+const MAX_SUBJECT_FUNCTION = 240
 /** 内置层级名：固定存在、含全部用例，不能改名/删除。 */
 const DEFAULT_CATEGORY = '默认'
 
@@ -213,13 +214,20 @@ function normalizeStored(input) {
     ...(Array.isArray(input.expectedOutputs) ? { expectedOutputs: namedValues(input.expectedOutputs, 'value') } : {}),
     code: text(input.code, MAX_CODE),
     codeRef: text(input.codeRef, MAX_CODE_REF),
-    // 用例层级：空串 = 默认层级。旧数据没有这个字段，读出来就是空串，
-    // 不需要升 STORE_VERSION（升版本会把用户用例隔离重置成示例数据）。
+    subjectFunction: text(input.subjectFunction, MAX_SUBJECT_FUNCTION),
+    // 保留旧分类数据与兼容接口，不再用于函数层级。
     category: text(input.category, MAX_CATEGORY),
     demo: input.demo === true,
     createdAt: isoOrNow(input.createdAt),
     updatedAt: isoOrNow(input.updatedAt),
   }
+}
+
+function normalizeSubjectFunction(value) {
+  if (value !== undefined && typeof value !== 'string') throw bad(400, '被测函数必须是字符串')
+  const name = (value || '').trim()
+  if (name.length > MAX_SUBJECT_FUNCTION) throw bad(400, '被测函数最多 240 个字符')
+  return name
 }
 
 function normalizePatch(input, existing) {
@@ -228,6 +236,7 @@ function normalizePatch(input, existing) {
   if (!TEST_TYPES.has(input.testType)) throw bad(400, '测试类型只能是功能、接口、边界、逻辑或性能测试')
   return {
     ...existing,
+    subjectFunction: normalizeSubjectFunction(input.subjectFunction === undefined ? existing?.subjectFunction : input.subjectFunction),
     caseId: text(input.caseId, MAX_CASE_ID),
     title,
     testType: input.testType,
@@ -513,13 +522,26 @@ async function handle(req, res) {
       return
     }
 
-    /* ── 用例层级（分类）────────────────────────────────────────
-     * 分类本身不单独存表：它就是 records[].category 的去重集合，
-     * 空串固定表示「默认」层（含全部用例）。这样不会出现空分类，
-     * 也不用担心分类表和用例数据不一致。
-     * 注意：exportCases 不受影响 —— cases.json 仍只导出用例字段，
-     * 不给同事的报告链路塞新字段。
-     */
+    // 所有生成 Skill 共用此接口，业务函数独立于 Skill 名称与测试入口。
+    if (op === 'assignFunction') {
+      const ids = Array.isArray(body.ids) ? [...new Set(body.ids.filter(id => typeof id === 'string' && id !== ''))] : []
+      if (!ids.length) throw bad(400, '请先选择用例')
+      if (typeof body.subjectFunction !== 'string') throw bad(400, '请提供被测函数；空字符串可解除关联')
+      const subjectFunction = normalizeSubjectFunction(body.subjectFunction)
+      const moved = await serial(async () => {
+        const store = await readStore(sessionId)
+        const wanted = new Set(ids)
+        if (ids.some(id => !store.records.some(record => record.id === id))) throw bad(404, '选中的用例不存在，请刷新后重试')
+        const updatedAt = new Date().toISOString()
+        const next = store.records.map(record => wanted.has(record.id) ? { ...record, subjectFunction, updatedAt } : record)
+        await persist(next, store.seeded, sessionId, store.categories)
+        return ids.length
+      })
+      send(res, 200, { ok: true, moved, subjectFunction })
+      return
+    }
+
+    // 旧分类兼容接口：保留已有 category/categories，不影响 subjectFunction。
     /* 先建层级、再归入用例：不要求此刻就有用例挂上去。 */
     if (op === 'createCategory') {
       const raw = typeof body.category === 'string' ? body.category.trim() : ''
@@ -720,6 +742,7 @@ async function exportCases(store, file, runner) {
       expectedOutputs: record.expectedOutputs === undefined ? namedValues(old?.expectedOutputs, 'value') : record.expectedOutputs,
       code: record.code,
       codeRef: record.codeRef,
+      subjectFunction: text(record.subjectFunction, MAX_SUBJECT_FUNCTION),
       // 测试函数名：**当前用例代码推导优先**，推导不出才用旧值。
       // 反过来的话，把 test_old 改名成 test_new 后，仍会去跑已经不存在的 test_old。
       testFunc: testFuncOf(record, runner) || ((old && typeof old.testFunc === 'string') ? old.testFunc.trim() : ''),
@@ -1822,6 +1845,7 @@ export function applySessions(service) {
 
 /** Test-only surface (not part of the plugin contract). */
 export const __test = {
+  handle,
   handleTools,
   pythonPath,
   nodePath,

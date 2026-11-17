@@ -3,160 +3,115 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import vm from 'node:vm'
 
-function harness({ running = true, listRunning = false, bound = true, awaiting = true } = {}) {
-  let descriptor
-  let state
-  const effects = []
-  const requests = []
-  const timers = new Set()
-  const listeners = new Set()
-  const settled = []
-  let snapshot = { running }
-  let summary = { running: listRunning }
-  const source = {
-    getSnapshot: () => snapshot,
-    subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener) },
-  }
+function harness() {
+  let descriptor, slot = 0
+  const states = [], refs = [], effects = [], requests = [], timers = new Set(), listeners = new Set()
   const React = {
     createElement: (type, props, ...children) => ({ type, props, children }),
     useState(initial) {
-      const value = typeof initial === 'function' ? initial() : initial
-      const first = state === undefined
-      if (first) state = value
-      return [first ? state : value, next => { if (first) state = typeof next === 'function' ? next(state) : next }]
+      const id = slot++
+      if (!(id in states)) states[id] = typeof initial === 'function' ? initial() : initial
+      return [states[id], value => { states[id] = typeof value === 'function' ? value(states[id]) : value }]
     },
-    useRef: current => ({ current }),
-    useEffect: effect => effects.push(effect),
+    useRef(current) { const id = slot++; return refs[id] ||= { current } },
+    useEffect(fn, deps) {
+      const id = slot++, old = effects[id]
+      if (!old || deps.some((value, i) => value !== old.deps[i])) {
+        old?.cleanup?.()
+        effects[id] = { deps, fn, dirty: true }
+      }
+    },
   }
-  const context = {
-    window: { __ModuleLoader__: { load: value => { descriptor = value } } },
-    URLSearchParams, console,
+  const source = { getSnapshot: () => ({ running: true }), subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn) } }
+  vm.runInNewContext(readFileSync(process.env.DSH_PANEL_CLIENT_PATH || new URL('../lib/client.js', import.meta.url), 'utf8'), {
+    window: { __ModuleLoader__: { load: x => { descriptor = x } } }, URLSearchParams, console,
     fetch: () => new Promise(resolve => requests.push(runs => resolve({ ok: true, json: async () => ({ ok: true, runs }) }))),
-    setInterval: fn => { timers.add(fn); return fn },
-    clearInterval: fn => timers.delete(fn),
-  }
-  vm.runInNewContext(readFileSync(process.env.DSH_PANEL_CLIENT_PATH || new URL('../lib/client.js', import.meta.url), 'utf8'), context)
-  const api = descriptor.factory(name => name === 'react' ? React : {}).__test
-  api.setCodeServices({ sessions: {
-    binding: id => bound && id === 'session-a' ? { session: source } : undefined,
-    list: { getSnapshot: () => ({ byId: { 'session-a': summary } }) },
-  } })
-  api.RunRecords({
-    record: { caseId: 'TC-1' }, sessionId: 'session-a', awaiting,
-    pendingRunId: 'new', baselineRunId: 'old', clickedAt: Date.now(),
-    onSettled: (...args) => settled.push(args),
+    setInterval(fn) { timers.add(fn); return fn }, clearInterval(fn) { timers.delete(fn) },
   })
-  const cleanups = effects.map(effect => effect()).filter(value => typeof value === 'function')
-  return {
-    get state() { return state },
-    settled, listeners, timers, requests,
-    async flush() { await new Promise(setImmediate) },
-    async answer(runs) {
-      const pending = requests.splice(0)
-      pending.forEach(resolve => resolve(runs))
-      await new Promise(setImmediate)
+  const api = descriptor.factory(name => name === 'react' ? React : {}).__test
+  api.setCodeServices({ sessions: { binding: () => ({ session: source }) } })
+  let props = { record: { caseId: 'TC-1' }, sessionId: 'session-a', awaiting: true, pendingRunId: 'new', refreshTick: 0 }
+  return { requests, timers, listeners,
+    render(patch) {
+      props = { ...props, ...patch }; slot = 0
+      const tree = api.RunRecords(props)
+      effects.forEach(effect => { if (effect.dirty) { effect.dirty = false; effect.cleanup = effect.fn() } })
+      return tree
     },
-    change(value) { snapshot = { running: value }; listeners.forEach(listener => listener()) },
-    changeSummary(value) { summary = { running: value } },
-    poll() { [...timers].forEach(fn => fn()) },
-    dispose() { cleanups.forEach(cleanup => cleanup()) },
+    get runs() { return states[0].runs },
+    async answer(runs) { const queued = requests.splice(0); queued.forEach(fn => fn(runs)); await new Promise(setImmediate) },
+    dispose() { effects.forEach(effect => effect.cleanup?.()) },
   }
 }
-const old = { runId: 'old', status: 'passed', finishedAt: '2026-11-15T00:00:00Z' }
-const complete = { runId: 'new', status: 'passed', finishedAt: '2026-11-16T00:00:00Z' }
+function nodes(tree) {
+  if (!tree || typeof tree !== 'object') return []
+  if (Array.isArray(tree)) return tree.flatMap(nodes)
+  return [tree, ...nodes(tree.children)]
+}
+const old = { runId: 'old', status: 'passed', durationMs: 1234 }
+const complete = { runId: 'new', status: 'passed', finishedAt: '2026-11-17T00:00:00Z', durationMs: 2500 }
 const active = { ...complete, status: 'running', finishedAt: '' }
-const ids = h => Array.from(h.state.runs, run => run.runId)
+const ids = h => Array.from(h.runs, run => run.runId)
 
-test('分析期间初次加载和轮询都只显示旧记录，对话结束后发布本次结果', async () => {
-  const h = harness()
-  await h.answer([active, old])
-  assert.deepEqual(ids(h), ['old'])
-  assert.equal(h.settled.length, 0)
-  h.poll()
-  await h.answer([complete, old])
-  assert.deepEqual(ids(h), ['old'])
-  h.change(false)
-  h.poll()
-  await h.answer([complete, old])
-  assert.deepEqual(ids(h), ['new', 'old'])
-  assert.equal(h.settled.length, 1)
-  h.dispose()
+test('执行等待期间读取旧记录一次，不监听会话也不启动轮询', async () => {
+  const h = harness(); h.render()
+  assert.equal(h.requests.length, 1)
   assert.equal(h.listeners.size, 0)
   assert.equal(h.timers.size, 0)
+  await h.answer([complete, old])
+  assert.deepEqual(ids(h), ['old'])
+  h.render()
+  assert.equal(h.requests.length, 0)
+  h.dispose()
 })
 
-test('对话已停止但本次结果仍在运行时继续等，不能把旧记录当成本次结果', async () => {
-  const h = harness({ running: false })
+test('点击表头刷新后读取最终结果；同一刷新版本不重复请求', async () => {
+  const h = harness(); h.render(); await h.answer([active, old])
+  assert.deepEqual(ids(h), ['old'])
+  h.render({ awaiting: false, refreshTick: 1 })
+  assert.equal(h.requests.length, 1)
+  await h.answer([complete, old])
+  assert.deepEqual(ids(h), ['new', 'old'])
+  const tree = h.render()
+  assert.equal(h.requests.length, 0)
+  assert.equal(nodes(tree).some(n => n.props?.className === 'dp-run-wait'), false)
+  assert.ok(nodes(tree).some(n => n.children?.includes('2.5s')))
+  h.dispose()
+})
+
+test('刷新时还在运行的记录不展示，完成后再次手动刷新可显示', async () => {
+  const h = harness(); h.render({ awaiting: false })
   await h.answer([active, old])
   assert.deepEqual(ids(h), ['old'])
-  assert.equal(h.settled.length, 0)
-  h.poll()
-  await h.answer([old])
-  assert.equal(h.settled.length, 0)
-  h.poll()
-  await h.answer([complete, old])
-  assert.equal(h.settled.length, 1)
+  h.render({ refreshTick: 1 }); await h.answer([complete, old])
+  assert.deepEqual(ids(h), ['new', 'old'])
+  assert.equal(h.timers.size, 0)
   h.dispose()
 })
 
-test('没有历史记录时保持空列表，不能因为运行状态未知提前展示', async () => {
-  const h = harness({ running: undefined, listRunning: undefined })
-  h.change(undefined)
-  h.changeSummary(undefined)
-  await h.answer([complete])
-  assert.deepEqual(ids(h), [])
-  assert.equal(h.settled.length, 0)
-  h.dispose()
-})
-
-test('绑定暂不可用时使用会话摘要，响应返回前重新检查运行状态', async () => {
-  const h = harness({ bound: false, listRunning: true })
-  await h.answer([complete, old])
-  assert.deepEqual(ids(h), ['old'])
-  h.changeSummary(false)
-  h.poll()
-  h.changeSummary(true)
-  await h.answer([complete, old])
-  assert.equal(h.settled.length, 0)
-  h.changeSummary(false)
-  h.poll()
-  await h.answer([complete, old])
-  assert.equal(h.settled.length, 1)
+test('手动刷新使旧请求过期，迟到响应不能覆盖新结果', async () => {
+  const h = harness(); h.render()
+  const initial = h.requests.shift()
+  h.render({ awaiting: false, refreshTick: 1 })
+  await h.answer([complete, old]); initial([old]); await new Promise(setImmediate)
+  assert.deepEqual(ids(h), ['new', 'old'])
   h.dispose()
 })
 
 test('组件卸载后丢弃迟到响应', async () => {
-  const h = harness({ running: false })
-  h.dispose()
+  const h = harness(); h.render(); h.dispose()
   await h.answer([complete, old])
-  assert.equal(h.settled.length, 0)
+  assert.deepEqual(ids(h), [])
 })
 
-test('最终结果发布后，迟到的初次请求不能覆盖新记录', async () => {
-  const h = harness({ running: false })
-  assert.equal(h.requests.length, 2)
-  const initial = h.requests.shift()
+test('普通展开读取历史记录，最多五条的布局和操作保留', async () => {
+  const h = harness(); h.render({ awaiting: false })
   await h.answer([complete, old])
+  const tree = h.render()
   assert.deepEqual(ids(h), ['new', 'old'])
-  initial([old])
-  await h.flush()
-  assert.deepEqual(ids(h), ['new', 'old'])
-  h.dispose()
-})
-
-test('历史记录正常读取，无待执行任务时不订阅或轮询', async () => {
-  const h = harness({ awaiting: false })
-  await h.answer([complete, old])
-  assert.deepEqual(ids(h), ['new', 'old'])
-  assert.equal(h.listeners.size, 0)
-  assert.equal(h.timers.size, 0)
-  h.dispose()
-})
-
-test('中断标记只取本次执行，不受历史中断记录影响', async () => {
-  const h = harness({ running: false })
-  await h.answer([complete, { ...old, status: 'interrupted' }])
-  assert.equal(h.settled.length, 1)
-  assert.equal(h.settled[0][2], false)
+  assert.equal(nodes(tree).filter(n => n.props?.label === '报告').length, 2)
+  assert.equal(nodes(tree).filter(n => n.props?.label === '日志').length, 2)
+  assert.equal(nodes(tree).filter(n => n.props?.label === '删除').length, 2)
+  assert.equal(h.listeners.size, 0); assert.equal(h.timers.size, 0)
   h.dispose()
 })

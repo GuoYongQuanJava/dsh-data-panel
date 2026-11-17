@@ -132,6 +132,10 @@ Invoke-RestMethod "$env:DSH_WEB_URL/data-panel/tools?project=$PWD" | ConvertTo-J
 - 无论哪种语言（含 Go / Rust / Java / .NET / C++ / Ruby / PHP），判断标准一致：只看阶梯结果，不凭一次命令失败下结论。
 
 ### Step 2: 生成测试用例
+**按被测函数组织用例（必须）：** 每条用例填写独立的 `subjectFunction`，表示源码中实际被测的业务函数或方法，例如 `src/order.ts::Order.calculateDiscount`。同一个函数的正常值、边界、分支等用例使用完全相同的值；不同文件或类的同名函数用路径和类名区分。字段最多 240 字符。它与执行入口 `testFunc` 不同，不能填写测试函数名、测试类型、模块分类或中文场景名称。无法确认源码函数时留空，面板显示“未关联函数”，不得猜测。
+
+这是一份插件通用数据约定，适用于本 workflow 和用户自定义 Skill。用例层级由记录中的该字段自动聚合；不要再调用旧分类 API 建立层级。
+
 按被测单元的实际特性，从以下五种测试类型中选择；不要求每个单元都凑齐五类：
 - **功能测试（functional）**：正常业务行为与预期输出
 - **接口测试（api）**：接口参数、返回值、协议约定与错误响应
@@ -167,6 +171,8 @@ echo "$DSH_SESSION_ID"                                       # bash
 **写入两个位置（必须同时完成）：**
 1. `<项目>/.dsh/test-sessions/<SID>/cases.json` — 规范文件（**不要再写项目共享的 `.dsh/testcases/cases.json`**）
 2. 数据面板 API — POST 到 `$env:DSH_WEB_URL/data-panel/api`，body 必须带 `"sessionId": "<SID>"`
+
+`subjectFunction` 必须同时写入面板 API 的 `record` 和 `cases.json` 中的对应条目；以面板记录为准导出，单独写 cases.json 不会为面板建立函数关联。生成后查询面板，核对同一函数的用例被合并到同一组。用户改用自定义 Skill 时也沿用这个字段，不依赖 Skill 名称。
 
 `inputVariables` 和 `expectedOutputs` 必须同时写入这两处；面板导出时会沿用面板记录，只有面板未提供结构化变量时才保留 `cases.json` 中原有的结构化字段。编辑用例后再次核对导出结果，避免报告读到旧变量。
 
@@ -365,6 +371,7 @@ SKILL.md 的 frontmatter 写 `designer` / `reviewer` / `tester` 三个人员字�
   "codeRef": "测试文件绝对路径#L行号",
   "code": "测试代码内容",
   "testFunc": "测试函数名或测试名",
+  "subjectFunction": "src/order.ts::Order.calculateDiscount",
   "status": "pending"
 }
 ```
@@ -436,6 +443,15 @@ GET $env:DSH_WEB_URL/data-panel/api?sessionId=<SID>
 ```json
 { "sessionId": "<SID>", "op": "update", "id": "rec_xxx", "patch": { "title": "新名称", ... } }
 ```
+
+创建和更新都支持 `"subjectFunction": "src/order.ts::Order.calculateDiscount"`；更新时省略保留原值，传空字符串解除关联。旧分类和 `testFunc` 不会用于推断被测函数。
+
+**POST 批量关联被测函数：**
+```json
+{ "sessionId": "<SID>", "op": "assignFunction", "ids": ["rec_xxx", "rec_yyy"], "subjectFunction": "src/order.ts::Order.calculateDiscount" }
+```
+
+`ids` 使用面板记录的 `id`；所有 ID 必须存在，否则整批拒绝。传 `"subjectFunction": ""` 可解除关联，用例内容与执行记录保留。
 
 **POST 删除：**
 ```json
