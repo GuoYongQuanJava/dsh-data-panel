@@ -523,11 +523,25 @@ window.__ModuleLoader__.load({
  * （变量只定义在 .dp-root 上；不加的话 background: var(--dp-bg) 解析失败 → 菜单和卡片全透明，
  *  就是之前截图里「下拉菜单透出后面场景文字」的原因。）
  *
- * 但 .dp-root 自带 height:100% + overflow:auto，直接继承会让集成页多出一层滚动条，
- * 并把 fixed/absolute 菜单重新裁掉。这里复位成「高度自适应、不滚动」：
- * 滚动交给宿主右侧栏本身，和单元测试的观感一致。
+ * 滚动：必须让根节点自己滚（沿用 .dp-root 的 height:100% + overflow:auto），
+ * 和单元测试的 DataPanelView 一致。
+ *
+ * 曾经这里复位成 height:auto + overflow:visible，理由是「多一层滚动条、
+ * 并把菜单裁掉」。结果是把滚动的责任推给了宿主右侧栏 —— 一旦宿主那一层
+ * 不滚（DSH 右侧栏就是 overflow:hidden 的固定高容器），集成页的用例 / 步骤 /
+ * 报告三页就完全滑不动，长表格直接被切掉。
+ * 菜单裁切与横向滚动改由下面几条各自解决，不再靠放弃纵向滚动来换。
  */
-.it-root.dp-root { height: auto; min-height: 0; overflow: visible; background: transparent; }
+.it-root.dp-root {
+	height: 100%;
+	min-height: 0;
+	overflow-y: auto;
+	overflow-x: hidden;
+	background: transparent;
+	/* 触屏 / 触控板惯性滚动；同时保证内部横向容器仍能接管水平手势 */
+	overscroll-behavior: contain;
+	-webkit-overflow-scrolling: touch;
+}
 .it-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; }
 
 /* 子页切换：下拉按钮（与「全部类型」下拉同款细边框：边框/背景/文字都取主题色） */
@@ -615,7 +629,7 @@ window.__ModuleLoader__.load({
 .it-main { flex: 1 1 auto; min-width: 0; }
 
 /* 集成测试表：复用 dp-table 观感，列少、可横向滚动 */
-.it-table-wrap { border: 1px solid var(--dp-border); border-radius: 12px; background: var(--dp-bg); overflow-x: auto; }
+.it-table-wrap { border: 1px solid var(--dp-border); border-radius: 12px; background: var(--dp-bg); overflow-x: auto; overscroll-behavior-x: contain; }
 .it-table { width: 100%; min-width: 520px; border-collapse: collapse; font-size: 12px; }
 .it-table th { padding: 8px 7px; border-bottom: 1px solid var(--dp-border); background: var(--dp-bg2); color: var(--dp-text3); font-size: 11px; font-weight: 600; letter-spacing: .04em; text-align: center; white-space: nowrap; }
 .it-table td { padding: 9px 7px; border-bottom: 1px solid var(--dp-border2); color: var(--dp-text2); vertical-align: middle; text-align: center; }

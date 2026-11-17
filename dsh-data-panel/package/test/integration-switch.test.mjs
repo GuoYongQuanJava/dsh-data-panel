@@ -219,9 +219,12 @@ test('集成根节点带 dp-root，否则 --dp-bg 等变量取不到值（菜单
   assert.ok(cls.includes('it-root'), '仍要保留 it-root 供自身样式使用')
   assert.ok(cls.includes('dp-docked'), 'dock 时套 dp-docked，留白才和单元测试一致')
 
-  // 复位 .dp-root 的 height/overflow，避免多出一层滚动条或裁掉菜单
+  // 根节点必须自己承担纵向滚动：集成三页共用它，靠宿主滚会在宿主 overflow:hidden 时完全滚不动
   const css = readFileSync(CLIENT, 'utf8')
   const rule = (css.match(/\.it-root\.dp-root \{[^}]*\}/) || [''])[0]
-  assert.ok(/height:\s*auto/.test(rule), '要复位 height: ' + rule)
-  assert.ok(/overflow:\s*visible/.test(rule), '要复位 overflow，否则菜单被裁: ' + rule)
+  assert.ok(/height:\s*100%/.test(rule), '要撑满宿主高度才能内部滚动: ' + rule)
+  assert.ok(/overflow-y:\s*auto/.test(rule), '纵向必须自己滚，否则长表格滚不动: ' + rule)
+  // 不能再用 height:auto + overflow:visible —— 那正是「三页都滑不动」的成因
+  assert.equal(/height:\s*auto/.test(rule), false, '不要再复位 height:auto: ' + rule)
+  assert.equal(/overflow:\s*visible/.test(rule), false, '不要再复位 overflow:visible: ' + rule)
 })
