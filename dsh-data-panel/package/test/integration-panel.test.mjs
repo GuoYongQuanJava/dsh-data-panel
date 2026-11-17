@@ -168,3 +168,28 @@ test('步骤表：序号格箭头展开执行结果子表，操作列是查看�
   assert.equal(find(render(), 'step-runs-' + id), undefined, '再点箭头应收起')
   assert.equal(h.requests.length, 0)
 })
+
+test('用例页有「生成测试步骤」，步骤页有「执行」，都只给演示提示', () => {
+  const h = harness(), render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a' })
+
+  // 用例页：生成测试步骤 + 新增用例，不该出现执行
+  const casesTree = render()
+  const generate = find(casesTree, 'generate-steps')
+  assert.ok(generate, '用例页要有「生成测试步骤」')
+  assert.equal(generate.children.join(''), '生成测试步骤')
+  assert.ok(find(casesTree, 'add-case'), '用例页仍要有新增用例')
+  assert.equal(find(casesTree, 'run-steps'), undefined, '用例页不应出现「执行」')
+
+  // 步骤页：执行，不再有生成测试步骤
+  find(render(), 'tab-steps').props.onClick()
+  const stepsTree = render()
+  const run = find(stepsTree, 'run-steps')
+  assert.ok(run, '步骤页要有「执行」')
+  assert.equal(run.children.join(''), '执行')
+  assert.equal(find(stepsTree, 'generate-steps'), undefined, '步骤页不应出现「生成测试步骤」')
+
+  // 只加了按钮，没接逻辑：点下去给演示提示，且不发请求
+  run.props.onClick()
+  assert.ok(find(render(), 'notice'), '点执行应给出未接入提示')
+  assert.equal(h.requests.length, 0)
+})

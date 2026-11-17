@@ -5417,14 +5417,28 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 							),
 							/*
 							 * 主操作按子页给不同的东西：
-							 *   测试用例 —— 新增用例（primary，唯一的颜色强调）
+							 *   测试用例 —— 新增用例（primary，唯一的颜色强调）+ 生成测试步骤
+							 *   测试步骤 —— 执行
 							 *   测试报告 —— 总体报告（汇总视图）
-							 *   测试步骤 —— 没有独立主操作，步骤跟着用例走
 							 * 原来的「全部执行」在这里点了只会弹一句「还没接入后端」，
 							 * 而这一轮明确用例页不承载执行，所以不再摆这个按钮。
 							 */
 							tab === "reports"
 								? h(Button, { variant: "ghost", "data-it": "overview", onClick: function () { setOverview(true); } }, "总体报告")
+								: null,
+							tab === "cases"
+								? h(Button, {
+									variant: "ghost",
+									"data-it": "generate-steps",
+									onClick: function () { notConnected("生成测试步骤"); }
+								}, "生成测试步骤")
+								: null,
+							tab === "steps"
+								? h(Button, {
+									variant: "ghost",
+									"data-it": "run-steps",
+									onClick: function () { notConnected("执行"); }
+								}, "执行")
 								: null,
 							tab === "cases"
 								? h(Button, {
