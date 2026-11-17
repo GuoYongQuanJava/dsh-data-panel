@@ -112,7 +112,6 @@ test('步骤编辑支持增加、排序、删除和保存，不更改传入数�
 })
 
 test('总体报告排除和恢复只作用于纳入选择，真实条目保留', () => {
-  const h = harness(), records = [{ id: 'a', title: 'A', scenario: '登录', status: 'pass', reports: [{}] }, { id: 'b', title: 'B', scenario: '订单', status: 'fail', reports: [{}] }]
   const render = () => h.render(h.api.IntegrationOverview, { records, onClose() {}, onNotice() {} })
   assert.equal(typeof h.api.IntegrationOverview, 'function')
   find(render(), 'exclude-a').props.onClick()

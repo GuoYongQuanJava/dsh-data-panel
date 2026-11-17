@@ -4437,6 +4437,49 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 		}
 
 		/**
+		 * 步骤编辑弹窗：只编辑这条用例的操作步骤，不带用例本身那些字段。
+		 *
+		 * 为什么要单独一个弹窗：测试步骤页的「编辑」是这个页面自己的主操作，
+		 * 它改的是步骤，不该跳进「编辑用例」那种表单里 —— 那边改的是名称、分类、描述。
+		 * 两者入口不同、对象不同，混在一起会让人以为点错了。
+		 *
+		 * 保存时回传整条 record（steps 已替换），父组件直接替换即可。
+		 */
+		function IntegrationStepsModal(props) {
+			var source = props.record || {};
+			var stepsState = useState(function () {
+				return Array.isArray(source.steps) ? source.steps.map(function (s) { return Object.assign({}, s); }) : [];
+			});
+			var steps = stepsState[0];
+			var setSteps = stepsState[1];
+
+			function save() {
+				if (typeof props.onSave !== "function") return;
+				props.onSave(Object.assign({}, source, { steps: steps }));
+			}
+
+			return h(Modal, {
+				title: "编辑测试步骤",
+				subtitle: (source.caseId ? source.caseId + " · " : "") + (source.title || ""),
+				className: "it-case-modal it-steps-modal",
+				onClose: props.onClose,
+				footer: [
+					h(Button, { key: "close", variant: "ghost", onClick: props.onClose }, "取消"),
+					h(Button, { key: "save", variant: "primary", "data-it": "save-steps-modal", onClick: save }, "保存")
+				]
+			},
+				h("div", { className: "it-detail" },
+					h(IntegrationStepsEditor, {
+						steps: steps,
+						embedded: true,
+						onSave: function (next) { setSteps(next); },
+						onClose: props.onClose
+					})
+				)
+			);
+		}
+
+		/**
 		 * 步骤编辑器：增加 / 删除 / 上移下移 / 改内容。
 		 *
 		 * 不直接改 props.steps —— 全部改动在本地副本上做，
@@ -4462,32 +4505,48 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 					return Object.assign({}, row, { no: index + 1 });
 				});
 			}
+			/*
+			 * 所有改动都经这一个入口，而不是各处直接 setRows。
+			 *
+			 * 原因：嵌在 IntegrationStepsModal 里时（embedded），弹窗底部才是「保存」，
+			 * 本组件自带的按钮被隐藏了。此时必须把每次改动实时同步给父组件，
+			 * 否则用户在输入框里改完直接点弹窗的「保存」，改的内容会丢。
+			 *
+			 * 用「先算新值、再分别更新」的写法，避免在 setState 的 updater 里
+			 * 再去调父组件的 setState。
+			 */
+			function apply(compute) {
+				var next = renumber(compute(rows));
+				setRows(next);
+				if (props.embedded === true && typeof props.onSave === "function") props.onSave(next);
+				return next;
+			}
 			function move(index, delta) {
-				setRows(function (previous) {
-					var target = index + delta;
-					if (target < 0 || target >= previous.length) return previous;
-					var next = previous.slice();
+				var target = index + delta;
+				if (target < 0 || target >= rows.length) return;
+				apply(function (list) {
+					var next = list.slice();
 					var tmp = next[index];
 					next[index] = next[target];
 					next[target] = tmp;
-					return renumber(next);
+					return next;
 				});
 			}
 			function removeAt(index) {
-				setRows(function (previous) {
-					return renumber(previous.filter(function (_, i) { return i !== index; }));
+				apply(function (list) {
+					return list.filter(function (_, i) { return i !== index; });
 				});
 			}
 			function add() {
-				setRows(function (previous) {
-					return renumber(previous.concat([{ no: previous.length + 1, action: "", operation: "", expected: "" }]));
+				apply(function (list) {
+					return list.concat([{ no: list.length + 1, action: "", operation: "", expected: "" }]);
 				});
 			}
 			function change(index, key) {
 				return function (event) {
 					var value = event && event.target ? event.target.value : "";
-					setRows(function (previous) {
-						return previous.map(function (row, i) {
+					apply(function (list) {
+						return list.map(function (row, i) {
 							return i === index ? Object.assign({}, row, { [key]: value }) : row;
 						});
 					});
@@ -4565,10 +4624,17 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 				),
 				h("div", { className: "it-detail-foot", style: { justifyContent: "space-between", marginTop: "8px" } },
 					h(Button, { size: "sm", variant: "ghost", onClick: add, "data-it": "add-step" }, "新增步骤"),
-					h("span", { style: { display: "inline-flex", gap: "7px" } },
-						h(Button, { size: "sm", variant: "ghost", onClick: props.onClose }, "取消"),
-						h(Button, { size: "sm", variant: "primary", onClick: save, "data-it": "save-steps" }, "保存步骤")
-					)
+					/*
+					 * embedded 时不渲染自带的「取消 / 保存步骤」：
+					 * 它被 IntegrationStepsModal 包着用时，保存的语义在弹窗底部那对按钮上，
+					 * 这里再来一对会让人不知道该按哪个。
+					 */
+					props.embedded === true
+						? null
+						: h("span", { style: { display: "inline-flex", gap: "7px" } },
+							h(Button, { size: "sm", variant: "ghost", onClick: props.onClose }, "取消"),
+							h(Button, { size: "sm", variant: "primary", onClick: save, "data-it": "save-steps" }, "保存步骤")
+						)
 				)
 			);
 		}
@@ -5079,7 +5145,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 													h("td", null,
 														h("div", { className: "it-ops" },
 															h(IconButton, { name: "eye", label: "查看 " + (record.title || ""), "data-it": "view-" + record.id, onClick: function () { setDetail({ mode: "view", record: record }); } }),
-															h(IconButton, { name: "edit", label: "编辑步骤 " + (record.title || ""), "data-it": "edit-btn-" + record.id, onClick: function () { setDetail({ mode: "edit", record: record }); } })
+															h(IconButton, { name: "edit", label: "编辑步骤 " + (record.title || ""), "data-it": "edit-btn-" + record.id, onClick: function () { setDetail({ kind: "steps", record: record }); } })
 														)
 													)
 												),
@@ -5472,12 +5538,23 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 				),
 				// 用例详情 / 新增 / 编辑：弹窗。
 				detail !== null
-					? h(IntegrationCaseEditor, {
-						mode: detail.mode,
-						record: detail.record,
-						onSave: saveCase,
-						onClose: function () { setDetail(null); }
-					})
+					? (detail.kind === "steps"
+						/*
+						 * 测试步骤页的编辑：改的是这条用例的步骤，不是用例本身的字段。
+						 * 之前这里错接了 IntegrationCaseEditor，点「编辑步骤」弹出来的却是
+						 * 「编辑用例」表单，看起来像点错了入口。
+						 */
+						? h(IntegrationStepsModal, {
+							record: detail.record,
+							onSave: function (next) { saveCase(next); },
+							onClose: function () { setDetail(null); }
+						})
+						: h(IntegrationCaseEditor, {
+							mode: detail.mode,
+							record: detail.record,
+							onSave: saveCase,
+							onClose: function () { setDetail(null); }
+						}))
 					: null,
 				// 项目总体报告：弹窗。
 				overview
