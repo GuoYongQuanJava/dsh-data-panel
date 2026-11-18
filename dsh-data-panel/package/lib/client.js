@@ -1702,7 +1702,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 		 * 面板不再让模型自己跑测试再回传日志 —— 那样漏调/超时/超长都会丢。
 		 * 现在模型只负责执行返回的命令，输出由 runner 边跑边写进 run.log。
 		 */
-		function prepareRun(sessionId, scope, caseId) {
+		function prepareRun(sessionId, scope, caseId, caseIds) {
 			if (typeof sessionId !== "string" || sessionId === "") {
 				return Promise.reject(new Error("还没有取得当前会话"));
 			}
@@ -1714,6 +1714,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 			// cwd 只作为兜底：宿主会用会话自身的项目目录，并校验它确实存在。
 			var body = { sessionId: sessionId, cwd: cwd, scope: scope };
 			if (scope === "case") body.caseId = caseId || "";
+			if (scope === "cases") body.caseIds = Array.isArray(caseIds) ? caseIds : [];
 			return callApi("/data-panel/run/prepare", {
 				method: "POST",
 				headers: { "content-type": "application/json", accept: "application/json" },
@@ -3327,10 +3328,10 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 			}
 
 			/**
-			 * 表头全选框：只作用**当前页**，但不能覆盖别的页已勾的。
+			 * 表头全选框：作用**当前筛选结果的全部用例**（跨页，不只当前页），且不覆盖已勾的。
 			 *
-			 * 勾选时把本页 id 并进已有集合；取消时只移除本页的 id。
-			 * 之前直接 `setPicked(ids.slice())` 会把前几页的选择整片丢掉。
+			 * 传入的是 filtered（筛选后的全量）：勾选时并为并集，已全选时只移除这一批。
+			 * 以前传的是 pageRecords，只看当前页；现在改为全量。
 			 */
 			function togglePickAll(ids) {
 				var allPicked = ids.length > 0 && ids.every(function (id) { return pickedSet[id] === true; });
@@ -3361,6 +3362,53 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 					store.setError("关联失败：" + (failure && failure.message ? failure.message : String(failure)));
 				}).finally(function () {
 					setBusy(false);
+				});
+			}
+
+			/**
+			 * 执行选中的用例（多选）。
+			 *
+			 * 与单条执行同一套机制：宿主先冻结快照 + 拼命令，再把命令预填到面板所属会话。
+			 * 区别只在 scope="cases" 与 caseIds；执行后保留勾选，方便对同一批连跑。
+			 */
+			function runPicked() {
+				if (picked.length === 0) {
+					store.setError("请先勾选要执行的用例。");
+					return;
+				}
+				var targetSession = panelSessionId(props);
+				var all = snap.records || [];
+				var byId = Object.create(null);
+				all.forEach(function (record) { byId[record.id] = record; });
+				var chosen = picked.map(function (id) { return byId[id]; }).filter(Boolean);
+				if (chosen.length === 0) {
+					store.setError("选中的用例已经不在了，刷新后再试。");
+					return;
+				}
+				var runnable = chosen.filter(function (record) { return record.demo !== true; });
+				if (runnable.length === 0) {
+					store.setError("选中的都是示例数据，没有可执行的测试代码。");
+					return;
+				}
+				var caseIds = runnable.map(function (record) { return record.caseId; });
+				setRunResult("正在准备执行 " + caseIds.length + " 条用例…");
+				prepareRun(targetSession, "cases", "", caseIds).then(function (prep) {
+					var outcome = prefillDraft(targetSession, runPickedPrompt(runnable, targetSession, prep));
+					if (!outcome.ok) { setRunResult(""); store.setError("执行：" + outcome.message); return; }
+					store.setError("");
+					setRunResult(outcome.message + "  运行编号：" + prep.runId + "  框架：" + (prep.framework || prep.frameworkId || "未知"));
+					// 标记这些行正在执行（不自动展开：全选时会展开上千行）。
+					setAwaiting(function (previous) {
+						var next = Object.assign({}, previous);
+						runnable.forEach(function (record) {
+							next[record.id] = { caseId: record.caseId, runId: prep.runId || "" };
+						});
+						return next;
+					});
+					// 勾选保留：方便对同一批用例连跑（要取消点勾选栏的「取消选择」）。
+				}).catch(function (failure) {
+					setRunResult("");
+					store.setError("执行准备失败：" + (failure && failure.message ? failure.message : String(failure)));
 				});
 			}
 
@@ -3424,32 +3472,17 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 							h(Icon, { name: "plus", size: 15 }),
 							"新增用例"
 						),
-						// 执行 / 报告 / 日志：三个同高、同规格，顺序固定为 全部执行 → 报告 → 日志。
+						// 执行 / 报告 / 日志：三个同高、同规格，顺序固定为 执行选中 → 报告 → 日志。
+						// 「执行选中」只看勾选：未勾选不可点，勾了之后文案带条数。
 						h("div", { className: "dp-toolbar-actions" },
-								h(Button, {
-									className: "dp-run-all-btn",
-								disabled: snap.status === "refreshing",
-								title: "准备全部用例的执行命令，填进当前会话",
-								onClick: function () {
-									// 先让宿主准备（导出用例 + 生成 runId + 给命令），再把命令预填到面板所属会话。
-									var currentRecords = snap.records || [];
-									var targetSession = panelSessionId(props);
-									if (currentRecords.length === 0) {
-										store.setError("当前面板里还没有用例，先新增或生成用例后再执行。");
-										return;
-									}
-									setRunResult("正在准备执行…");
-									prepareRun(targetSession, "all", "").then(function (prep) {
-										var outcome = prefillDraft(targetSession, runAllPrompt(currentRecords, targetSession, prep));
-										if (!outcome.ok) { setRunResult(""); store.setError("执行：" + outcome.message); return; }
-										store.setError("");
-										setRunResult(outcome.message + "  运行编号：" + prep.runId + "  框架：" + (prep.framework || prep.frameworkId || "未知"));
-									}).catch(function (failure) {
-										setRunResult("");
-										store.setError("执行准备失败：" + (failure && failure.message ? failure.message : String(failure)));
-									});
-								},
-							}, "全部执行"),
+							h(Button, {
+								className: "dp-run-all-btn",
+								disabled: snap.status === "refreshing" || picked.length === 0,
+								title: picked.length === 0
+									? "请先勾选要执行的用例"
+									: ("执行选中的 " + picked.length + " 条用例"),
+								onClick: runPicked,
+							}, picked.length > 0 ? ("执行选中 (" + picked.length + ")") : "执行选中"),
 							h(Button, {
 								className: "dp-report-btn",
 								onClick: function () { openLatestTotalReport(); },
@@ -3527,9 +3560,12 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 													h("th", { className: "dp-pick" },
 												h("input", {
 													type: "checkbox",
-													"aria-label": "全选当前页",
-													checked: pageRecords.length > 0 && pageRecords.every(function (record) { return pickedSet[record.id] === true; }),
-													onChange: function () { togglePickAll(pageRecords.map(function (record) { return record.id; })); }
+													"aria-label": "全选全部用例",
+													// 全选的是当前筛选结果的全部（不只当前页）；跟进搜索/类型/状态条件。
+													checked: filtered.length > 0 && filtered.every(function (record) { return pickedSet[record.id] === true; }),
+													ref: function (node) { if (node) node.indeterminate = picked.length > 0 && !(filtered.length > 0 && filtered.every(function (record) { return pickedSet[record.id] === true; })); },
+													title: "全选当前筛选下的全部用例（共 " + filtered.length + " 条）",
+													onChange: function () { togglePickAll(filtered.map(function (record) { return record.id; })); }
 												})
 											),
 											h("th", null, "用例标识"),
@@ -6102,6 +6138,29 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 			});
 			return [
 				"请执行本会话用例面板里的全部用例（共 " + list.length + " 条）：",
+				""
+			].concat(named).concat([
+				"",
+				runInstruction(prep)
+			]).join("\n");
+		}
+
+		/**
+		 * 「执行选中」的执行指令。
+		 *
+		 * 与「全部」的区别只在措辞：这里明确说是本次勾选的那些，避免 AI 误以为要跑全量。
+		 * 命令同样由宿主拼好，只包含这些用例的测试函数。
+		 */
+		function runPickedPrompt(records, sessionId, prep) {
+			var list = Array.isArray(records) ? records : [];
+			if (list.length === 0) {
+				return ["没有选中的用例。"].join("\n");
+			}
+			var named = list.map(function (record) {
+				return "- " + record.caseId + "（" + record.title + "）";
+			});
+			return [
+				"请执行本次选中的 " + list.length + " 条用例（不是全部）：",
 				""
 			].concat(named).concat([
 				"",

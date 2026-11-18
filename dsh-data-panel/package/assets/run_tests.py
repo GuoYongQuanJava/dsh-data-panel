@@ -772,7 +772,12 @@ def main() -> int:
     say(f"runId: {args.run_id}")
     say(f"项目: {project}")
     say(f"框架: {label}（{spec.get('language') or 'unknown'} / {mode}）")
-    scope_text = "全部用例" if result["scope"] == "all" else str(result["caseId"])
+    if result["scope"] == "all":
+        scope_text = "全部用例"
+    elif result["scope"] == "cases":
+        scope_text = "选中用例"
+    else:
+        scope_text = str(result["caseId"])
     say(f"范围: {scope_text}（{len(targets)} 条）")
     if not_run:
         say("注意：以下用例没有关联测试目标，未执行 -> " + "、".join(n.get("caseId", "?") for n in not_run))

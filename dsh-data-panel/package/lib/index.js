@@ -1094,7 +1094,7 @@ async function handleTestCode(req, res) {
   }
 }
 
-async function prepareRun({ sessionId, cwd, scope, caseId, store }) {
+async function prepareRun({ sessionId, cwd, scope, caseId, caseIds, store }) {
   const preferred = await resolveSessionCwd(sessionId, cwd)
   const { project, root, runner } = await resolveProjectRunner({ sessionId, cwd: preferred, scope, caseId, store })
   await mkdir(join(root, 'tests'), { recursive: true })
@@ -1159,8 +1159,22 @@ async function prepareRun({ sessionId, cwd, scope, caseId, store }) {
   const snapshotCasesFile = join(snapshotDir, 'cases.json')
   await writeTextFile(snapshotTestFile, liveTestText)
   // 单条执行的快照只保留这一条：报告只应该覆盖本次真正执行的用例，
-  // 否则 bridge.py 会把同会话的其他用例都写成“未执行”。
-  const snapshotCases = scope === 'case' ? cases.filter((item) => item.caseId === caseId) : cases
+  // 执行范围：单条 / 多条选中 / 全部。快照、targets、报告都只覆盖这个范围，
+  // 否则 bridge.py 会把本次没跑的用例也写成“未执行”。
+  const pickedIds = Array.isArray(caseIds) ? caseIds.map((id) => String(id)) : []
+  // 多选里若夹了已被删的用例，要早报，而不是静默少跑几条。
+  if (scope === 'cases') {
+    const known = new Set(store.records.map((r) => String(r.caseId)))
+    const missing = pickedIds.filter((id) => !known.has(id))
+    if (missing.length > 0) {
+      throw bad(404, `本会话找不到这些用例：${missing.slice(0, 5).join('、')}${missing.length > 5 ? ' 等' : ''}`)
+    }
+  }
+  const selectedCases =
+    scope === 'case' ? cases.filter((item) => item.caseId === caseId)
+      : scope === 'cases' ? cases.filter((item) => pickedIds.includes(String(item.caseId)))
+        : cases
+  const snapshotCases = selectedCases
   await writeTextFile(snapshotCasesFile, JSON.stringify({
     version: 1,
     exportedAt: new Date().toISOString(),
@@ -1170,7 +1184,7 @@ async function prepareRun({ sessionId, cwd, scope, caseId, store }) {
   // 本次要跑的目标；缺目标、或目标在测试文件里根本不存在的，都单独记账。
   const targets = []
   const notRun = []
-  const selected = scope === 'case' ? cases.filter((c) => c.caseId === caseId) : cases
+  const selected = selectedCases
   for (const item of selected) {
     const func = testFuncOf(item, runner)
     if (func === '') {
@@ -1209,6 +1223,8 @@ async function prepareRun({ sessionId, cwd, scope, caseId, store }) {
     sessionId,
     scope,
     caseId: scope === 'case' ? caseId : '',
+    // 多选执行时 runner 会把实际跑到的 caseId 写进 result.cases，这里再记一份方便回溯。
+    caseIds: scope === 'cases' ? selectedCases.map((item) => item.caseId) : undefined,
     project,
     root,
     // testFile 指向**原位置**（执行用）；casesFile 指向快照（报告用）。
@@ -1237,6 +1253,7 @@ async function prepareRun({ sessionId, cwd, scope, caseId, store }) {
     command,
     scope,
     caseId: scope === 'case' ? caseId : '',
+    caseIds: scope === 'cases' ? selectedCases.map((item) => item.caseId) : undefined,
     caseCount: cases.length,
     targetCount: targets.length,
     testFile: liveTestFile,
@@ -1262,16 +1279,30 @@ async function handleRunPrepare(req, res) {
     const body = await readJson(req)
     const sessionId = extractSessionId(req, body)
     if (sessionId === '') throw bad(400, '缺少会话 ID')
-    const scope = body.scope === 'all' ? 'all' : 'case'
+    const scope = body.scope === 'all' ? 'all'
+      : body.scope === 'cases' ? 'cases'
+        : 'case'
     const caseId = typeof body.caseId === 'string' ? body.caseId.trim() : ''
+    const caseIds = Array.isArray(body.caseIds)
+      ? body.caseIds.map((id) => String(id).trim()).filter((id) => id !== '')
+      : []
     if (scope === 'case' && caseId === '') throw bad(400, '单条执行需要 caseId')
+    if (scope === 'cases' && caseIds.length === 0) throw bad(400, '多选执行需要 caseIds')
 
     const cwd = await resolveSessionCwd(sessionId, body.cwd)
     const store = await serial(() => readStore(sessionId))
     if (scope === 'case' && !store.records.some((r) => r.caseId === caseId)) {
       throw bad(404, `本会话找不到用例 ${caseId}`)
     }
-    const result = await prepareRun({ sessionId, cwd, scope, caseId, store })
+    if (scope === 'cases') {
+      // 逐个核对：选中后被删的用例要紧早报，而不是静默少跑几条。
+      const known = new Set(store.records.map((r) => String(r.caseId)))
+      const missing = caseIds.filter((id) => !known.has(id))
+      if (missing.length > 0) {
+        throw bad(404, `本会话找不到这些用例：${missing.slice(0, 5).join('、')}${missing.length > 5 ? ' 等' : ''}`)
+      }
+    }
+    const result = await prepareRun({ sessionId, cwd, scope, caseId, caseIds, store })
     send(res, 200, { ok: true, ...result })
   } catch (error) {
     const status = Number.isInteger(error?.status) ? error.status : 500
@@ -1297,9 +1328,11 @@ async function handleRunLatest(req, res) {
     allRuns.sort((a, b) => String(b.runId).localeCompare(String(a.runId)))
     const hit = allRuns.find((run) => {
       if (query.scope === 'all') return run.result !== null && run.result.scope === 'all'
-      return run.result !== null
-        && run.result.scope === 'case'
-        && String(run.result.caseId || '') === query.caseId
+      // 单条用例：既包括“只跑了这一条”的运行，也包括“多选里包含这一条”的运行。
+      if (run.result === null) return false
+      if (run.result.scope === 'case') return String(run.result.caseId || '') === query.caseId
+      return Array.isArray(run.result.cases)
+        && run.result.cases.map((item) => String(item)).includes(String(query.caseId))
     })
     if (hit === undefined) {
       send(res, 200, { ok: true, exists: false })
@@ -1338,8 +1371,12 @@ async function handleRunList(req, res) {
         // 同一个 runId 可能在多个资产根里都能看到，只取一份。
         if (seen.has(run.runId)) continue
         if (query.scope === 'case') {
-          if (run.result.scope !== 'case') continue
-          if (String(run.result.caseId || '') !== caseId) continue
+          // 单条运行的 caseId 命中，或多选运行里包含这条用例，都算它的记录。
+          const inRun = run.result.scope === 'case'
+            ? String(run.result.caseId || '') === caseId
+            : Array.isArray(run.result.cases)
+              && run.result.cases.map((item) => String(item)).includes(String(caseId))
+          if (!inRun) continue
         } else if (run.result.scope !== 'all') {
           continue
         }
@@ -1574,7 +1611,8 @@ async function handleRunReport(req, res) {
         let caseId = ''
         try {
           const resultMeta = JSON.parse(await readFile(join(dirname(reportsDir), 'runs', name, 'result.json'), 'utf8'))
-          scope = resultMeta.scope === 'case' ? 'case' : 'all'
+          // 范围原样透出（case / cases / all），工具栏「报告」只认 all。
+          scope = resultMeta.scope === 'case' ? 'case' : resultMeta.scope === 'cases' ? 'cases' : 'all'
           caseId = typeof resultMeta.caseId === 'string' ? resultMeta.caseId : ''
         } catch {
           // 旧 run 没有 result.json 就按总报告处理。
@@ -1683,9 +1721,13 @@ async function handleRunReportLatest(req, res) {
           meta = null
         }
         if (meta === null) continue
-        const runScope = meta.scope === 'case' ? 'case' : 'all'
+        const runScope = meta.scope === 'case' ? 'case' : meta.scope === 'cases' ? 'cases' : 'all'
         if (scope === 'case') {
-          if (runScope !== 'case' || String(meta.caseId || '') !== query.caseId) continue
+          // 单条运行时 caseId 命中；多选运行时 cases 里包含它也算。
+          const inRun = runScope === 'case'
+            ? String(meta.caseId || '') === query.caseId
+            : Array.isArray(meta.cases) && meta.cases.map((item) => String(item)).includes(String(query.caseId))
+          if (!inRun) continue
         } else if (runScope !== 'all') {
           continue
         }
