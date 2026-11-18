@@ -1353,12 +1353,11 @@ async function handleRunLatest(req, res) {
     }
     allRuns.sort((a, b) => String(b.runId).localeCompare(String(a.runId)))
     const hit = allRuns.find((run) => {
-      if (query.scope === 'all') return run.result !== null && run.result.scope === 'all'
-      // 单条用例：既包括“只跑了这一条”的运行，也包括“多选里包含这一条”的运行。
       if (run.result === null) return false
-      if (run.result.scope === 'case') return String(run.result.caseId || '') === query.caseId
-      return Array.isArray(run.result.cases)
-        && run.result.cases.map((item) => String(item)).includes(String(query.caseId))
+      // 整体执行：全部用例(all) / 选中的多条(cases) 都算，工具栏「日志」读这个。
+      if (query.scope === 'all') return run.result.scope === 'all' || run.result.scope === 'cases'
+      // 单条用例只看单条执行，不和批量执行混。
+      return run.result.scope === 'case' && String(run.result.caseId || '') === query.caseId
     })
     if (hit === undefined) {
       send(res, 200, { ok: true, exists: false })
@@ -1397,13 +1396,10 @@ async function handleRunList(req, res) {
         // 同一个 runId 可能在多个资产根里都能看到，只取一份。
         if (seen.has(run.runId)) continue
         if (query.scope === 'case') {
-          // 单条运行的 caseId 命中，或多选运行里包含这条用例，都算它的记录。
-          const inRun = run.result.scope === 'case'
-            ? String(run.result.caseId || '') === caseId
-            : Array.isArray(run.result.cases)
-              && run.result.cases.map((item) => String(item)).includes(String(caseId))
-          if (!inRun) continue
-        } else if (run.result.scope !== 'all') {
+          // 单条用例的执行记录只收单条执行；批量执行只在工具栏的总报告 / 总日志里看。
+          if (run.result.scope !== 'case') continue
+          if (String(run.result.caseId || '') !== caseId) continue
+        } else if (run.result.scope === 'case') {
           continue
         }
         seen.add(run.runId)
@@ -1753,14 +1749,11 @@ async function handleRunReportLatest(req, res) {
           meta = null
         }
         if (meta === null) continue
-        const runScope = meta.scope === 'case' ? 'case' : meta.scope === 'cases' ? 'cases' : 'all'
         if (scope === 'case') {
-          // 单条运行时 caseId 命中；多选运行时 cases 里包含它也算。
-          const inRun = runScope === 'case'
-            ? String(meta.caseId || '') === query.caseId
-            : Array.isArray(meta.cases) && meta.cases.map((item) => String(item)).includes(String(query.caseId))
-          if (!inRun) continue
-        } else if (runScope !== 'all') {
+          // 单条用例的报告只认单条执行；批量执行的汇总报告在工具栏「报告」里。
+          if (meta.scope !== 'case') continue
+          if (String(meta.caseId || '') !== query.caseId) continue
+        } else if (meta.scope === 'case') {
           continue
         }
         if (best === null || name > best.runId) best = { runId: name, root }

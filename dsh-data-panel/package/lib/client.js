@@ -3618,23 +3618,13 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			var setBoardHeight = boardHeightState[1];
 			var boardRef = useRef(null);
 
-			// 量表格卡片高度。窗口缩放、行数变化、分页条出现/消失都会触发。
-			useEffect(function () {
-				if (typeof ResizeObserver === "undefined") return undefined;
-				var node = boardRef.current;
-				if (!node) return undefined;
-				var observer = new ResizeObserver(function (entries) {
-					var entry = entries[0];
-					var height = entry && entry.contentRect ? entry.contentRect.height : 0;
-					setBoardHeight(Math.round(height));
-				});
-				observer.observe(node);
-				return function () { observer.disconnect(); };
-			}, []);
+			// 删掉了原来那个「卡片高度 → 左栏容量」的 ResizeObserver：
+			// 卡片内容少时高度也跟着矮，左栏层级就被切成一页只放两三层，整个目录缩在顶部。
+			// 现在两栏统一用「窗口可用高度」，不随表格内容多少变。
 
-			// 卡片可用高度 = 窗口高度 - 卡片顶边。
-			// 不用 vh - 固定值：那个数字换分辨率 / 缩放 / 窗口大小就错位，
-			// 要么下方留一大块空白，要么超出屏幕。这里实测，内容不满一屏时只当上限。
+			// 可用高度 = 窗口高度 - 卡片顶边（实测，不用 vh - 固定值，换分辨率/缩放都对）。
+			// 卡片用 height 撑满（不是 max-height）：左边层级栏和右边表格等高，页码永远贴底，
+			// 用例多少都不会把左栏缩上去。
 			useEffect(function () {
 				if (typeof window === "undefined") return undefined;
 				var frame = 0;
@@ -3646,7 +3636,8 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 					if (!(top > 0)) return;
 					var avail = Math.round(window.innerHeight - top - 16);
 					if (avail < 240) avail = 240;
-					node.style.maxHeight = avail + "px";
+					node.style.height = avail + "px";
+					setBoardHeight(avail);
 				}
 				function schedule() {
 					if (frame) return;
