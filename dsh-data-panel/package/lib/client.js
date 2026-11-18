@@ -242,6 +242,10 @@ window.__ModuleLoader__.load({
 .dp-main { flex: 1 1 auto; min-width: 0; }
 .dp-sidebar-title { color: var(--dp-text3); font-size: 11px; font-weight: 650; letter-spacing: .08em; text-transform: uppercase; white-space: nowrap; }
 .dp-sidebar-tools { display: flex; align-items: center; gap: 2px; }
+/* 表头「+」按钮：与行内操作图标同尺寸（20px），不抢标题的位置。 */
+.dp-sidebar-tools .dp-icon-btn { width: 20px; height: 20px; }
+/* 层级为空时的一句引导，不留空白。 */
+.dp-cat-empty { padding: 4px 8px 6px; color: var(--dp-text3); font-size: 11px; line-height: 1.5; }
 /* 「默认」是分组标题：纯文字，不是按钮，也不响应 hover。 */
 /* 「默认」：外观是分组标题，但整行可点（点它 = 看全部用例）。 */
 .dp-cat-group { display: flex; align-items: baseline; justify-content: space-between; gap: 6px; width: 100%; margin: 0 0 2px; padding: 6px 8px; border: 0; border-radius: 7px; background: transparent; color: var(--dp-text3); font: inherit; font-size: 11px; font-weight: 650; letter-spacing: .06em; text-transform: uppercase; text-align: left; cursor: pointer; transition: background .12s, color .12s; }
@@ -252,7 +256,7 @@ window.__ModuleLoader__.load({
 .dp-pick-count { color: var(--dp-text); font-size: 12.5px; font-weight: 500; }
 .dp-pick-count b { color: var(--dp-brand); font-weight: 700; }
 .dp-pick-hint { color: var(--dp-text3); font-size: 11.5px; }
-.dp-cat { display: flex; align-items: center; gap: 2px; margin-bottom: 1px; border-radius: 7px; transition: background .12s; }
+.dp-cat { position: relative; display: flex; align-items: center; gap: 2px; margin-bottom: 1px; border-radius: 7px; transition: background .12s; }
 .dp-cat:hover { background: var(--dp-bg2); }
 .dp-cat.is-active { background: color-mix(in srgb, var(--dp-brand) 9%, transparent); }
 .dp-cat-main { display: flex; align-items: center; gap: 6px; flex: 1 1 auto; min-width: 0; padding: 6px 8px; border: 0; border-radius: 8px; background: transparent; color: var(--dp-text2); font: inherit; font-size: 12.5px; text-align: left; cursor: pointer; }
@@ -260,14 +264,44 @@ window.__ModuleLoader__.load({
 .dp-cat-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dp-cat-count { flex: 0 0 auto; color: var(--dp-text3); font-size: 11px; font-variant-numeric: tabular-nums; }
 .dp-cat.is-active .dp-cat-count { color: var(--dp-brand); }
-.dp-cat-ops { display: none; flex: 0 0 auto; gap: 1px; padding-right: 2px; }
+/*
+ * 行内操作（改名 / 删除）。
+ *
+ * 用绝对定位**浮在行右侧**，而不是挤进 flex 流里：
+ * 左栏 docked 形态只有 112px 宽，两个 20px 按钮 + 间距要 43px，
+ * 挤进流里会把层级名压到只剩 2~3 个字（实测 nameClientW 78px → 33px），
+ * 层级几乎没法辨认。浮起来之后名称宽度完全不变，hover 时才浮出操作。
+ *
+ * 底色用 --dp-bg（实色）盖住下面的文字，左侧用渐变收边；
+ * 行底色在 hover / 选中时不同，所以两处各配一条渐变，避免出现一块硬边。
+ */
+.dp-cat-ops { position: absolute; right: 2px; top: 50%; display: none; align-items: center; gap: 1px; padding-left: 12px; transform: translateY(-50%); background: linear-gradient(to right, transparent, var(--dp-bg2) 12px); }
 .dp-cat:hover .dp-cat-ops { display: flex; }
 .dp-cat-ops.is-visible { display: flex; }
+/* 选中行底色是品牌色混合，操作区跟着换底，否则白块在彩色行上很扎眼。 */
+.dp-cat.is-active .dp-cat-ops { background: linear-gradient(to right, transparent, color-mix(in srgb, var(--dp-brand) 9%, var(--dp-bg)) 12px); }
 .dp-cat-ops .dp-icon-btn { width: 20px; height: 20px; }
 /* 「放入」用品牌色，和改名/删除区分开。 */
 .dp-cat-ops .dp-cat-drop { color: var(--dp-brand); }
 .dp-cat-ops .dp-cat-drop:hover { background: color-mix(in srgb, var(--dp-brand) 16%, transparent); color: var(--dp-brand); }
 .dp-cat-flip { transform: rotate(180deg); }
+/*
+ * 左栏两段：上「自定义层级」、下「按被测函数」。
+ * 两段各有一行小标题，切段时标题本身就是入口（点标题 = 切到该维度并回到「全部」）。
+ * 两段是**互斥**的筛选维度：同一时刻只按其中一个过滤，不会叠加成 AND。
+ */
+/*
+ * 段标题行：整行是一个按钮，而不是「div 里套文字按钮」。
+ * 套按钮的话只有 75.8px 的文字区可点，行左右的内边距点上去没反应；
+ * 用 label + count 两个 flex 子项平铺整行，点击热区就是整行。
+ */
+.dp-cat-section { display: flex; align-items: center; justify-content: space-between; gap: 4px; width: 100%; margin: 6px 0 2px; padding: 4px 8px; border: 0; border-radius: 6px; background: transparent; color: var(--dp-text3); font: inherit; font-size: 10px; font-weight: 650; letter-spacing: .06em; text-align: left; cursor: pointer; appearance: none; -webkit-appearance: none; transition: background .12s, color .12s; }
+.dp-cat-section:first-child { margin-top: 0; }
+.dp-cat-section:hover { background: var(--dp-bg2); color: var(--dp-text2); }
+/* 当前正在用的维度：标题用主题色，明确「现在按这个筛」。 */
+.dp-cat-section.is-active { color: var(--dp-brand); }
+.dp-cat-section-label { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dp-cat-section-count { flex: 0 0 auto; font-variant-numeric: tabular-nums; font-weight: 500; }
 /* 表格勾选列 */
 .dp-pick { width: 30px; padding: 0 4px 0 0; text-align: center; }
 .dp-pick input { width: 14px; height: 14px; margin: 0; accent-color: var(--dp-brand); cursor: pointer; vertical-align: middle; }
@@ -540,12 +574,20 @@ window.__ModuleLoader__.load({
  * 报告三页就完全滑不动，长表格直接被切掉。
  * 菜单裁切与横向滚动改由下面几条各自解决，不再靠放弃纵向滚动来换。
  */
+/*
+ * 背景：必须和单元测试一样用 var(--dp-bg)，不能是 transparent。
+ *
+ * 之前这里写 transparent，理由是「集成页只是套在 .dp-root 里的一层」。
+ * 在白色主题下看不出问题（宿主底色也是白），但切到深色主题就露馅了：
+ * 单元测试是 --dp-bg 的深灰，集成页是 transparent 透出宿主更深的底色，
+ * 两者明显不是一个层级 —— 集成页看起来"陷进去"了一块。
+ */
 .it-root.dp-root {
 	height: 100%;
 	min-height: 0;
 	overflow-y: auto;
 	overflow-x: hidden;
-	background: transparent;
+	background: var(--dp-bg);
 	/* 触屏 / 触控板惯性滚动；同时保证内部横向容器仍能接管水平手势 */
 	overscroll-behavior: contain;
 	-webkit-overflow-scrolling: touch;
@@ -590,6 +632,8 @@ window.__ModuleLoader__.load({
 .it-version-item:hover { background: var(--dp-bg2); color: var(--dp-text); }
 .it-version-item.is-active { background: color-mix(in srgb, var(--dp-brand) 12%, transparent); color: var(--dp-brand); font-weight: 600; }
 .it-version-name { flex: 0 0 auto; font-variant-numeric: tabular-nums; }
+/* 「当前」小标签：只给排在第一位的那一项，明确告诉用户现在看的是哪版 */
+.it-version-current { flex: 0 0 auto; padding: 0 5px; border-radius: 4px; background: color-mix(in srgb, var(--dp-brand) 14%, transparent); color: var(--dp-brand); font-size: 10px; line-height: 15px; font-weight: 600; }
 .it-version-meta { flex: 1 1 auto; color: var(--dp-text3); font-size: 11px; text-align: right; }
 
 /*
@@ -608,19 +652,68 @@ window.__ModuleLoader__.load({
  * 极窄容器会把它压到只剩图标。
  */
 .it-toolbar .dp-search { min-width: 132px; }
+/*
+ * 「筛选」按钮 + 下拉 + 已筛选提示条（只在测试步骤页出现）。
+ * 按钮沿用工具栏那套细边框（与「全部类型」下拉同档），
+ * 选中过筛选项时描边强调，让用户知道当前看的是筛过的数据。
+ */
+.it-result-filter { position: relative; display: inline-flex; }
+.it-filter-btn { display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 11px; border: 1px solid var(--dp-border); border-radius: 9px; background: var(--dp-bg); color: var(--dp-text2); font: inherit; font-size: 12.5px; font-weight: 500; white-space: nowrap; cursor: pointer; transition: background .15s, border-color .15s, color .15s; }
+.it-filter-btn:hover { background: var(--dp-bg2); color: var(--dp-text); }
+.it-filter-btn.is-open { background: var(--dp-bg2); border-color: var(--dp-brand); color: var(--dp-brand); }
+.it-filter-btn.is-filtered { border-color: var(--dp-brand); color: var(--dp-brand); }
+/* 下拉顶部：说明文字 + 全选 / 清空 */
+.it-filter-head { display: flex; align-items: center; gap: 8px; padding: 4px 6px 7px; border-bottom: 1px solid var(--dp-border2); margin-bottom: 4px; }
+.it-filter-title { flex: 1 1 auto; color: var(--dp-text); font-size: 12.5px; font-weight: 600; white-space: nowrap; }
+.it-filter-link { padding: 0; border: 0; background: none; color: var(--dp-brand); font: inherit; font-size: 12.5px; cursor: pointer; white-space: nowrap; }
+.it-filter-link:hover { text-decoration: underline; text-underline-offset: 2px; }
+/* 两列勾选项 */
+.it-filter-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 2px 8px; padding: 2px 6px 4px; }
+.it-filter-cell { display: flex; align-items: center; gap: 7px; padding: 5px 2px; color: var(--dp-text2); font-size: 12.5px; cursor: pointer; }
+.it-filter-cell:hover { color: var(--dp-text); }
+/*
+ * 勾选框。
+ * 页面上默认是白底，原来用 var(--dp-bg)（也是白）配 var(--dp-border)（#e5e6eb）的细边，
+ * 几乎和背景融在一起看不清。这里改成：边框加深、未选中时给一点浅灰底，
+ * 选中时用主题色实心块 —— 无论白底还是暗底都能一眼分辨。
+ */
+.it-filter-box { display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; border: 1.5px solid var(--dp-text3); border-radius: 4px; background: var(--dp-bg2); color: #fff; transition: background .12s, border-color .12s; }
+.it-filter-box:hover { border-color: var(--dp-brand); }
+.it-filter-box.is-on { border-color: var(--dp-brand); background: var(--dp-brand); }
+.it-filter-box.is-on svg { stroke-width: 2.6; }
+/* 已筛选提示条：一条浅蓝底 + 可点的「清除筛选」，放在表格上方 */
+.it-filter-bar { display: flex; align-items: center; gap: 10px; margin-bottom: 9px; padding: 7px 11px; border-radius: 8px; background: color-mix(in srgb, var(--dp-brand) 9%, transparent); color: var(--dp-text); font-size: 12.5px; }
+.it-filter-bar b { color: var(--dp-brand); font-weight: 600; }
+/* 主表上方的小工具条：左边说明标签，右边「筛选」，整行浅底以便和表格分开 */
+.it-subbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 9px; padding: 6px 4px 6px 10px; border-radius: 9px; background: var(--dp-bg2); }
+.it-subbar-label { color: var(--dp-text2); font-size: 12.5px; font-weight: 600; }
 .it-toolbar .dp-select { flex: 0 0 auto; width: auto; }
 /* 下拉的包裹层默认 flex-shrink:1，nowrap 下会被压扁；锁成固有宽度，只让搜索框收缩 */
 .it-toolbar .it-switch,
-.it-toolbar .it-version { flex: 0 0 auto; }
-.it-toolbar-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; flex: 0 0 auto; }
+.it-toolbar .it-version,
+.it-toolbar .it-result-filter { flex: 0 0 auto; }
+.it-toolbar-actions { display: flex; align-items: center; gap: 6px; margin-left: auto; flex: 0 0 auto; }
 .it-toolbar .it-version-btn { height: 36px; border-radius: 10px; padding: 0 10px; }
 .it-toolbar .it-switch-btn { height: 36px; }
 .it-toolbar .dp-btn { flex: 0 0 auto; }
-/* 极窄容器：允许换行，避免搜索框被挤到不可用 */
-@media (max-width: 560px) {
-	.it-toolbar { flex-wrap: wrap; }
-	.it-toolbar .dp-search { flex: 1 1 100%; min-width: 0; }
-	.it-toolbar-actions { margin-left: 0; }
+/*
+ * 工具栏的搜索框：吃剩余空间，但给个上限免得过宽。
+ * （筛选器已经挪到测试步骤页内部，工具栏回到 6 个控件，不再那么挤。）
+ */
+.it-toolbar .dp-search { flex: 1 1 200px; min-width: 120px; max-width: 320px; }
+/*
+ * 极窄容器：控件实在放不下时才换行。
+ * 实测 620px 宽仍能排成一行（控件总宽约 800px，搜索框会被压缩让位），
+ * 所以断点收到 520px，只有真正的窄栏才折成多行。
+ */
+@media (max-width: 520px) {
+	.it-toolbar { flex-wrap: wrap; row-gap: 6px; }
+	.it-toolbar .dp-search { flex: 1 1 100%; min-width: 0; max-width: none; }
+	/*
+	 * 换行后第二行只剩「子页 / 类型」，操作区独占第三行会浪费高度。
+	 * 这里让操作区紧跟其后排列，并把它的左外边距清零（否则会被推到最右撑满一行）。
+	 */
+	.it-toolbar-actions { margin-left: 0; flex: 1 1 auto; justify-content: flex-end; }
 }
 .it-notice { margin-bottom: 12px; padding: 8px 11px; border: 1px solid color-mix(in srgb, var(--dp-brand) 30%, transparent); border-radius: 10px; background: color-mix(in srgb, var(--dp-brand) 6%, transparent); color: var(--dp-text); font-size: 12px; }
 
@@ -638,6 +731,17 @@ window.__ModuleLoader__.load({
 
 /* 集成测试表：复用 dp-table 观感，列少、可横向滚动 */
 .it-table-wrap { border: 1px solid var(--dp-border); border-radius: 12px; background: var(--dp-bg); overflow-x: auto; overscroll-behavior-x: contain; }
+/*
+ * 卡片容器：单元测试的表格是包在 .dp-card 里的 —— 一个带边框、圆角的卡片，
+ * 表格在上、分页条在下（分页条有顶部分隔线和自己的底色）。
+ * 集成页原来把表格和分页条平铺在页面上，看起来比单元测试"散"。
+ * 这里补一层同款卡片，让两边结构一致。
+ */
+.it-card { border: 1px solid var(--dp-border); border-radius: 14px; background: var(--dp-bg); overflow: hidden; }
+/* 卡片里的表格不再需要自己那层边框（会和卡片边框叠成双线） */
+.it-card > .it-table-wrap { border: 0; border-radius: 0; }
+/* 卡片底部：分页条固定在这一条里，和单元测试的 .dp-card-foot 一致 */
+.it-card > .it-pager { margin: 0; padding: 10px 14px 11px; border-top: 1px solid var(--dp-border); background: var(--dp-bg); }
 .it-table { width: 100%; min-width: 520px; border-collapse: collapse; font-size: 12px; }
 .it-table th { padding: 8px 7px; border-bottom: 1px solid var(--dp-border); background: var(--dp-bg2); color: var(--dp-text3); font-size: 11px; font-weight: 600; letter-spacing: .04em; text-align: center; white-space: nowrap; }
 .it-table td { padding: 9px 7px; border-bottom: 1px solid var(--dp-border2); color: var(--dp-text2); vertical-align: middle; text-align: center; }
@@ -657,6 +761,18 @@ window.__ModuleLoader__.load({
  * 放在序号左边才不会和右侧操作列抢注意力。
  */
 .it-no-cell { display: inline-flex; align-items: center; gap: 3px; }
+/*
+ * 拖拽手柄：6 个灰点（3×2）、透明背景，只在测试用例页出现。
+ * 鼠标移到行上才显现，避免整列都是点、看着吵；用 grab / grabbing 光标提示可拖。
+ */
+.it-drag-handle { display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 20px; padding: 0; border: 0; background: transparent; color: var(--dp-text3); cursor: grab; opacity: 0; transition: opacity .12s, color .12s; }
+.it-table tr:hover .it-drag-handle,
+.it-drag-handle.is-active { opacity: 1; }
+.it-drag-handle:hover { color: var(--dp-text2); }
+.it-drag-handle:active,
+.it-drag-handle.is-active { cursor: grabbing; color: var(--dp-brand); }
+/* 拖拽中的行：底色加重，明确「这一行正在被搬动」 */
+.it-table tr.is-dragging > td { background: color-mix(in srgb, var(--dp-brand) 7%, transparent); }
 .it-row-toggle { display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; padding: 0; border: 0; border-radius: 5px; background: transparent; color: var(--dp-text3); cursor: pointer; transition: background .12s, color .12s, transform .14s; }
 .it-row-toggle:hover { background: var(--dp-bg3); color: var(--dp-text); }
 .it-row-toggle svg { transition: transform .14s; }
@@ -679,10 +795,15 @@ window.__ModuleLoader__.load({
 .it-pill { display: inline-block; padding: 0 7px; border-radius: 5px; font-size: 11px; line-height: 18px; white-space: nowrap; }
 .it-pill[data-tone="ok"] { background: color-mix(in srgb, #16a34a 14%, transparent); color: #16a34a; }
 .it-pill[data-tone="bad"] { background: color-mix(in srgb, var(--dp-danger) 12%, transparent); color: var(--dp-danger); }
+/* 异常：执行过程本身出错（环境、超时、崩溃），和「未通过」用不同颜色区分 */
+.it-pill[data-tone="error"] { background: color-mix(in srgb, var(--dp-warning) 15%, transparent); color: var(--dp-warning); }
 .it-pill[data-tone="idle"] { background: var(--dp-bg3); color: var(--dp-text3); }
 .it-pill[data-tone="brand"] { background: color-mix(in srgb, var(--dp-brand) 12%, transparent); color: var(--dp-brand); }
 .it-ops { display: flex; justify-content: center; gap: 1px; }
 .it-empty { padding: 34px 16px; color: var(--dp-text3); font-size: 12.5px; text-align: center; }
+/* 空状态：标题稍重一点，说明文字更轻，比原来单行灰字更好读 */
+.it-empty-title { margin-bottom: 6px; color: var(--dp-text2); font-size: 13.5px; font-weight: 600; }
+.it-empty-hint { color: var(--dp-text3); font-size: 12px; line-height: 1.6; }
 
 /* 展开区 / 明细小表：步骤明细（ItStepTable）和报告弹窗仍在用，最多约五行高度后滚动 */
 .it-scroll-5 { max-height: 132px; overflow-y: auto; }
@@ -737,6 +858,26 @@ window.__ModuleLoader__.load({
 .it-step-row:last-child { border-bottom: 0; }
 .it-step-no { padding-top: 6px; color: var(--dp-text3); font-size: 11px; text-align: center; font-variant-numeric: tabular-nums; }
 .it-step-ops { display: flex; gap: 1px; padding-top: 3px; }
+/*
+ * 步骤表的列头。网格列与 .it-step-row 必须完全一致（含弹窗内的覆盖值），
+ * 否则标题和输入框会错位 —— 两套网格一旦有一列宽度不同，后面所有列都会累积偏移。
+ * 序号与操作列留空但仍占位。
+ *
+ * 列头文字给 12px 左内边距，和输入框内部的文字起点对齐（视觉上比对齐边框更整齐）。
+ * 弹窗内的网格覆盖见 .it-steps-modal .it-step-head，两处必须成对修改。
+ */
+.it-step-head { display: grid; grid-template-columns: 22px 1fr 1fr 1fr auto; gap: 6px; padding: 0 0 7px; border-bottom: 1px solid var(--dp-border); margin-bottom: 2px; color: var(--dp-text3); font-size: 11px; font-weight: 600; letter-spacing: .03em; }
+/* 操作列固定宽度：列头这里是空 span（宽 0），步骤行里是图标按钮。
+   不固定的话两套网格的最后一列宽度不同，前面所有列都会被挤偏。
+   宽度按「拖拽手柄 + 删除」两个按钮定，给 56px 足够。 */
+.it-step-head > span:last-child { width: 56px; min-width: 56px; text-align: center; }
+.it-step-row > .it-step-ops { width: 56px; justify-content: flex-end; }
+/* 与输入框内部文字的起点对齐（输入框左内边距 10px，弹窗里 12px） */
+.it-step-head > span:nth-child(2),
+.it-step-head > span:nth-child(3),
+.it-step-head > span:nth-child(4) { padding-left: 10px; }
+/* 拖拽中的步骤行高亮，与测试用例页同一套观感 */
+.it-step-row.is-dragging { background: color-mix(in srgb, var(--dp-brand) 7%, transparent); border-radius: 8px; }
 
 /* 总体报告 */
 .it-overview { display: flex; flex-direction: column; gap: 9px; }
@@ -751,11 +892,12 @@ window.__ModuleLoader__.load({
 .it-report-group { border: 1px solid var(--dp-border); border-radius: 11px; background: var(--dp-bg); overflow: hidden; }
 /* 组内表格自己带一层边框，和卡片边框叠在一起会显粗，这里让表格贴边无框 */
 .it-report-group .it-table-wrap { border: 0; border-radius: 0; }
-.it-report-head { display: flex; align-items: center; gap: 7px; width: 100%; padding: 9px 11px; border: 0; border-bottom: 1px solid var(--dp-border); background: var(--dp-bg2); color: var(--dp-text); font: inherit; text-align: left; cursor: pointer; transition: background .12s; }
-.it-report-head:hover { background: var(--dp-bg3); }
-.it-report-head.is-collapsed { border-bottom: 0; }
+.it-report-head { display: flex; align-items: center; gap: 7px; width: 100%; padding: 9px 11px; border-bottom: 1px solid var(--dp-border); background: var(--dp-bg2); color: var(--dp-text); font: inherit; text-align: left; transition: background .12s; }
+/* 折叠按钮本身只包箭头 + 名称 + 徽标，右侧「通过/失败」不属于点击区 */
+.it-report-toggle { display: inline-flex; align-items: center; gap: 7px; padding: 0; border: 0; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.it-report-toggle:hover .it-report-name { color: var(--dp-brand); }
 .it-report-caret { display: inline-flex; color: var(--dp-text3); transform: rotate(90deg); transition: transform .14s; }
-.it-report-head.is-collapsed .it-report-caret { transform: rotate(0deg); }
+.it-report-toggle.is-collapsed .it-report-caret { transform: rotate(0deg); }
 .it-report-name { flex: 0 0 auto; font-size: 13px; font-weight: 650; }
 .it-report-badge { flex: 0 0 auto; padding: 0 7px; border-radius: 5px; background: color-mix(in srgb, var(--dp-brand) 11%, transparent); color: var(--dp-brand); font-size: 11px; line-height: 17px; }
 .it-report-sum { flex: 1 1 auto; color: var(--dp-text3); font-size: 11.5px; text-align: right; }
@@ -763,6 +905,36 @@ window.__ModuleLoader__.load({
 
 /* 分页：复用单元测试 .dp-pager 的度量，只补集成页需要的间距 */
 .it-pager { margin-top: 10px; }
+
+/*
+ * 报告页多选（对齐原型图 4）。
+ * 非多选态：右上角一个「多选」文字按钮；
+ * 多选态：整行换成「共 N 条报告（通过 X / 失败 Y） + 退出多选 + 导出已选报告 + 全选 + 清空」。
+ */
+/* 「多选」紧跟汇总文字之后，不要 margin-left:auto（那会把它推到最右） */
+.it-multi-enter { margin-left: 2px; padding: 0; border: 0; background: none; color: var(--dp-brand); font: inherit; font-size: 12.5px; font-weight: 600; cursor: pointer; white-space: nowrap; }
+.it-multi-enter:hover { text-decoration: underline; text-underline-offset: 3px; }
+.it-multi-bar { display: flex; align-items: center; gap: 14px; margin-bottom: 10px; color: var(--dp-text2); font-size: 12.5px; }
+.it-multi-stat { color: var(--dp-text2); }
+.it-multi-stat b { color: var(--dp-text); font-weight: 650; }
+.it-multi-link { padding: 0; border: 0; background: none; color: var(--dp-text2); font: inherit; font-size: 12.5px; cursor: pointer; white-space: nowrap; }
+.it-multi-link:hover { color: var(--dp-brand); text-decoration: underline; text-underline-offset: 3px; }
+.it-multi-link.is-strong { color: var(--dp-brand); font-weight: 600; }
+/* 导出已选报告：浅底按钮，禁用时半透明（原型里未选时是灰的） */
+.it-multi-export { display: inline-flex; align-items: center; gap: 5px; height: 28px; padding: 0 11px; border: 1px solid transparent; border-radius: 8px; background: color-mix(in srgb, var(--dp-brand) 9%, transparent); color: var(--dp-brand); font: inherit; font-size: 12.5px; white-space: nowrap; cursor: pointer; }
+.it-multi-export:hover:not(:disabled) { background: color-mix(in srgb, var(--dp-brand) 15%, transparent); }
+.it-multi-export:disabled { opacity: .5; cursor: not-allowed; }
+
+/* 组内分页 / 子表分页共用一套（图 5 的形态）：共 N 条，每页 [15条/页] ‹ 1 › */
+.it-sub-pager, .it-sub-pager-wrap { display: flex; align-items: center; justify-content: flex-end; gap: 8px; padding: 8px 10px; color: var(--dp-text2); font-size: 12.5px; }
+.it-sp-total { color: var(--dp-text3); white-space: nowrap; }
+.it-sp-select { height: 28px; padding: 0 22px 0 8px; border: 1px solid var(--dp-brand); border-radius: 7px; background: var(--dp-bg); color: var(--dp-text); font: inherit; font-size: 12.5px; outline: none; cursor: pointer; }
+.it-sp-btn { display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px; padding: 0; border: 1px solid var(--dp-border); border-radius: 7px; background: var(--dp-bg); color: var(--dp-text2); cursor: pointer; }
+.it-sp-btn:hover:not(:disabled) { background: var(--dp-bg2); color: var(--dp-text); }
+.it-sp-btn:disabled { opacity: .45; cursor: not-allowed; }
+.it-sp-page { display: inline-flex; align-items: center; justify-content: center; min-width: 26px; height: 26px; padding: 0 6px; border: 1px solid var(--dp-brand); border-radius: 7px; background: var(--dp-bg); color: var(--dp-brand); font: inherit; font-size: 12.5px; font-weight: 600; font-variant-numeric: tabular-nums; cursor: pointer; }
+/* 组内分页条：贴在卡片下沿，去掉卡片自己的下边框重复感 */
+.it-report-group > .it-sub-pager { border-top: 1px solid var(--dp-border2); justify-content: flex-end; }
 
 /*
  * 用例编辑弹窗：原型是单列、约 700px、字段间距宽松。
@@ -784,6 +956,65 @@ window.__ModuleLoader__.load({
 .it-case-modal .it-count { right: 12px; bottom: 12px; font-size: 12px; }
 .it-case-modal .it-input-wrap.is-area .it-area { padding-bottom: 24px; }
 .it-case-modal .it-input-wrap.is-area .it-count { bottom: 9px; }
+
+/*
+ * 步骤编辑弹窗：和用例弹窗不是一回事，单独给一套度量。
+ *
+ * 之前它只挂 it-case-modal，什么专属样式都没有，结果：
+ *   · 宽度照抄 720px —— 但这里有「动作 / 输入步骤 / 预期结果」三列并排，
+ *     每列都被挤到只能露出十来个字，看什么都得点进去才行；
+ *   · 列表沿用 .it-scroll-5 的 132px 上限 —— 只够露出两行半，
+ *     第三条被拦腰切断，看起来像坏了。
+ *
+ * 现在：宽度放到 1040（三列各自能放下整句），高度给上限但不强制撑满 ——
+ * 步骤少的时候弹窗自然矮一点，步骤多的时候列表自己滚，底部按钮始终露在外面。
+ */
+.dp-modal.it-steps-modal { width: min(1040px, 96vw); max-height: min(84vh, 760px); }
+.it-steps-modal .dp-modal-body {
+	flex: 0 1 auto;
+	min-height: 0;
+	display: flex;
+	flex-direction: column;
+	padding: 6px 22px 12px;
+}
+.it-steps-modal .it-detail { min-height: 0; display: flex; flex-direction: column; gap: 0; }
+/*
+ * 步骤列表：随内容长高，但不超过剩余空间。
+ * 用 max-height 而不是 flex:1 —— 否则步骤只有两三条时会留出一大块空白，
+ * 底部「新增步骤」被推到很远的地方，看起来像布局坏了。
+ */
+/*
+ * 步骤列表的滚动区。
+ *
+ * 高度按「5 行」定死（每行 38px 输入框 + 8px 上下内边距 + 1px 虚线分隔 ≈ 55px，
+ * 5 行约 275px），超过 5 步就在这个区域里滚动，而不是把弹窗越撑越长。
+ * 用 max-height 而不是 flex:1 —— 步骤少时不留大块空白，「新增步骤」紧跟其后。
+ */
+.it-steps-modal .it-steps-scroll {
+	flex: 0 1 auto;
+	min-height: 0;
+	max-height: 278px;
+	overflow-y: auto;
+}
+.it-steps-modal .it-steps-scroll .it-step-row { padding: 8px 0; }
+/* 三列输入等宽，别再让「预期结果」被压成一条缝 */
+.it-steps-modal .it-step-row { grid-template-columns: 24px 1fr 1fr 1fr auto; gap: 8px; }
+.it-steps-modal .it-step-no { padding-top: 11px; }
+/* 底部「新增步骤」固定在列表下方，列表再长也看得到它 */
+.it-steps-modal .it-detail-foot { flex: 0 0 auto; padding-top: 10px; border-top: 1px solid var(--dp-border); }
+/* 输入框与用例弹窗同档（14px / 38px）：三列并排时 42px 太占高度，压到 38 更耐看 */
+.it-steps-modal .it-input { height: 38px; padding: 0 10px; font-size: 13.5px; border-radius: 8px; }
+.it-steps-modal .it-step-row .it-input:focus { border-color: var(--dp-brand); box-shadow: 0 0 0 3px color-mix(in srgb, var(--dp-brand) 13%, transparent); outline: none; }
+/* 步骤行的操作图标（上移 / 下移 / 删除）垂直对齐输入框中线 */
+.it-steps-modal .it-step-ops { display: inline-flex; align-items: center; gap: 4px; height: 38px; }
+/* 步骤弹窗里手柄常显（表格页才需要 hover 才出现，弹窗里是编辑态，直接露出更好找） */
+.it-steps-modal .it-drag-handle.is-visible { opacity: 1; }
+/* 弹窗内网格必须与 .it-steps-modal .it-step-row 完全一致（24px + 8px gap），否则会错位 */
+.it-steps-modal .it-step-head { grid-template-columns: 24px 1fr 1fr 1fr auto; gap: 8px; }
+/* 弹窗里输入框左内边距是 12px，列头文字跟着对齐 */
+.it-steps-modal .it-step-head > span:nth-child(2),
+.it-steps-modal .it-step-head > span:nth-child(3),
+.it-steps-modal .it-step-head > span:nth-child(4) { padding-left: 12px; }
 
 /* 窄面板：侧栏进一步收窄，工具栏两行 */
 .it-root.is-narrow .it-side { width: 96px; }
@@ -941,20 +1172,57 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 		var IT_SCENARIOS_ALL = "全部用例";
 		var IT_SCENARIOS_NONE = "未分组";
 
-		// 集成测试的测试类型：原型里接口/UI 混排，这里按实际工程口径给四项。
+		/*
+		 * 集成测试的测试类型（七类，按工程口径定）。
+		 * 顺序就是「全部类型」下拉与顶部看板的显示顺序：
+		 * 功能 → 性能 → 边界 → 接口 → 强度 → 安全性 → 余量。
+		 */
 		var IT_TYPES = {
+			functional: { label: "功能测试" },
+			performance: { label: "性能测试" },
+			boundary: { label: "边界测试" },
 			api: { label: "接口测试" },
-			ui: { label: "UI 测试" },
-			flow: { label: "业务流程" },
-			data: { label: "数据校验" }
+			stress: { label: "强度测试" },
+			security: { label: "安全性测试" },
+			margin: { label: "余量测试" }
 		};
-		var IT_TYPE_KEYS = ["api", "ui", "flow", "data"];
+		var IT_TYPE_KEYS = ["functional", "performance", "boundary", "api", "stress", "security", "margin"];
 
 		var IT_STATUS = {
 			pass: { label: "通过", tone: "ok" },
 			fail: { label: "未通过", tone: "bad" },
+			error: { label: "异常", tone: "error" },
 			none: { label: "未执行", tone: "idle" }
 		};
+
+		/**
+		 * 执行结果筛选可选的三种值。
+		 *
+		 * 「未执行」不在筛选范围里 —— 筛选是用来找「跑过的结果」的，
+		 * 没有执行记录的用例本来就不该出现在按结果筛的视图里。
+		 */
+		var IT_RESULT_FILTERS = [
+			{ key: "pass", label: "通过" },
+			{ key: "fail", label: "未通过" },
+			{ key: "error", label: "异常" }
+		];
+
+		/**
+		 * 一条用例当前显示的「执行结果」：取它最新一次执行记录的结果。
+		 *
+		 * 为什么取 records[0] 而不是 record.status：
+		 *   status 是父组件算好的汇总值，但步骤表这一列要的是「最新一次跑的怎么样」，
+		 *   两者在数据被局部改动（比如新增/删除某条记录）时可能不一致。
+		 * records 按时间倒序存放（最新在最前），所以直接取第一条。
+		 * 没有执行记录时返回 none，由调用方显示成「未执行」。
+		 */
+		function itLatestResult(record) {
+			var runs = Array.isArray(record && record.records) ? record.records : [];
+			if (runs.length === 0) return "none";
+			var latest = runs[0] || {};
+			var result = latest.result;
+			return IT_STATUS[result] ? result : "none";
+		}
 
 		/**
 		 * 生成一份集成测试示例数据。
@@ -983,7 +1251,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 					caseId: "IT-001",
 					title: "商品加入购物车",
 					scenario: "商品与购物车",
-					type: "ui",
+					type: "functional",
 					description: "在商品详情页选择规格后点击加入购物车，商品应进入购物车并给出成功提示",
 					precondition: "已登录，商品处于上架状态且库存充足",
 					expectedResult: "购物车数量 +1，右上角角标同步更新，提示「已加入购物车」",
@@ -1005,7 +1273,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 					caseId: "IT-002",
 					title: "购物车数量修改与库存上限校验",
 					scenario: "商品与购物车",
-					type: "ui",
+					type: "functional",
 					description: "在购物车页修改商品数量，超过库存时应有拦截提示",
 					precondition: "购物车已有该商品，库存为 5 件",
 					expectedResult: "数量可改为 1~5；输入 6 时提示「超出库存」，自动回到 5",
@@ -1024,7 +1292,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 					caseId: "IT-003",
 					title: "优惠券抵扣结算",
 					scenario: "订单与支付",
-					type: "flow",
+					type: "functional",
 					description: "结算页选择满 100 减 20 的优惠券，应付金额应正确抵扣",
 					precondition: "已登录，账户有「满 100 减 20」券，商品合计 129 元",
 					expectedResult: "优惠显示 20 元，应付 109 元，订单详情记录该券",
@@ -1043,7 +1311,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 					caseId: "IT-004",
 					title: "提交订单后取消订单",
 					scenario: "订单与支付",
-					type: "flow",
+					type: "functional",
 					description: "对待支付订单执行取消，订单状态应变为已取消",
 					precondition: "已登录，存在一笔待支付订单",
 					expectedResult: "状态变为「已取消」，库存回滚，优惠券退回账户",
@@ -1065,7 +1333,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 					caseId: "IT-005",
 					title: "新增收货地址并设为默认",
 					scenario: "账户与会员",
-					type: "ui",
+					type: "functional",
 					description: "在个人中心新增收货地址并勾选设为默认",
 					precondition: "已登录，当前没有默认地址",
 					expectedResult: "地址新增成功并置顶，标记「默认」，下单自动选中",
@@ -1083,7 +1351,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 					caseId: "IT-006",
 					title: "会员积分展示与累计",
 					scenario: "账户与会员",
-					type: "data",
+					type: "boundary",
 					description: "完成一笔 129 元订单后，积分应按 1 元 1 分累计",
 					precondition: "已登录，当前积分 200",
 					expectedResult: "积分变为 329，明细新增一条 +129 记录",
@@ -1137,7 +1405,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 					caseId: "IT-009",
 					title: "退出登录清除会话",
 					scenario: "用户与登录",
-					type: "ui",
+					type: "functional",
 					description: "退出登录后本地凭证必须清除，不能通过浏览器后退恢复访问",
 					precondition: "已登录",
 					expectedResult: "返回登录页，token 已清除，后退也无法进入需登录页面",
@@ -1243,18 +1511,41 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 			return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate());
 		}
 
-		/** 按搜索结果过滤集成用例：标识 / 名称 / 说明 / 场景 / 类型名。 */
+		/**
+		 * 把版本号（"V0.0.12" 这种）转成可比较的数字。
+		 *
+		 * 直接用字符串比较会出错：V0.0.10 < V0.0.9（'1' < '9'），
+		 * 而实际它是更晚的版本。这里取每段的数字，按 major * 1e6 + minor * 1e3 + patch
+		 * 压缩成一个整数 —— 覆盖到千位足够版本号用。
+		 */
+		function itVersionValue(name) {
+			var text = typeof name === "string" ? name.replace(/^[Vv]/, "") : "";
+			var parts = text.split(".");
+			var major = parseInt(parts[0], 10) || 0;
+			var minor = parseInt(parts[1], 10) || 0;
+			var patch = parseInt(parts[2], 10) || 0;
+			return major * 1000000 + minor * 1000 + patch;
+		}
+
+		/**
+		 * 按搜索结果过滤集成用例：标识 / 名称 / 说明 / 场景 / 类型名。
+		 *
+		 * options.results 是「执行结果」多选筛选：空数组表示不限，
+		 * 非空时只保留最新一次执行结果命中其中任一值的用例。
+		 */
 		function itFilterRecords(records, options) {
 			var query = typeof options?.query === "string" ? options.query.trim().toLowerCase() : "";
 			var scenario = typeof options?.scenario === "string" ? options.scenario : "";
 			var type = typeof options?.type === "string" ? options.type : "all";
 			var status = typeof options?.status === "string" ? options.status : "all";
+			var results = Array.isArray(options?.results) ? options.results : [];
 			return (Array.isArray(records) ? records : []).filter(function (record) {
 				if (scenario !== "" && scenario !== IT_SCENARIOS_ALL) {
 					if (itScenarioOf(record) !== scenario) return false;
 				}
 				if (type !== "all" && record.type !== type) return false;
 				if (status !== "all" && (record.status || "none") !== status) return false;
+				if (results.length > 0 && results.indexOf(itLatestResult(record)) === -1) return false;
 				if (query === "") return true;
 				var typeLabel = IT_TYPES[record.type]?.label || "";
 				return [record.caseId, record.title, record.description, record.scenario, typeLabel]
@@ -1320,6 +1611,28 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 				// 用描边闭合三角形，线宽与其它图标一致，不是实心块。
 				case "play":
 					children = [h("path", { key: "a", d: "M8 4.8 19 12 8 19.2z" })];
+					break;
+				// 下载：向下箭头 + 底部托盘。用于「导出报告」——
+				// 它和「查看报告」（eye）必须有明显区别，原来两个都是文件/眼睛图标，容易点混。
+				case "download":
+					children = [
+						h("path", { key: "a", d: "M12 4v10" }),
+						h("path", { key: "b", d: "m7.5 10 4.5 4.5 4.5-4.5" }),
+						h("path", { key: "c", d: "M5 19h14" })
+					];
+					break;
+				// 拖拽手柄：3 列 × 2 行共 6 个实心圆点。
+				// 用 fill 而不是 stroke —— 圆点要实心才像抓手，描边会变成小圈。
+				case "grip":
+					children = [4.5, 8.5].flatMap(function (cy, row) {
+						return [8, 12, 16].map(function (cx, col) {
+							return h("circle", { key: "d" + row + col, cx: cx, cy: cy + 3, r: 1.35, fill: "currentColor", stroke: "none" });
+						});
+					});
+					break;
+				// 筛选：漏斗。用于「筛选」按钮（对齐原型里的漏斗图标）。
+				case "filter":
+					children = [h("path", { key: "a", d: "M4 5h16l-6.2 7.4V19l-3.6-2v-4.6z" })];
 					break;
 				case "copy":
 					children = [h("rect", { key: "a", x: 9, y: 9, width: 11, height: 11, rx: 2 }), h("path", { key: "b", d: "M5 15V5a1 1 0 0 1 1-1h9" })];
@@ -2171,6 +2484,44 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 				}));
 		}
 
+		/**
+		 * 自定义层级名：记录里的 category 字段，空串表示「默认（未分层）」。
+		 * 与 subjectFunction 是两套独立维度，不能用其中一个推断另一个。
+		 */
+		function categoryOf(record) {
+			return typeof record?.category === "string" ? record.category.trim() : "";
+		}
+
+		/**
+		 * 自定义层级左栏行。
+		 *
+		 * 第一行「全部层级」（value 空串）固定在最前，点它 = 清掉层级筛选；
+		 * 其余按名字排。「空层级」也要出现在列表里 —— 建完就能改名/删除/往里放用例，
+		 * 只在记录里聚合的话新建的空层级会立刻消失。
+		 * 所以显式清单（snap.categories）∪ 记录里实际用到的，与后端 categoryList 口径一致。
+		 */
+		function layerRows(records, names) {
+			var list = Array.isArray(records) ? records : [];
+			var seen = Object.create(null);
+			(Array.isArray(names) ? names : []).forEach(function (name) {
+				if (typeof name === "string" && name.trim() !== "") seen[name.trim()] = true;
+			});
+			list.forEach(function (record) {
+				var name = categoryOf(record);
+				if (name !== "") seen[name] = true;
+			});
+			var rows = [{ key: "__all__", value: "", label: "全部层级", count: list.length }];
+			Object.keys(seen).sort(function (a, b) { return a.localeCompare(b, "zh-CN"); }).forEach(function (name) {
+				rows.push({
+					key: "layer:" + name,
+					value: name,
+					label: name,
+					count: list.filter(function (record) { return categoryOf(record) === name; }).length
+				});
+			});
+			return rows;
+		}
+
 		function FunctionField(props) {
 			return h(Field, { label: "被测函数", full: true, hint: "填写源码中的业务函数，如 src/order.ts::Order.discount；留空为未关联函数。" },
 				h("input", { className: "dp-input dp-input-mono", value: props.value, maxLength: 240,
@@ -2181,7 +2532,14 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 				})));
 		}
 
+		/*
+		 * 两种用途共用同一个弹窗，靠 props.mode 分流：
+		 *   "function"（默认）—— 给选中的用例设置「被测函数」，带 datalist 可选已有函数
+		 *   "layer"          —— 新建 / 重命名「自定义层级」，纯文本、60 字符上限
+		 * 两者校验规则不同（函数 240 / 层级 60，层级还禁用内置名），所以必须分开。
+		 */
 		function CategoryPrompt(props) {
+			var layerMode = props.mode === "layer";
 			var valueState = useState(props.initialValue || "");
 			var value = valueState[0];
 			var setValue = valueState[1];
@@ -2191,6 +2549,13 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 
 			function submit() {
 				var name = value.trim();
+				if (layerMode) {
+					if (name === "") { setError("层级名不能为空"); return; }
+					if (name === "默认") { setError("「默认」是内置层级，换个名字"); return; }
+					if (name.length > 60) { setError("层级名最多 60 个字符"); return; }
+					props.onSubmit(name);
+					return;
+				}
 				if (name.length > 240) { setError("被测函数最多 240 个字符"); return; }
 				props.onSubmit(name);
 			}
@@ -2201,11 +2566,23 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 				onClose: props.onClose,
 				footer: [
 					h(Button, { key: "cancel", onClick: props.onClose }, "取消"),
-					h(Button, { key: "ok", variant: "primary", onClick: submit }, "确定")
+					h(Button, { key: "ok", variant: "primary", "data-it": layerMode ? "layer-name-ok" : "function-name-ok", onClick: submit }, "确定")
 				]
 			},
-				h(FunctionField, { value: value, functions: props.functions, listId: "dp-bulk-functions", onChange: function (next) { setValue(next); setError(""); } }),
-				h("p", { className: "dp-hint" }, "填写已有或新的被测函数；清空后确定可解除所选用例的函数关联。"),
+				layerMode
+					? h(Field, { label: "层级名称", full: true, hint: "填新名字就是新建一个层级；建好后可以把用例放进去。" },
+						h("input", {
+							className: "dp-input",
+							value: value,
+							maxLength: 60,
+							placeholder: "例如：订单模块",
+							"data-it": "layer-name-input",
+							onChange: function (event) { setValue(event.target.value); setError(""); },
+							onKeyDown: function (event) { if (event.key === "Enter") submit(); }
+						})
+					)
+					: h(FunctionField, { value: value, functions: props.functions, listId: "dp-bulk-functions", onChange: function (next) { setValue(next); setError(""); } }),
+				layerMode ? null : h("p", { className: "dp-hint" }, "填写已有或新的被测函数；清空后确定可解除所选用例的函数关联。"),
 				error ? h("p", { className: "dp-hint", style: { color: "var(--dp-danger)" } }, error) : null
 			);
 		}
@@ -2732,7 +3109,12 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 		}
 
 		/**
-		 * 左栏「用例层级」。
+		 * 左栏「用例层级」，两段：
+		 *   上段「自定义层级」—— 手动新建/改名/删除的层级（记录里的 category 字段）
+		 *   下段「按被测函数」—— 由 subjectFunction 自动聚合，不能手工增删
+		 *
+		 * 两段是**互斥**的筛选维度：同一时刻只按其中一个过滤。
+		 * 选自定义层级会清掉函数选择，反之亦然（见 DataPanelView 的 pickLayer / pickFunction）。
 		 *
 		 * 两条约束来自用户反馈：
 		 *   1. 左栏高度跟着表格走 —— 表格矮而层级多时不能无限拉长，
@@ -2742,8 +3124,13 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 		 * 自己量自己的话会陷入「内容变高 → 自己更高 → 又能放更多」的循环。
 		 */
 		function CategorySidebar(props) {
-			var rows = props.rows;
+			var functionRowsList = props.rows;
+			var layerRowsList = Array.isArray(props.layerRows) ? props.layerRows : [];
 			var activeCategory = props.activeCategory;
+			var activeLayer = props.activeLayer;
+			// 当前生效的维度：'' = 按函数（默认，保持原有行为），'layer' = 按自定义层级。
+			var axis = props.axis === "layer" ? "layer" : "function";
+			var rows = axis === "layer" ? layerRowsList : functionRowsList;
 
 			var docked = props.docked === true;
 			var boardHeight = Number(props.boardHeight) || 0;
@@ -2766,29 +3153,79 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 				? rows.slice((currentPage - 1) * capacity, currentPage * capacity)
 				: rows;
 
-			// 行数变少（删层级 / 换会话）时把页码收回到合法范围，否则会停在空页上。
+			// 行数变少（删层级 / 换会话 / 切维度）时把页码收回到合法范围，否则会停在空页上。
 			useEffect(function () {
 				if (page > totalPages) setPage(totalPages);
 			}, [page, totalPages]);
+
+			/*
+			 * 两段标题。点标题 = 切到该维度并回到「全部」，
+			 * 这样从「按函数」切回「按层级」不用先去点某一条。
+			 */
+			/*
+			 * 两段标题。点标题 = 切到该维度并回到「全部」，
+			 * 这样从「按函数」切回「按层级」不用先去点某一条。
+			 * 整行就是一个 <button>，点击热区覆盖左右内边距，不是只有文字可点。
+			 */
+			function section(title, key, count) {
+				var on = axis === key;
+				return h("button", {
+					type: "button",
+					className: cn("dp-cat-section", on ? "is-active" : ""),
+					title: "按「" + title + "」查看",
+					"aria-pressed": on,
+					"data-it": "cat-section-" + key,
+					onClick: function () {
+						if (typeof props.onAxisChange === "function") props.onAxisChange(key);
+					}
+				},
+					h("span", { className: "dp-cat-section-label" }, title),
+					h("span", { className: "dp-cat-section-count" }, String(count))
+				);
+			}
 
 			return h("aside", {
 				className: "dp-sidebar",
 				// 高度跟表格走：有量到值就锁死上限，量不到用 CSS 里的兜底 62vh。
 				style: boardHeight > 0 ? { maxHeight: boardHeight + "px" } : null,
 			},
+				// 表头：标题 + 「新建层级」按钮（只作用于自定义层级那一段）。
 				h("div", { className: "dp-sidebar-head" },
 					h("span", { className: "dp-sidebar-title" }, "用例层级"),
-					h("span", { className: "dp-hint" }, "按函数")
+					h("div", { className: "dp-sidebar-tools" },
+						h(IconButton, {
+							name: "plus",
+							label: "新建层级",
+							"data-it": "cat-create",
+							onClick: function () {
+								// 新建层级前先把维度切到「自定义层级」，否则刚建完看不到它。
+								if (typeof props.onAxisChange === "function") props.onAxisChange("layer");
+								if (typeof props.onCreate === "function") props.onCreate();
+							}
+						})
+					)
 				),
 				h("div", { className: "dp-cat-scroll" },
-					// 勾选的引导文案统一放在表格下方的操作条里，左栏不再重复。
+					// ── 段一：自定义层级 ──
+					section("自定义层级", "layer", layerRowsList.length > 0 ? layerRowsList.length - 1 : 0),
+					axis === "layer"
+						? (layerRowsList.length <= 1
+							? h("div", { className: "dp-cat-empty" }, "还没有层级，点上边的 + 新建一个。")
+							: null)
+						: null,
+					// ── 段二：按被测函数 ──
+					section("按被测函数", "function", functionRowsList.length > 2 ? functionRowsList.length - 2 : 0),
+					/*
+					 * 行列表。函数维度的第一行是「全部用例」分组标题，
+					 * 层级维度的第一行「全部层级」同样是分组标题 —— 两者都会切回全部。
+					 */
 					visibleRows.map(function (row) {
-						// 全部用例可点击切回。
+						// 「全部用例」/「全部层级」：value 为空串，两个维度都是这个约定。
 						if (row.value === "") {
 							return h("button", {
 								key: row.key,
 								type: "button",
-								className: cn("dp-cat-group", activeCategory === "" ? "is-active" : ""),
+								className: cn("dp-cat-group", (axis === "layer" ? activeLayer : activeCategory) === "" ? "is-active" : ""),
 								// 条数本来就常驻显示，tooltip 里不再重复（用户反馈 hover 时多冒一个数字）。
 								title: "显示全部用例",
 								onClick: function () { props.onSelect(""); },
@@ -2797,9 +3234,10 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 								h("span", { className: "dp-cat-group-count" }, String(row.count))
 							);
 						}
+						var selected = axis === "layer" ? activeLayer === row.value : activeCategory === row.value;
 						return h("div", {
 							key: row.key,
-							className: cn("dp-cat", activeCategory === row.value ? "is-active" : ""),
+							className: cn("dp-cat", selected ? "is-active" : ""),
 						},
 							h("button", {
 								type: "button",
@@ -2811,7 +3249,28 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 								h("span", { className: "dp-cat-name" }, row.label),
 								h("span", { className: "dp-cat-count" }, String(row.count))
 							),
-							null
+							/*
+							 * 只有自定义层级这一段才有改名/删除 —— 函数层级是自动聚合出来的，
+							 * 删它等于删用例上的函数关联，语义不同，这里不提供。
+							 */
+							axis === "layer"
+								? h("span", { className: "dp-cat-ops" },
+									h("span", {
+										role: "button",
+										className: "dp-icon-btn",
+										title: "重命名层级",
+										"data-it": "cat-rename-" + row.value,
+										onClick: function () { if (typeof props.onRename === "function") props.onRename(row.value); }
+									}, h(Icon, { name: "edit", size: 12 })),
+									h("span", {
+										role: "button",
+										className: "dp-icon-btn danger",
+										title: "删除层级（用例退回默认层）",
+										"data-it": "cat-delete-" + row.value,
+										onClick: function () { if (typeof props.onDelete === "function") props.onDelete(row.value); }
+									}, h(Icon, { name: "trash", size: 12 }))
+								)
+								: null
 						);
 					})
 				),
@@ -3059,6 +3518,19 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 			var categoryState = useState("");
 			var activeCategory = categoryState[0];
 			var setActiveCategory = categoryState[1];
+			/*
+			 * 自定义层级（记录的 category 字段）的筛选值。
+			 * 与 activeCategory（被测函数）是**互斥**的两套维度：
+			 *   axis === "function" → 按 activeCategory 过滤
+			 *   axis === "layer"    → 按 activeLayer 过滤
+			 * 同时只用一个，避免两个条件叠成 AND 后筛出空表。
+			 */
+			var layerState = useState("");
+			var activeLayer = layerState[0];
+			var setActiveLayer = layerState[1];
+			var axisState = useState("function");
+			var axis = axisState[0];
+			var setAxis = axisState[1];
 			// 左栏常驻显示，不再提供折叠。
 			// 表格勾选（存 record.id）。
 			var pickedState = useState([]);
@@ -3190,8 +3662,14 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 			var filtered = useMemo(function () {
 				var needle = query.trim().toLowerCase();
 				return records.filter(function (record) {
-					// 函数关联来自统一字段，不从旧分类或测试函数猜测。
-					if (activeCategory !== "") {
+					/*
+					 * 两个维度互斥，按当前 axis 只判一个：
+					 *   按函数 —— 函数关联来自统一字段，不从旧分类或测试函数猜测；
+					 *   按层级 —— 只看记录的 category 字段。
+					 */
+					if (axis === "layer") {
+						if (activeLayer !== "" && categoryOf(record) !== activeLayer) return false;
+					} else if (activeCategory !== "") {
 						var owned = subjectFunctionOf(record);
 						if (activeCategory === null ? owned !== "" : owned !== activeCategory) return false;
 					}
@@ -3202,11 +3680,13 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 						.toLowerCase()
 						.indexOf(needle) !== -1;
 				});
-			}, [records, query, type, activeCategory]);
+			}, [records, query, type, activeCategory, activeLayer, axis]);
 
 
 			var categoryRows = useMemo(function () { return functionRows(records); }, [records]);
 			var functionNames = categoryRows.slice(2).map(function (row) { return row.value; });
+			// 自定义层的左栏行：显式清单 ∪ 记录里用到的（空层级也要能看见）。
+			var layerRowsData = useMemo(function () { return layerRows(records, snap.categories); }, [records, snap.categories]);
 
 			var pickedSet = useMemo(function () {
 				var map = Object.create(null);
@@ -3253,12 +3733,92 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 
 			function openCreate() {
 				setFormError("");
-				setForm({ mode: "create", record: { subjectFunction: activeCategory || "" } });
+				// 新建时把当前筛的两个维度带进表单：正在看哪个层级/函数，就默认落到那里。
+				setForm({
+					mode: "create",
+					record: {
+						subjectFunction: axis === "function" ? (activeCategory || "") : "",
+						category: axis === "layer" ? (activeLayer || "") : ""
+					}
+				});
 			}
 
 			function openEdit(record) {
 				setFormError("");
 				setForm({ mode: "edit", record: record });
+			}
+
+			/*
+			 * ── 自定义层级：新建 / 改名 / 删除 ──
+			 *
+			 * 数据落在记录的 category 字段上，清单由后端 categoryList 维护
+			 * （显式清单 ∪ 记录里用到的，所以空层级也能存在、能改名、能删）。
+			 * 这三个操作都不碰用例本身：删除层级只把用例退回默认层，一条都不删。
+			 */
+
+			/**
+			 * 左栏两段互斥切换。
+			 * 切维度时把另一维的选择清掉 —— 否则「按层级」还留着上次的函数筛选，
+			 * 一次都筛不到会让人以为用例丢了。
+			 */
+			function pickAxis(next) {
+				setAxis(next === "layer" ? "layer" : "function");
+				if (next === "layer") setActiveCategory("");
+				else setActiveLayer("");
+				setPage(1);
+				setPicked([]);
+			}
+
+			function pickLayer(value) {
+				setAxis("layer");
+				setActiveCategory("");
+				setActiveLayer(typeof value === "string" ? value : "");
+				setPage(1);
+				setPicked([]);
+			}
+
+			function pickFunction(value) {
+				setAxis("function");
+				setActiveLayer("");
+				setActiveCategory(value);
+				setPage(1);
+				setPicked([]);
+			}
+
+			/** 新建层级：不要求先勾用例，建完再往里放（旧版就是这个行为）。 */
+			function submitLayerName(name) {
+				var pending = categoryPrompt;
+				if (pending === null) return;
+				setCategoryPrompt(null);
+				setBusy(true);
+				var action = pending.mode === "rename"
+					? store.renameCategory(pending.from, name).then(function () {
+						setActiveAxisLayer(name);
+					})
+					: store.createCategory(name).then(function () {
+						setActiveAxisLayer(name);
+						// 建完重拉一次，左栏拿到的是落盘后的真实清单（含空层级）。
+						return store.load(true).catch(function () {});
+					});
+				action
+					.then(function () { store.setError(""); })
+					.catch(function (failure) {
+						store.setError((pending.mode === "rename" ? "重命名层级失败：" : "新建层级失败：")
+							+ (failure && failure.message ? failure.message : String(failure)));
+					})
+					.finally(function () { setBusy(false); });
+			}
+
+			/** 新建/改名成功后把筛选切到那个层级，用户能立刻看到它。 */
+			function setActiveAxisLayer(name) {
+				setAxis("layer");
+				setActiveCategory("");
+				setActiveLayer(name);
+				setPage(1);
+			}
+
+			function deleteLayer(name) {
+				setConfirm({ kind: "deleteCategory", category: name });
 			}
 
 			function submit(values) {
@@ -3285,6 +3845,15 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 				var action = null;
 				if (confirm.kind === "clearDemo") {
 					action = store.clearDemo();
+				} else if (confirm.kind === "deleteCategory") {
+					// 只解散层级：里面的用例退回默认层（category = ""），一条都不删。
+					action = store.deleteCategory(confirm.category).then(function () {
+						// 正在看这个层级的话，筛掉后会是空表，切回全部层级。
+						if (activeLayer === confirm.category) {
+							setActiveLayer("");
+							setPage(1);
+						}
+					});
 				} else {
 					action = store.remove(confirm.record.id);
 				}
@@ -3518,11 +4087,21 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 				h("div", { className: "dp-board" },
 					h(CategorySidebar, {
 						rows: categoryRows,
+						layerRows: layerRowsData,
+						axis: axis,
 						activeCategory: activeCategory,
+						activeLayer: activeLayer,
 						pickedCount: picked.length,
 						docked: docked,
 						boardHeight: boardHeight,
-						onSelect: function (value) { setActiveCategory(value); setPage(1); setPicked([]); }
+						onSelect: function (value) {
+							if (axis === "layer") pickLayer(value);
+							else pickFunction(value);
+						},
+						onAxisChange: pickAxis,
+						onCreate: function () { setCategoryPrompt({ mode: "layer" }); },
+						onRename: function (name) { setCategoryPrompt({ mode: "rename", from: name }); },
+						onDelete: deleteLayer
 					}),
 					h("div", { className: "dp-main" },
 						h("div", { className: "dp-card", ref: boardRef },
@@ -3541,7 +4120,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 											category: activeCategory,
 											total: records.length,
 											onClear: function () { setQuery(""); setType("all"); },
-											onGoDefault: function () { setActiveCategory(""); setPicked([]); },
+											onGoDefault: function () { setActiveCategory(""); setActiveLayer(""); setPicked([]); },
 											onCreate: openCreate
 										})
 										: h("table", { className: "dp-table" },
@@ -3700,7 +4279,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 							// 勾选反馈放在表格下方，不顶在表格上方。
 							picked.length > 0 ? h("div", { className: "dp-pick-bar" },
 								h("span", { className: "dp-pick-count" }, "已选 ", h("b", null, String(picked.length)), " 条"),
-								h(Button, { size: "sm", disabled: busy, onClick: function () { setCategoryPrompt({ initialValue: activeCategory || "" }); } }, "关联被测函数"),
+								h(Button, { size: "sm", disabled: busy, onClick: function () { setCategoryPrompt({ mode: "function", initialValue: activeCategory || "" }); } }, "关联被测函数"),
 								h(Button, { variant: "ghost", size: "sm", onClick: function () { setPicked([]); } }, "取消选择")
 							) : null,
 							loading || filtered.length === 0 ? null : h("div", { className: "dp-card-foot" },
@@ -3748,14 +4327,25 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 					sessionId: panelSessionId(props),
 					onClose: function () { setRunView(null); }
 				}) : null,
-				categoryPrompt !== null ? h(CategoryPrompt, {
-					title: "关联被测函数",
-					subtitle: "为已选的 " + picked.length + " 条用例设置源码中的业务函数。",
-					initialValue: categoryPrompt.initialValue,
-					functions: functionNames,
-					onSubmit: submitCategoryName,
-					onClose: function () { setCategoryPrompt(null); }
-				}) : null,
+				categoryPrompt !== null ? (categoryPrompt.mode === "layer" || categoryPrompt.mode === "rename"
+					? h(CategoryPrompt, {
+						mode: "layer",
+						title: categoryPrompt.mode === "rename" ? "重命名层级" : "新建层级",
+						subtitle: categoryPrompt.mode === "rename"
+							? "当前：" + categoryPrompt.from
+							: "层级用来把用例按业务模块分组，不影响「按被测函数」那一套。",
+						initialValue: categoryPrompt.mode === "rename" ? categoryPrompt.from : "",
+						onSubmit: submitLayerName,
+						onClose: function () { setCategoryPrompt(null); }
+					})
+					: h(CategoryPrompt, {
+						title: "关联被测函数",
+						subtitle: "为已选的 " + picked.length + " 条用例设置源码中的业务函数。",
+						initialValue: categoryPrompt.initialValue || "",
+						functions: functionNames,
+						onSubmit: submitCategoryName,
+						onClose: function () { setCategoryPrompt(null); }
+					})) : null,
 				// 删除执行记录：不可恢复，先确认（只删 runs/<runId>/，不动用例）。
 				removeRun !== null ? h(ConfirmDialog, {
 					title: "删除这次执行记录？",
@@ -3781,10 +4371,24 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 					}
 				}) : null,
 				confirm !== null ? h(ConfirmDialog, {
-					title: confirm.kind === "clearDemo" ? "清空示例用例？" : "删除这条用例？",
-					message: confirm.kind === "clearDemo" ? "只会移除标记为示例的用例，你后来新建或编辑过的内容会保留。" : "删除后无法恢复，右侧已打开的详情页也会变为空。",
-					detail: confirm.kind === "delete" ? h("span", null, "即将删除：", h("b", null, confirm.record.title)) : null,
-					confirmLabel: confirm.kind === "clearDemo" ? "清空示例" : "删除",
+					title: confirm.kind === "clearDemo"
+						? "清空示例用例？"
+						: (confirm.kind === "deleteCategory"
+							? "删除层级「" + confirm.category + "」？"
+							: "删除这条用例？"),
+					message: confirm.kind === "clearDemo"
+						? "只会移除标记为示例的用例，你后来新建或编辑过的内容会保留。"
+						: (confirm.kind === "deleteCategory"
+							? "层级会消失，里面的用例退回「默认」层，一条都不会被删。"
+							: "删除后无法恢复，右侧已打开的详情页也会变为空。"),
+					detail: confirm.kind === "delete"
+						? h("span", null, "即将删除：", h("b", null, confirm.record.title))
+						: (confirm.kind === "deleteCategory"
+							? h("span", null, "解散层级：", h("b", null, confirm.category), "（用例保留，退回默认层）")
+							: null),
+					confirmLabel: confirm.kind === "clearDemo"
+						? "清空示例"
+						: (confirm.kind === "deleteCategory" ? "删除层级" : "删除"),
 					busy: busy,
 					onCancel: function () { if (!busy) setConfirm(null); },
 					onConfirm: confirmAction
@@ -4498,28 +5102,29 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 				h("div", { className: "it-detail" },
 					field("title", "用例名称", "如 商品加入购物车", { required: true }),
 					/*
-					 * 用例分类直接填名称：填一个已有的就归到那个分类，填新的就是新建。
-					 * 这样不用先建分类再挂用例，录入链路短一截。
+					 * 用例功能项：下拉选择已有功能项。
+					 * 功能项由对话框按代码/需求规则生成（集成测试场景），
+					 * 所以这里只能选、不能当场新建。
 					 */
-					field("scenario", "用例分类", "如 商品与购物车", {
-						hint: "直接填写分类名称；填已有的分类就归到该分类，填新名称就是新建一个分类"
-					}),
-					field("description", "用例描述", "这条用例验证什么行为", { multiline: true }),
-					h("div", { className: "it-grid-2" },
-						h("label", { key: "type", className: "it-field" },
-							labelRow("测试类型", false),
-							readonly
-								? h("div", { className: "it-input", style: { minHeight: "30px", background: "var(--dp-bg2)" } }, IT_TYPES[form.type]?.label || "—")
-								: h("div", { className: "it-input-wrap" },
-									h("select", { className: "it-input", value: form.type, "data-it": "field-type", onChange: edit("type") },
-										IT_TYPE_KEYS.map(function (key) {
-											return h("option", { key: key, value: key }, IT_TYPES[key].label);
-										})
-									)
+					h("label", { key: "scenario", className: "it-field" },
+						labelRow("用例功能项", false),
+						readonly
+							? h("div", { className: "it-input", style: { minHeight: "30px", background: "var(--dp-bg2)" } }, form.scenario || "—")
+							: h("div", { className: "it-input-wrap" },
+								h("select", {
+									className: "it-input",
+									value: form.scenario,
+									"data-it": "field-scenario",
+									onChange: edit("scenario")
+								},
+									h("option", { value: "" }, "请选择功能项"),
+									(Array.isArray(props.scenarios) ? props.scenarios : []).map(function (name) {
+										return h("option", { key: name, value: name }, name);
+									})
 								)
-						),
-						field("precondition", "前置条件", "执行前需要满足的条件")
-					)
+							)
+					),
+					field("description", "用例描述", "这条用例验证什么行为", { multiline: true })
 				)
 			);
 		}
@@ -4548,8 +5153,9 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 
 			return h(Modal, {
 				title: "编辑测试步骤",
-				subtitle: (source.caseId ? source.caseId + " · " : "") + (source.title || ""),
-				className: "it-case-modal it-steps-modal",
+				// 副标题只留用例名称：用例标识（IT-001）已按要求去掉
+				subtitle: source.title || "",
+				className: "it-steps-modal",
 				onClose: props.onClose,
 				footer: [
 					h(Button, { key: "close", variant: "ghost", onClick: props.onClose }, "取消"),
@@ -4587,12 +5193,51 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 			});
 			var rows = state[0];
 			var setRows = state[1];
+			/*
+			 * 拖拽排序状态。组件自己管，因为 IntegrationStepsEditor 是独立组件，
+			 * 拿不到 IntegrationPanel 里那套 dragFrom / dragIndex。
+			 * 语义和测试用例页一致：按下记起点，移动到别的行时真实换位，松手结束。
+			 */
+			var dragFromState = useState(null);
+			var dragFrom = dragFromState[0];
+			var setDragFrom = dragFromState[1];
+			var dragIndexState = useState(null);
+			var dragIndex = dragIndexState[0];
+			var setDragIndex = dragIndexState[1];
 
 			function renumber(list) {
 				return list.map(function (row, index) {
 					return Object.assign({}, row, { no: index + 1 });
 				});
 			}
+			function beginDrag(index) {
+				setDragFrom(index);
+				setDragIndex(index);
+			}
+			function endDrag() {
+				setDragFrom(null);
+				setDragIndex(null);
+			}
+			/** 把第 from 行移动到第 to 行（拖动时实时换位）。 */
+			function moveRow(from, to) {
+				if (from === null || to === null || from === to) return;
+				if (from < 0 || from >= rows.length || to < 0 || to >= rows.length) return;
+				var next = rows.slice();
+				var item = next.splice(from, 1)[0];
+				next.splice(to, 0, item);
+				apply(function () { return next; });
+				setDragFrom(to);
+				setDragIndex(to);
+			}
+
+			// 拖动中松手要结束：鼠标可能已经离开列表，所以监听挂在 document 上。
+			useEffect(function () {
+				if (dragFrom === null) return undefined;
+				if (typeof document === "undefined" || typeof document.addEventListener !== "function") return undefined;
+				function onUp() { endDrag(); }
+				document.addEventListener("mouseup", onUp);
+				return function () { document.removeEventListener("mouseup", onUp); };
+			}, [dragFrom]);
 			/*
 			 * 所有改动都经这一个入口，而不是各处直接 setRows。
 			 *
@@ -4608,17 +5253,6 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 				setRows(next);
 				if (props.embedded === true && typeof props.onSave === "function") props.onSave(next);
 				return next;
-			}
-			function move(index, delta) {
-				var target = index + delta;
-				if (target < 0 || target >= rows.length) return;
-				apply(function (list) {
-					var next = list.slice();
-					var tmp = next[index];
-					next[index] = next[target];
-					next[target] = tmp;
-					return next;
-				});
 			}
 			function removeAt(index) {
 				apply(function (list) {
@@ -4654,12 +5288,31 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 				else props.onSave(Object.assign({}, props.record || {}, { steps: next }));
 			}
 
-			return h("div", null,
-				h("div", { className: "it-scroll-5" },
+			return h("div", { className: "it-steps-editor" },
+				/*
+				 * 列头：三列内容靠 placeholder 提示不够，长文本一填进去就看不出来是哪一列。
+				 * 序号 / 操作两列没有标题，用空字符串占位保持网格对齐。
+				 */
+				h("div", { className: "it-step-head" },
+					h("span", null, ""),
+					h("span", null, "测试方法"),
+					h("span", { className: "it-step-head-3" }, "输入步骤"),
+					h("span", null, "预期结果"),
+					h("span", null, "操作")
+				),
+				/*
+				 * 列表容器：嵌在弹窗里时（embedded）用 it-steps-scroll 吃满剩余高度；
+				 * 独立使用时退回 it-scroll-5 的紧凑上限（约五行）。
+				 */
+				h("div", { className: props.embedded === true ? "it-steps-scroll" : "it-scroll-5" },
 					rows.length === 0
 						? h("div", { className: "it-empty" }, "还没有步骤，点下面「新增步骤」加一条")
 						: rows.map(function (row, index) {
-							return h("div", { key: index, className: "it-step-row" },
+							return h("div", {
+								key: index,
+								className: cn("it-step-row", dragIndex === index ? "is-dragging" : ""),
+								onMouseEnter: function () { if (dragFrom !== null) moveRow(dragFrom, index); }
+							},
 								h("span", { className: "it-step-no" }, String(index + 1)),
 								h("input", {
 									className: "it-input",
@@ -4683,22 +5336,24 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 									onChange: change(index, "expected")
 								}),
 								h("span", { className: "it-step-ops" },
-									h(IconButton, {
-										name: "chevron",
-										label: "上移第 " + (index + 1) + " 步",
-										className: "it-step-up",
-										"data-it": "step-up-" + index,
-										disabled: index === 0,
-										onClick: function () { move(index, -1); }
-									}),
-									h(IconButton, {
-										name: "chevron",
-										label: "下移第 " + (index + 1) + " 步",
-										className: "it-step-down",
-										"data-it": "step-down-" + index,
-										disabled: index === rows.length - 1,
-										onClick: function () { move(index, 1); }
-									}),
+									/*
+									 * 拖拽手柄：与测试用例页同一个组件（6 个灰点的 grip 图标）。
+									 * 按住后在行间移动即可换位，松手落定。
+									 *
+									 * 顺序调整只靠这个手柄 —— 不再另放上移/下移按钮，
+									 * 两套入口做同一件事只会让操作列更挤。
+									 */
+									h("span", {
+										className: cn("it-drag-handle is-visible", dragIndex === index ? "is-active" : ""),
+										role: "button",
+										tabIndex: 0,
+										title: "拖动调整顺序",
+										"data-it": "step-drag-" + index,
+										onMouseDown: function (event) {
+											if (event && typeof event.preventDefault === "function") event.preventDefault();
+											beginDrag(index);
+										}
+									}, h(Icon, { name: "grip", size: 14 })),
 									h(IconButton, {
 										name: "trash",
 										danger: true,
@@ -4851,40 +5506,70 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 			var versionBtnRef = useRef(null);
 
 			/*
-			 * 点空白处 / 按 Esc 关闭两个下拉。
-			 * 菜单是 fixed 定位、浮在最上层，不主动关会一直悬在那里挡住表格。
-			 * 用捕获阶段监听，避免被内部按钮的 onClick 拦掉。
+			 * 点空白处 / 按 Esc 关闭所有下拉。
+			 *
+			 * 判断方式用 ref.contains(target)，而不是逐级比对 data-it：
+			 *   · ItMenu 虽然 CSS 是 position:fixed，DOM 上仍是触发按钮的同级/子节点，
+			 *     所以 contains 能正确区分「点菜单里」和「点菜单外」；
+			 *   · 原来那套 data-it 白名单要求每个新菜单都往名单里加一项，漏一个就关不掉，
+			 *     而且会漏掉菜单内部的文本节点/图标节点。
+			 *
+			 * 两个事件都监听：mousedown 处理常规点击，click 兜底某些环境里
+			 * mousedown 被宿主或 preventDefault 吃掉的情况。重复关闭是幂等的。
 			 */
 			useEffect(function () {
-				if (!switchOpen && !versionOpen) return undefined;
+				if (!switchOpen && !versionOpen && !resultOpen) return undefined;
 				if (typeof document === "undefined" || typeof document.addEventListener !== "function") return undefined;
-				function onDown(event) {
-					var target = event && event.target;
-					// 点在菜单内部或触发按钮上就交给各自的 onClick 处理。
+
+				/*
+				 * 判断点击是否落在某个下拉内部。
+				 *
+				 * 这里不用 ref.contains()：ItResultFilter 是普通函数、不是 React 组件
+				 * （它在 IntegrationPanel 渲染时被直接调用），传进去的 ref 不会被 React 绑定，
+				 * ref.current 永远是 null —— 那会导致「点菜单内部也被当成外部」，菜单立刻关掉。
+				 *
+				 * 改用 DOM 属性：三个下拉的容器都带 data-dropdown="switch|version|result"，
+				 * 菜单本身在容器内部（ItMenu 虽然 position:fixed，DOM 上仍是子孙节点），
+				 * 所以从事件目标逐级向上找这个属性即可。
+				 */
+				function insideDropdown(kind, target) {
 					var node = target;
 					while (node && node !== document) {
-						if (node.getAttribute && (node.getAttribute("data-it") === "switch-menu" ||
-							node.getAttribute("data-it") === "version-menu" ||
-							(node.getAttribute("data-it") || "").indexOf("menu-panel") !== -1)) return;
+						if (node.getAttribute && node.getAttribute("data-dropdown") === kind) return true;
 						node = node.parentNode;
 					}
+					return false;
+				}
+
+				function onDown(event) {
+					var target = event && event.target;
+					// 落在任一已打开的菜单内部 → 交给它们的 onClick 处理，不在这里关。
+					if (switchOpen && insideDropdown("switch", target)) return;
+					if (versionOpen && insideDropdown("version", target)) return;
+					if (resultOpen && insideDropdown("result", target)) return;
 					setSwitchOpen(false);
 					setVersionOpen(false);
+					setResultOpen(false);
 				}
 				function onKey(event) {
 					if (event && event.key === "Escape") {
 						setSwitchOpen(false);
 						setVersionOpen(false);
+						setResultOpen(false);
 					}
 				}
 				document.addEventListener("mousedown", onDown, true);
+				// click 兜底：个别宿主/浏览器里 mousedown 会被吞掉或先被 preventDefault，
+				// 再挂一个 click 保证「点空白一定关」。重复关闭是幂等的。
+				document.addEventListener("click", onDown, true);
 				document.addEventListener("keydown", onKey);
 				return function () {
 					document.removeEventListener("mousedown", onDown, true);
+					document.removeEventListener("click", onDown, true);
 					document.removeEventListener("keydown", onKey);
 				};
-			}, [switchOpen, versionOpen]);
-			// 子页：cases / steps / reports。
+			}, [switchOpen, versionOpen, resultOpen]);
+			// 子页：cases / steps / reports。默认进入测试用例页。
 			var tabState = useState("cases");
 			var tab = tabState[0];
 			var setTab = tabState[1];
@@ -4915,13 +5600,80 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 			var reportPageState = useState(1);
 			var reportPage = reportPageState[0];
 			var setReportPage = reportPageState[1];
+			/*
+			 * 报告页是「每个功能项一组、组内各自分页」，所以页码按组名各存一份。
+			 * 用 state 存 map，切换某组页码时只改那一项。
+			 */
+			var reportMapState = useState({});
+			var reportPageMap = reportMapState[0];
+			var setReportPageMap = reportMapState[1];
+			function setReportPageMapSet(groupName, page) {
+				setReportPageMap(function (previous) {
+					var next = Object.assign({}, previous);
+					next[groupName] = page;
+					return next;
+				});
+			}
 			var pageSizeState = useState(10);
 			var pageSize = pageSizeState[0];
 			var setPageSize = pageSizeState[1];
-			// 报告页被收起的场景名（默认全展开）。
-			var collapsedState = useState([]);
-			var collapsed = collapsedState[0];
-			var setCollapsed = collapsedState[1];
+			/*
+			 * 测试用例页的拖拽排序。
+			 * dragFrom 是「当前页可见列表里的下标」，null 表示没在拖；
+			 * dragIndex 只用来给正在拖的那一行加高亮。
+			 * 移动过程中就真实换位，松手即落定 —— 不做浮层预览，
+			 * 因为表格行高一致，直接换位反而更直观。
+			 */
+			var dragFromState = useState(null);
+			var dragFrom = dragFromState[0];
+			var setDragFrom = dragFromState[1];
+			var dragIndexState = useState(null);
+			var dragIndex = dragIndexState[0];
+			var setDragIndex = dragIndexState[1];
+			/*
+			 * 步骤页子表（执行记录）自己的分页。
+			 * 每条用例各记一个页码（按 record.id 存），展开多条时互不干扰；
+			 * 每页条数全局共用一个，选项按需求是 15 / 30 / 50 / 100。
+			 */
+			var subPageState = useState({});
+			var subPage = subPageState[0];
+			var setSubPage = subPageState[1];
+			var subSizeState = useState(15);
+			var subSize = subSizeState[0];
+			var setSubSize = subSizeState[1];
+			/*
+			 * 报告页哪些功能项分组是「展开」的。
+			 *
+			 * 默认空数组 = 全部收起，点标题才展开 —— 这与「所有下拉菜单默认为关闭」
+			 * 的要求一致：一进报告页看到的是各功能项的小结，而不是一屏铺开的表格。
+			 * 点刷新也会清空，回到全收起状态。
+			 */
+			var expandedGroupState = useState([]);
+			var expandedGroups = expandedGroupState[0];
+			var setExpandedGroups = expandedGroupState[1];
+			/*
+			 * 报告页的多选态。
+			 * multiSelect 为 true 时每行和每个分组标题前出现勾选框，
+			 * 顶部换成「退出多选 / 导出已选报告 / 全选 / 清空」这一行。
+			 * selected 存 record.id。
+			 */
+			var multiState = useState(false);
+			var multiSelect = multiState[0];
+			var setMultiSelect = multiState[1];
+			var selectedState = useState([]);
+			var selected = selectedState[0];
+			var setSelected = selectedState[1];
+			/*
+			 * 「执行结果」多选筛选（通过 / 未通过 / 异常）。
+			 * 空数组 = 不筛选；选了几项就只显示最新执行结果命中这几项的用例。
+			 */
+			var resultFilterState = useState([]);
+			var resultFilter = resultFilterState[0];
+			var setResultFilter = resultFilterState[1];
+			var resultOpenState = useState(false);
+			var resultOpen = resultOpenState[0];
+			var setResultOpen = resultOpenState[1];
+			var resultBtnRef = useRef(null);
 			/*
 			 * 步骤页里被展开的行（存 record.id）。
 			 * 只有测试步骤这一页有行内下拉：箭头挂在序号格里，展开后是执行结果子表。
@@ -4967,8 +5719,18 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 				});
 			}
 
-			function filtered() {
+			/*
+			 * 「按状态筛选」只在测试步骤页存在，所以这里拆成两个列表：
+			 *   baseCurrent —— 搜索 + 功能项 + 类型，三页共用
+			 *   current     —— 再叠加执行结果筛选，只给测试步骤页用
+			 * 用例页和报告页拿 baseCurrent，筛选不会漏到那两页去。
+			 */
+			function filteredBase() {
 				return itFilterRecords(records, { query: query, scenario: scenario, type: type, status: status });
+			}
+
+			function filtered() {
+				return itFilterRecords(records, { query: query, scenario: scenario, type: type, status: status, results: resultFilter });
 			}
 
 			/**
@@ -4990,8 +5752,72 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 				});
 			}
 
+			/*
+			 * 拖拽排序（仅测试用例页）。
+			 *
+			 * 做法：手柄按下时记下起始下标；鼠标进入别的行时把两行真实换位；
+			 * 松开（全局 mouseup）结束。全程手写，不依赖任何拖拽库。
+			 *
+			 * 换位操作作用于「过滤后的完整列表」而不是当前页的切片：
+			 * 这样跨页拖动也能落到正确位置，序号自然跟着重排。
+			 * 换位后把结果写回当前版本的数据（patchRecords）。
+			 */
+			function visibleOffset() {
+				var pageCount = Math.max(1, Math.ceil(filtered().length / pageSize));
+				var current = Math.min(Math.max(1, casePage), pageCount);
+				return (current - 1) * pageSize;
+			}
+
+			function beginDrag(index) {
+				setDragFrom(index);
+				setDragIndex(index);
+			}
+
+			function endDrag() {
+				setDragFrom(null);
+				setDragIndex(null);
+			}
+
+			/** 把列表中 from 位置的行移动到 to 位置（都在「过滤后列表」坐标系里）。 */
+			function moveRecord(from, to) {
+				if (from === to || from === null || to === null) return;
+				var base = visibleOffset();
+				var list = filtered();
+				var a = base + from;
+				var b = base + to;
+				if (a < 0 || b < 0 || a >= list.length || b >= list.length) return;
+				var movedId = list[a].id;
+				var targetId = list[b].id;
+				// 在完整 records 里按 id 交换两者的位置，其余不动。
+				var full = records.slice();
+				var ia = full.findIndex(function (r) { return r.id === movedId; });
+				var ib = full.findIndex(function (r) { return r.id === targetId; });
+				if (ia === -1 || ib === -1) return;
+				var item = full.splice(ia, 1)[0];
+				full.splice(ib, 0, item);
+				patchRecords(full);
+				setDragFrom(b);
+				setDragIndex(b);
+			}
+
+			// 拖动过程中松手要结束，鼠标可能已经离开表格，所以监听挂在 document 上。
+			useEffect(function () {
+				if (dragFrom === null) return undefined;
+				if (typeof document === "undefined" || typeof document.addEventListener !== "function") return undefined;
+				function onUp() { endDrag(); }
+				document.addEventListener("mouseup", onUp);
+				return function () { document.removeEventListener("mouseup", onUp); };
+			}, [dragFrom]);
+
 			function refresh() {
-				// 刷新只提示，不动数据：这里还没有后端可重读。
+				/*
+				 * 刷新时把所有下拉、以及报告页的功能项分组都收起来。
+				 * 用户点刷新就是想看最新的完整列表，留着半开的菜单/分组只会挡视线。
+				 */
+				setSwitchOpen(false);
+				setVersionOpen(false);
+				setResultOpen(false);
+				setExpandedGroups([]);
 				setNotice("演示数据：真实数据接入后这里会重读最新记录。");
 			}
 			function notConnected(name) {
@@ -5033,11 +5859,28 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 				if (typeCounts[record.type] !== undefined) typeCounts[record.type] += 1;
 			});
 			var current = filtered();
+			// 用例页 / 报告页使用的列表：不含「按状态筛选」，该筛选只属于测试步骤页。
+			var baseCurrent = filteredBase();
+
+			/*
+			 * 「筛选」按钮 + 提示条。定义在这里（IntegrationPanel 作用域）而不是 stepsView 里，
+			 * 原因是按钮要放进工具栏（在 stepsView 之前渲染），提示条归 stepsView 用。
+			 * 「已显示 / 总数」里的总数取未筛选前的集合，才是用户能感知的「筛掉了多少」。
+			 */
+			var filterParts = ItResultFilter({
+				value: resultFilter,
+				open: resultOpen,
+				buttonRef: resultBtnRef,
+				shown: current.length,
+				total: records.length,
+				onToggle: function (next) { setResultOpen(next); },
+				onChange: function (next) { setResultFilter(next); resetPages(); }
+			});
 
 			/** 场景侧栏。 */
 			function sidebar() {
 				return h("aside", { className: "it-side" },
-					h("div", { className: "it-side-title" }, "场景"),
+					h("div", { className: "it-side-title" }, "功能项"),
 					scenarios.map(function (row) {
 						return h("button", {
 							key: row.key,
@@ -5123,15 +5966,24 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 			 * 所以这里没有勾选框、没有执行按钮，操作列只有编辑和删除。
 			 */
 			function casesView() {
-				var rows = current;
+				var rows = baseCurrent;
 				var shown = pageRows(rows, casePage);
 				return h(React.Fragment, null,
 					h("div", { className: "it-board" },
 						sidebar(),
 						h("div", { className: "it-main" },
-							h("div", { className: "it-table-wrap", "data-it": "cases-table" },
-								rows.length === 0
-									? h("div", { className: "it-empty" }, query.trim() !== "" ? "没有匹配的用例" : "这个场景下还没有用例")
+							/* 和单元测试一样：表格 + 分页条包在一张卡片里（.dp-card 的观感） */
+							h("div", { className: "it-card" },
+								h("div", { className: "it-table-wrap", "data-it": "cases-table" },
+									rows.length === 0
+									? h("div", { className: "it-empty" },
+										h("div", { className: "it-empty-title" },
+											query.trim() !== "" ? "没有匹配的测试用例" : "当前还没有测试用例"),
+										h("div", { className: "it-empty-hint" },
+											query.trim() !== ""
+												? "换个关键词，或清空搜索条件再看看。"
+												: "点右上角「新增用例」手动加一条，或在对话框里让 AI 按需求生成测试用例。")
+									)
 									: h("table", { className: "it-table" },
 										h("thead", null,
 											h("tr", null,
@@ -5143,11 +5995,36 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 											)
 										),
 										h("tbody", null, shown.map(function (record, index) {
-											return h("tr", { key: record.id, "data-case-row": record.id },
-												h("td", null, String((Math.min(Math.max(1, casePage), Math.max(1, Math.ceil(rows.length / pageSize))) - 1) * pageSize + index + 1)),
+											return h("tr", {
+												key: record.id,
+												"data-case-row": record.id,
+												className: cn(dragIndex === index ? "is-dragging" : ""),
+												onMouseEnter: function () { if (dragFrom !== null) moveRecord(dragFrom, index); },
+												onMouseLeave: function () {}
+											},
+												h("td", null,
+													h("div", { className: "it-no-cell" },
+														/*
+														 * 拖拽手柄：6 个灰点 3×2、透明背景。
+														 * 按下记下起点，移动到别的行时真实换位（列表立刻跟着动），
+														 * 松开即结束。手写原生事件，不引第三方拖拽库。
+														 */
+														h("span", {
+															className: cn("it-drag-handle", dragIndex === index ? "is-active" : ""),
+															role: "button",
+															tabIndex: 0,
+															title: "拖动调整顺序",
+															"data-it": "drag-" + record.id,
+															onMouseDown: function (event) {
+																if (event && typeof event.preventDefault === "function") event.preventDefault();
+																beginDrag(index);
+															}
+														}, h(Icon, { name: "grip", size: 14 })),
+														h("span", null, String((Math.min(Math.max(1, casePage), Math.max(1, Math.ceil(rows.length / pageSize))) - 1) * pageSize + index + 1))
+													)
+												),
 												h("td", { className: "it-left" },
-													h("span", { className: "it-name-text" }, record.title || "—"),
-													record.caseId ? h("span", { className: "it-case-tag" }, record.caseId) : null
+													h("span", { className: "it-name-text" }, record.title || "—")
 												),
 												h("td", { className: "it-left" },
 													h("p", { className: "it-cell-2", title: record.description || "" }, record.description || "—")
@@ -5155,18 +6032,163 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 												h("td", null, itDate(record.createdAt)),
 												h("td", null,
 													h("div", { className: "it-ops" },
-														h(IconButton, { name: "edit", label: "编辑 " + (record.title || ""), "data-it": "edit-btn-" + record.id, onClick: function () { setDetail({ mode: "edit", record: record }); } }),
-														h(IconButton, { name: "trash", danger: true, label: "删除 " + (record.title || ""), "data-it": "delete-" + record.id, onClick: function () { confirmSet({ record: record }); } })
+														h(IconButton, { name: "edit", label: "编辑", "data-it": "edit-btn-" + record.id, onClick: function () { setDetail({ mode: "edit", record: record }); } }),
+														h(IconButton, { name: "trash", danger: true, label: "删除", "data-it": "delete-" + record.id, onClick: function () { confirmSet({ record: record }); } })
 													)
 												)
 											);
 										}))
 									)
 							),
-							rows.length > 0 ? pager(rows, casePage, setCasePage, "cases-pager") : null
+								rows.length > 0 ? pager(rows, casePage, setCasePage, "cases-pager") : null
+							)
 						)
 					)
 				);
+			}
+
+			/**
+			 * 子表分页（按原型图 5 的形态）：共 N 条，每页 [15条/页 ▾]  ‹ 1 ›
+			 *
+			 * 和主表那个 .dp-pager 不是一套：子表在展开区里，空间小、字号小，
+			 * 所以单独做一套紧凑的，选项固定 15 / 30 / 50 / 100。
+			 * 页码用按钮显示当前页；上一页 / 下一页是两端的箭头。
+			 */
+			function subPager(record, pageValue, setPageValue) {
+				var runs = Array.isArray(record.records) ? record.records : [];
+				var pageCount = Math.max(1, Math.ceil(runs.length / subSize));
+				var current = Math.min(Math.max(1, pageValue), pageCount);
+				return h(React.Fragment, null,
+					h("span", { className: "it-sp-total" }, "共 " + runs.length + " 条，每页"),
+					h("select", {
+						className: "it-sp-select",
+						value: String(subSize),
+						"data-it": "sub-page-size",
+						onChange: function (event) {
+							var next = Number(event.target.value);
+							setSubSize(next > 0 ? next : 15);
+							setPageValue(1);
+						},
+						"aria-label": "每页条数"
+					}, [15, 30, 50, 100].map(function (n) {
+						return h("option", { key: n, value: String(n) }, n + "条/页");
+					})),
+					h("button", {
+						type: "button",
+						className: "it-sp-btn",
+						disabled: current <= 1,
+						"data-it": "sub-page-prev",
+						onClick: function () { if (current > 1) setPageValue(current - 1); }
+					}, h(Icon, { name: "chevron", size: 11, style: { transform: "rotate(180deg)" } })),
+					h("button", {
+						type: "button",
+						className: "it-sp-page is-active",
+						"data-it": "sub-page-current",
+						onClick: function () { if (current < pageCount) setPageValue(current + 1); }
+					}, String(current)),
+					h("button", {
+						type: "button",
+						className: "it-sp-btn",
+						disabled: current >= pageCount,
+						"data-it": "sub-page-next",
+						onClick: function () { if (current < pageCount) setPageValue(current + 1); }
+					}, h(Icon, { name: "chevron", size: 11 }))
+				);
+			}
+
+			/**
+			 * 「筛选」按钮 + 多选下拉 + 已筛选提示条。
+			 *
+			 * 只在测试步骤页使用（测试用例 / 测试报告两页暂不加）。
+			 * 交互按要求：
+			 *   · 按钮文案固定为「筛选」，不显示当前筛的是哪个字段
+			 *   · 点列表外部要关闭（全局 mousedown 见 IntegrationPanel 的 useEffect）
+			 *   · 勾选后出现提示条：「已按状态筛选：当前显示 X / Y 条用例  清除筛选」
+			 */
+			function ItResultFilter(props) {
+				var picked = Array.isArray(props.value) ? props.value : [];
+				var open = props.open === true;
+				function emit(next) {
+					if (typeof props.onChange === "function") props.onChange(next);
+				}
+				var keys = IT_RESULT_FILTERS.map(function (item) { return item.key; });
+
+				var button = h("div", { className: "it-result-filter", "data-dropdown": "result" },
+					h("button", {
+						type: "button",
+						ref: props.buttonRef,
+						className: cn("it-filter-btn", open ? "is-open" : "", picked.length > 0 ? "is-filtered" : ""),
+						"aria-haspopup": "listbox",
+						"aria-expanded": open,
+						"data-it": "result-menu",
+						title: "按状态筛选用例",
+						onClick: function () {
+							if (typeof props.onToggle === "function") props.onToggle(!open);
+						}
+					},
+						h(Icon, { name: "filter", size: 14 }),
+						"筛选"
+					),
+					h(ItMenu, {
+						open: open,
+						anchorRef: props.buttonRef,
+						align: "right",
+						width: 196,
+						maxHeight: 210,
+						testId: "result-menu-panel"
+					},
+						/* 顶部一行：说明文字 + 全选 / 清空（清空 = 全不勾，不是关闭筛选） */
+						h("div", { className: "it-filter-head" },
+							h("span", { className: "it-filter-title" }, "按状态筛选用例"),
+							h("button", {
+								type: "button",
+								className: "it-filter-link",
+								"data-it": "result-select-all",
+								onClick: function () { emit(keys.slice()); }
+							}, "全选"),
+							h("button", {
+								type: "button",
+								className: "it-filter-link",
+								"data-it": "result-clear",
+								onClick: function () { emit([]); }
+							}, "清空")
+						),
+						/* 两列排布（对齐原型）：通过 / 未通过 在上，异常 在下 */
+						h("div", { className: "it-filter-grid" },
+							IT_RESULT_FILTERS.map(function (item) {
+								var on = picked.indexOf(item.key) !== -1;
+								return h("label", {
+									key: item.key,
+									className: "it-filter-cell",
+									"data-it": "result-" + item.key,
+									onClick: function (event) {
+										if (event && typeof event.preventDefault === "function") event.preventDefault();
+										emit(on
+											? picked.filter(function (x) { return x !== item.key; })
+											: picked.concat([item.key]));
+									}
+								},
+									h("span", { className: cn("it-filter-box", on ? "is-on" : "") }, on ? h(Icon, { name: "check", size: 11 }) : null),
+									h("span", null, item.label)
+								);
+							})
+						)
+					)
+				);
+
+				var bar = picked.length === 0
+					? null
+					: h("div", { className: "it-filter-bar", "data-it": "result-bar" },
+						h("span", null, "已按状态筛选：当前显示 ", h("b", null, String(props.shown)), " / ", String(props.total), " 条用例"),
+						h("button", {
+							type: "button",
+							className: "it-filter-link",
+							"data-it": "result-bar-clear",
+							onClick: function () { emit([]); }
+						}, "清除筛选")
+					);
+
+				return { button: button, bar: bar };
 			}
 
 			/**
@@ -5183,19 +6205,38 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 					h("div", { className: "it-board" },
 						sidebar(),
 						h("div", { className: "it-main" },
-							h("div", { className: "it-table-wrap", "data-it": "steps-table" },
-								rows.length === 0
-									? h("div", { className: "it-empty" }, "这个场景下还没有步骤")
+							/*
+							 * 主表上方：左边「测试步骤」说明，右边「筛选」按钮；勾选后下面多一条提示条。
+							 * 筛选按钮固定在这里，不随工具栏拥挤而移位。
+							 */
+							h("div", { className: "it-subbar", "data-it": "steps-subbar" },
+								h("span", { className: "it-subbar-label" }, "测试步骤"),
+								filterParts.button
+							),
+							filterParts.bar,
+							/* 表格 + 分页条包在卡片里，与单元测试同构 */
+							h("div", { className: "it-card" },
+								h("div", { className: "it-table-wrap", "data-it": "steps-table" },
+									rows.length === 0
+									? h("div", { className: "it-empty" },
+										h("div", { className: "it-empty-title" },
+											query.trim() !== "" ? "没有匹配的测试步骤" : "当前还没有测试步骤"),
+										h("div", { className: "it-empty-hint" },
+											query.trim() !== ""
+												? "换个关键词，或清空搜索条件再看看。"
+												: "先在「测试用例」页准备好用例，再点「生成测试步骤」。")
+									)
 									: h("table", { className: "it-table it-table-steps" },
 										h("thead", null,
 											h("tr", null,
 												h("th", { style: { width: "72px" } }, "序号"),
-												h("th", { style: { width: "18%" } }, "用例名称"),
-												h("th", { style: { width: "96px" } }, "测试方法"),
+												h("th", { style: { width: "17%" } }, "用例名称"),
+												h("th", { style: { width: "90px" } }, "测试方法"),
 												h("th", null, "输入步骤"),
 												h("th", null, "预期结果"),
+												h("th", { style: { width: "80px" } }, "执行结果"),
 												h("th", { style: { width: "92px" } }, "生成日期"),
-												h("th", { style: { width: "86px" } }, "操作")
+												h("th", { style: { width: "78px" } }, "操作")
 											)
 										),
 										h("tbody", null, shown.map(function (record, index) {
@@ -5229,17 +6270,25 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 													h("td", null, (first && first.action) || "—"),
 													h("td", { className: "it-left" }, stepLines(record, "operation") || h("span", { className: "it-muted" }, "—")),
 													h("td", { className: "it-left" }, stepLines(record, "expected") || h("span", { className: "it-muted" }, "—")),
+													/*
+													 * 执行结果：取这条用例最新一次执行记录的结果（通过 / 未通过 / 异常）。
+													 * 和下方展开的执行结果子表同一份数据，这里只给一眼能扫的结论。
+													 */
+													h("td", null, (function () {
+														var latest = IT_STATUS[itLatestResult(record)] || IT_STATUS.none;
+														return h("span", { className: "it-pill", "data-tone": latest.tone, "data-it": "result-cell-" + record.id }, latest.label);
+													})()),
 													h("td", null, itDate(record.createdAt)),
 													h("td", null,
 														h("div", { className: "it-ops" },
-															h(IconButton, { name: "eye", label: "查看 " + (record.title || ""), "data-it": "view-" + record.id, onClick: function () { setDetail({ mode: "view", record: record }); } }),
+															h(IconButton, { name: "play", label: "执行 " + (record.title || ""), "data-it": "run-" + record.id, onClick: function () { notConnected("执行"); } }),
 															h(IconButton, { name: "edit", label: "编辑步骤 " + (record.title || ""), "data-it": "edit-btn-" + record.id, onClick: function () { setDetail({ kind: "steps", record: record }); } })
 														)
 													)
 												),
 												open
 													? h("tr", { className: "it-expand-row" },
-														h("td", { colSpan: 7, "data-it": "step-runs-" + record.id },
+														h("td", { colSpan: 8, "data-it": "step-runs-" + record.id },
 															h("div", { className: "it-expand-box" },
 																h("table", { className: "it-mini it-mini-runs" },
 																	h("thead", null,
@@ -5258,7 +6307,11 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 																		if (runs.length === 0) {
 																			return h("tr", null, h("td", { colSpan: 7, className: "it-muted" }, "这条用例还没有执行记录"));
 																		}
-																		return runs.map(function (run, runIndex) {
+																		// 子表自己分页：页码按用例 id 各记一份
+																		var cur = Math.min(Math.max(1, subPage[record.id] || 1), Math.max(1, Math.ceil(runs.length / subSize)));
+																		var start = (cur - 1) * subSize;
+																		return runs.slice(start, start + subSize).map(function (run, i) {
+																			var runIndex = start + i;
 																			var runMeta = IT_STATUS[run.result] || IT_STATUS.none;
 																			return h("tr", { key: run.runId },
 																				h("td", null, String(runIndex + 1)),
@@ -5269,8 +6322,8 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 																				h("td", null, itTime(run.at)),
 																				h("td", null,
 																					h("div", { className: "it-ops" },
-																						h(IconButton, { name: "eye", label: "查看报告", onClick: function () { notConnected("查看报告"); } }),
-																						h(IconButton, { name: "doc", label: "导出报告", onClick: function () { notConnected("导出报告"); } }),
+																						h(IconButton, { name: "doc", label: "查看报告", "data-it": "report-sub", onClick: function () { notConnected("查看报告"); } }),
+																						h(IconButton, { name: "download", label: "导出报告", onClick: function () { notConnected("导出报告"); } }),
 																						h(IconButton, { name: "trash", danger: true, label: "删除记录", onClick: function () { notConnected("删除执行记录"); } })
 																					)
 																				)
@@ -5278,7 +6331,19 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 																		});
 																	})())
 																)
-															)
+															),
+															/* 子表底部的分页条（15 / 30 / 50 / 100），只在有多条记录时出现 */
+															(record.records || []).length > 0
+																? h("div", { className: "it-sub-pager" },
+																	subPager(record, subPage[record.id] || 1, function (next) {
+																		setSubPage(function (prev) {
+																			var map = Object.assign({}, prev);
+																			map[record.id] = next;
+																			return map;
+																		});
+																	})
+																)
+																: null
 														)
 													)
 													: null
@@ -5286,7 +6351,8 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 										}))
 									)
 							),
-							rows.length > 0 ? pager(rows, stepPage, setStepPage, "steps-pager") : null
+								rows.length > 0 ? pager(rows, stepPage, setStepPage, "steps-pager") : null
+							)
 						)
 					)
 				);
@@ -5300,8 +6366,8 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 			 * 分组头可点，收起后只留汇总行 —— 场景多的时候一眼能扫完通过率。
 			 */
 			function reportsView() {
-				var rows = current.filter(function (record) { return (record.records || []).length > 0; });
-				// 按场景归组，保持侧栏里的顺序（全部 → 各场景按名称）。
+var rows = baseCurrent.filter(function (record) { return (record.records || []).length > 0; });
+				// 按功能项归组，保持侧栏里的顺序（全部 → 各功能项按名称）。
 				var groups = [];
 				scenarios.forEach(function (item) {
 					if (item.name === IT_SCENARIOS_ALL) return;
@@ -5316,98 +6382,218 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 					});
 				});
 
-				// 分页作用于「所有纳入分组的用例」整体，不是每组各分各的。
-				var flat = groups.reduce(function (list, group) { return list.concat(group.records); }, []);
-				var currentPage = Math.min(Math.max(1, reportPage), Math.max(1, Math.ceil(flat.length / pageSize)));
-				var start = (currentPage - 1) * pageSize;
-				var end = start + pageSize;
-				var offset = 0;
+				var allIds = groups.reduce(function (list, group) {
+					return list.concat(group.records.map(function (r) { return r.id; }));
+				}, []);
+				var allChecked = allIds.length > 0 && allIds.every(function (id) { return selected.indexOf(id) !== -1; });
+
+				function toggleOne(id) {
+					setSelected(function (previous) {
+						return previous.indexOf(id) === -1
+							? previous.concat([id])
+							: previous.filter(function (x) { return x !== id; });
+					});
+				}
+				function toggleGroup(ids) {
+					var every = ids.every(function (id) { return selected.indexOf(id) !== -1; });
+					setSelected(function (previous) {
+						return every
+							? previous.filter(function (id) { return ids.indexOf(id) === -1; })
+							: previous.concat(ids.filter(function (id) { return previous.indexOf(id) === -1; }));
+					});
+				}
 
 				return h(React.Fragment, null,
-					h("div", { className: "it-overview-stat" },
-						h("span", null, "报告 ", h("b", null, String(rows.reduce(function (sum, record) { return sum + (record.records || []).length; }, 0))), " 份"),
-						h("span", null, "通过 ", h("b", null, String(rows.filter(function (r) { return r.status === "pass"; }).length)), " 条"),
-						h("span", null, "未通过 ", h("b", null, String(rows.filter(function (r) { return r.status === "fail"; }).length)), " 条")
-					),
+					/*
+					 * 顶部汇总行。多选态下换成「多选操作行」：
+					 * 退出多选 / 导出已选报告 / 全选 / 清空 —— 对齐原型图 4。
+					 */
+					multiSelect
+						? h("div", { className: "it-multi-bar", "data-it": "multi-bar" },
+							h("span", { className: "it-multi-stat" },
+								"共 ", h("b", null, String(rows.length)), " 条报告（通过 ",
+								String(rows.filter(function (r) { return r.status === "pass"; }).length),
+								" / 失败 ",
+								String(rows.filter(function (r) { return r.status === "fail"; }).length), "）"
+							),
+							h("button", { type: "button", className: "it-multi-link is-strong", "data-it": "multi-exit", onClick: function () { setMultiSelect(false); setSelected([]); } }, "退出多选"),
+							h("button", {
+								type: "button",
+								className: "it-multi-export",
+								"data-it": "multi-export",
+								disabled: selected.length === 0,
+								onClick: function () { notConnected("导出已选报告"); }
+							}, h(Icon, { name: "download", size: 13 }), "导出已选报告"),
+							h("button", { type: "button", className: "it-multi-link", "data-it": "multi-select-all", onClick: function () { setSelected(allIds.slice()); } }, "全选"),
+							h("button", { type: "button", className: "it-multi-link", "data-it": "multi-clear", onClick: function () { setSelected([]); } }, "清空")
+						)
+						: h("div", { className: "it-overview-stat" },
+							h("span", null, "报告 ", h("b", null, String(rows.reduce(function (sum, record) { return sum + (record.records || []).length; }, 0))), " 份"),
+							h("span", null, "通过 ", h("b", null, String(rows.filter(function (r) { return r.status === "pass"; }).length)), " 条"),
+							h("span", null, "未通过 ", h("b", null, String(rows.filter(function (r) { return r.status === "fail"; }).length)), " 条"),
+							// 「多选」是文字按钮，点开才进入多选态（对齐原型）
+							h("button", {
+								type: "button",
+								className: "it-multi-enter",
+								"data-it": "multi-enter",
+								onClick: function () { setMultiSelect(true); }
+							}, "多选")
+						),
 					groups.length === 0
-						? h("div", { className: "it-empty" }, "这个场景下还没有报告")
+						? h("div", { className: "it-empty" },
+							h("div", { className: "it-empty-title" }, "当前还没有测试报告"),
+							h("div", { className: "it-empty-hint" }, "在「测试步骤」页点「一键执行」，跑完就会在这里生成报告。"))
 						: h("div", { className: "it-report-groups" }, groups.map(function (group) {
-							// 这一组在本页里可见的行
-							var from = Math.max(start, offset);
-							var to = Math.min(end, offset + group.records.length);
-							var visible = to > from ? group.records.slice(from - offset, to - offset) : [];
-							var groupStart = offset;
-							offset += group.records.length;
-							if (visible.length === 0) return null;
-							var open = collapsed.indexOf(group.name) === -1;
+							/*
+							 * 每个分组各自分页：页码按组名存，互不影响。
+							 * （图 4 里每组都有自己的独立分页条。）
+							 */
+							var groupTotal = group.records.length;
+							var groupPages = Math.max(1, Math.ceil(groupTotal / pageSize));
+							var groupPage = Math.min(Math.max(1, (reportPageMap[group.name] || 1)), groupPages);
+							var groupStart = (groupPage - 1) * pageSize;
+							var visible = group.records.slice(groupStart, groupStart + pageSize);
+							var open = expandedGroups.indexOf(group.name) !== -1;
+							var groupIds = group.records.map(function (r) { return r.id; });
+							var groupChecked = groupIds.length > 0 && groupIds.every(function (id) { return selected.indexOf(id) !== -1; });
+
 							return h("section", { key: group.name, className: "it-report-group", "data-it": "report-group-" + group.name },
-								h("button", {
-									type: "button",
-									className: cn("it-report-head", open ? "" : "is-collapsed"),
-									"aria-expanded": open,
-									"data-it": "report-toggle-" + group.name,
-									onClick: function () {
-										setCollapsed(function (previous) {
-											return previous.indexOf(group.name) === -1
-												? previous.concat([group.name])
-												: previous.filter(function (item) { return item !== group.name; });
-										});
-									}
-								},
-									h("span", { className: "it-report-caret" }, h(Icon, { name: "chevron", size: 13 })),
-									h("span", { className: "it-report-name" }, group.name),
-									h("span", { className: "it-report-badge" }, String(group.reports) + " 条报告"),
+								h("div", { className: "it-report-head" },
+									multiSelect
+										? h("span", {
+											className: cn("it-filter-box", groupChecked ? "is-on" : ""),
+											role: "checkbox",
+											"aria-checked": groupChecked,
+											"data-it": "group-check-" + group.name,
+											onClick: function () { toggleGroup(groupIds); }
+										}, groupChecked ? h(Icon, { name: "check", size: 11 }) : null)
+										: null,
+									h("button", {
+										type: "button",
+										className: cn("it-report-toggle", open ? "" : "is-collapsed"),
+										"aria-expanded": open,
+										"data-it": "report-toggle-" + group.name,
+										onClick: function () {
+											setExpandedGroups(function (previous) {
+												return previous.indexOf(group.name) === -1
+													? previous.concat([group.name])
+													: previous.filter(function (item) { return item !== group.name; });
+											});
+										}
+									},
+										h("span", { className: "it-report-caret" }, h(Icon, { name: "chevron", size: 13 })),
+										h("span", { className: "it-report-name" }, group.name),
+										h("span", { className: "it-report-badge" }, String(group.reports) + " 条报告")
+									),
 									h("span", { className: "it-report-sum" },
 										"通过 ", h("b", null, String(group.passed)),
 										" / 失败 ", h("b", null, String(group.failed))
 									)
 								),
 								open
-									? h("div", { className: "it-table-wrap" },
-										h("table", { className: "it-table", "data-it": "reports-table" },
-											h("thead", null,
-												h("tr", null,
-													h("th", { style: { width: "52px" } }, "序号"),
-													h("th", { style: { width: "96px" } }, "用例标识"),
-													h("th", null, "用例名称"),
-													h("th", { style: { width: "96px" } }, "测试方法"),
-													h("th", { style: { width: "72px" } }, "执行结果"),
-													h("th", { style: { width: "96px" } }, "测试时间"),
-													h("th", { style: { width: "78px" } }, "操作")
-												)
-											),
-											h("tbody", null, visible.map(function (record, index) {
-												var meta = IT_STATUS[record.status] || IT_STATUS.none;
-												var first = (record.steps || [])[0];
-												return h("tr", { key: record.id, "data-case-row": record.id },
-													h("td", null, String(groupStart + (from - offset) + index + 1)),
-													h("td", null, h("span", { className: "it-case-id" }, record.caseId || "—")),
-													h("td", { className: "it-left" },
-														h("button", {
-															type: "button",
-															className: "it-name-btn",
-															title: record.title,
-															"data-it": "view-" + record.id,
-															onClick: function () { setDetail({ mode: "view", record: record }); }
-														}, record.title || "—")
-													),
-													h("td", null, (first && first.action) || "—"),
-													h("td", null, h("span", { className: "it-pill", "data-tone": meta.tone }, meta.label)),
-													h("td", null, itDate(record.lastRunAt)),
-													h("td", null,
-														h("div", { className: "it-ops" },
-															h(IconButton, { name: "eye", label: "查看报告 " + (record.title || ""), "data-it": "report-" + record.id, onClick: function () { notConnected("查看报告"); } }),
-															h(IconButton, { name: "doc", label: "导出报告 " + (record.title || ""), "data-it": "export-" + record.id, onClick: function () { notConnected("导出报告"); } })
-														)
+									? h(React.Fragment, null,
+										h("div", { className: "it-table-wrap" },
+											h("table", { className: "it-table", "data-it": "reports-table" },
+												h("thead", null,
+													h("tr", null,
+														multiSelect ? h("th", { style: { width: "40px" } }, "") : null,
+														h("th", { style: { width: "52px" } }, "序号"),
+														h("th", { style: { width: "96px" } }, "用例标识"),
+														h("th", null, "用例名称"),
+														h("th", { style: { width: "96px" } }, "测试方法"),
+														h("th", { style: { width: "72px" } }, "执行结果"),
+														h("th", { style: { width: "96px" } }, "测试时间"),
+														h("th", { style: { width: "78px" } }, "操作")
 													)
-												);
-											}))
-										)
+												),
+												h("tbody", null, visible.map(function (record, index) {
+													var meta = IT_STATUS[record.status] || IT_STATUS.none;
+													var first = (record.steps || [])[0];
+													var checked = selected.indexOf(record.id) !== -1;
+													return h("tr", { key: record.id, "data-case-row": record.id },
+														multiSelect
+															? h("td", null,
+																h("span", {
+																	className: cn("it-filter-box", checked ? "is-on" : ""),
+																	role: "checkbox",
+																	"aria-checked": checked,
+																	"data-it": "row-check-" + record.id,
+																	onClick: function () { toggleOne(record.id); }
+																}, checked ? h(Icon, { name: "check", size: 11 }) : null)
+															)
+															: null,
+														h("td", null, String(groupStart + index + 1)),
+														h("td", null, h("span", { className: "it-case-id" }, record.caseId || "—")),
+														h("td", { className: "it-left" },
+															h("button", {
+																type: "button",
+																className: "it-name-btn",
+																title: record.title,
+																"data-it": "view-" + record.id,
+																onClick: function () { setDetail({ mode: "view", record: record }); }
+															}, record.title || "—")
+														),
+														h("td", null, (first && first.action) || "—"),
+														h("td", null, h("span", { className: "it-pill", "data-tone": meta.tone }, meta.label)),
+														h("td", null, itDate(record.lastRunAt)),
+														h("td", null,
+															h("div", { className: "it-ops" },
+																h(IconButton, { name: "eye", label: "查看报告 " + (record.title || ""), "data-it": "report-" + record.id, onClick: function () { notConnected("查看报告"); } }),
+																h(IconButton, { name: "download", label: "导出报告 " + (record.title || ""), "data-it": "export-" + record.id, onClick: function () { notConnected("导出报告"); } })
+															)
+														)
+													);
+												}))
+											)
+										),
+										/* 组内分页（图 5 的形态）：共 N 条，每页 [15条/页] ‹ 1 › */
+										groupTotal > 0
+											? h("div", { className: "it-sub-pager" },
+												h("span", { className: "it-sp-total" }, "共 " + groupTotal + " 条，每页"),
+												h("select", {
+													className: "it-sp-select",
+													value: String(pageSize),
+													"data-it": "report-page-size",
+													onChange: function (event) {
+														var next = Number(event.target.value);
+														setPageSize(next > 0 ? next : 15);
+														setReportPageMap({});
+													},
+													"aria-label": "每页条数"
+												}, [15, 30, 50, 100].map(function (n) {
+													return h("option", { key: n, value: String(n) }, n + "条/页");
+												})),
+												h("button", {
+													type: "button",
+													className: "it-sp-btn",
+													disabled: groupPage <= 1,
+													"data-it": "report-page-prev",
+													onClick: function () {
+														if (groupPage > 1) setReportPageMapSet(group.name, groupPage - 1);
+													}
+												}, h(Icon, { name: "chevron", size: 11, style: { transform: "rotate(180deg)" } })),
+												h("button", {
+													type: "button",
+													className: "it-sp-page is-active",
+													onClick: function () {
+														if (groupPage < groupPages) setReportPageMapSet(group.name, groupPage + 1);
+													}
+												}, String(groupPage)),
+												h("button", {
+													type: "button",
+													className: "it-sp-btn",
+													disabled: groupPage >= groupPages,
+													"data-it": "report-page-next",
+													onClick: function () {
+														if (groupPage < groupPages) setReportPageMapSet(group.name, groupPage + 1);
+													}
+												}, h(Icon, { name: "chevron", size: 11 }))
+											)
+											: null
 									)
 									: null
 							);
-						})),
-					flat.length > 0 ? pager(flat, reportPage, setReportPage, "reports-pager") : null
+						}))
 				);
 			}
 
@@ -5481,7 +6667,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 							label: "搜索集成测试用例",
 							placeholder: "搜索标识、名称、说明或场景"
 						}),
-						h("div", { className: "it-switch" },
+						h("div", { className: "it-switch", "data-dropdown": "switch" },
 							h("button", {
 								type: "button",
 								ref: switchBtnRef,
@@ -5541,7 +6727,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 								"刷新"
 							),
 							// 版本切换：放在操作区，作为「当前查看的数据范围」。
-							h("div", { className: "it-version" },
+							h("div", { className: "it-version", "data-dropdown": "version" },
 								h("button", {
 									type: "button",
 									ref: versionBtnRef,
@@ -5558,26 +6744,48 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 									anchorRef: versionBtnRef,
 									align: "right",
 									width: 186,
-									maxHeight: 150,
+									/*
+									 * 最多露出 5 条，超过就滚动。
+									 * 每条实测约 30px（6px 上下内边距 + 12px 行高 + 间距），
+									 * 5 条 ≈ 150px，再留 8px 给菜单自身的内边距。
+									 */
+									maxHeight: 158,
 									testId: "version-menu-panel"
 								},
-									seed.versions.map(function (item) {
+									/*
+									 * 版本按创建顺序递增（V0.0.1 最早），展示时最新的排最上：
+									 * 当前版本 → 比它旧的依次往下。
+									 *
+									 * 排序依据是版本号里的数字段（major.minor.patch），
+									 * 不是字符串比较 —— 否则 V0.0.10 会排在 V0.0.9 前面。
+									 * 只复制一份再排，不动 seed.versions 本身。
+									 */
+									seed.versions
+										.slice()
+										.sort(function (a, b) {
+											return itVersionValue(b.name) - itVersionValue(a.name);
+										})
+										.map(function (item) {
+										var isCurrent = item.name === version;
 										return h("button", {
 											key: item.name,
 											type: "button",
-											className: cn("it-version-item", version === item.name ? "is-active" : ""),
+											className: cn("it-version-item", isCurrent ? "is-active" : ""),
 											"data-it": "version-" + item.name,
 											onClick: function () {
 												setVersion(item.name);
 												setVersionOpen(false);
-												// 换版本是一整套新数据，页码和折叠态都重置。
+												// 换版本是一整套新数据，页码和分组展开态都重置
 												setCasePage(1);
 												setStepPage(1);
 												setReportPage(1);
-												setCollapsed([]);
+												setExpandedGroups([]);
 											}
 										},
 											h("span", { className: "it-version-name" }, item.name),
+											isCurrent
+												? h("span", { className: "it-version-current" }, "当前")
+												: null,
 											h("span", { className: "it-version-meta" }, itTime(item.at))
 										);
 									})
@@ -5606,7 +6814,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 									variant: "ghost",
 									"data-it": "run-steps",
 									onClick: function () { notConnected("执行"); }
-								}, "执行")
+								}, "一键执行")
 								: null,
 							tab === "cases"
 								? h(Button, {
@@ -5640,6 +6848,10 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 						: h(IntegrationCaseEditor, {
 							mode: detail.mode,
 							record: detail.record,
+							// 功能项下拉的可选项：由现有用例聚合而来（不含「全部用例」这个虚拟项）。
+							scenarios: scenarios
+								.map(function (row) { return row.name; })
+								.filter(function (name) { return name !== IT_SCENARIOS_ALL; }),
 							onSave: saveCase,
 							onClose: function () { setDetail(null); }
 						}))
@@ -6748,7 +7960,10 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 			IntegrationPanel: IntegrationPanel,
 			IntegrationCaseEditor: IntegrationCaseEditor,
 			IntegrationStepsEditor: IntegrationStepsEditor,
+			IntegrationStepsModal: IntegrationStepsModal,
 			IntegrationOverview: IntegrationOverview,
+			itLatestResult: itLatestResult,
+			itVersionValue: itVersionValue,
 			DetailView: DetailView,
 			DetailEditor: DetailEditor,
 			FunctionField: FunctionField,
@@ -6772,6 +7987,8 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 			IntegrationCaseEditor: IntegrationCaseEditor,
 			IntegrationStepsEditor: IntegrationStepsEditor,
 			IntegrationOverview: IntegrationOverview,
+			itLatestResult: itLatestResult,
+			itVersionValue: itVersionValue,
 			buildIntegrationSeed: buildIntegrationSeed,
 			itFilterRecords: itFilterRecords,
 			itScenarioRows: itScenarioRows,

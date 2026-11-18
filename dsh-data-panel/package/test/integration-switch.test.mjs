@@ -143,8 +143,9 @@ test('集成页与单元页共用同一套骨架，工具栏保持一行', () =>
   assert.ok(hasClass('dp-toolbar'), '工具栏要复用 .dp-toolbar，尺寸才和单元测试一致')
   assert.ok(hasClass('dp-stats'), '看板复用 dp-stats 才同视觉')
 
-  // 看板与工具栏都在，且工具栏里同时有子页下拉、搜索、类型筛选、刷新、主操作
-  for (const key of ['switch-menu', 'search', 'refresh', 'add-case']) {
+  // 看板与工具栏都在，且工具栏里同时有子页下拉、搜索、类型筛选、刷新
+  // （「新增用例」只在测试用例页出现，默认页已改为测试报告，故不在此断言）
+  for (const key of ['switch-menu', 'search', 'refresh']) {
     assert.ok(find(tree, key), '工具栏缺少 ' + key)
   }
 

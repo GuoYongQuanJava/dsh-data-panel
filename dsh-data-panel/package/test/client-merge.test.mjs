@@ -172,7 +172,7 @@ test('勾选用例后打开批量关联，提交到当前会话，取消选择�
   assert.equal(nodes(h.render(props)).some(n => n.props?.className === 'dp-pick-bar'), false)
 })
 
-test('函数关联弹窗允许清空，侧栏保留分页且没有任意分类管理入口', () => {
+test('函数关联弹窗允许清空，侧栏保留分页且层级入口可用', () => {
   const h = harness(record), results = []
   const promptProps = { initialValue: 'Order.discount', onSubmit: x => results.push(x) }
   let tree = h.component(h.api.CategoryPrompt, promptProps)
@@ -184,11 +184,87 @@ test('函数关联弹窗允许清空，侧栏保留分页且没有任意分类�
   const rows = Array.from({ length: 12 }, (_, i) => ({ key: String(i), value: String(i), label: 'function' + i, count: 2 }))
   const props = { rows, activeCategory: '', boardHeight: 160, onSelect() {} }
   let sidebar = side.component(side.api.CategorySidebar, props)
-  assert.equal(nodes(sidebar).some(n => n.props?.label === '新建层级'), false)
+  // 自定义层级的「新建层级」入口必须存在（本轮恢复的功能）。
+  assert.ok(nodes(sidebar).some(n => n.props?.label === '新建层级'), '侧栏要有「新建层级」入口')
   assert.equal(nodes(sidebar).filter(n => n.props?.className === 'dp-cat-main').length, 3)
   nodes(sidebar).find(n => n.props?.title === '下一页层级').props.onClick()
   sidebar = side.component(side.api.CategorySidebar, props)
   assert.ok(nodes(sidebar).some(n => n.children?.includes('function3')))
+})
+
+test('左栏两段：自定义层级可新建改名删除，按函数段不出现增删入口', () => {
+  const h = harness(record)
+  const fnRows = [{ key: '__all__', value: '', label: '全部用例', count: 3 },
+    { key: '__unassigned__', value: null, label: '未关联函数', count: 1 },
+    { key: 'function:A', value: 'A', label: 'A', count: 2 }]
+  const layerRowsData = [{ key: '__all__', value: '', label: '全部层级', count: 3 },
+    { key: 'layer:订单', value: '订单', label: '订单', count: 2 }]
+  const calls = []
+  const props = {
+    rows: fnRows,
+    layerRows: layerRowsData,
+    axis: 'layer',
+    activeCategory: '',
+    activeLayer: '订单',
+    boardHeight: 400,
+    onSelect(v) { calls.push(['select', v]) },
+    onAxisChange(v) { calls.push(['axis', v]) },
+    onCreate() { calls.push(['create']) },
+    onRename(v) { calls.push(['rename', v]) },
+    onDelete(v) { calls.push(['delete', v]) }
+  }
+
+  const all = nodes(h.component(h.api.CategorySidebar, props))
+
+  // 两段标题都在。
+  assert.ok(all.some(n => n.props?.['data-it'] === 'cat-section-layer'))
+  assert.ok(all.some(n => n.props?.['data-it'] === 'cat-section-function'))
+
+  // 层级行有改名/删除；「全部层级」那行是分组标题，不该有。
+  assert.ok(all.some(n => n.props?.['data-it'] === 'cat-rename-订单'), '层级行要有重命名')
+  assert.ok(all.some(n => n.props?.['data-it'] === 'cat-delete-订单'), '层级行要有删除')
+  assert.equal(all.some(n => n.props?.['data-it'] === 'cat-rename-'), false, '分组标题行不应有改名')
+
+  // 三个入口都应把动作回传给父组件。
+  all.find(n => n.props?.['data-it'] === 'cat-create').props.onClick()
+  all.find(n => n.props?.['data-it'] === 'cat-rename-订单').props.onClick()
+  all.find(n => n.props?.['data-it'] === 'cat-delete-订单').props.onClick()
+  all.find(n => n.props?.['data-it'] === 'cat-section-function').props.onClick()
+  assert.deepEqual(calls, [['axis', 'layer'], ['create'], ['rename', '订单'], ['delete', '订单'], ['axis', 'function']])
+
+  // 切到「按函数」段：函数行不提供改名/删除（那是自动聚合出来的）。
+  const fnAll = nodes(h.component(h.api.CategorySidebar, { ...props, axis: 'function', activeLayer: '' }))
+  assert.equal(fnAll.some(n => String(n.props?.['data-it'] || '').startsWith('cat-rename-')), false, '函数段不应有重命名')
+  assert.equal(fnAll.some(n => String(n.props?.['data-it'] || '').startsWith('cat-delete-')), false, '函数段不应有删除')
+})
+
+test('层级弹窗与函数弹窗分流：层级走纯文本并禁用内置名', () => {
+  const h = harness(record), out = []
+  const layerProps = { mode: 'layer', title: '新建层级', initialValue: '', onSubmit: x => out.push(x) }
+  // 弹窗底部的「确定」在 props.footer 里，不在 children 里。
+  const okBtn = tree => tree.props.footer.find(n => n.props['data-it'] === 'layer-name-ok')
+  const input = tree => nodes(tree).find(n => n.props?.['data-it'] === 'layer-name-input')
+
+  let tree = h.component(h.api.CategoryPrompt, layerProps)
+  // 层级模式下不该出现被测函数的 datalist 输入
+  assert.equal(nodes(tree).some(n => n.type === h.api.FunctionField), false, '层级弹窗不应复用被测函数输入')
+  assert.ok(input(tree), '层级弹窗要有独立输入框')
+
+  // 空名不应提交
+  okBtn(tree).props.onClick()
+  assert.deepEqual(out, [])
+
+  // 内置名「默认」也不应提交
+  input(tree).props.onChange({ target: { value: '默认' } })
+  tree = h.component(h.api.CategoryPrompt, layerProps)
+  okBtn(tree).props.onClick()
+  assert.deepEqual(out, [])
+
+  // 正常名字可以提交
+  input(tree).props.onChange({ target: { value: '订单模块' } })
+  tree = h.component(h.api.CategoryPrompt, layerProps)
+  okBtn(tree).props.onClick()
+  assert.deepEqual(out, ['订单模块'])
 })
 
 test('批量关联和解除后立即更新真实 store 的层级计数，迟到响应不串会话', async () => {
