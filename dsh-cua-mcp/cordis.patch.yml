@@ -1,0 +1,7 @@
+# dsh-cua-mcp bundle patch
+#
+# 把 CUA 桌面驱动挂成一个插件行。装成 bundle 后，DSH 的「已安装插件」页会出现
+# dsh-cua-mcp 这一条，右侧开关控制它的加载与卸载 —— 关掉就等于不注册 MCP 服务器。
+- insert:
+    - id: cua-mcp
+      name: 'dsh-cua-mcp'

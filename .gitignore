@@ -3,3 +3,8 @@ __pycache__/
 .pytest_cache/
 testReport/calculator-report.docx
 node_modules/
+
+# dsh-cua-mcp 的 CUA 桌面驱动二进制（约 81 MB）不进版本库。
+# 它是第三方产物、有自己的发布版本，混进 Git 会让每次升级都在历史里留一份旧副本。
+# 部署时把 vendor/cua/ 单独打包分发即可；插件在缺二进制时只记一条警告、不报错。
+dsh-cua-mcp/vendor/cua/
