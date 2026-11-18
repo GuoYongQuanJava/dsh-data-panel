@@ -1,2 +1,9 @@
 deepseek-harness-0.2.2-rc.1-win-x64.exe filter=lfs diff=lfs merge=lfs -text
 vc_redist.x64.exe filter=lfs diff=lfs merge=lfs -text
+
+# dsh-cua-mcp 随包分发的 CUA 桌面驱动（集成测试的功能测试靠它点击真实界面）。
+# 二进制必须和插件一起走 —— 缺了它插件就无法注册 MCP 服务器。
+# 约 81 MB，走 LFS 避免仓库膨胀；克隆后用 git lfs pull 拉全实体。
+dsh-cua-mcp/vendor/cua/*.exe filter=lfs diff=lfs merge=lfs -text
+dsh-cua-mcp/vendor/cua/*.dll filter=lfs diff=lfs merge=lfs -text
+dsh-cua-mcp/vendor/cua/*.node filter=lfs diff=lfs merge=lfs -text

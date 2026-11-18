@@ -35,10 +35,24 @@ export function apply(ctx) {
   const cuaDir = join(dirname(dirname(fileURLToPath(import.meta.url))), 'vendor', 'cua')
   const cuaExe = join(cuaDir, 'cua-driver.exe')
 
+  /*
+   * 缺二进制时**明确报错，不静默降级**。
+   *
+   * 曾经的写法是 logger.warn 后 return —— 结果是插件出现在「已安装插件」里、
+   * 开关也是开的，但模型那边一个 mcp__cua__* 工具都没有，界面上没有任何提示。
+   * 用的人只能靠自己猜「是不是漏了什么」，实际排查成本很高。
+   *
+   * 现在：二进制是插件的组成部分，缺了就是包装坏了，直接把原因说清楚并抛出。
+   * 抛出会让本插件加载失败（独立插件，不影响其他插件），错误进入宿主日志与插件页。
+   */
   if (!existsSync(cuaExe)) {
-    // 精简分发包（不含二进制）时走到这里：不打服务器，但也不报错中断。
-    ctx.logger?.warn?.('dsh-cua-mcp: 找不到 %s，未注册 CUA 服务器', cuaExe)
-    return
+    throw new Error(
+      'dsh-cua-mcp: 缺少 CUA 驱动，无法注册 MCP 服务器。\n' +
+      '期望路径：' + cuaExe + '\n' +
+      'vendor/cua/ 是插件的组成部分，应随包一起分发（Git LFS 管理）。\n' +
+      '若刚克隆仓库，请先执行：git lfs pull\n' +
+      '若从离线包部署，请确认 vendor/cua/ 目录已完整拷贝（8 个文件，约 81 MB）。',
+    )
   }
 
   /*
