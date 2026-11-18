@@ -868,6 +868,24 @@ async function listRuns(root) {
   return runs
 }
 
+/**
+ * 读某次执行快照里冻结的用例（输入 / 预期输出）。
+ * 为什么要看快照：用例事后被改过时，历史记录必须显示“当时跑的那份”，
+ * 否则会出现“预期 -2 / 实际 -1 / 结果 通过”这种自相矛盾的行。
+ * 拿不到（旧版本没写快照）就返回 null，由上层给空值。
+ */
+async function readSnapshotCase(root, runId, caseId) {
+  try {
+    const file = join(root, 'runs', runId, 'snapshot', 'cases.json')
+    const parsed = JSON.parse(await readFile(file, 'utf8'))
+    const cases = Array.isArray(parsed?.cases) ? parsed.cases : []
+    const hit = cases.find((item) => item && String(item.caseId || '') === String(caseId))
+    return hit || null
+  } catch {
+    return null
+  }
+}
+
 
 function runQueryOf(req) {
   const url = new URL(req.url, 'http://localhost')
@@ -1337,6 +1355,10 @@ async function handleRunList(req, res) {
         const caseDuration = matchingTest && typeof matchingTest.durationMs === 'number'
           ? matchingTest.durationMs
           : (typeof result.durationMs === 'number' ? result.durationMs : 0)
+        // 输入 / 预期输出取“那次执行冻结的快照”，不是用例当前值。
+        const snapshotCase = query.scope === 'case'
+          ? await readSnapshotCase(root, run.runId, caseId)
+          : null
         runs.push({
           runId: run.runId,
           // 只回传列表需要的摘要字段；完整结果仍走 /result，避免列表过重。
@@ -1348,6 +1370,9 @@ async function handleRunList(req, res) {
           caseOutcome,
           message: matchingTest && typeof matchingTest.message === 'string' ? matchingTest.message : '',
           actual: matchingTest && typeof matchingTest.actual === 'string' ? matchingTest.actual : '',
+          // 执行当时的输入 / 预期输出（快照冻结值）。
+          input: snapshotCase && typeof snapshotCase.input === 'string' ? snapshotCase.input : '',
+          expected: snapshotCase && typeof snapshotCase.expected === 'string' ? snapshotCase.expected : '',
           durationMs: query.scope === 'case' ? caseDuration : (typeof result.durationMs === 'number' ? result.durationMs : 0),
           startedAt: typeof result.startedAt === 'string' ? result.startedAt : '',
           finishedAt: typeof result.finishedAt === 'string' ? result.finishedAt : '',

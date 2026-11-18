@@ -72,9 +72,9 @@ window.__ModuleLoader__.load({
 .dp-root ::-webkit-scrollbar { width: 10px; height: 10px; }
 .dp-root ::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--dp-text3) 28%, transparent); border: 3px solid transparent; border-radius: 999px; background-clip: padding-box; }
 .dp-root ::-webkit-scrollbar-track { background: transparent; }
-.dp-shell { max-width: 1180px; margin: 0 auto; padding: 26px 30px 56px; }
+.dp-shell { max-width: 1180px; margin: 0 auto; padding: 26px 30px 16px; }
 /* 右侧栏里的面板：容器窄，收紧留白并让工具栏折行，表格靠 .dp-card-scroll 横向滚动。 */
-.dp-root.dp-docked .dp-shell { max-width: none; padding: 14px 12px 28px; }
+.dp-root.dp-docked .dp-shell { max-width: none; padding: 14px 12px 12px; }
 .dp-root.dp-docked .dp-header { gap: 12px; }
 .dp-root.dp-docked .dp-title { font-size: 18px; margin: 4px 0 3px; }
 .dp-root.dp-docked .dp-subtitle { font-size: 12px; }
@@ -120,23 +120,29 @@ window.__ModuleLoader__.load({
 .dp-run-result { margin: 0 0 12px; padding: 9px 12px; border: 1px solid var(--dp-border); border-radius: 10px; color: var(--dp-text); font-size: 12px; white-space: pre-wrap; }
 .dp-alert button { margin-left: auto; padding: 0; border: 0; background: none; color: inherit; font: inherit; font-size: 12px; font-weight: 500; cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
 /* 上拉菜单要能溢出卡片，所以这里不用 overflow:hidden；圆角靠内层各自裁。 */
-.dp-card { position: relative; border: 1px solid var(--dp-border); border-radius: 14px; background: var(--dp-bg); }
-.dp-card-scroll { overflow-x: auto; overflow-y: hidden; }
+/* 卡片限高 + 弹性列：表头吸顶、分页贴底，只有中间表格区滚动。 */
+/* 卡片限高 + 弹性列：表头吸顶、分页贴底，只有中间表格区滚动。
+   max-height 不在 CSS 里写死（vh - 固定值 换分辨率就错位），由 JS 实测后设 inline style。 */
+.dp-card { position: relative; display: flex; flex-direction: column; border: 1px solid var(--dp-border); border-radius: 14px; background: var(--dp-bg); }
+.dp-card-scroll { flex: 1 1 auto; min-height: 0; overflow-x: auto; overflow-y: auto; }
 .dp-table { width: 100%; min-width: 720px; border-collapse: collapse; table-layout: fixed; }
 .dp-table th { padding: 11px 12px; border-bottom: 1px solid var(--dp-border); background: var(--dp-bg2); color: var(--dp-text3); font-size: 11px; font-weight: 600; letter-spacing: .05em; text-align: center; white-space: nowrap; }
+/* 表头吸顶：卡片内只有表格区滚动，所以 sticky 挂在滚动容器上。
+   border-collapse 会把 sticky 状态的底边框吃掉，用 inset 阴影补回。 */
+.dp-table thead th { position: sticky; top: 0; z-index: 2; box-shadow: inset 0 -1px 0 var(--dp-border); }
 /* 表头统一居中：即使某列表头带了 dp-right，也按居中显示。 */
 .dp-table th.dp-right { text-align: center; }
-.dp-table td { padding: 12px; border-bottom: 1px solid var(--dp-border2); vertical-align: middle; letter-spacing: .02em; }
+.dp-table td { padding: 12px; border-bottom: 1px solid var(--dp-border2); vertical-align: middle; letter-spacing: .02em; text-align: center; }
 .dp-table tbody tr:last-child td { border-bottom: 0; }
 .dp-row { transition: background .12s; }
 .dp-row:hover { background: var(--dp-bg2); }
-.dp-title-cell { display: flex; align-items: flex-start; gap: 6px; min-width: 0; }
+.dp-title-cell { display: flex; align-items: flex-start; justify-content: center; gap: 6px; min-width: 0; }
 /* 「示例」标签在两行标题里要贴第一行走。 */
 .dp-title-cell .dp-demo-tag { flex: 0 0 auto; margin-top: 1px; }
 .dp-title-link { display: inline-flex; align-items: center; min-width: 0; max-width: 100%; padding: 0; border: 0; background: none; color: var(--dp-text); font: inherit; font-weight: 550; text-align: left; cursor: pointer; }
 .dp-title-link:hover { color: var(--dp-brand); }
 .dp-title-link:hover .dp-title-text { text-decoration: underline; text-underline-offset: 3px; }
-.dp-title-text { display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 2; word-break: break-word; }
+.dp-title-text { display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 1; text-align: center; word-break: break-all; }
 .dp-demo-tag { flex: 0 0 auto; padding: 0 6px; border: 1px solid color-mix(in srgb, var(--dp-warning) 36%, transparent); border-radius: 5px; color: var(--dp-warning); font-size: 10px; line-height: 16px; }
 .dp-ext { display: inline-flex; flex: 0 0 auto; align-items: center; justify-content: center; width: 20px; height: 20px; border-radius: 6px; color: var(--dp-text3); }
 .dp-ext:hover { background: var(--dp-bg3); color: var(--dp-brand); }
@@ -147,10 +153,12 @@ window.__ModuleLoader__.load({
 .dp-pill[data-tone="blocked"] { background: color-mix(in srgb, var(--dp-danger) 10%, transparent); color: var(--dp-danger); }
 .dp-chip { display: inline-block; max-width: 100%; overflow: hidden; padding: 1px 8px; border: 1px solid var(--dp-border); border-radius: 6px; color: var(--dp-text2); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 /* 用例标识是无空格长串，2 行截断靠 break-all 才断得开。 */
-.dp-case-id { display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 2; color: var(--dp-text2); font-family: ui-monospace, SFMono-Regular, "Cascadia Code", Consolas, monospace; font-size: 12px; line-height: 1.45; word-break: break-all; }
-.dp-cell-text { display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 2; margin: 0; color: var(--dp-text2); font-size: 12px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
+.dp-case-id { display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 1; color: var(--dp-text2); font-family: ui-monospace, SFMono-Regular, "Cascadia Code", Consolas, monospace; font-size: 12px; line-height: 1.45; word-break: break-all; }
+.dp-cell-text { display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 2; margin: 0; color: var(--dp-text2); font-size: 12px; line-height: 1.55; text-align: center; white-space: pre-wrap; word-break: break-all; }
 /* 要 3 行的列（测试说明 / 输入 / 预期输出）加这个类。 */
 .dp-cell-text.dp-cell-3 { -webkit-line-clamp: 3; }
+/* 单行截断的列（用例表 / 执行记录）：超出的用省略号，全文靠 title 悬停看。 */
+.dp-cell-text.dp-cell-1 { -webkit-line-clamp: 1; }
 /*
  * 行首展开箭头：收起朝右，展开转 90 度朝下。
  * 尺寸比一行文字（12px × 1.45 ≈ 17.4px）大一些，所以用负 margin-top 把按钮中心
@@ -197,7 +205,7 @@ window.__ModuleLoader__.load({
 /* 操作列内容也居中，和它的表头对齐（表头已经是 text-align:center）。 */
 .dp-run-ops { display: flex; justify-content: center; gap: 2px; }
 /* 「实际输出」单元格里的原始文本。挂在 dp-left 上，和表头的对齐类保持一致。 */
-.dp-run-table td.dp-left pre { margin: 0; max-height: 72px; overflow: auto; white-space: pre-wrap; word-break: break-all; font-family: ui-monospace, SFMono-Regular, "Cascadia Code", Consolas, monospace; font-size: 11px; line-height: 1.5; color: var(--dp-text2); }
+.dp-run-table td.dp-left pre { margin: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-family: ui-monospace, SFMono-Regular, "Cascadia Code", Consolas, monospace; font-size: 11px; line-height: 1.5; color: var(--dp-text2); }
 .dp-run-state { display: inline-block; padding: 0 7px; border-radius: 5px; font-size: 11px; line-height: 18px; }
 .dp-run-state[data-tone="ok"] { background: color-mix(in srgb, #16a34a 14%, transparent); color: #16a34a; }
 .dp-run-state[data-tone="bad"] { background: color-mix(in srgb, var(--dp-danger) 12%, transparent); color: var(--dp-danger); }
@@ -293,7 +301,7 @@ window.__ModuleLoader__.load({
 .dp-type[data-tone="perf"] { border-color: color-mix(in srgb, var(--dp-warning) 36%, transparent); background: color-mix(in srgb, var(--dp-warning) 7%, transparent); color: var(--dp-warning); }
 .dp-owner { color: var(--dp-text2); }
 .dp-time { color: var(--dp-text3); font-size: 12px; white-space: nowrap; }
-.dp-actions { display: flex; justify-content: flex-end; align-items: center; gap: 0; }
+.dp-actions { display: flex; justify-content: center; align-items: center; gap: 0; }
 .dp-icon-btn { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; padding: 0; border: 0; border-radius: 8px; background: transparent; color: var(--dp-text3); cursor: pointer; transition: background .12s, color .12s; }
 .dp-icon-btn:hover { background: var(--dp-bg3); color: var(--dp-text); }
 .dp-icon-btn.danger:hover { background: color-mix(in srgb, var(--dp-danger) 10%, transparent); color: var(--dp-danger); }
@@ -1866,11 +1874,14 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 			return h("span", { className: "dp-case-id", title: value || "未填写用例标识" }, value || "—");
 		}
 
-		/** 单元格文本。默认截断 2 行，传 lines={3} 截断 3 行。 */
+		/** 单元格文本。默认截断 2 行；lines={1} 单行 + title 悬停看全文，lines={3} 截断 3 行。 */
 		function CellText(props) {
 			var value = props.value || "";
+			var cls = props.lines === 1 ? "dp-cell-1" : props.lines === 3 ? "dp-cell-3" : "";
 			return h("p", {
-				className: cn("dp-cell-text", props.lines === 3 ? "dp-cell-3" : "", value ? "" : "empty")
+				className: cn("dp-cell-text", cls, value ? "" : "empty"),
+				// 单行截断时把全文放 title，否则鼠标悬停看不到被截掉的部分。
+				title: value && props.lines === 1 ? value : undefined
 			}, value || "—");
 		}
 
@@ -2333,11 +2344,14 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 					h("thead", null,
 						h("tr", null,
 							h("th", { style: { width: "42px" } }, "#"),
-							h("th", { style: { width: "150px" } }, "执行时间"),
-							h("th", { style: { width: "92px" } }, "耗时"),
-							h("th", { className: "dp-grow" }, "实际输出"),
-							h("th", { style: { width: "82px" } }, "结果"),
-							h("th", { style: { width: "112px" } }, "操作")
+							h("th", { style: { width: "132px" } }, "执行时间"),
+							h("th", { style: { width: "72px" } }, "耗时"),
+							// 输入 / 预期输出：取那次执行的快照值（用例事后改了也不影响已跑过的记录）。
+							h("th", { style: { width: "150px" } }, "输入"),
+							h("th", { style: { width: "150px" } }, "预期输出"),
+							h("th", { className: "dp-grow", style: { width: "24%" } }, "实际输出"),
+							h("th", { style: { width: "72px" } }, "结果"),
+							h("th", { style: { width: "100px" } }, "操作")
 						)
 					),
 					h("tbody", null, view.runs.map(function (run, index) {
@@ -2350,6 +2364,12 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 							h("td", null, String(view.runs.length - index)),
 							h("td", { title: run.runId }, fmtFull(run.startedAt)),
 							h("td", { title: "执行结果记录的耗时" }, costText),
+							h("td", { className: "dp-left" },
+								h(CellText, { value: run.input, lines: 1 })
+							),
+							h("td", { className: "dp-left" },
+								h(CellText, { value: run.expected, lines: 1 })
+							),
 							h("td", { className: "dp-left" },
 								h("pre", { title: actualText }, actualText)
 							),
@@ -3067,6 +3087,38 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 				return function () { observer.disconnect(); };
 			}, []);
 
+			// 卡片可用高度 = 窗口高度 - 卡片顶边。
+			// 不用 vh - 固定值：那个数字换分辨率 / 缩放 / 窗口大小就错位，
+			// 要么下方留一大块空白，要么超出屏幕。这里实测，内容不满一屏时只当上限。
+			useEffect(function () {
+				if (typeof window === "undefined") return undefined;
+				var frame = 0;
+				function apply() {
+					frame = 0;
+					var node = boardRef.current;
+					if (!node) return;
+					var top = node.getBoundingClientRect().top;
+					if (!(top > 0)) return;
+					var avail = Math.round(window.innerHeight - top - 16);
+					if (avail < 240) avail = 240;
+					node.style.maxHeight = avail + "px";
+				}
+				function schedule() {
+					if (frame) return;
+					if (typeof requestAnimationFrame === "function") frame = requestAnimationFrame(apply);
+					else frame = setTimeout(apply, 16);
+				}
+				schedule();
+				// 数据加载后表头 / 统计行可能换行，卡片顶边会变，再量一次。
+				var late = setTimeout(schedule, 400);
+				window.addEventListener("resize", schedule);
+				return function () {
+					window.removeEventListener("resize", schedule);
+					clearTimeout(late);
+					if (frame && typeof cancelAnimationFrame === "function") cancelAnimationFrame(frame);
+				};
+			}, []);
+
 			function openLatestReport(scope, caseId, noDocMessage, noRunMessage) {
 				var sid = panelSessionId(props);
 				if (sid === "") { store.setError("还没取得当前会话"); return; }
@@ -3529,9 +3581,9 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 														)
 													),
 													h("td", null, h(TypeTag, { testType: record.testType })),
-													h("td", null, h(CellText, { value: record.description, lines: 3 })),
-													h("td", null, h(CellText, { value: record.input, lines: 3 })),
-													h("td", null, h(CellText, { value: record.expected, lines: 3 })),
+													h("td", null, h(CellText, { value: record.description, lines: 1 })),
+													h("td", null, h(CellText, { value: record.input, lines: 1 })),
+													h("td", null, h(CellText, { value: record.expected, lines: 1 })),
 													h("td", null,
 														h("div", { className: "dp-actions" },
 															h(IconButton, {
