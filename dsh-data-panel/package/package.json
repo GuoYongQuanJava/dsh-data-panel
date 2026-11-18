@@ -14,6 +14,7 @@
     "lib/index.js",
     "lib/client.js",
     "lib/runners.js",
+    "lib/scope.js",
     "lib/toolchain.js",
     "assets/run_tests.py",
     "cordis.patch.yml",

@@ -135,6 +135,7 @@ C++ / GoogleTest 项目：`binary` 指向构建产物，`preCommand` 可选地�
 | `command` | **必填**，字符串数组。`{target}` 单条目标、`{targets}` 本次全部目标 |
 | `preCommand` | 执行测试前先跑一次的命令（如 `cmake --build`）；非 0 退出码 → 状态 `build-failed` |
 | `targetArg` | batch 模式每个目标的写法，默认 `{file}::{target}`（如 pytest 的 `file.py::test_x`） |
+| `targetsSeparator` | batch 模式将多个目标嵌入同一个参数时的分隔符，默认空格；gtest 的 `--gtest_filter={targets}` 配 `:`，覆盖率重放沿用同一筛选 |
 | `junit` | batch 模式的 JUnit XML 路径，默认 `junit.xml`（在 run 目录下） |
 | `cwd` | 命令工作目录，默认 `{project}` |
 | `env` | 追加环境变量，值支持占位符 |
@@ -197,7 +198,7 @@ preset/runner.json 的 coverage 配置
 | `go` | `go test -coverprofile=coverage.out ./...` | 自带，无需插件 |
 | `maven` | `mvn test jacoco:report` | `pom.xml` 配 `jacoco-maven-plugin` |
 | `dotnet` | `dotnet test --collect:"XPlat Code Coverage"` | `coverlet.collector` 包 |
-| `ctest` / `gtest` / `meson` | 默认不采，用 `runner.json` 接 gcov/lcov | 如 `gcovr --xml -o coverage.xml` → `format: cobertura` |
+| `ctest` / `gtest` / `meson` | 默认不采，用 `runner.json.coverage` 接本地工具；Windows 客户环境优先 VS 工具 + gtest | 参见仓库 `skills/cpp-test/SKILL.md`；旧版 VS XML 保留原件，自动统计须使用已接入的格式，不能仅改扩展名 |
 
 C/C++ 的例子（接 lcov/gcovr 后就能出数字）：
 
@@ -303,6 +304,7 @@ type TestCase = {
   caseId: string                                      // 用例标识（≤80，留空时后端生成 TC-xxxxxxxx）
   title: string                                       // 用例名称（必填，≤200）
   testType: 'functional' | 'api' | 'boundary' | 'logic' | 'performance'
+  testTypes?: string[] // 主类型在首位，最多两类；旧单类型兼容，执行/报告不重复计数
   description: string                                 // 测试说明（≤2000）
   input: string                                       // 输入（≤4000，按换行原样展示）
   expected: string                                    // 预期输出（≤4000，按换行原样展示）
@@ -358,6 +360,10 @@ GET  /data-panel/tools
 ```
 
 `sessionId` 必填。缺失或为空时接口返回 `400`，不会再回退到任何共享文件。
+
+`testType` 保留主类型，`testTypes` 可含一个有依据的附加类型。默认单类型；双类型应在说明中写清验证依据。名称建议按函数组用 `T001/T002`，完整场景写 `description`，`caseId` 仍须会话内唯一。函数层级继续由 `subjectFunction` 自动聚合。
+
+日志接口额外返回 `analysis`，读取同一次运行的 `analysis.md`；`content` 始终保留 runner 原始日志。测试结束后模型可依据真实异常写分析旁注，界面明确标注“模型异常分析”，不改写原始日志、result.json 或报告数据。没有分析文件不影响原日志读取。
 
 用例的 `subjectFunction` 是插件统一支持的业务函数字段（最多 240 字符），与采用哪个 Skill 无关。自定义 Skill 可沿用以下创建格式，并在会话资产的 cases.json 中写入相同字段：
 
@@ -420,6 +426,7 @@ GET  /data-panel/tools
 ```
 lib/index.js          Host 半：会话存储 + API + 执行准备/日志读取
 lib/runners.js        运行器适配层：框架识别、runner.json 校验、目标提取与命令渲染
+lib/scope.js          源码文件清单、函数用例关联和排除证据核对
 lib/toolchain.js       工具链发现：任意工具名的多层搜索阶梯（与语言无关）
 lib/client.js         Client 半：「面板」按钮 + 右侧栏看板和详情
 assets/run_tests.py   通用执行器：按 request.runner 执行并产生日志与结构化结果
@@ -434,6 +441,12 @@ cordis.patch.yml      Bundle 挂载行
 - 详情正文：`ctx.slots.register({ name: 'sidebar.right.pane.tab', key: 'data-panel-detail' })`
 - 打开详情：`ctx.sidebarRight.openTab('data-panel-detail', { params: { id } })`
 - 新增语言/框架：往 `lib/runners.js` 的 `PRESETS` 加一项并写 `tools: [...]`（工具探活会自动覆盖它），或让项目写 `runner.json`
+
+## 测试范围与实际输出检查
+
+- 用 `node <插件目录>/lib/scope.js <项目路径> [业务源码目录 ...]` 生成文件和 SHA256 清单，审查函数、用例关联及排除理由后存为会话资产目录的 `scope.json`。排除项需真实命令、退出码和日志证据；详细格式见仓库 Skill 的 `references/test-scope.md`。
+- prepare 重新核对清单，将范围及证据摘要冻结到本次 `snapshot/scope.json`、request/result 的 `testScope`。旧项目缺清单或有遗漏时告警，兼容执行继续；`scope=all/case` 的原有含义不变。文件清单不等同于工具覆盖率，函数枚举仍需审查。
+- 生成测试代码后，用 `assets/run_tests.py --check-actual-json <序列化自测日志> [--cases <cases.json>]` 只读检查输出格式。正式执行后再次校验，`actualOutputValidation` 和日志记录具体用例、行号及原因。非法 JSON 不补造实际值，不改变断言结论，也不中断后续用例。
 
 ## 已知边界（v0.4）
 

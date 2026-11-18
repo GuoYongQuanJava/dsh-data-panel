@@ -1,0 +1,64 @@
+import test, { after } from 'node:test'
+import assert from 'node:assert/strict'
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
+import { scopeInventory, assessScope, scanSourceFiles } from '../lib/scope.js'
+
+const root = mkdtempSync(join(tmpdir(), 'dsh-scope-'))
+after(() => rmSync(root, { recursive: true, force: true }))
+function fixture() {
+  const project = mkdtempSync(join(root, 'project-'))
+  mkdirSync(join(project, 'src'))
+  writeFileSync(join(project, 'src/a.cpp'), 'int foo() { return 1; }\n')
+  return project
+}
+const cases = [{ caseId: 'TC-1', subjectFunction: 'src/a.cpp::foo' }]
+
+test('清单扫描真实源码，不因模型未纳入就漏掉整个文件', () => {
+  const project = fixture()
+  const inventory = scopeInventory(project, ['src'])
+  assert.equal(inventory.files.length, 1)
+  assert.equal(inventory.files[0].status, 'deferred')
+  writeFileSync(join(project, 'src/new.cpp'), 'int omitted() { return 2; }')
+  const result = assessScope(project, inventory, cases)
+  assert.equal(result.summary.scannedFiles, 2)
+  assert.ok(result.warnings.some((text) => text.includes('源码未列入清单：src/new.cpp')))
+})
+
+test('文件/函数/用例关联与源码哈希核验；单条范围不冒充全量执行', () => {
+  const project = fixture()
+  const inventory = scopeInventory(project, ['src'])
+  inventory.files[0] = { ...inventory.files[0], status: 'tested', functions: [{ subjectFunction: cases[0].subjectFunction, caseIds: ['TC-1'] }] }
+  const result = assessScope(project, inventory, cases, ['TC-1'])
+  assert.equal(result.status, 'reviewed')
+  assert.equal(result.summary.linkedFunctions, 1)
+  assert.deepEqual(result.selectedCaseIds, ['TC-1'])
+  writeFileSync(join(project, 'src/a.cpp'), 'int foo() { return 3; }')
+  assert.ok(assessScope(project, inventory, cases).warnings.some((text) => text.includes('SHA256')))
+  inventory.files[0].functions[0].caseIds = ['unknown']
+  assert.ok(assessScope(project, inventory, cases).warnings.some((text) => text.includes('关联不一致')))
+})
+
+test('排除须有命令、退出码、日志证据；将证据摘要绑定本次快照', () => {
+  const project = fixture()
+  const inventory = scopeInventory(project, ['src'])
+  inventory.files[0].status = 'excluded'
+  inventory.files[0].reason = '独立编译缺少客户专用依赖'
+  assert.ok(assessScope(project, inventory, []).warnings.some((text) => text.includes('排除项缺少')))
+  writeFileSync(join(project, 'compile.log'), 'fatal error: vendor.h not found')
+  inventory.files[0].proof = { command: 'cl /c src/a.cpp', exitCode: 2, logFile: 'compile.log' }
+  const result = assessScope(project, inventory, [])
+  assert.equal(result.status, 'reviewed')
+  assert.match(result.proofEvidence[0].content, /vendor.h/)
+  assert.equal(result.proofEvidence[0].sha256.length, 64)
+  writeFileSync(join(project, 'compile.log'), 'later change')
+  assert.match(result.proofEvidence[0].content, /vendor.h/)
+})
+
+test('缺少清单、错误格式、越界扫描均明确告警', () => {
+  const project = fixture()
+  assert.equal(assessScope(project, null, cases).status, 'missing')
+  assert.equal(assessScope(project, {}, cases).status, 'invalid')
+  assert.throws(() => scanSourceFiles(project, ['..']), /项目内/)
+})

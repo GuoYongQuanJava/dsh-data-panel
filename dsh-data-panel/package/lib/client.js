@@ -154,6 +154,8 @@ window.__ModuleLoader__.load({
 .dp-chip { display: inline-block; max-width: 100%; overflow: hidden; padding: 1px 8px; border: 1px solid var(--dp-border); border-radius: 6px; color: var(--dp-text2); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 /* 用例标识是无空格长串，2 行截断靠 break-all 才断得开。 */
 .dp-case-id { display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 1; color: var(--dp-text2); font-family: ui-monospace, SFMono-Regular, "Cascadia Code", Consolas, monospace; font-size: 12px; line-height: 1.45; word-break: break-all; }
+/* 用例行上的执行次数角标 */
+.dp-run-count { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px; background: var(--dp-brand); color: var(--dp-on-brand); font-size: 10.5px; font-weight: 600; line-height: 1; font-variant-numeric: tabular-nums; }
 .dp-cell-text { display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 2; margin: 0; color: var(--dp-text2); font-size: 12px; line-height: 1.55; text-align: center; white-space: pre-wrap; word-break: break-all; }
 /* 要 3 行的列（测试说明 / 输入 / 预期输出）加这个类。 */
 .dp-cell-text.dp-cell-3 { -webkit-line-clamp: 3; }
@@ -1050,6 +1052,8 @@ var TEST_TYPES = {
 	performance: { label: "性能测试", tone: "perf" }
 };
 var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
+var CASE_OUTCOME = { passed: "通过", failed: "未通过", error: "未通过", skipped: "跳过", unknown: "未确认", "": "" };
+var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", unknown: "idle", "": "" };
 		function testTypeOptions(value) {
 			var options = TEST_TYPE_KEYS.map(function (key) {
 				return h("option", { key: key, value: key }, TEST_TYPES[key].label);
@@ -2084,6 +2088,10 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 		}
 
 		/** 某次执行的原始日志。 */
+		function displayRunLog(data) {
+			if (!data || !data.exists) return "";
+			return (data.content || "") + (data.analysis ? "\n\n── 模型异常分析（辅助判断，非执行器原始输出）──\n" + data.analysis : "");
+		}
 		function fetchRunLog(sessionId, runId) {
 			var params = new URLSearchParams();
 			params.set("sessionId", sessionId);
@@ -2179,6 +2187,9 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 		}
 
 		function TypeTag(props) {
+			if (Array.isArray(props.testTypes) && props.testTypes.length > 1) {
+				return h("span", null, props.testTypes.map(function (type) { return h(TypeTag, { key: type, testType: type }); }));
+			}
 			var meta = TEST_TYPES[props.testType] || { label: "待重新分类", tone: "func" };
 			return h("span", { className: "dp-type", "data-tone": meta.tone }, meta.label);
 		}
@@ -2186,6 +2197,31 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 		function CaseId(props) {
 			var value = props.caseId || "";
 			return h("span", { className: "dp-case-id", title: value || "未填写用例标识" }, value || "—");
+		}
+		function typesOf(record) {
+			return [record.testType].concat(record.testTypes || []).filter(function (type, index, all) {
+				return TEST_TYPE_KEYS.indexOf(type) !== -1 && all.indexOf(type) === index;
+			});
+		}
+		function runSummaryKey(records) {
+			return records.map(function (record) {
+				return String(record.id || "") + "\u0000" + String(record.caseId || "");
+			}).join("\u0001");
+		}
+		function updateCaseStatus(previous, id, latestStatus) {
+			var next = Object.assign({}, previous);
+			if (latestStatus) next[id] = latestStatus;
+			else delete next[id];
+			return next;
+		}
+		function SecondaryType(props) {
+			var secondary = typesOf(props.values).filter(function (type) { return type !== props.values.testType; })[0] || "";
+			return h(Field, { label: "附加测试类型（可选）", hint: "默认留空；只有同一场景确实同时验证另一类目标时才选。" },
+				h("select", { className: "dp-select", value: secondary, onChange: function (event) {
+					props.onChange(event.target.value ? [props.values.testType, event.target.value] : [props.values.testType]);
+				} }, h("option", { value: "" }, "无"), TEST_TYPE_KEYS.filter(function (type) { return type !== props.values.testType; }).map(function (type) {
+					return h("option", { key: type, value: type }, TEST_TYPES[type].label);
+				})))
 		}
 
 		/** 单元格文本。默认截断 2 行；lines={1} 单行 + title 悬停看全文，lines={3} 截断 3 行。 */
@@ -2317,7 +2353,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 			},
 				h("div", { className: "dp-code-meta" },
 					record.caseId ? h("code", null, record.caseId) : null,
-					h(TypeTag, { testType: record.testType })
+					h(TypeTag, { testType: record.testType, testTypes: typesOf(record) })
 				),
 				code
 					? h("pre", { className: "dp-code-body" }, code)
@@ -2362,7 +2398,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 						var logData = both[1];
 						setView({
 							status: "ready",
-							content: logData && logData.exists ? (logData.content || "") : "",
+							content: displayRunLog(logData),
 							error: "",
 							updatedAt: (logData && logData.updatedAt) || "",
 							result: resultData && resultData.exists ? resultData.result : null,
@@ -2387,7 +2423,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 						if (!alive) return;
 						setView({
 							status: "ready",
-							content: log && log.exists ? (log.content || "") : "",
+							content: displayRunLog(log),
 							error: "",
 							updatedAt: (log && log.updatedAt) || "",
 							result: latest.result || null,
@@ -2670,6 +2706,10 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 					return run.status !== "running" && run.runId !== pendingRunId;
 				});
 				setView({ status: runs.length === 0 ? "empty" : "ready", runs: runs, error: "" });
+				if (typeof props.onRunsLoaded === "function") {
+					var latestOutcome = runs.length > 0 ? (runs[0].caseOutcome || runs[0].status || "") : "";
+					props.onRunsLoaded(record.id, runs.length, latestOutcome);
+				}
 			}
 
 			useEffect(function () {
@@ -2700,13 +2740,6 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 
 			var body = null;
 			// 等结果期间只显示执行状态，完成后在记录里显示耗时。
-			var waitingHint = null;
-			if (awaiting) {
-				waitingHint = h("div", { className: "dp-run-wait" },
-					h("span", { className: "dp-run-wait-dot" }),
-					"正在执行…"
-				);
-			}
 			if (view.status === "loading") {
 				body = h("div", { className: "dp-run-empty" }, "正在读取执行记录…");
 			} else if (view.status === "error") {
@@ -2778,8 +2811,6 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 			}
 
 			return h("div", { className: "dp-run-panel" },
-				// 等结果时把执行状态放最上面。
-				waitingHint,
 				h("div", { className: "dp-run-scroll", ref: scrollRef }, body)
 			);
 		}
@@ -2812,7 +2843,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 					setView({
 						status: "ready",
 						result: resultData && resultData.exists ? resultData.result : null,
-						log: logData && logData.exists ? (logData.content || "") : "",
+						log: displayRunLog(logData),
 						error: ""
 					});
 				}).catch(function (failure) {
@@ -3304,6 +3335,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 					caseId: initial.caseId || "",
 					title: initial.title || "",
 					testType: TEST_TYPE_KEYS.indexOf(initial.testType) !== -1 ? initial.testType : (props.mode === "edit" ? "" : "functional"),
+					testTypes: typesOf(initial),
 					description: initial.description || "",
 					input: initial.input || "",
 					expected: initial.expected || "",
@@ -3369,7 +3401,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 							className: "dp-input",
 							value: values.title,
 							maxLength: 200,
-							placeholder: "例如：RingBuffer功能测试",
+							placeholder: "例如：T001（详细场景填写在测试说明）",
 							onChange: function (event) { set("title", event.target.value); }
 						})
 					),
@@ -3386,9 +3418,10 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 						h("select", {
 							className: "dp-select",
 							value: values.testType,
-							onChange: function (event) { set("testType", event.target.value); }
+							onChange: function (event) { set("testType", event.target.value); set("testTypes", [event.target.value]); }
 						}, testTypeOptions(values.testType))
 					),
+					h(SecondaryType, { values: values, onChange: function (types) { set("testTypes", types); } }),
 					h(FunctionField, { value: values.subjectFunction, functions: props.functions, listId: "dp-form-functions", onChange: function (value) { set("subjectFunction", value); } }),
 					h(Field, { label: "测试说明", full: true },
 						h("textarea", {
@@ -3449,6 +3482,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 
 		function DataPanelView(props) {
 			var snap = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
+			var records = snap.records || [];
 			// 本组件只作为右侧栏的「测试用例」tab 渲染（apply 里带 dock: true 注册）。
 			// 主区那个入口已经改成 tab 行末尾的按钮（见 startPanelButton）。
 			var docked = props.dock === true;
@@ -3472,6 +3506,9 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 			var formErrorState = useState("");
 			var formError = formErrorState[0];
 			var setFormError = formErrorState[1];
+			var savedHintState = useState("");
+			var savedHint = savedHintState[0];
+			var setSavedHint = savedHintState[1];
 			var pageState = useState(1);
 			var page = pageState[0];
 			var setPage = pageState[1];
@@ -3506,6 +3543,41 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 			var runRefreshState = useState(0);
 			var runRefreshTick = runRefreshState[0];
 			var setRunRefreshTick = runRefreshState[1];
+			// 每条用例已执行的次数（来自 run list）。
+			var runCountsState = useState({});
+			var runCounts = runCountsState[0];
+			var setRunCounts = runCountsState[1];
+			// 每条用例最新一次执行的结果（passed / failed / error）。
+			var caseStatusesState = useState({});
+			var caseStatuses = caseStatusesState[0];
+			var setCaseStatuses = caseStatusesState[1];
+			var summaryRecordsKey = runSummaryKey(records);
+
+			// 首次加载时批量拉取所有用例的执行计数和最新状态。
+			useEffect(function () {
+				var sessionId = panelSessionId(props);
+				if (!sessionId || records.length === 0) return;
+				var active = true;
+				var promises = records.map(function (r) {
+					return fetchRunList(sessionId, "case", r.caseId).then(function (data) {
+						var runs = (data && data.runs) || [];
+						var latest = runs[0];
+						return { id: r.id, count: runs.length, status: latest ? (latest.caseOutcome || latest.status || "") : "" };
+					}).catch(function () { return { id: r.id, count: 0, status: "" }; });
+				});
+				Promise.all(promises).then(function (results) {
+					if (!active) return;
+					var counts = {};
+					var statuses = {};
+					results.forEach(function (r) {
+						counts[r.id] = r.count;
+						if (r.status) statuses[r.id] = r.status;
+					});
+					setRunCounts(counts);
+					setCaseStatuses(statuses);
+				});
+				return function () { active = false; };
+			}, [summaryRecordsKey, panelSessionId(props)]);
 			// 正在查看的那次执行（{ record, run }）。
 			var runViewState = useState(null);
 			var runView = runViewState[0];
@@ -3658,7 +3730,6 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 				store.load().catch(function () {});
 			}, []);
 
-			var records = snap.records || [];
 			var filtered = useMemo(function () {
 				var needle = query.trim().toLowerCase();
 				return records.filter(function (record) {
@@ -3673,7 +3744,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 						var owned = subjectFunctionOf(record);
 						if (activeCategory === null ? owned !== "" : owned !== activeCategory) return false;
 					}
-					if (type !== "all" && record.testType !== type) return false;
+					if (type !== "all" && typesOf(record).indexOf(type) === -1) return false;
 					if (!needle) return true;
 					return [record.caseId, record.title, record.description, record.input, record.expected, record.subjectFunction]
 						.join(" ")
@@ -3697,9 +3768,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 			var typeCounts = {};
 			TEST_TYPE_KEYS.forEach(function (key) { typeCounts[key] = 0; });
 			records.forEach(function (record) {
-				if (Object.prototype.hasOwnProperty.call(typeCounts, record.testType)) {
-					typeCounts[record.testType] += 1;
-				}
+				typesOf(record).forEach(function (type) { typeCounts[type] += 1; });
 			});
 
 			useEffect(function () {
@@ -3732,6 +3801,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 			}
 
 			function openCreate() {
+				setSavedHint("");
 				setFormError("");
 				// 新建时把当前筛的两个维度带进表单：正在看哪个层级/函数，就默认落到那里。
 				setForm({
@@ -3744,6 +3814,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 			}
 
 			function openEdit(record) {
+				setSavedHint("");
 				setFormError("");
 				setForm({ mode: "edit", record: record });
 			}
@@ -3830,6 +3901,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 				action
 					.then(function () {
 						setForm(null);
+						setSavedHint("用例已保存。若修改了输入、预期结果或测试场景，请同步检查对应测试代码，确保两者一致。");
 					})
 					.catch(function (error) {
 						setFormError(error.message);
@@ -4070,6 +4142,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 					),
 					// 勾选反馈放在表格下方（不占表格上方的空间）。
 					runResult ? h("div", { className: "dp-run-result" }, runResult) : null,
+					savedHint ? h("div", { className: "dp-hint", role: "status" }, savedHint) : null,
 					snap.error ? h("div", { className: "dp-alert" },
 						snap.error,
 						h("button", { type: "button", onClick: refresh }, "重试")
@@ -4132,6 +4205,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 												h("col", { style: { width: "19%" } }),
 												h("col", { style: { width: "13%" } }),
 												h("col", { style: { width: "13%" } }),
+											h("col", { style: { width: "7%" } }),
 												h("col", { style: { width: "16%" } })
 											),
 											h("thead", null,
@@ -4153,6 +4227,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 													h("th", null, "测试说明"),
 													h("th", null, "输入"),
 													h("th", null, "预期输出"),
+											h("th", null, "执行状态"),
 													h("th", { className: "dp-right" }, "操作")
 												)
 											),
@@ -4179,7 +4254,8 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 															"aria-expanded": isOpen,
 															onClick: function () { toggleExpand(record.id); }
 														}, h(Icon, { name: "chevron", size: 19 })),
-														h(CaseId, { caseId: record.caseId })
+														h(CaseId, { caseId: record.caseId }),
+																																							runCounts[record.id] > 0 ? h("span", { className: "dp-run-count", title: "已执行 " + runCounts[record.id] + " 次" }, String(runCounts[record.id])) : null
 													)
 												),
 													h("td", null,
@@ -4195,10 +4271,11 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 															record.demo ? h("span", { className: "dp-demo-tag" }, "示例") : null
 														)
 													),
-													h("td", null, h(TypeTag, { testType: record.testType })),
+													h("td", null, h(TypeTag, { testType: record.testType, testTypes: typesOf(record) })),
 													h("td", null, h(CellText, { value: record.description, lines: 1 })),
 													h("td", null, h(CellText, { value: record.input, lines: 1 })),
 													h("td", null, h(CellText, { value: record.expected, lines: 1 })),
+											h("td", null, caseStatuses[record.id] ? h("span", { className: "dp-run-state", "data-tone": CASE_TONE[caseStatuses[record.id]] || "idle" }, CASE_OUTCOME[caseStatuses[record.id]] || caseStatuses[record.id]) : null),
 													h("td", null,
 														h("div", { className: "dp-actions" },
 															h(IconButton, {
@@ -4228,6 +4305,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 																setRunResult(outcome.message + "  运行编号：" + prep.runId + "  框架：" + (prep.framework || prep.frameworkId || "未知"));
 																// 只标记本次执行；不订阅对话，不发起后台读取。
 																setAwaiting(function (previous) {
+																																																				setRunCounts(function (prev) { var next = Object.assign({}, prev); next[record.id] = (next[record.id] || 0) + 1; return next; });
 																	var next = Object.assign({}, previous);
 																	next[record.id] = { caseId: record.caseId, runId: prep.runId || "" };
 																	return next;
@@ -4257,7 +4335,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 											),
 											isOpen
 												? h("tr", { className: "dp-row-expand" },
-													h("td", { colSpan: 8, className: "dp-run-cell" },
+													h("td", { colSpan: 9, className: "dp-run-cell" },
 														h(RunRecords, {
 															record: record,
 															sessionId: panelSessionId(props),
@@ -4267,6 +4345,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 											onReport: function (run) { openRunReport(record, run); },
 											onLog: function (run) { setLogView({ record: record, runId: run.runId }); },
 															onRemove: function (runId, done) { setRemoveRun({ record: record, runId: runId, done: done }); },
+																										onRunsLoaded: function (id, count, latestStatus) { setRunCounts(function (prev) { var next = Object.assign({}, prev); next[id] = count; return next; }); setCaseStatuses(function (prev) { return updateCaseStatus(prev, id, latestStatus); }); },
 
 														})
 													)
@@ -4405,6 +4484,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 					caseId: record.caseId || "",
 					title: record.title || "",
 					testType: TEST_TYPE_KEYS.indexOf(record.testType) !== -1 ? record.testType : "",
+					testTypes: typesOf(record),
 					description: record.description || "",
 					input: record.input || "",
 					expected: record.expected || "",
@@ -4466,9 +4546,10 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 						h("select", {
 							className: "dp-select",
 							value: values.testType,
-							onChange: function (event) { set("testType", event.target.value); }
+							onChange: function (event) { set("testType", event.target.value); set("testTypes", [event.target.value]); }
 						}, testTypeOptions(values.testType))
 					),
+					h(SecondaryType, { values: values, onChange: function (types) { set("testTypes", types); } }),
 					h(FunctionField, { value: values.subjectFunction, functions: functionRows(store.getSnapshot().records).slice(2).map(function (row) { return row.value; }), listId: "dp-detail-functions", onChange: function (value) { set("subjectFunction", value); } }),
 					h(Field, { label: "测试说明" },
 						h("textarea", {
@@ -4529,7 +4610,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 				h("div", { className: "dp-detail-head" },
 					h("div", { className: "dp-detail-kicker" },
 						record.caseId ? h("span", { className: "dp-chip dp-chip-mono" }, record.caseId) : null,
-						h(TypeTag, { testType: record.testType }),
+						h(TypeTag, { testType: record.testType, testTypes: typesOf(record) }),
 						record.demo ? h("span", { className: "dp-demo-tag" }, "示例数据") : null
 					),
 					h("h2", { className: "dp-detail-title" }, record.title),
@@ -4605,6 +4686,9 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 			var id = typeof params.id === "string" ? params.id : "";
 			// 详情 Tab 由表格打开：带上记录所属会话，相对路径才能解析到工作区。
 			var sessionId = typeof params.sessionId === "string" ? params.sessionId : "";
+			var savedHintState = useState("");
+			var savedHint = savedHintState[0];
+			var setSavedHint = savedHintState[1];
 
 			var editingState = useState(false);
 			var editing = editingState[0];
@@ -4679,6 +4763,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 			function save(values) {
 				setBusy(true);
 				setError("");
+				setSavedHint("");
 				store.update(id, values, sessionId)
 					.then(function (updated) {
 						// 会话不一致时 store 不会动快照，这里补一份本地更新，界面才不会显得没保存。
@@ -4691,6 +4776,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 							});
 						}
 						setEditing(false);
+						setSavedHint("用例已保存。若修改了输入、预期结果或测试场景，请同步检查对应测试代码，确保两者一致。");
 					})
 					.catch(function (failure) {
 						setError(failure.message);
@@ -4787,6 +4873,7 @@ var TEST_TYPE_KEYS = ["functional", "api", "boundary", "logic", "performance"];
 					onCancel: function () { if (!busy) { setEditing(false); setError(""); } }
 				}) : null,
 				!editing && error ? h("div", { className: "dp-alert", style: { marginTop: "12px" } }, error) : null,
+				!editing && savedHint ? h("div", { className: "dp-hint", role: "status" }, savedHint) : null,
 				confirm ? h(ConfirmDialog, {
 					title: "删除这条用例？",
 					message: "删除后无法恢复，列表和右侧详情都会同步移除。",
@@ -7309,14 +7396,22 @@ var rows = baseCurrent.filter(function (record) { return (record.records || []).
 				"3. 结束时写 result.json（退出码 / 通过失败数 / 耗时 / 状态）。",
 				"",
 				"要求：",
+				"本次测试结束后，对异常按 Skill 写 runs/<runId>/analysis.md：记录用例编号、真实异常、证据位置、已确认或推测原因及建议。不要改写 run.log 或 result.json；不要因此中途暂停确认或自动修复，日志窗口会单独标注模型分析。",
+				"提醒：本次执行使用磁盘上的测试代码，请注意它与当前用例信息保持一致；此提醒无需确认，不增加执行前检查或暂停。",
 				"1. 原样执行上面的命令，不要新建或修改测试文件，也不要改成跑别的用例。",
 				"2. 跑完后先按 Skill 的 Step 6，用本次 runId 生成 Word 报告到 reports/<runId>/（单条执行也要，文件名带 caseId）；如果项目还没配置报告模板，就明确告诉我缺什么，不要跳过不说。然后再总结。",
 				"3. 总结时用一两句话说明：通过还是失败、失败的是哪条用例、失败原因是什么。",
 				"4. 如果命令本身起不来（找不到运行时、测试文件缺失、权限问题），把报错原文告诉我，不要自己另找测试文件重跑。",
-				"5. 如果命令告诉你“测试文件在准备后被修改”，停下来告诉我要重新点一次执行，不要自己重跑。"
+				"5. 如果命令告诉你“测试文件在准备后被修改”，停下来告诉我要重新点一次执行，不要自己重跑。",
+				"用例与测试代码的一致性核对只在本次全部测试执行结束、按原流程处理报告后进行，结果仅写在最终对话总结中。不要因此中途暂停、要求确认、修改用例或代码，也不要修改 runner 的测试结果或报告数据。",
+				"核对本次会话资产目录 " + prep.root + " 下 runs/" + prep.runId + "/request.json 指定的 casesFile 与 snapshotTestFile，按 caseId 和 testFunc 对照输入、预期结果、测试场景与实际断言，不要拿后来修改的文件代替本次快照。",
+				"有明确证据不一致时，最终对话逐条列出用例编号、用例要求和测试代码的具体差异，并说明可能导致测试结果不能准确反映当前用例要求。无法读取快照或无法判断时明确说未能确认一致性；没有发现明显差异时如实说明，不把测试通过当作一致性证明，不编造问题清单。"
 			];
 			if (Array.isArray(prep.missingTestFunc) && prep.missingTestFunc.length > 0) {
 				lines.push("6. 注意：以下用例没有关联测试函数/测试名，这次不会被执行：" + prep.missingTestFunc.join("、"));
+			}
+			if (Array.isArray(prep.scopeWarnings) && prep.scopeWarnings.length > 0) {
+				lines.push("测试范围提醒（不暂停本次执行，不要求中途确认）：" + prep.scopeWarnings.slice(0, 20).join("；") + (prep.scopeWarnings.length > 20 ? "；另有 " + (prep.scopeWarnings.length - 20) + " 项，见本次 request.json 的 testScope.warnings" : "") + "。完成后结合 request/result 中的 testScope 明确实际测试范围，不得将本次结果宣称为全工程全部通过。");
 			}
 			return lines.join("\n");
 		}
@@ -7966,6 +8061,10 @@ var rows = baseCurrent.filter(function (record) { return (record.records || []).
 			itVersionValue: itVersionValue,
 			DetailView: DetailView,
 			DetailEditor: DetailEditor,
+			SecondaryType: SecondaryType,
+			displayRunLog: displayRunLog,
+			runSummaryKey: runSummaryKey,
+			updateCaseStatus: updateCaseStatus,
 			FunctionField: FunctionField,
 			DetailBody: DetailBody,
 			RecordFormModal: RecordFormModal,

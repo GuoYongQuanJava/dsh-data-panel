@@ -523,6 +523,7 @@ export function resolveRunner({ project, root }) {
     testFile,
     command,
     targetArg,
+    targetsSeparator: typeof merged.targetsSeparator === 'string' ? merged.targetsSeparator : ' ',
     binary,
     preCommand,
     targetCompose: typeof merged.targetCompose === 'string' ? merged.targetCompose : '',
@@ -564,21 +565,36 @@ export function targetOf(record, runner) {
       continue
     }
     if (!match) continue
-    if (runner.targetCompose) {
-      const composed = runner.targetCompose.replace(/\{(\d+)\}/g, (whole, index) => {
-        const part = match[Number(index)]
-        return typeof part === 'string' ? part.trim() : ''
-      }).trim()
-      if (composed !== '') return composed
-      continue
-    }
-    if (typeof match[1] === 'string' && match[1].trim() !== '') return match[1].trim()
+    const target = targetFromMatch(match, runner)
+    if (target !== '') return target
   }
   return ''
 }
 
-/** 测试文件里是否真的有这个目标；runner.json 没给规则时不做判断。 */
+/** 提取与定位共用同一套捕获组和组合规则，避免测试名漂移。 */
+function targetFromMatch(match, runner) {
+  if (runner.targetCompose) {
+    return runner.targetCompose.replace(/\{(\d+)\}/g, (whole, index) => {
+      const part = match[Number(index)]
+      return typeof part === 'string' ? part.trim() : ''
+    }).trim()
+  }
+  return typeof match[1] === 'string' ? match[1].trim() : ''
+}
+
+/** 优先定位同名测试声明；无法提取时沿用原有声明规则。 */
 export function targetLine(testText, target, runner) {
+  for (const source of runner.targetExtract || []) {
+    try {
+      for (const match of testText.matchAll(new RegExp(source, 'gm'))) {
+        if (targetFromMatch(match, runner) === target) {
+          return testText.slice(0, match.index).split('\n').length
+        }
+      }
+    } catch {
+      // 自定义提取规则无效时继续尝试其他规则及原有定位方式。
+    }
+  }
   if (!runner.targetDeclare) return 0
   const replacement = runner.targetDotted
     ? String(target).split('.').map((part) => escapeRegExp(part)).join('\\s*,\\s*')
@@ -674,6 +690,7 @@ export function renderRunnerSpec(runner, ctx) {
     cwd: fillPlaceholders(runner.cwd, mergedCtx),
     command: renderedCommand,
     targetArg: runner.targetArg,
+    targetsSeparator: runner.targetsSeparator,
     targetEscape: runner.targetEscape,
     junit,
     env: Object.fromEntries(Object.entries(runner.env || {}).map(([key, value]) => [key, fillPlaceholders(value, mergedCtx)])),

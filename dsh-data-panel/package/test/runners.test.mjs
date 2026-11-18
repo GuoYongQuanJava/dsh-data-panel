@@ -14,6 +14,7 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
+import { Readable } from 'node:stream'
 
 // 测试不能写用户真实的 DSH_HOME；但先用它找到 DSH 自带的 Python。
 const REAL_DSH_HOME = process.env.DSH_HOME || join(homedir(), '.dsh')
@@ -30,6 +31,7 @@ process.env.DSH_PYTHON_PATH = existsSync(BUNDLED_PYTHON)
 const { __test } = await import('../lib/index.js')
 const { PRESETS, detectPreset, targetOf, targetDeclared, targetLine, resolveRunner, renderRunnerSpec, escapeRegExp } =
   await import('../lib/runners.js')
+const { scopeInventory } = await import('../lib/scope.js')
 
 const tempDirs = []
 test('结构化变量在面板保存和导出时保持真实名称及取值', async () => {
@@ -155,6 +157,39 @@ test('gtest：TEST(Suite, Name) 组合成 Suite.Name，并按逗号形式校验'
   assert.equal(targetDeclared('TEST(Suite, Pass) {}', 'Suite.Pass', gtest), true)
   assert.equal(targetDeclared('TEST(Suite, Pass) {}', 'Suite.Other', gtest), false)
   assert.equal(targetLine('// generated\nTEST(Suite, Pass) {}', 'Suite.Pass', gtest), 2)
+  assert.equal(targetLine('TEST(Suite, Other) {}\nTEST_F(Suite, Pass) {}', 'Suite.Pass', gtest), 2)
+})
+
+test('查看 JS 测试：跳过注册表并按完整测试名找到后续声明', () => {
+  const text = [
+    'const cases = ["adds", "adds [1]+", "subs"];',
+    'test("adds", () => {});',
+    'test.only("subs", () => {});',
+    'it.skip("adds [1]+", () => {});',
+  ].join('\r\n')
+  for (const preset of ['vitest', 'jest', 'node-test']) {
+    const runner = PRESETS[preset]
+    assert.equal(targetLine(text, 'adds', runner), 2)
+    assert.equal(targetLine(text, 'subs', runner), 3)
+    assert.equal(targetLine(text, 'adds [1]+', runner), 4)
+    assert.equal(targetDeclared(text, 'adds [1]+', runner), true)
+  }
+})
+
+test('查看测试：缺少、无效或未命中的提取规则沿用原定位方式', () => {
+  const text = '// header\nregister("custom");'
+  const targetDeclare = '[\'"]{target}[\'"]'
+  for (const targetExtract of [undefined, [], ['['], PRESETS.pytest.targetExtract, ['(?=.)']]) {
+    assert.equal(targetLine(text, 'custom', { targetDeclare, targetExtract }), 2)
+  }
+  assert.equal(targetLine(text, 'missing', { targetDeclare }), 0)
+  assert.equal(targetLine(text, 'custom', {}), 0)
+})
+
+test('查看测试：忽略无效规则并按捕获组组合目标名', () => {
+  const runner = { ...PRESETS.gtest, targetExtract: ['[', ...PRESETS.gtest.targetExtract] }
+  assert.equal(targetLine('TEST(Suite, Other) {}\nTEST(Suite, Pass) {}', 'Suite.Pass', runner), 2)
+  assert.equal(targetOf({ code: 'TEST(Suite, Pass) {}' }, runner), 'Suite.Pass')
 })
 
 test('resolveRunner：runner.json 可以覆盖预置，也可以完全自定义', () => {
@@ -392,6 +427,139 @@ test('查看测试代码与执行使用同一测试文件和目标，忽略指�
   const request = JSON.parse(readFileSync(join(root, 'runs', prep.runId, 'request.json'), 'utf8'))
   assert.equal(request.testFile, view.testFile)
   assert.deepEqual(request.targets, [{ caseId: 'TC-2', func: view.testFunc }])
+})
+
+test('查看 JS 测试代码接口按已保存测试名定位函数声明，忽略注册表和旧源码链接', async () => {
+  const project = makeDir('panel-js-test-code-')
+  const sessionId = 'js-test-code'
+  const root = join(project, '.dsh', 'test-sessions', sessionId)
+  write(join(root, 'runner.json'), JSON.stringify({ preset: 'node-test' }))
+  write(join(root, 'cases.json'), JSON.stringify({ cases: [{ caseId: 'TC-1', testFunc: 'subs' }] }))
+  const file = join(root, 'tests', 'test_generated.test.mjs')
+  write(file, 'const cases = ["subs"];\ntest("adds", () => {});\ntest("subs", () => {});\n')
+  const store = { records: [makeRecord({ caseId: 'TC-1', code: '', codeRef: join(project, 'src.js') + '#L1' })] }
+  const view = await __test.resolveTestCode({ sessionId, cwd: project, caseId: 'TC-1', store })
+  assert.equal(view.testFile, file)
+  assert.equal(view.testFunc, 'subs')
+  assert.equal(view.line, 3)
+  assert.match(view.warning, /codeRef/)
+})
+
+test('日志读取分离模型分析，保留真实异常原文，缺分析时仍可读取', async () => {
+  const project = makeDir('panel-analysis-')
+  const root = writePytestProject(project)
+  const prep = await __test.prepareRun({ sessionId: 'test-session-1', cwd: project, scope: 'case', caseId: 'TC-1', store: { records: [makeRecord({ caseId: 'TC-1', code: 'def test_add_ok(): pass' })] } })
+  const runDir = join(root, 'runs', prep.runId)
+  const original = 'AssertionError: expected 6, got 5\n'
+  write(join(runDir, 'run.log'), original)
+  const readLog = async () => {
+    let status, data
+    const req = Readable.from([])
+    req.method = 'GET'; req.url = '/data-panel/run/log?sessionId=test-session-1&runId=' + prep.runId; req.headers = {}
+    await __test.handleRunLog(req, { writeHead(value) { status = value }, end(value) { data = JSON.parse(value) } })
+    assert.equal(status, 200)
+    return data
+  }
+  assert.equal((await readLog()).analysis, '')
+  write(join(runDir, 'analysis.md'), 'TC-1：预期与断言可能不一致；证据 run.log:1，原因尚未确认。')
+  const response = await readLog()
+  assert.equal(response.content, original)
+  assert.match(response.analysis, /原因尚未确认/)
+  assert.equal(readFileSync(join(runDir, 'run.log'), 'utf8'), original)
+})
+
+test('gtest batch 与覆盖率重放共用本次筛选，VS Cobertura 解析不冒充 MC/DC', () => {
+  const project = makeDir('panel-vs-coverage-')
+  const root = join(project, '.dsh', 'test-sessions', 'vs')
+  write(join(root, 'runner.json'), JSON.stringify({
+    preset: 'gtest', mode: 'batch', targetArg: '{target}', targetsSeparator: ':',
+    command: ['{binary}', '--gtest_filter={targets}', '--gtest_output=xml:{junit}'],
+    junit: 'junit.xml',
+    coverage: { command: ['C:/VS/Microsoft.CodeCoverage.Console.exe', 'collect', '--output-format', 'cobertura', '--output', '{coverageFile}', '{binary}', '--gtest_filter={targets}'], format: 'cobertura', file: 'coverage/coverage.xml' },
+  }))
+  const runner = resolveRunner({ project, root })
+  const spec = renderRunnerSpec(runner, { project, root, runId: 'run-vs', runDir: join(root, 'runs', 'run-vs'), binary: runner.binary })
+  assert.equal(spec.targetsSeparator, ':')
+  const report = join(project, 'coverage.xml')
+  write(report, '<coverage lines-valid="10" lines-covered="7" branches-valid="4" branches-covered="2"/>')
+  const script = [
+    'import runpy,json,sys,pathlib',
+    'api=runpy.run_path(sys.argv[1]); spec=json.loads(sys.argv[2])',
+    'targets=[{"func":"Suite.One"},{"func":"Suite.Two"}]',
+    'prepare=api["prepare_argv"]',
+    'assert "--gtest_filter=Suite.One:Suite.Two" in prepare(spec,targets,"")',
+    'coverage={**spec,"command":spec["coverage"]["command"]}',
+    'assert "--gtest_filter=Suite.One:Suite.Two" in prepare(coverage,targets,"")',
+    'assert "--gtest_filter=Suite.One" in prepare(coverage,targets[:1],"")',
+    'stats=api["parse_coverage_report"](pathlib.Path(sys.argv[3]),"cobertura")',
+    'assert stats["line"]["percent"]==70.0 and stats["branch"]["percent"]==50.0',
+    'assert "mcdc" not in stats and "statement" not in stats',
+  ].join('\n')
+  const result = spawnSync(process.env.DSH_PYTHON_PATH, ['-c', script, new URL('../assets/run_tests.py', import.meta.url).pathname.replace(/^\/(\w:)/, '$1'), JSON.stringify(spec), report], { encoding: 'utf8' })
+  assert.equal(result.status, 0, result.stdout + result.stderr)
+})
+
+test('prepare 固定范围清单和排除证据，runner 结果保留范围，不改变 scope=case', async () => {
+  const project = makeDir('panel-scope-run-')
+  const root = writePytestProject(project)
+  write(join(project, 'src/calc.py'), 'def add(a, b): return a + b\n')
+  const inventory = scopeInventory(project, ['src'])
+  inventory.files[0].status = 'tested'
+  inventory.files[0].functions = [{ subjectFunction: 'src/calc.py::add', caseIds: ['TC-1'] }]
+  write(join(root, 'scope.json'), JSON.stringify(inventory))
+  const store = { records: [makeRecord({ caseId: 'TC-1', code: 'def test_add_ok(): pass', subjectFunction: 'src/calc.py::add' })] }
+  const prep = await __test.prepareRun({ sessionId: 'test-session-1', cwd: project, scope: 'case', caseId: 'TC-1', store })
+  const runDir = join(root, 'runs', prep.runId)
+  const request = JSON.parse(readFileSync(join(runDir, 'request.json'), 'utf8'))
+  assert.equal(request.scope, 'case')
+  assert.equal(request.testScope.status, 'reviewed')
+  assert.deepEqual(request.testScope.selectedCaseIds, ['TC-1'])
+  write(join(root, 'scope.json'), '{}')
+  assert.equal(JSON.parse(readFileSync(join(runDir, 'snapshot/scope.json'), 'utf8')).status, 'reviewed')
+  const run = runPrepared(prep)
+  assert.equal(run.status, 0, run.stdout + run.stderr)
+  const result = JSON.parse(readFileSync(join(runDir, 'result.json'), 'utf8'))
+  assert.equal(result.testScope.status, 'reviewed')
+  assert.equal(result.scope, 'case')
+})
+
+test('实际 JSON 生成后检查拒绝缺括号、非法数值、重复字段及编号/字段遗漏', () => {
+  const project = makeDir('panel-json-check-')
+  const log = join(project, 'serialization-selfcheck.log')
+  const cases = join(project, 'cases.json')
+  const runner = new URL('../assets/run_tests.py', import.meta.url).pathname.replace(/^\/(\w:)/, '$1')
+  write(cases, JSON.stringify({ cases: [{ caseId: 'TC-1', expectedOutputs: [{ name: 'result', value: '5' }] }] }))
+  const execute = (text) => {
+    write(log, text)
+    return spawnSync(process.env.DSH_PYTHON_PATH, [runner, '--check-actual-json', log, '--cases', cases], { encoding: 'utf8' })
+  }
+  for (const text of ['ACTUAL_JSON[TC-1]: {"result":5', 'ACTUAL_JSON[TC-1]: {"result":NaN}', 'ACTUAL_JSON[TC-1]: {"result":1e999}', 'ACTUAL_JSON[TC-1]: {"result":5,"result":6}', 'ACTUAL_JSON[TC-1]: []', 'ACTUAL_JSON[TC-2]: {"result":5}', 'ACTUAL_JSON[TC-1]: {}']) {
+    const result = execute(text)
+    assert.equal(result.status, 2, text + result.stderr)
+    assert.equal(JSON.parse(result.stdout).valid, false)
+  }
+  const result = execute('ACTUAL_JSON[TC-1]: {"result":5,"text":"引号\\\"与反斜杠\\\\","ok":true,"empty":null}\n')
+  assert.equal(result.status, 0, result.stderr + result.stdout)
+  assert.equal(JSON.parse(result.stdout).valid, true)
+})
+
+test('正式执行中非法实际 JSON 只告警，后续用例照常执行，断言结论不变', async () => {
+  const project = makeDir('panel-json-run-')
+  const root = join(project, '.dsh/test-sessions/json-run')
+  write(join(root, 'runner.json'), JSON.stringify({ preset: 'node-test' }))
+  const code = 'import test from "node:test";\ntest("one", () => console.log(\'ACTUAL_JSON[TC-1]: {"result":5\'));\ntest("two", () => console.log(\'ACTUAL_JSON[TC-2]: {"result":6}\'));\n'
+  write(join(root, 'tests/test_generated.test.mjs'), code)
+  const store = { records: [makeRecord({ caseId: 'TC-1', code: 'test("one", () => {})', expectedOutputs: [{ name: 'result', value: '5' }] }), makeRecord({ id: 'r2', caseId: 'TC-2', code: 'test("two", () => {})', expectedOutputs: [{ name: 'result', value: '6' }] })] }
+  const prep = await __test.prepareRun({ sessionId: 'json-run', cwd: project, scope: 'all', caseId: '', store })
+  const run = runPrepared(prep)
+  assert.equal(run.status, 0, run.stdout + run.stderr)
+  const runDir = join(root, 'runs', prep.runId)
+  const result = JSON.parse(readFileSync(join(runDir, 'result.json'), 'utf8'))
+  assert.equal(result.passed, 2)
+  assert.equal(result.actualOutputValidation.valid, false)
+  assert.ok(result.actualOutputValidation.issues.some((issue) => issue.caseId === 'TC-1'))
+  assert.equal(result.tests.find((item) => item.caseId === 'TC-2').actualOutputs.result, '6')
+  assert.match(readFileSync(join(runDir, 'run.log'), 'utf8'), /实际输出 JSON 告警/)
 })
 
 test('查看测试代码明确区分缺测试文件与缺目标', async () => {

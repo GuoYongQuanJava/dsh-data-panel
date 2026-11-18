@@ -141,6 +141,7 @@ test('步骤编辑支持增加、拖动排序、删除和保存，不更改传�
 
 test('总体报告排除和恢复只作用于纳入选择，真实条目保留', () => {
   const h = harness(), records = [{ id: 'a', title: 'A', scenario: '登录', status: 'pass', reports: [{}] }, { id: 'b', title: 'B', scenario: '订单', status: 'fail', reports: [{}] }]
+  const original = JSON.stringify(records)
   const render = () => h.render(h.api.IntegrationOverview, { records, onClose() {}, onNotice() {} })
   assert.equal(typeof h.api.IntegrationOverview, 'function')
   find(render(), 'exclude-a').props.onClick()
@@ -149,6 +150,7 @@ test('总体报告排除和恢复只作用于纳入选择，真实条目保留',
   find(render(), 'restore-all').props.onClick()
   assert.ok(find(render(), 'overview-a'))
   assert.equal(records.length, 2)
+  assert.equal(JSON.stringify(records), original, '排除和恢复不能修改原始用例内容')
 })
 
 test('步骤页的编辑打开的是步骤弹窗，不是编辑用例', () => {

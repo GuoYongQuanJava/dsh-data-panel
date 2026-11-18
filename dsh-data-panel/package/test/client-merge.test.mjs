@@ -100,7 +100,7 @@ test('点击执行后展开记录并等待，点击表头刷新保持展开并�
   assert.equal(drafts.length, 1)
   const waiting = h.api.RunRecords(run.props)
   const hint = nodes(waiting).find(node => node.props?.className === 'dp-run-wait')
-  assert.deepEqual(nodes(hint).flatMap(node => node.children || []).filter(value => typeof value === 'string'), ['正在执行…'])
+  assert.equal(hint, undefined, '不再显示“正在执行…”提示，等待状态仍由执行记录维护')
   nodes(h.render(props)).find(node => node.children?.includes('刷新')).props.onClick()
   const finished = nodes(h.render(props)).find(node => node.type === h.api.RunRecords)
   assert.equal(finished.props.awaiting, false)
@@ -129,6 +129,54 @@ test('用例按业务函数合并计数和筛选，不按分类或测试入口�
   assert.equal(form.props.record.subjectFunction, 'src/a.js::discount')
   sidebar.props.onSelect(sidebar.props.rows[1].value)
   assert.equal(nodes(h.render(props)).filter(n => n.props?.label === '执行').length, 1)
+})
+
+test('双类型在新增和详情编辑中保留、可取消，主类型改变后清空附加选择', () => {
+  for (const editor of ['RecordFormModal', 'DetailEditor']) {
+    const h = harness(record), saved = []
+    const props = { mode: 'edit', record: { ...record, testTypes: ['functional', 'api'] }, onSubmit: value => saved.push(value), onSave: value => saved.push(value) }
+    const render = () => h.component(h.api[editor], props)
+    let secondary = nodes(render()).find(n => n.type === h.api.SecondaryType)
+    assert.deepEqual(Array.from(secondary.props.values.testTypes), ['functional', 'api'])
+    secondary.props.onChange(['functional'])
+    nodes(render()).find(n => n.type === 'form').props.onSubmit({ preventDefault() {} })
+    assert.deepEqual(Array.from(saved[0].testTypes), ['functional'])
+    secondary = nodes(render()).find(n => n.type === h.api.SecondaryType)
+    secondary.props.onChange(['functional', 'api'])
+    nodes(render()).find(n => n.type === 'select' && n.props.value === 'functional').props.onChange({ target: { value: 'boundary' } })
+    nodes(render()).find(n => n.type === 'form').props.onSubmit({ preventDefault() {} })
+    assert.deepEqual(Array.from(saved[1].testTypes), ['boundary'])
+  }
+})
+
+test('双类型筛选包含附加类型，同一用例仍只有一个执行入口', () => {
+  const h = harness([{ ...record, testTypes: ['functional', 'api'] }, { ...record, id: 'r2', caseId: 'TC-2', testType: 'logic' }])
+  const props = { sessionId: 'session-a' }
+  const tree = h.render(props)
+  const tabs = nodes(tree).find(n => n.props?.onChange && n.props?.value === 'all')
+  assert.ok(tabs)
+  tabs.props.onChange({ target: { value: 'api' } })
+  const filtered = h.render(props)
+  assert.equal(nodes(filtered).filter(n => n.props?.label === '执行').length, 1)
+})
+
+test('原始日志与模型异常分析明确区分，缺分析时不改变原文', () => {
+  const h = harness(record)
+  assert.equal(h.api.displayRunLog({ exists: true, content: 'raw\n' }), 'raw\n')
+  assert.equal(h.api.displayRunLog({ exists: false }), '')
+  const text = h.api.displayRunLog({ exists: true, content: 'raw\n', analysis: 'cause' })
+  assert.ok(text.startsWith('raw\n'))
+  assert.ok(text.includes('非执行器原始输出'))
+  assert.ok(text.endsWith('cause'))
+})
+
+test('执行摘要在用例标识变化时刷新，最后一条记录删除后清空旧状态', () => {
+  const h = harness(record)
+  const firstKey = h.api.runSummaryKey([{ id: 'rec1', caseId: 'TC-1' }])
+  const renamedKey = h.api.runSummaryKey([{ id: 'rec1', caseId: 'TC-2' }])
+  assert.notEqual(firstKey, renamedKey)
+  assert.equal(JSON.stringify(h.api.updateCaseStatus({ rec1: 'passed' }, 'rec1', 'failed')), '{"rec1":"failed"}')
+  assert.equal(JSON.stringify(h.api.updateCaseStatus({ rec1: 'passed' }, 'rec1', '')), '{}')
 })
 
 test('详情显示被测函数，旧数据明确未关联', () => {

@@ -23,6 +23,7 @@ import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { PRESET_TOOLS, PRESETS, detectPreset, renderRunnerSpec, resolveRunner, targetDeclared, targetLine, targetOf } from './runners.js'
 import { resolveSpecs, resolveTool, resolveTools, searchLayers } from './toolchain.js'
+import { assessScope } from './scope.js'
 
 
 export const name = 'dsh-data-panel'
@@ -207,6 +208,7 @@ function normalizeStored(input) {
     // 旧记录的原值只读保留；不在读取时悄悄改成「功能测试」。
     // 新建或编辑时由 normalizePatch 限定为当前五类。
     testType: typeof input.testType === 'string' ? input.testType : '',
+    testTypes: [...new Set([input.testType, ...(Array.isArray(input.testTypes) ? input.testTypes : [])])].filter((type) => TEST_TYPES.has(type)),
     description: text(input.description, MAX_DESCRIPTION),
     input: text(input.input, MAX_INPUT),
     expected: text(input.expected, MAX_EXPECTED),
@@ -234,12 +236,21 @@ function normalizePatch(input, existing) {
   const title = text(input.title, MAX_TITLE)
   if (!title) throw bad(400, '用例名称不能为空')
   if (!TEST_TYPES.has(input.testType)) throw bad(400, '测试类型只能是功能、接口、边界、逻辑或性能测试')
+  const suppliedTypes = input.testTypes === undefined
+    ? (existing?.testTypes || []).filter((type) => type !== existing?.testType || type === input.testType)
+    : input.testTypes
+  if (!Array.isArray(suppliedTypes) || suppliedTypes.some((type) => !TEST_TYPES.has(type))) {
+    throw bad(400, 'testTypes 必须是五种有效测试类型组成的数组')
+  }
+  const testTypes = [...new Set([input.testType, ...suppliedTypes])]
+  if (testTypes.length > 2) throw bad(400, '一条用例最多选择两种测试类型；独立场景请拆分')
   return {
     ...existing,
     subjectFunction: normalizeSubjectFunction(input.subjectFunction === undefined ? existing?.subjectFunction : input.subjectFunction),
     caseId: text(input.caseId, MAX_CASE_ID),
     title,
     testType: input.testType,
+    testTypes,
     description: text(input.description, MAX_DESCRIPTION),
     input: text(input.input, MAX_INPUT),
     expected: text(input.expected, MAX_EXPECTED),
@@ -485,8 +496,13 @@ async function handle(req, res) {
         const index = store.records.findIndex((item) => item.id === id)
         if (index === -1) throw bad(404, '记录不存在')
         const existing = store.records[index]
+        const patch = body.patch || body.record || {}
+        const next = { ...existing, ...patch }
+        if (patch.testType !== undefined && patch.testTypes === undefined && patch.testType !== existing.testType) {
+          next.testTypes = (existing.testTypes || []).filter((type) => type !== existing.testType)
+        }
         const updated = {
-          ...normalizePatch({ ...existing, ...(body.patch || body.record || {}) }, existing),
+          ...normalizePatch(next, existing),
           demo: false,
         }
         store.records[index] = updated
@@ -735,6 +751,7 @@ async function exportCases(store, file, runner) {
       caseId: record.caseId,
       title: record.title,
       testType: record.testType,
+      testTypes: record.testTypes || [record.testType],
       description: record.description,
       input: record.input,
       expected: record.expected,
@@ -1205,6 +1222,13 @@ async function prepareRun({ sessionId, cwd, scope, caseId, caseIds, store }) {
   }
 
   // 把「怎么跑」冻结进 request.json：命令由宿主拼好，runner 只负责执行与记录。
+  let scopeDocument = null
+  let scopeReadError = ''
+  try { scopeDocument = JSON.parse(await readFile(join(root, 'scope.json'), 'utf8')) }
+  catch (error) { if (error.code !== 'ENOENT') scopeReadError = 'scope.json 无法读取或 JSON 无效' }
+  const testScope = assessScope(project, scopeDocument, cases, selected.map((item) => item.caseId))
+  if (scopeReadError) { testScope.status = 'invalid'; testScope.warnings.unshift(scopeReadError) }
+  await writeTextFile(join(snapshotDir, 'scope.json'), JSON.stringify(testScope, null, 2))
   const runnerSpec = renderRunnerSpec(runner, {
     python: pythonPath(),
     node: nodePath(),
@@ -1232,6 +1256,7 @@ async function prepareRun({ sessionId, cwd, scope, caseId, caseIds, store }) {
     testFile: liveTestFile,
     testFileSha256,
     snapshotTestFile,
+    testScope,
     casesFile: snapshotCasesFile,
     testFileExists: true,
     targets,
@@ -1263,6 +1288,7 @@ async function prepareRun({ sessionId, cwd, scope, caseId, caseIds, store }) {
     framework: runner.label,
     frameworkId: runner.id,
     runnerMode: runner.mode,
+    scopeWarnings: testScope.warnings,
     language: runner.language,
     // 本次执行用到的工具（绝对路径），面板/日志里能看出到底用哪个运行时跑的。
     tools: toolStatus.resolved,
@@ -1448,10 +1474,16 @@ async function handleRunLog(req, res) {
     }
     const truncated = content.length > MAX_RUN_LOG
     if (truncated) content = content.slice(0, MAX_RUN_LOG) + '\n\n…(日志过长，仅显示前 4 MB)'
+    // 模型分析是旁注，绝不改写执行器的原始日志或结构化结果。
+    let analysis = ''
+    try {
+      analysis = (await readFile(join(dirname(file), 'analysis.md'), 'utf8')).slice(0, 100000)
+    } catch { /* 尚未分析时仍正常返回原始日志。 */ }
     send(res, 200, {
       ok: true,
       exists: true,
       content,
+      analysis,
       truncated,
       updatedAt: logStat ? logStat.mtime.toISOString() : undefined,
     })
@@ -1938,5 +1970,6 @@ export const __test = {
   handleOpenFile,
   listRuns,
   handleRunList,
+  handleRunLog,
   handleRunDelete,
 }

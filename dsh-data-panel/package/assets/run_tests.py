@@ -121,7 +121,24 @@ def parse_junit(path: Path) -> list:
     return results
 
 ACTUAL_LINE = re.compile(r'ACTUAL(?:\[([^\]]+)\])?\s*:\s*(.*)$')
-ACTUAL_JSON_LINE = re.compile(r'ACTUAL_JSON\[([^\]]+)\]\s*:\s*(\{.*\})\s*$')
+ACTUAL_JSON_MARKER = re.compile(r'ACTUAL_JSON\[([^\]]+)\]\s*:\s*(.*)$')
+
+
+def _strict_json_object(payload):
+    def unique_pairs(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"重复输出字段：{key}")
+            result[key] = value
+        return result
+    def invalid_constant(value):
+        raise ValueError(f"JSON 不支持 {value}")
+    value = json.loads(payload, object_pairs_hook=unique_pairs, parse_constant=invalid_constant)
+    if not isinstance(value, dict):
+        raise ValueError("实际输出必须是 JSON 对象")
+    json.dumps(value, allow_nan=False)
+    return value
 
 
 def parse_actuals(text: str) -> dict:
@@ -133,12 +150,16 @@ def parse_actuals(text: str) -> dict:
     tagged = {}
     untagged = []
     named = {}
-    for line in (text or "").splitlines():
-        structured = ACTUAL_JSON_LINE.search(line)
-        if structured:
+    invalid = []
+    for line_number, line in enumerate((text or "").splitlines(), 1):
+        structured = ACTUAL_JSON_MARKER.search(line)
+        if "ACTUAL_JSON[" in line:
             try:
-                values = json.loads(structured.group(2))
-            except (ValueError, TypeError):
+                if not structured or not structured.group(1).strip():
+                    raise ValueError("ACTUAL_JSON 标记缺少有效 caseId、右方括号或冒号")
+                values = _strict_json_object(structured.group(2))
+            except (ValueError, TypeError) as error:
+                invalid.append({"caseId": structured.group(1).strip() if structured else "", "line": line_number, "reason": str(error)})
                 values = None
             if isinstance(values, dict) and all(isinstance(key, str) for key in values):
                 named[structured.group(1).strip()] = {
@@ -155,7 +176,28 @@ def parse_actuals(text: str) -> dict:
             tagged[key] = value
         else:
             untagged.append(value)
-    return {"tagged": tagged, "untagged": untagged, "named": named}
+    return {"tagged": tagged, "untagged": untagged, "named": named, "invalid": invalid}
+
+
+def validate_actual_json(text: str, cases=None) -> dict:
+    parsed = parse_actuals(text)
+    issues = list(parsed["invalid"])
+    case_list = cases or []
+    known = {str(case.get("caseId") or ""): case for case in case_list}
+    for case_id in parsed["named"]:
+        if known and case_id not in known:
+            issues.append({"caseId": case_id, "reason": "实际输出编号不在本次用例清单中"})
+    for case_id, case in known.items():
+        outputs = case.get("expectedOutputs") or []
+        expected = {item.get("name") for item in outputs if isinstance(item, dict) and item.get("name")}
+        if not expected:
+            continue
+        missing = sorted(expected - set(parsed["named"].get(case_id, {})))
+        if missing:
+            issues.append({"caseId": case_id, "reason": "缺少实际输出字段：" + ", ".join(missing)})
+    if not parsed["named"] and not case_list and not issues:
+        issues.append({"caseId": "", "reason": "未发现合法 ACTUAL_JSON 输出，不能完成序列化自检"})
+    return {"valid": not issues, "caseIds": list(parsed["named"]), "issues": issues}
 
 
 def match_test(entries: list, func: str):
@@ -578,9 +620,11 @@ def main() -> int:
     import argparse
 
     parser = argparse.ArgumentParser(description="会话级测试执行器（通用）")
-    parser.add_argument("--project", required=True, help="项目根目录")
-    parser.add_argument("--root", required=True, help="会话资产目录")
-    parser.add_argument("--run-id", required=True, help="本次执行编号")
+    parser.add_argument("--project", help="项目根目录")
+    parser.add_argument("--root", help="会话资产目录")
+    parser.add_argument("--run-id", help="本次执行编号")
+    parser.add_argument("--check-actual-json", help="只检查生成后序列化自测的输出日志，不运行测试或写结果")
+    parser.add_argument("--cases", help="JSON 自检的用例清单（可选）")
     parser.add_argument("--timeout", type=int, default=None, help="覆盖 runner.json 的超时秒数")
     args = parser.parse_args()
 
@@ -588,6 +632,19 @@ def main() -> int:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
+
+    if args.check_actual_json:
+        try:
+            data = read_json(Path(args.cases)) if args.cases else []
+            cases = data.get("cases", []) if isinstance(data, dict) else data
+            validation = validate_actual_json(_read_text(Path(args.check_actual_json)), cases)
+            print(json.dumps(validation, ensure_ascii=False, indent=2))
+            return 0 if validation["valid"] else 2
+        except Exception as error:
+            print(json.dumps({"valid": False, "error": str(error)}, ensure_ascii=False))
+            return 2
+    if not args.project or not args.root or not args.run_id:
+        parser.error("执行需要 --project、--root、--run-id")
 
     project = Path(args.project).resolve()
     root = Path(args.root).resolve()
@@ -646,6 +703,17 @@ def main() -> int:
         result["errors"] = sum(1 for item in result["tests"] if item["outcome"] == "error")
         result["skipped"] = sum(1 for item in result["tests"] if item["outcome"] == "skipped")
         result["unconfirmed"] = sum(1 for item in result["tests"] if item["outcome"] == "unknown")
+        if result["tests"]:
+            try:
+                frozen = read_json(Path(request["casesFile"]))
+                case_ids = set(result.get("cases") or [])
+                cases = [case for case in frozen.get("cases", []) if case.get("caseId") in case_ids]
+                validation = validate_actual_json(log_path.read_text(encoding="utf-8", errors="replace"), cases)
+                result["actualOutputValidation"] = validation
+                for issue in validation["issues"]:
+                    say(f"[实际输出 JSON 告警] {issue.get('caseId') or '未关联用例'}：{issue['reason']}")
+            except Exception as error:
+                result["actualOutputValidation"] = {"valid": False, "issues": [{"reason": f"无法完成实际输出核验：{error}"}]}
         # ── 覆盖率（可选）：作为“额外证据”采集，失败不影响本次执行结论 ──
         if "coverage" not in result and status in ("passed", "partial", "failed"):
             try:
@@ -717,6 +785,9 @@ def main() -> int:
         timeout_sec = DEFAULT_TIMEOUT
     deadline = started + timeout_sec
     result["scope"] = request.get("scope", "all")
+    result["testScope"] = request.get("testScope") or {"status": "missing", "warnings": ["旧执行请求未包含测试范围清单"]}
+    for warning in result["testScope"].get("warnings", []):
+        say(f"[测试范围告警] {warning}")
     result["caseId"] = request.get("caseId", "")
     targets = request.get("targets") or []
     not_run = request.get("notRun") or []

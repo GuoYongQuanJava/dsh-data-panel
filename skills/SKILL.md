@@ -9,9 +9,15 @@ description: 通用单元测试工作流：识别项目语言和测试框架，�
 
 本 Skill 面向**不同语言和项目**：先识别被测代码的语言、构建系统与测试框架，再按该项目适用的方式生成与运行测试。用例分析、人工审查、会话归属、面板台账、执行与日志、报告桥接都是通用流程；面板的「执行 / 全部执行」不绑定 Python，它按会话资产目录里的 `runner.json`（或自动识别的内置框架）选择命令。
 
+## 按语言加载专项 Skill
+
+在 Step 1 识别语言后、配置 runner 或生成测试代码前，若本次被测源码包含 C++，必须读取与本文件同目录下的 [C++ 测试专项 Skill](cpp-test/SKILL.md)，并在后续步骤中结合使用。混合语言工程仅对 C++ 部分应用专项规则；其他语言继续使用本工作流。
+
+主 Skill 负责六步流程、范围清单、用例与面板数据、统一执行、日志和报告；C++ Skill 负责构建、gtest、原生工具与覆盖率细节，不另起测试流程、不重复要求审查确认。它是随本 Skill 一起部署的子目录，按当前文件实际路径解析相对链接，不要求依赖 Skill 自动发现；若文件缺失，明确报告部署不完整，不能声称已读取或猜测其内容。
+
 ## 工具链发现（通用，适用于任何语言）
 
-这门工作流要支持任意语言，所以**没有任何“特殊语言”**：Python、Node、Go、Rust、Java、.NET、C/C++、Ruby、PHP 一律走同一条搜索阶梯。
+所有语言统一遵循下面的工具搜索阶梯；语言专项 Skill 补充构建与采集细节，不替代这套发现规则。
 
 **一次命令失败不代表没装工具**（尤其是 DSH 自带的 Python / Node，它们不在系统 PATH 里）。
 
@@ -116,6 +122,10 @@ Invoke-RestMethod "$env:DSH_WEB_URL/data-panel/tools?project=$PWD" | ConvertTo-J
 
 输出：可测试单元清单。
 
+为每个纳入测试的函数确定唯一 `subjectFunction`（路径、类名、函数名），列出函数与预计场景数。后续生成前核对清单，不能漏掉已纳入的函数；不能测试的函数说明原因，不生成占位假用例。
+
+**全量范围清单：** 生成用例前按 [全量测试范围与排除证据](references/test-scope.md) 从磁盘扫描工程源码，逐文件枚举业务函数，生成会话 `scope.json`，记录纳入、仅声明、排除及暂缓项。排除需理由、真实探针命令/退出码及日志证据，不能直接相信“依赖某库就不能测”。不能只盘点决定测试的几个函数；未枚举或未验证的文件必须保留为缺口。后续 prepare 会核对并冻结清单，缺失或不一致只告警，不在执行中途暂停确认。
+
 #### Step 1.5: 确认被测语言与工具（必做，不要跳过）
 
 按上文「工具链发现」那节执行。最短路径：
@@ -136,12 +146,20 @@ Invoke-RestMethod "$env:DSH_WEB_URL/data-panel/tools?project=$PWD" | ConvertTo-J
 
 这是一份插件通用数据约定，适用于本 workflow 和用户自定义 Skill。用例层级由记录中的该字段自动聚合；不要再调用旧分类 API 建立层级。
 
+**一条用例只验证一个具体场景：** 同一形参的候选值 `1/0/-1` 表示三个独立场景时，拆成三条用例，每条都有确定输入和对应预期，不能在一条记录或一个测试函数中循环跑完再只记一个结果。多个形参共同组成一次调用可以放在一条用例中；数组、集合、路径、除法表达式本身是合法的单个输入，不因包含 `/` 或多个元素机械拆分。多步操作共同验证一个状态场景也可保留为一条，不为凑数量做无意义的全排列。参数化框架只有在每个参数实例有独立 `caseId`、准确可筛选的 `testFunc` 和逐条证据时才可使用。
+
+**名称与编号：** `title` 仅使用函数组内的短编号 `T001`、`T002`，每个函数从 T001 开始；详细文字全部放 `description`，说明前置状态、调用动作、具体输入、验证目标及预期行为。相同函数内编号不重复，新增时接着编号，编辑后不重排已有编号。`caseId` 是会话内唯一、稳定的关联 ID（例如 `ORDER-DISCOUNT-T001`）；不同函数可复用名称 T001，但不能复用 caseId，也不要把 `testFunc` 改成显示编号。
+
+生成后按 `subjectFunction` 验收：纳入测试的 10 个函数应形成 10 个函数组，每组包含该函数的拆分场景；同名异类、异文件函数不能合并。以查询面板 API 后的实际记录和组内数量为准，不仅核对聊天中的清单。没有可生成用例的函数单独说明，不用假用例凑组。
+
 按被测单元的实际特性，从以下五种测试类型中选择；不要求每个单元都凑齐五类：
 - **功能测试（functional）**：正常业务行为与预期输出
 - **接口测试（api）**：接口参数、返回值、协议约定与错误响应
 - **边界测试（boundary）**：0、-1、最大值、空值等边界输入
 - **逻辑测试（logic）**：条件分支、状态转换与业务规则
 - **性能测试（performance）**：有明确指标时验证耗时、吞吐量或资源使用
+
+**默认单类型，少量双类型：** `testType` 保持一个主类型；只有同一个具体场景和断言确实同时验证第二类独立要求时，才填 `testTypes: [主类型, 附加类型]`，最多两类。单类型填 `[主类型]` 即可。不能因为“调用了函数”就都标接口，不能因为“验证了功能”就为所有边界/逻辑用例附加功能类型；不同输入或不同目标优先拆成不同用例。双类型在 `description` 写明第二类的验证依据；交付前逐条复查双类型，若大量出现，检查是否套用了默认标签，保留确有证据的场景。筛选计数可能同时包含双类型用例，总用例数、执行和报告仍按 caseId 计一次；当前报告沿主类型分组，不为附加类型复制用例。
 
 **Step 2 的第一步：取当前会话 ID 和会话资产目录**
 
@@ -201,23 +219,8 @@ echo "$DSH_SESSION_ID"                                       # bash
 - `command`：字符串数组；单条模式用 `{target}`，整批模式用 `{targets}`。可用占位符还有 `{file}` `{binary}` `{project}` `{root}` `{runId}` `{runDir}` `{junit}`。
 - `mode`：能产出 JUnit XML 的框架用 `batch`（一条命令跑完，逐条结果来自 JUnit）；否则用 `per-case`（一条用例一条命令，退出码即证据，默认）。
 - Java / Go / C# / Rust / C++ 的测试文件通常必须位于项目源码树内，用 `project:` 写实际路径。
-- C++ / GoogleTest：用 preset `gtest`，`binary` 指向**已构建**的测试可执行文件（`Suite.Name` 会作为 `--gtest_filter`）；需要面板先构建就把构建命令写进 `preCommand`（如 `cmake --build {project}/build`）。
-- `targetExtract` 只用于从面板用例的 `code` 推断测试名；在 `runner.json` 中自定义时会**替换**内置提取规则，可用字符串或字符串数组兼容多种写法。`targetDeclare` 是**单个正则字符串**，准备执行时用它检查测试文件是否声明了目标；自定义它也会替换内置规则。两项不能代替核对实际注册的测试名。
-- **C/C++ 专用（内网常见）**：
-  - 先看 `GET /data-panel/tools?project=<项目>` 里 `ctest` / `gtest` 的 `missing`；缺的通常是 `cmake` 或编译器。
-  - 编译器是**三选一**（`g++` / `clang++` / `cl`），装了任一个就行；`missing` 里写的是整组 `g++|clang++|cl`。
-  - Windows 上 `cmake.exe` / `ctest.exe` / `cl.exe` 大多数时候**不在 PATH**（Visual Studio 自带）。面板会自动去 VS / CMake / LLVM / MSYS2 的常见落点扫，不用你手动找。
-  - 装在非标准位置（内网离线包解压到 D 盘等）：`$env:DSH_TOOL_SEARCH_DIRS = 'D:\tools\cmake-3.29\bin;D:\tools\msys64\mingw64\bin'`，支持 `*`；单个工具也可以用 `$env:DSH_CMAKE_PATH`。
-  - `gtest` 必须写 `binary`（已构建的可执行文件）和构建步骤，例如：
-    ```json
-    { "preset": "gtest",
-      "testFile": "project:tests/generated_test.cpp",
-      "binary": "project:build/tests/generated_test",
-      "preCommand": ["cmake", "--build", "build"] }
-    ```
-    `preCommand` 只是一条命令（argv 数组），所以 configure 要先单独做完：`cmake -S . -B build` 跑一次（或在项目里写个 build 脚本，`preCommand` 调它）。
-  - CTest 项目不需要 `binary`：测试注册进 CTest 后，面板直接 `ctest -R ^名字$`；同样建议把构建写进 `preCommand`。
-  - 项目只有 `Makefile` / `*.vcxproj`、既没有 `CMakeLists.txt` 也没有 `meson.build` 时，面板无法自动识别；不要硬编，直接写 `runner.json` 声明命令，或者先问用户是否同意加一个 CMake 构建入口。
+- `targetExtract` 用于从面板用例的 `code` 推断测试名，也用于在真实测试文件中定位同名测试声明；在 `runner.json` 中自定义时会**替换**内置提取规则，可用字符串或字符串数组兼容多种写法。`targetDeclare` 是**单个正则字符串**，准备执行时用它检查测试文件是否声明了目标，定位无法提取时也沿用它；自定义它会替换内置规则。两项不能代替核对实际注册的测试名。
+- C++ 的构建、gtest 目标、runner 配置与 VS 覆盖率按已加载的 [C++ 测试专项 Skill](cpp-test/SKILL.md) 核对。
 - 没有 `runner.json` 时面板会按 `go.mod` / `pom.xml` / `package.json` / Python 测试迹象等自动识别；识别不出来会直接报错，不要靠猜。
 - 内置命令只是常见默认值。第一次接入项目时，请核对项目真实的测试命令；不一致就覆盖。
 
@@ -250,8 +253,12 @@ echo "$DSH_SESSION_ID"                                       # bash
   - 其他语言：用对应语言的 stdout 打印同样格式。
 - 生成后先自检（见下方「源码一致性规则」）。
 
+**实际输出生成后自检：** 按 [实际输出 JSON 检查](references/actual-json-check.md) 复用序列化函数，独立验证引号、转义、Unicode、null、布尔和数值样本，调用 runner 的 `--check-actual-json` 检查自测日志；缺括号或输出字段不齐须修正生成代码。自测不运行被测业务，合成值不能进入正式执行证据。缺环境无法验证时在原有审查中说明，不假称已通过。正式执行后 runner 还会在 `actualOutputValidation` 和日志中登记问题，不中断其他用例。
+
 ### Step 4: 等待人工审查
 生成完成后**必须停下来**，告知用户审查。禁止未经确认就执行测试。
+
+此次原有审查同时展示 scope.json 的扫描根、文件/函数/用例数、排除依据和未处理缺口，以及序列化自检结果。由用户确认本轮测试范围；不在执行途中增加新的确认步骤。
 
 ### Step 5: 执行测试
 用户确认后执行。使用面板「执行 / 全部执行」按钮：
@@ -282,7 +289,13 @@ echo "$DSH_SESSION_ID"                                       # bash
 
 > 每次执行（包括面板里单条用例的「执行」）都必须生成报告；单条执行只包含这一条用例，报告文件名带 caseId。
 
+**异常原文与模型分析：** 不因分析异常而暂停本次其他测试、要求中途确认或擅自修复。runner 结束后，读取同一 runId 的 `result.json`、`run.log`、用例及测试代码快照；对 failed/error/notRun/unknown，以及构建失败、超时、中断等运行异常逐项说明。保留原始异常文本和实际结果，不将预期异常（例如通过的 EXPECT_THROW）误判为失败。
+
+将模型分析单独写入该次 `runs/<runId>/analysis.md`（UTF-8），日志窗口会在原始日志下分区展示。每项写明 caseId、testFunc、真实异常摘要、证据位置（run.log 行号、断言文件行号或 result.json 字段）、分析原因、建议与不确定性。无法归属用例的构建/环境异常写“运行级异常”，不要编造关联。区分已确认原因和推测原因；证据不足就写“原因尚未确认”。不覆盖或追加 run.log，不改 result.json/快照，不把模型分析包装成 runner 原始输出。无异常不必生成分析文件；未能生成分析时在最终对话说明，不能阻塞结果和报告交付。分析仅记录，不自动执行建议。
+
 ### Step 6: 生成 Word 报告
+**最终对话中的一致性提醒：** 本次全部测试执行结束并按原流程处理报告后，对照本次 `runs/<runId>/request.json` 指定的 `casesFile`（用例快照）与 `snapshotTestFile`（测试代码快照），按 `caseId`、`testFunc` 核对输入、预期结果、测试场景和实际断言。有明确证据不一致时，仅在最终对话总结中逐条列出用例编号及具体差异，提醒“可能导致测试结果不能准确反映当前用例要求”。无法读取快照或无法判断时说明“未能确认一致性”；未发现明显差异时如实说明，不能凭测试通过证明一致，也不能编造差异。此辅助核对不增加执行前检查，不中途暂停或要求确认，不自动修改用例、测试代码、runner 结果或报告数据，不改变既有测试与报告流程。
+
 报告只消费**已经真实跑过的那次 run**：
 
 - **每次执行都要生成报告，包括单条用例的「执行」**。单条执行的 snapshot/cases.json 只含该条用例，报告就只写这一条；文件名建议 `<项目>-<caseId>-测试报告.docx`。
@@ -329,11 +342,7 @@ if ($LASTEXITCODE -ne 0) { throw "报告工具需要 DSH 自带 Python 3：$repo
 - 每个 preset 已自带 coverage 配置（pytest / vitest / jest / go / maven / dotnet），runner 会在**用例跑完后额外跑一次采集**，解析报告后写进 result.json；
 - 所以报告里总是「未采集」时，先看 `result.json` 的 `coverage.reason`，常见的两种：
   1. **没装采集插件** —— reason 里会直接给安装命令（如 `python -m pip install coverage pytest-cov`、`npm i -D @vitest/coverage-v8`）；**让用户装好再重跑**，不要自己编数据；
-  2. **框架默认不采覆盖率**（C/C++ 的 ctest/gtest/meson）—— 在 `runner.json` 里写 `coverage` 接上 gcov/gcovr/lcov，例如：
-     ```json
-     { "coverage": { "command": ["gcovr", "-r", ".", "--xml", "{coverageFile}"],
-                     "format": "cobertura", "file": "coverage.xml" } }
-     ```
+  2. **框架默认不采覆盖率** —— C++ 按 [C++ 测试专项 Skill](cpp-test/SKILL.md) 配置本机已核实的工具和输出格式；其他框架按项目现有工具及 runner 扩展点配置。
 - 支持的 `format`：`coveragepy-json` / `istanbul-summary` / `go-cover` / `lcov` / `cobertura` / `jacoco`；
 - 覆盖率采集失败**不会**把执行判成失败，不要因为它失败就把这次执行说成失败。
 - 逐条结论**只认** result.json 里 `tests` 的逐条结果——`batch` 来自 JUnit，`per-case` 来自每条命令的退出码；找不到证据就标「未确认」，绝不用整体状态推断通过。
@@ -361,8 +370,9 @@ SKILL.md 的 frontmatter 写 `designer` / `reviewer` / `tester` 三个人员字�
 ```json
 {
   "caseId": "TC-XXX-001",
-  "title": "用例名称",
+  "title": "T001",
   "testType": "functional|api|boundary|logic|performance",
+  "testTypes": ["functional"],
   "description": "测试说明",
   "input": "输入",
   "expected": "预期输出",
@@ -378,7 +388,7 @@ SKILL.md 的 frontmatter 写 `designer` / `reviewer` / `tester` 三个人员字�
 
 ### ⚠️ codeRef 规则（重要！多次踩坑）
 
-1. **指向测试代码文件，不是被测源码** — 用户在数据面板点"查看代码"看的是 `codeRef` 指向的文件；路径按实际测试语言和文件名填写
+1. **保留作兼容线索，指向实际测试代码文件** — “查看测试代码”与执行共用 `runner.testFile` 和 `testFunc`，按目标在真实测试文件中定位；`codeRef` 不决定跳转文件或行号，指错文件时只提示。填写时按实际测试语言和文件名填写，不要指向被测源码。
 2. **使用绝对路径** — 相对路径在不同工作目录下解析不一致
 3. **使用正斜杠 `/`** — Windows 兼容
 4. **使用 `#L` 标注行号而非 `:`** — 避免与 Windows 盘符的冒号冲突
@@ -390,7 +400,7 @@ SKILL.md 的 frontmatter 写 `designer` / `reviewer` / `tester` 三个人员字�
 "codeRef": "<项目>/tests/order.test.ts#L8"
 ```
 
-**错误示例（会导致 404/路径错误）：**
+**错误示例（可能误导旧入口或项目目录查找）：**
 ```json
 "codeRef": "src/calculator.py:8"           // 相对路径 + 指向源码
 "codeRef": "E:\xxx\file.py:8"             // 反斜杠 + 冒号行号
