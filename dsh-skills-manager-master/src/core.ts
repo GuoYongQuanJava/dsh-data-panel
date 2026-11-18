@@ -4059,6 +4059,66 @@ export async function createSkill(input: CreateInput, log?: Log, options: Mutati
   return { name, path: join(target, "SKILL.md"), root: definition.key };
 }
 
+/** 覆盖写入已有技能的 SKILL.md：校验 frontmatter、禁止改名、写前备份、原子替换。 */
+  export async function updateSkill(
+  input: { root?: RootInput; name?: string; document?: string },
+  log?: Log,
+  options: MutationOptions = {},
+) {
+  const requestedRoot = Object.prototype.hasOwnProperty.call(options, "root")
+    ? options.root
+    : (input && input.root) || rootByKey("dsh");
+  const definition = await checkedWritableRootDefinition(requestedRoot);
+  if (definition && definition.ok === false) return definition;
+  if (!definition) return readonlyError("update");
+  const name = String((input && input.name) || "").trim();
+  const document = String((input && input.document) || "");
+  if (!validStateSkillName(name) || !KEBAB_RE.test(name))
+    return { ok: false, error: `技能不存在: ${name}`, code: "error.skill.notFound", params: { name } };
+  if (!document.trim())
+    return { ok: false, error: "技能内容不能为空", code: "error.create.bodyRequired" };
+  if (document.length > 1 << 18)
+    return { ok: false, error: "技能内容过长", code: "error.create.tooLarge" };
+  const entry = await resolveEntry(definition, name);
+  if (!entry)
+    return { ok: false, error: `技能不存在: ${name}`, code: "error.skill.notFound", params: { name } };
+  if (entry.linked === true)
+    return { ok: false, error: "外部目录链接，只读", code: "error.update.linked", params: { name } };
+  const target = entry.docPath;
+  const doc = parseSkillDoc(document);
+  // 「禁止改名」的基准取**原文件里的 name**，不是目录名：
+  // 目录名和 frontmatter 的 name 本来就可能不一致（技能被整目录挪过位置），
+  // 用目录名比会把「只改正文」误判成「改 name」。
+  let baseName = name;
+  try {
+    const currentDoc = parseSkillDoc(await fs.readFile(target, "utf8"));
+    const parsedName = String(currentDoc.map.name || "").trim();
+    if (parsedName) baseName = parsedName;
+  } catch {
+    // 读不到原文件就退回目录名
+  }
+  if (!doc.hasFrontmatter)
+    return { ok: false, error: "SKILL.md 缺少 frontmatter", code: "error.update.frontmatter", params: { name } };
+  const declared = String(doc.map.name || "").trim();
+  if (declared !== baseName)
+    return {
+      ok: false,
+      error: `不能修改 name（当前 ${baseName}）`,
+      code: "error.update.rename",
+      params: { name: baseName, declared: declared || "空" },
+    };
+  const backup = `${target}.bak`;
+  try {
+    await fs.copyFile(target, backup);
+  } catch {
+    // 备份失败不阻断保存，但要留痕。
+    if (log) log("update", `备份失败: ${backup}`);
+  }
+  await writeFileAtomically(target, document.endsWith("\n") ? document : `${document}\n`);
+  if (log) log("update", `更新 ${target}`);
+  return { root: definition.key, name, path: target, backup };
+}
+
 export async function skillDetail(key: string, name: string, options: ScopeOptions & { workspaceBound?: boolean } = {}) {
   const scopedRoots = await projectRoots(options.projectCwds);
   const presets = options.presetRoots || [];

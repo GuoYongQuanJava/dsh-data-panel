@@ -1,7 +1,7 @@
 import type { ClawHubPage, ClawHubSearchResponse } from './clawhub-catalog.js';
 import type * as React from 'react';
 import type { createRepositoryManager } from './repositories.js';
-import type { state, skillDetail, createSkill, listTrash, listWorkspaces, workspaceSkills, addCustomSources, updateCustomSource, removeCustomSource, scanCustomSourceCandidates } from './core.js';
+import type { state, skillDetail, createSkill, updateSkill, listTrash, listWorkspaces, workspaceSkills, addCustomSources, updateCustomSource, removeCustomSource, scanCustomSourceCandidates } from './core.js';
 import type { ImportResult } from './types.js';
 export type Translate = (key: string, params?: object) => string;
 type Success<T> = T extends {
@@ -47,6 +47,7 @@ export type ApiRoutes = RepositoryRoutes & Record<SkillsShSearchPath, SkillsShSe
     '/category-enable': unknown;
     '/category-disable': unknown;
     '/skill-note': unknown;
+    '/update': Success<Awaited<ReturnType<typeof updateSkill>>>;
     '/sidebar-entry': { enabled: boolean };
 };
 export type ApiCall = <K extends keyof ApiRoutes>(path: K, options?: RequestInit) => Promise<ApiRoutes[K]>;

@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 .pytest_cache/
 testReport/calculator-report.docx
+node_modules/

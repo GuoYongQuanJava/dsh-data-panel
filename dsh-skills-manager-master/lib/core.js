@@ -3407,6 +3407,54 @@ ${body}
   if (log) log("create", `\u521B\u5EFA ${join(target, "SKILL.md")}`);
   return { name, path: join(target, "SKILL.md"), root: definition.key };
 }
+async function updateSkill(input, log, options = {}) {
+  const requestedRoot = Object.prototype.hasOwnProperty.call(options, "root") ? options.root : input && input.root || rootByKey("dsh");
+  const definition = await checkedWritableRootDefinition(requestedRoot);
+  if (definition && definition.ok === false) return definition;
+  if (!definition) return readonlyError("update");
+  const name = String(input && input.name || "").trim();
+  const document = String(input && input.document || "");
+  if (!validStateSkillName(name) || !KEBAB_RE.test(name))
+    return { ok: false, error: `\u6280\u80FD\u4E0D\u5B58\u5728: ${name}`, code: "error.skill.notFound", params: { name } };
+  if (!document.trim())
+    return { ok: false, error: "\u6280\u80FD\u5185\u5BB9\u4E0D\u80FD\u4E3A\u7A7A", code: "error.create.bodyRequired" };
+  if (document.length > 1 << 18)
+    return { ok: false, error: "\u6280\u80FD\u5185\u5BB9\u8FC7\u957F", code: "error.create.tooLarge" };
+  const entry = await resolveEntry(definition, name);
+  if (!entry)
+    return { ok: false, error: `\u6280\u80FD\u4E0D\u5B58\u5728: ${name}`, code: "error.skill.notFound", params: { name } };
+  if (entry.linked === true)
+    return { ok: false, error: "\u5916\u90E8\u76EE\u5F55\u94FE\u63A5\uFF0C\u53EA\u8BFB", code: "error.update.linked", params: { name } };
+  const target = entry.docPath;
+  const doc = parseSkillDoc(document);
+  let baseName = name;
+  try {
+    const currentDoc = parseSkillDoc(await fs.readFile(target, "utf8"));
+    const parsedName = String(currentDoc.map.name || "").trim();
+    if (parsedName) baseName = parsedName;
+  } catch {
+  }
+  if (!doc.hasFrontmatter)
+    return { ok: false, error: "SKILL.md \u7F3A\u5C11 frontmatter", code: "error.update.frontmatter", params: { name } };
+  const declared = String(doc.map.name || "").trim();
+  if (declared !== baseName)
+    return {
+      ok: false,
+      error: `\u4E0D\u80FD\u4FEE\u6539 name\uFF08\u5F53\u524D ${baseName}\uFF09`,
+      code: "error.update.rename",
+      params: { name: baseName, declared: declared || "\u7A7A" }
+    };
+  const backup = `${target}.bak`;
+  try {
+    await fs.copyFile(target, backup);
+  } catch {
+    if (log) log("update", `\u5907\u4EFD\u5931\u8D25: ${backup}`);
+  }
+  await writeFileAtomically(target, document.endsWith("\n") ? document : `${document}
+`);
+  if (log) log("update", `\u66F4\u65B0 ${target}`);
+  return { root: definition.key, name, path: target, backup };
+}
 async function skillDetail(key, name, options = {}) {
   const scopedRoots = await projectRoots(options.projectCwds);
   const presets = options.presetRoots || [];
@@ -3875,6 +3923,7 @@ export {
   trashRootPath,
   unquote,
   updateCustomSource,
+  updateSkill,
   userRoots,
   workspaceSkills
 };

@@ -14,6 +14,7 @@ import {
   importUploadedSkill,
   browseDirectories,
   createSkill,
+  updateSkill,
   skillDetail,
   listProviderCandidates,
   getProviderSkill,
@@ -752,6 +753,19 @@ function apply(ctx, config) {
           presetRoots
         });
       })
+    },
+    {
+      path: `${API_PREFIX}/update`,
+      methods: ["POST"],
+      fetch: (req) => handlePost(req, async (b) => {
+        const target = await workspaceTarget(b);
+        if (target && "ok" in target && target.ok === false) return target;
+        return updateSkill(
+          { name: b.name, document: String(b.document ?? "") },
+          log,
+          { root: target ? target.root : await requestRoot(String(b.root || "dsh"), void 0, req.headers.get("x-dsh-skills-session")) }
+        );
+      }, { afterSuccess: afterWrite })
     },
     {
       path: `${API_PREFIX}/create`,
