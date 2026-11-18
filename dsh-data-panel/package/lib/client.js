@@ -156,6 +156,13 @@ window.__ModuleLoader__.load({
 .dp-case-id { display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 1; color: var(--dp-text2); font-family: ui-monospace, SFMono-Regular, "Cascadia Code", Consolas, monospace; font-size: 12px; line-height: 1.45; word-break: break-all; }
 /* 用例行上的执行次数角标 */
 .dp-run-count { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px; background: var(--dp-brand); color: var(--dp-on-brand); font-size: 10.5px; font-weight: 600; line-height: 1; font-variant-numeric: tabular-nums; }
+/* 用例标识格：展开箭头固定宽度，标识在剩余宽度里居中；
+   执行次数气泡（.dp-run-count）绝对定位到右侧，不参与居中计算 ——
+   有气泡和没气泡的行，标识位置完全一致。右侧留的 padding 是气泡的地盘，不压文字。 */
+.dp-title-cell.dp-case-cell { position: relative; display: grid; grid-template-columns: 20px 1fr; align-items: center; column-gap: 6px; padding-right: 26px; }
+.dp-case-cell .dp-expand-btn { justify-self: center; }
+.dp-case-cell .dp-case-id { min-width: 0; text-align: center; }
+.dp-case-cell .dp-run-count { position: absolute; right: 0; top: 50%; transform: translateY(-50%); }
 .dp-cell-text { display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 2; margin: 0; color: var(--dp-text2); font-size: 12px; line-height: 1.55; text-align: center; white-space: pre-wrap; word-break: break-all; }
 /* 要 3 行的列（测试说明 / 输入 / 预期输出）加这个类。 */
 .dp-cell-text.dp-cell-3 { -webkit-line-clamp: 3; }
@@ -4235,7 +4242,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 													})
 												),
 												h("td", null,
-													h("div", { className: "dp-title-cell" },
+													h("div", { className: "dp-title-cell dp-case-cell" },
 														h("button", {
 															type: "button",
 															className: "dp-expand-btn",
