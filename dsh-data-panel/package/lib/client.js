@@ -768,6 +768,14 @@ window.__ModuleLoader__.load({
 .it-name-btn { padding: 0; border: 0; background: none; font: inherit; font-weight: 550; color: var(--dp-text); text-align: left; cursor: pointer; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .it-name-btn:hover { color: var(--dp-brand); text-decoration: underline; text-underline-offset: 3px; }
 .it-cell-2 { display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 2; margin: 0; color: var(--dp-text2); font-size: 11.5px; line-height: 1.5; text-align: left; }
+		/*
+		 * 用例描述整段显示，不做行数截断。
+		 *
+		 * 原来用 .it-cell-2（-webkit-line-clamp: 2）只露两行，用户要求全部显示：
+		 * 描述里常带前置条件与具体输入，被截掉就失去审查价值。
+		 * 用 pre-wrap 保留原文换行，长单词/长 ID 也要能断行溢出。
+		 */
+		.it-cell-full { margin: 0; color: var(--dp-text2); font-size: 11.5px; line-height: 1.55; text-align: left; white-space: pre-wrap; word-break: break-word; }
 /* 用例名称后面的小标签：用例表里放用例标识，步骤表里放步骤数 */
 .it-case-tag { display: inline-block; margin-left: 5px; padding: 0 6px; border-radius: 5px; background: var(--dp-bg3); color: var(--dp-text3); font-size: 10.5px; line-height: 16px; font-variant-numeric: tabular-nums; vertical-align: 1px; }
 /* 用例名称是内容而不是入口：用纯文本，不再做成按钮 */
@@ -1317,15 +1325,23 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 		};
 
 		/**
-		 * 执行结果筛选可选的三种值。
+		 * 执行结果筛选可选的值。
 		 *
-		 * 「未执行」不在筛选范围里 —— 筛选是用来找「跑过的结果」的，
-		 * 没有执行记录的用例本来就不该出现在按结果筛的视图里。
+		 * 四态：通过 / 未通过 / 异常 / **未执行**。
+		 * 「未执行」= 还没有任何执行记录（itLatestResult 返回 none）。
+		 * 它让用户能主动筛出「还没跑过的用例」，而不是只在跑过的结果里翻。
 		 */
 		var IT_RESULT_FILTERS = [
 			{ key: "pass", label: "通过" },
 			{ key: "fail", label: "未通过" },
-			{ key: "error", label: "异常" }
+			{ key: "error", label: "异常" },
+			/*
+			 * 「未执行」= 这条用例还没有任何执行记录。
+			 *
+			 * 它与「没通过筛选」不是一回事：加它是为了让用户能**主动筛出还没跑过的用例**，
+			 * 在一堆跑过的结果里找剩下没跑的。取值用 none，与 IT_STATUS.none 对齐。
+			 */
+			{ key: "none", label: "未执行" }
 		];
 
 		/**
@@ -1381,6 +1397,17 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 		/** 取某条用例的步骤数（编辑后可能是空数组）。 */
 		function itStepCount(record) {
 			return Array.isArray(record && record.steps) ? record.steps.length : 0;
+		}
+
+		/**
+		 * 取某条用例的执行记录条数。
+		 *
+		 * 步骤页主表用例名称后的角标就显示这个数字：它告诉用户「这条跑过几次」，
+		 * 与「有几个步骤」(itStepCount) 是两件事，不要混用。
+		 * 子表里一条记录 = 一次执行（单步执行一次算一条，一键执行一次也算一条）。
+		 */
+		function itRunCount(record) {
+			return Array.isArray(record && record.records) ? record.records.length : 0;
 		}
 
 		/** 某条用例按场景归属；空场景算「未分组」。 */
@@ -5502,7 +5529,14 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 					h(Button, {
 						key: "export",
 						variant: "ghost",
-						onClick: function () { if (typeof props.onNotice === "function") props.onNotice("演示数据：导出项目报告还没接入后端。"); }
+						"data-it": "overview-export",
+						onClick: function () {
+							if (typeof props.onExport !== "function") {
+								if (typeof props.onNotice === "function") props.onNotice("导出入口还没接好。");
+								return;
+							}
+							props.onExport(shown);
+						}
 					}, "导出"),
 					h(Button, { key: "close", onClick: props.onClose }, "关闭")
 				]
@@ -5821,6 +5855,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 					.then(function (data) {
 						var kinds = (data && data.kinds) || {};
 						var caseKind = kinds.case || {};
+						var stepKind = kinds.step || {};
 						var rawList = (caseKind.data && Array.isArray(caseKind.data.cases)) ? caseKind.data.cases : [];
 						var features = (caseKind.data && Array.isArray(caseKind.data.features)) ? caseKind.data.features : [];
 						var versions = Array.isArray(caseKind.index && caseKind.index.versions) ? caseKind.index.versions : [];
@@ -5833,11 +5868,91 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 						features.forEach(function (item) {
 							if (item && typeof item.id === "string") featureName[item.id] = item.name || item.id;
 						});
+						/*
+						 * ★ 把「生成测试步骤」产出的步骤合并进用例。
+						 *
+						 * 关键：用例存在 case-versions/<V>/cases.json，步骤存在
+						 * step-versions/<V>/steps.json，是两份文件。面板的步骤页是按
+						 * record.steps 渲染的，不合并的话步骤页永远是空的 —— 这正是
+						 * 「产物里有 60 行步骤、面板却不显示」的原因。
+						 *
+						 * 匹配依据是 caseId（不是数组下标：用户可能在用例页删过/调过顺序）。
+						 */
+						var stepByCaseId = Object.create(null);
+						var stepCases = (stepKind.data && Array.isArray(stepKind.data.cases)) ? stepKind.data.cases : [];
+						stepCases.forEach(function (item) {
+							if (!item || typeof item.caseId !== "string") return;
+							stepByCaseId[item.caseId] = Array.isArray(item.steps) ? item.steps : [];
+						});
+						/*
+						 * ★ 把执行记录合并进用例（子表 + 名称后的角标都靠它）。
+						 *
+						 * exec-records.json 的结构是 { 步骤版本: { caseId: [记录...] } }，
+						 * 记录只有 runId/at/result/durationMs 四个字段（详细结果在
+						 * runs/<runId>/ 里）。少合这一步，子表就永远是空的、角标永远是 0 ——
+						 * 即使磁盘上已经跑过。
+						 */
+						var execGroups = (stepKind.data && stepKind.data.execRecords && typeof stepKind.data.execRecords === "object")
+							? stepKind.data.execRecords
+							: {};
+						// 优先取「当前步骤版本」那一组；没有就摊平所有组（单步执行可能落在别的版本下）。
+						var execByCaseId = Object.create(null);
+						var activeStepVersion = stepKind.activeVersion || '';
+						(function () {
+							var pick = execGroups[activeStepVersion];
+							if (!pick || typeof pick !== "object") {
+								pick = {};
+								Object.keys(execGroups).forEach(function (key) {
+									var group = execGroups[key];
+									if (!group || typeof group !== "object") return;
+									Object.keys(group).forEach(function (caseId) {
+										var arr = Array.isArray(group[caseId]) ? group[caseId] : [];
+										pick[caseId] = (pick[caseId] || []).concat(arr);
+									});
+								});
+							}
+							Object.keys(pick).forEach(function (caseId) {
+								var arr = Array.isArray(pick[caseId]) ? pick[caseId] : [];
+								// 子表按时间倒序（最新在最前），与面板取 records[0] 显示最新结果一致。
+								execByCaseId[caseId] = arr.slice().sort(function (a, b) {
+									return String(b && b.at || '').localeCompare(String(a && a.at || ''));
+								});
+							});
+						})();
 						var list = rawList.map(function (item) {
 							if (!item || typeof item !== "object") return item;
 							var next = Object.assign({}, item);
 							if (!next.scenario && next.featureId && featureName[next.featureId]) {
 								next.scenario = featureName[next.featureId];
+							}
+							var own = Array.isArray(next.steps) ? next.steps : [];
+							if (own.length === 0 && next.caseId && stepByCaseId[next.caseId]) {
+								next.steps = stepByCaseId[next.caseId];
+							}
+							var ownRuns = Array.isArray(next.records) ? next.records : [];
+							if (ownRuns.length === 0 && next.caseId && execByCaseId[next.caseId]) {
+								next.records = execByCaseId[next.caseId];
+							}
+							/*
+							 * ★ 由执行记录推导 status / lastRunAt。
+							 *
+							 * cases.json 里**没有**这两个字段（用例本身是静态定义），
+							 * 面板的看板、报告页、总体报告统计都读 record.status。
+							 * 不在这里补，所有用例都会显示「未执行」、通过数恒为 0。
+							 *
+							 * 取最新一条记录（records 已按时间倒序）：
+							 *   result pas  → status "pass"
+							 *   result 其它 → status "fail"（error 也算没通过）
+							 *   没有记录     → status "none"
+							 */
+							var runs = Array.isArray(next.records) ? next.records : [];
+							if (runs.length > 0) {
+								var latestRun = runs[0];
+								next.status = latestRun.result === "pass" ? "pass" : "fail";
+								next.lastRunAt = latestRun.at || "";
+							} else if (!next.status) {
+								next.status = "none";
+								next.lastRunAt = "";
 							}
 							return next;
 						});
@@ -6010,6 +6125,443 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			}
 			function notConnected(name) {
 				setNotice("演示数据：" + name + "还没接入后端，等后续规范确认后再实现。");
+			}
+
+			/**
+			 * 把一段话术填进对话输入框（用户审阅后自己点发送）。
+			 *
+			 * 复用单元测试的 prefillDraft：它处理了「输入框正在发送中」的闸门、
+			 * 官方预填接口不可用时的降级，并且失败会给一句能读懂的原因。
+			 * 这里只负责「把话说清楚」+ 把结果告诉用户，不自己发消息。
+			 */
+			function prefillToComposer(text, okHint) {
+				var outcome = prefillDraft(sessionId, text);
+				if (outcome && outcome.ok) {
+					setNotice(okHint || outcome.message);
+					return true;
+				}
+				setNotice((outcome && outcome.message) || "没能把话术填进输入框。");
+				return false;
+			}
+
+			/** 用例清单（喂给话术）：按功能项分组，逐条列出 caseId + 标题 + 类型。 */
+			function caseLinesForPrompt() {
+				var groups = Object.create(null);
+				var order = [];
+				records.forEach(function (item) {
+					var name = itScenarioOf(item);
+					if (!groups[name]) { groups[name] = []; order.push(name); }
+					groups[name].push(item);
+				});
+				var lines = [];
+				order.forEach(function (name) {
+					lines.push("");
+					lines.push("### 功能项：" + name + "（" + groups[name].length + " 条）");
+					groups[name].forEach(function (item) {
+						var typeLabel = (IT_TYPES[item.type] && IT_TYPES[item.type].label) || item.type || "—";
+						lines.push("- " + (item.caseId || item.id) + "｜" + (item.title || "") + "｜" + typeLabel);
+						if (item.description) lines.push("  说明：" + item.description);
+					});
+				});
+				return lines.join("\n");
+			}
+
+			/**
+			 * 「生成测试步骤」按钮：把完整话术填进对话框，用户审阅后发送。
+			 *
+			 * 话术必须自带足够上下文：用例清单、步骤怎么写、代码不外露、快照与映射规则。
+			 * 否则模型要么漏用例，要么写出界面能看见的代码。
+			 */
+			function generateSteps() {
+				if (records.length === 0) {
+					setNotice("还没有测试用例，先在用例页生成或手动新增，再点「生成测试步骤」。");
+					return;
+				}
+				var text = [
+					"按集成测试 Skill 为下面这些用例生成测试步骤。",
+					"",
+					"本轮用例版本：" + version + "（共 " + records.length + " 条用例）",
+					"来源用例：case-versions/" + version.replace(/\./g, "_") + "/cases.json",
+					"",
+					"## 要处理的用例（按功能项分组）",
+					caseLinesForPrompt(),
+					"",
+					"## 生成要求",
+					"1. 为**每条用例的每个步骤**生成步骤三元组：action（动作）/ operation（输入步骤）/ expected（预期结果）。",
+					"2. 同时产出一一对应的测试代码（模型内部产物）：一个步骤 = 一个测试函数，",
+					"   每个步骤函数**自带前置准备**，保证单独执行第 N 步也能跑通。",
+					"3. 步骤写到 integration/step-versions/<新版本>/steps.json，",
+					"   用例快照写到同目录 cases.snapshot.json（生成步骤时冻结，执行只认快照）。",
+					"4. 代码写到 integration/tests/。",
+					"",
+					"## 硬性约束",
+					"- **测试代码是内部产物**：面板、API、报告里只出现步骤，不出现测试函数名、代码片段、codeRef。",
+					"- 步骤格式：{ no, action, operation, expected, target, channel }。",
+					"  channel 说明这一步走哪条通道：界面操作用 cua，跑测试代码用 runner。",
+					"- 本次新建一个步骤版本，**不要覆盖已有版本**；旧版本保留。",
+					"- 步骤版本要记 sourceCaseVersion = " + version + "。",
+					"- 强度测试不做。",
+					"",
+					"生成后**停下来等我审查步骤**，不要自己接着执行测试。"
+				].join("\n");
+				prefillToComposer(text, "已把「生成测试步骤」的话术填进对话输入框，审阅后按回车发送。");
+			}
+
+			/**
+			 * 总体报告的「导出」：打开**整项目那份**报告。
+			 *
+			 * 与单条报告的区别：
+			 *   · 单条报告 → reports/<runId>/cases/…docx，只含 4.1.1 那张表
+			 *   · 总体报告 → reports/<runId>/…整项目….docx，按配置项测试模板整体排版
+			 *
+			 * 所以这里要挑 kind === "overall" 的那份。先找最近一次一键执行的 runId。
+			 */
+			function exportOverallReport(shown) {
+				openOverallReport(shown);
+			}
+
+			/**
+			 * 打开「项目总体报告」——直接开 tab 页展示那份 Word。
+			 *
+			 * 用户要求的是 tab 页，不是弹窗里的 HTML 汇总。真正的总体报告
+			 * （`reports/<runId>/…整项目….docx`）按配置项测试模板整体排版、
+			 * 含所有用例步骤表的汇总，只有打开 docx 才能看到完整内容。
+			 *
+			 * @param shown 纳入范围的用例（弹窗里排除过之后的）；不传就用全部。
+			 */
+			function openOverallReport(shown) {
+				var list = Array.isArray(shown) ? shown : [];
+				// 取最近一次一键执行的 runId（records 已按时间倒序）。
+				var latest = null;
+				list.forEach(function (record) {
+					(Array.isArray(record.records) ? record.records : []).forEach(function (run) {
+						if (!run || run.source !== "all") return;
+						if (latest === null || String(run.at || "") > String(latest.at || "")) latest = run;
+					});
+				});
+				if (latest === null) {
+					setNotice("还没有一键执行的记录，没有总体报告可导出。先在步骤页点「一键执行」。");
+					return;
+				}
+				var runId = String(latest.runId || "");
+				if (runId === "") { setNotice("这次执行没有 runId，无法定位总体报告。"); return; }
+				if (sessionId === "") { setNotice("当前会话还没就绪，切到对话再点一次。"); return; }
+				setNotice("正在查找总体报告…");
+				fetchReportOf(sessionId, runId).then(function (detail) {
+					var files = (detail && Array.isArray(detail.files)) ? detail.files.filter(function (file) {
+						return file && typeof file.name === "string" && /\.docx$/i.test(file.name) && file.path;
+					}) : [];
+					// 总体报告：kind 为 overall，或文件名带「整项目」。
+					var overall = files.filter(function (file) {
+						return file.kind === "overall" || file.name.indexOf("整项目") !== -1;
+					})[0];
+					if (!overall) {
+						setNotice("这次执行还没有生成总体报告（runId " + runId + "）。让模型按配置项测试模板出一份整项目报告。");
+						return;
+					}
+					openReportFile(overall.path, sessionId, function () { setNotice("已打开项目总体报告。"); });
+				}).catch(function (failure) {
+					setNotice("读取总体报告失败：" + (failure && failure.message ? failure.message : String(failure)));
+				});
+			}
+
+			/**
+			 * 报告页的「查看 / 导出报告」：打开这条用例**最新一次**执行的报告。
+			 *
+			 * 报告页是按用例看结果的，用户点的是「这条用例的报告」而不是某个 runId，
+			 * 所以取子表里最新那条记录（records 已按时间倒序）的 runId。
+			 */
+			function viewLatestReportOfCase(record) {
+				/*
+				 * 报告页只认**一键执行**的记录（单步执行的报告不进报告页）。
+				 * 所以这里筛出 source === "all" 的，取最新一条。
+				 */
+				var runs = (Array.isArray(record && record.records) ? record.records : []).filter(function (run) {
+					return run && run.source === "all";
+				});
+				if (runs.length === 0) {
+					setNotice("这条用例还没有一键执行的记录，先在步骤页点「一键执行」。");
+					return;
+				}
+				// 传 caseId：同一个 runId 目录下有多份报告，要挑这条用例那一份。
+				viewRunReport(runs[0], record.caseId);
+			}
+
+			/**
+			 * 子表里点「查看报告」：按该次执行的 runId 打开 Word 报告。
+			 *
+			 * 复用单元测试那套链路（fetchReportOf → docxOf → openReportFile）：
+			 * 报告按 runId 定位，与「当前数据」无关，所以哪怕用例后来改过，
+			 * 打开的还是那次跑出来的那份。
+			 */
+			function viewRunReport(run, caseId) {
+				var runId = run && run.runId ? String(run.runId) : "";
+				if (runId === "") { setNotice("这条执行记录没有 runId，无法定位报告。"); return; }
+				if (sessionId === "") { setNotice("当前会话还没就绪，切到对话再点一次。"); return; }
+				setNotice("正在查找这次执行的报告…");
+				fetchReportOf(sessionId, runId).then(function (detail) {
+					// 传 caseId：一键执行的目录里有多份报告，要挑这条用例那一份（只含 4.1.1 那张表）。
+					var doc = docxFor(detail, caseId);
+					if (!doc) {
+						setNotice("这次执行还没有生成 Word 报告（runId " + runId + "）。跑完执行后让模型生成报告，或点「一键执行」出总体报告。");
+						return;
+					}
+					openReportFile(doc.path, sessionId, function () { setNotice("已打开报告。"); });
+				}).catch(function (failure) {
+					setNotice("读取报告失败：" + (failure && failure.message ? failure.message : String(failure)));
+				});
+			}
+
+			/**
+			 * 子表里点「导出报告」：把该次执行的 Word 报告另存到用户选的位置。
+			 *
+			 * 与「查看」共用同一份报告文件；这里走 openReportFile 的「保存」语义不可得时
+			 * 直接打开文件所在目录并提示，避免静默失败。
+			 */
+			function exportRunReport(run, caseId) {
+				var runId = run && run.runId ? String(run.runId) : "";
+				if (runId === "") { setNotice("这条执行记录没有 runId，无法导出报告。"); return; }
+				if (sessionId === "") { setNotice("当前会话还没就绪，切到对话再点一次。"); return; }
+				setNotice("正在准备导出…");
+				fetchReportOf(sessionId, runId).then(function (detail) {
+					var doc = docxFor(detail, caseId);
+					if (!doc || !doc.path) {
+						setNotice("这次执行还没有生成 Word 报告，无法导出（runId " + runId + "）。");
+						return;
+					}
+					openReportFile(doc.path, sessionId, function () { setNotice("已打开报告文件，可另存到你想要的位置。"); });
+				}).catch(function (failure) {
+					setNotice("导出失败：" + (failure && failure.message ? failure.message : String(failure)));
+				});
+			}
+
+			/**
+			 * 删除某次执行记录（只删这条记录，不动 runs/ 下的文件与用例）。
+			 *
+			 * 写回 exec-records.json：把该 caseId 数组里匹配 runId 的那条去掉。
+			 */
+			function removeRunRecord(record, run) {
+				var runId = run && run.runId ? String(run.runId) : "";
+				if (runId === "") return;
+				var left = (Array.isArray(record.records) ? record.records : []).filter(function (item) {
+					return String(item && item.runId) !== runId;
+				});
+				var updated = records.map(function (item) {
+					return item.id === record.id ? Object.assign({}, item, { records: left }) : item;
+				});
+				patchRecords(updated);
+				persistExecRecords(updated);
+				setNotice("已删除这条执行记录。");
+			}
+
+			/** 把执行记录写回磁盘（exec-records.json），结构是 { 步骤版本: { caseId: [记录] } }。 */
+			function persistExecRecords(list) {
+				if (typeof fetch !== "function" || sessionId === "" || loadState !== "ready") return;
+				var group = {};
+				(list || []).forEach(function (item) {
+					if (!item || !item.caseId) return;
+					var arr = Array.isArray(item.records) ? item.records : [];
+					if (arr.length > 0) group[item.caseId] = arr;
+				});
+				var payload = {};
+				payload[version] = group;
+				fetch("/data-panel/integration", {
+					method: "POST",
+					headers: { "content-type": "application/json", accept: "application/json" },
+					body: JSON.stringify({ sessionId: sessionId, kind: "step", op: "saveVersion", version: version, execRecords: payload })
+				}).then(function (response) {
+					return response.json().catch(function () { return {}; }).then(function (data) {
+						if (!response.ok || data.ok === false) throw new Error((data && data.error) || ("保存失败（HTTP " + response.status + "）"));
+						return data;
+					});
+				}).catch(function (error) {
+					setNotice("执行记录写回磁盘失败：" + (error && error.message ? error.message : String(error)) + "。界面上的改动还在。");
+				});
+			}
+
+			/**
+			 * 单条用例的「执行」按钮：把这一步的完整信息填进对话框。
+			 *
+			 * 与「一键执行」的区别只在范围：这里只跑用户点的那一条用例的步骤，
+			 * 结果留在步骤页该行下面的子表里，**不产生报告版本、不进报告页**。
+			 * 话术要把这条用例的全部步骤摊开，模型才知道每一步该做什么、期望什么。
+			 */
+			function runStepPrompt(record) {
+				if (!record) return;
+				var steps = Array.isArray(record.steps) ? record.steps : [];
+				if (steps.length === 0) {
+					setNotice("这条用例还没有测试步骤，先回用例页点「生成测试步骤」。");
+					return;
+				}
+				var typeLabel = (IT_TYPES[record.type] && IT_TYPES[record.type].label) || record.type || "—";
+				var promptSteps = steps.map(function (item) {
+					var channel = item.channel === "cua" ? "界面操作（CUA）" : (item.channel === "runner" ? "测试代码（runner）" : "未标注");
+					return [
+						"  第 " + (item.no || 0) + " 步",
+						"    动作：" + (item.action || "—"),
+						"    输入步骤：" + (item.operation || "—"),
+						"    预期结果：" + (item.expected || "—"),
+						"    通道：" + channel
+					].join("\n");
+				}).join("\n");
+
+				var text = [
+					"按集成测试 Skill 单步执行下面这条用例的测试步骤。",
+					"",
+					"## 用例信息",
+					"- 用例标识：" + (record.caseId || "—"),
+					"- 用例名称：" + (record.title || "—"),
+					"- 测试类型：" + typeLabel,
+					"- 功能项：" + itScenarioOf(record),
+					"- 步骤版本：" + version,
+					"- 用例说明：" + (record.description || "—"),
+					"- 前置条件：" + (record.precondition || "—"),
+					"- 预期结果：" + (record.expectedResult || "—"),
+					"",
+					"## 要执行的步骤（共 " + steps.length + " 步）",
+					promptSteps,
+					"",
+					"## 执行要求",
+					"1. 严格按上面列出的步骤执行，**只认步骤版本冻结的用例快照**，不读当前用例版本。",
+					"2. 标注为界面操作（CUA）的步骤，自己直接调 mcp__cua__* 工具执行，不要回来问我。",
+					"3. 标注为测试代码（runner）的步骤，走 run_tests.py。",
+					"4. 这是**单步执行**：结果写到测试步骤页这条用例的子表里，",
+					"   **不产生报告版本、不进测试报告页**。",
+					"   （每次执行对这条用例只追加一条执行记录。）",
+					"",
+					"5. **执行记录必须标 source = \"step\"**（表示这是单步执行）。",
+					"   面板靠它区分：单步记录只留在步骤页子表，**不会出现在测试报告页**。",
+					"   记录字段：{ runId, at, result, durationMs, source }。",
+					"",
+					"## ★ 必须为这次单条执行生成报告",
+					"- 生成时间：执行结束、拿到结果之后**立即生成**，不要等用户再点一次。",
+					"- **必须调原型生成**：`F:\\插件开发\\集成报告原型\\integration_report.py` 的 `build_single_step()`。",
+					"  **不许自己写填表逻辑，不许复制原型改，原型缺失要明确报错**（不要降级成简化版）。",
+					"- 存放位置：`integration/reports/<本次 runId>/`（**用这次执行的 runId 建目录**）。",
+					"- **只取「4.1.1 测试结果总结」那一张表**，不要按整本配置项测试模板排版。",
+					"- **不要章节号和表题**：不写「4.1 功能项名」、不写「4.1.1 测试结果总结」、",
+					"  不写「表1 标识 xxx 第 N 步」。单条报告 = 标题 + 一张填好的表。",
+					"  原型已经按这个规则改好了，**你只要把数据喂给它**。",
+					"- **测试类型按用例自身 type 填**（functional→功能测试、api→接口测试、boundary→边界测试…）；",
+					"  **测试方法固定「黑盒测试」**。两个格不一样，不要都写黑盒测试。",
+					"- **人员三字段暂定都写 `admin`；软件问题单编号写「无」**（原型里已是默认值）。",
+					"  单条报告要喂的数据结构：",
+					"    · people { designer, reviewer, tester }（都填 admin）",
+					"    · feature { code, name }",
+					"    · case { caseId, title, type, requirement, description, precondition, executedAt, outcome, steps[] }",
+					"    · steps[]：**整条用例的全部步骤**都要列出，本次未执行的标 outcome=\"notRun\"，",
+					"      observed 写「未执行（本次只执行第 N 步）」—— 不要只写执行的那一步。",
+					"- 文件名：`集成测试报告-<caseId>-第<N>步-<版本>.docx`。",
+					"- 报告生成后**停下来告诉我路径**，我要在步骤页子表点「查看报告」直接打开它。",
+					"",
+					"## 硬性约束",
+					"- 回写 observed 必须是**真实读到的现象**，不能把预期抄成观察。",
+					"- 找不到证据标「未确认」，不冒充 runner 证据。",
+					"- 编译错误、依赖缺失视为失败，不是通过。",
+					"- 报告/界面里不出现测试代码与函数名。"
+				].join("\n");
+
+				prefillToComposer(text, "已把这条用例的执行话术填进对话输入框，审阅后按回车发送。");
+			}
+
+			/**
+			 * 「一键执行」按钮：把执行话术填进对话框，用户审阅后发送。
+			 *
+			 * 这里不预先跑 runner —— 命令与 runId 由模型在收到话术后再准备，
+			 * 面板只负责把「跑什么、怎么记录、怎么取证」说清楚。
+			 */
+			function runAllIntegrationPrompt() {
+				var stepCount = records.reduce(function (sum, item) {
+					return sum + (Array.isArray(item.steps) ? item.steps.length : 0);
+				}, 0);
+				if (stepCount === 0) {
+					setNotice("当前还没有测试步骤，先在用例页点「生成测试步骤」。");
+					return;
+				}
+				var text = [
+					"按集成测试 Skill 一键执行当前步骤版本的全部步骤。",
+					"",
+					"步骤版本：" + version + "（共 " + records.length + " 条用例、" + stepCount + " 个步骤）",
+					"来源：integration/step-versions/" + version.replace(/\./g, "_") + "/steps.json",
+					"",
+					"## 执行要求",
+					"1. 严格按步骤版本执行，**只认 cases.snapshot.json 冻结的用例**，不读当前用例版本。",
+					"2. 功能测试（functional）走 CUA 桌面 MCP（mcp__cua__*），自己直接调用，不要回来问我。",
+					"3. 其余类型走 run_tests.py。两条通道并存是正常的，分别记录、分别标来源。",
+					"4. 执行记录要挂到测试步骤页主表每一行下面的子表里（每次一键执行对每条用例只加一条）。",
+					"   **每条记录必须标 source = \"all\"**（表示这是一键执行），否则报告页看不到它：",
+					"   面板靠 source 区分「单步执行（step，只在步骤页）」和「一键执行（all，进报告页）」。",
+					"5. 报告分两类，**排版方式完全不同，不要混用**（见下「报告要出什么」）。",
+					"",
+					"## ★ 报告要出什么（两类，别混淆）",
+					"",
+					"### 共用铁律：报告一律调原型，不许自己写填表逻辑",
+					"- 原型路径：`F:\\插件开发\\集成报告原型\\integration_report.py`",
+					"- 它对外只有两个函数：`build_single_step(...)` 单条报告、`build_full(...)` 总体报告。",
+					"- **不许自己实现表格填充**（会漏规范：不要章节号 / 类型映射 / 一页显示 / 人员默认值等）。",
+					"- **不许把原型复制一份改**（规范会分叉）。要改就改原型本身。",
+					"- **原型缺失时明确报错**，不许自己写个简化版冒充。",
+					"- 你的脚本只做「读 json → 组 data → 调原型」，填表交给原型。",
+					"",
+					"### A. 每条用例一份「单用列表」报告 —— 只取 4.1.1 那一张表",
+					"- **不要套整本配置项测试模板**，只取模板里 **4.1.1「测试结果总结」那一张表**并填好。",
+					"  模板里其它章节（1 范围、2 引用文档、3 评估、5 注释、附录）**全部不要**。",
+					"- **更不要章节号和表题**：不写「4.1 功能项名」、不写「4.1.1 测试结果总结」、",
+					"  不写「表1 标识 xxx 第 N 步」。单条报告 = 标题 + 一张填好的表。",
+					"- 生成方式：调原型的 `build_single_step()`，**不要用 `build_full()`**。",
+					"- **测试类型按用例自身填**（界面用例写「功能测试」、接口用例写「接口测试」…），",
+					"  **测试方法固定写「黑盒测试」**。两个格不一样，不要都写黑盒测试。",
+					"- **人员三字段暂定都写 `admin`；软件问题单编号写「无」**。",
+					"- 存放位置：`integration/reports/<本次 runId>/cases/`",
+					"- 文件名：`集成测试报告-<caseId>-全步骤-<版本>.docx`",
+					"- 内容：这条用例的**全部步骤**（no/action/operation/expected/observed/outcome），",
+					"  逐步骤填实；本次未执行的步骤标 outcome=\"notRun\"，observed 写「未执行（本次未执行该步）」。",
+					"- **每条用例都要有**，60 条用例就是 60 份。",
+					"",
+					"### B. 整个项目一份「总体报告」—— 按阶段分章，套整本模板",
+					"- 这一类**才**用整本模板：`1 范围` … `注释` + 附录A/B。",
+					"- 生成方式：用 `build_full()`，**数据要按 stages 组织**（不是平铺 features）：",
+					"  data = { meta, people, stages: [ { name, features:[{name,cases}], issues, inconsistent, regression } ] }",
+					"- **按测试阶段分章**：第 1 个阶段是 4 章，第 2 个是 5 章…（章号 = 阶段序号 + 3）。",
+					"  每个阶段内部：N.1 <功能点名称> → N.1.1 测试结果总结（**该功能点下所有用例表**）",
+					"  → N.2 <下一个功能点> → N.2.1 测试结果总结 … 依此类推",
+					"  → N.n 遇到的问题（n = 功能点数 + 1，写「详见附录A软件问题报告单」）",
+					"  → N.n+1 与测试用例/规程的不一致（一般写「无」）",
+					"  → N.n+2 回归测试（章内最后一节，只放本阶段未通过的用例重跑结果）；",
+					"    其下的 N.n+2.r <功能点名> **下面直接接表**，没有 .1 那层测试结果总结。",
+					"- **3.1 总体评估按阶段数展开段落**（模板是制式段「共 x 个这样的段」）：",
+					"  有几个阶段就复制几段，每段填该阶段数据；最后一段固定的「经本次配置项测试验证…」。",
+					"- **表2 分布统计**：表头「测试功能」要写成「**功能测试**」；7 类没有的写 **0** 不要空着；",
+					"  测试阶段列**不能空**。",
+					"- **表3 问题分类**：「合计问题数」没有写 **0**；「测试问题归零解决情况」没有写 **无**。",
+					"- **表4 记录单**：测试阶段不能空；详细需求追踪条目 = 用例标识去掉 `-N-Tnnn.CTD`。",
+					"- 存放位置：`integration/reports/<本次 runId>/`（与 cases/ 平级）",
+					"- 文件名：`集成测试报告-<项目名>-整项目-<版本>.docx`",
+					"",
+					"### ★ 用例标识规范（每条用例生成时就必须产出 caseCode）",
+					"- 格式：`测试类型缩写-651-项目缩写_需求来源_章节英文名-1或2-T序号.CTD`",
+					"- 例：`GN-651-JYSG_SRS_UI_TESTING-1-T001.CTD`、`JK-651-JYSG_DM_API_TESTING-2-T002.CTD`",
+					"- 类型缩写：功能=GN 接口=JK 安全=AQ 性能=XN 边界=BJ 强度=QD 余量=YL",
+					"- `651` 与结尾 `.CTD` **固定不变**；项目缩写如 肌颜时光→JYSG",
+					"- 需求来源：有需求文档=`SRS`，按代码归纳=`DM`",
+					"- 章节名：需求文档章节英文名；无需求文档用功能点英文名（如 `API_TESTING`）",
+					"- 倒数第二段：`1`=正常用例，`2`=专门测异常情况的用例",
+					"- **详细需求追踪条目** = 用例标识去掉 `-1-T001.CTD` 尾部",
+					"- 存进用例的 `caseCode` 字段；内部主键 `caseId` 保持不变（面板/执行靠它关联）",
+					"",
+					"### 怎么记录这两类报告的位置",
+					"执行结束后写一份 `reports/<runId>/report-data.json`，至少包含：",
+					"  { runId, stepVersion, caseVersion, generatedAt, summary, overallDocx, features }",
+					"其中 `overallDocx` 指向 B 那份总体报告；每条用例的单条报告路径记在 features 下各用例项里。",
+					"面板的「查看报告」按 runId 找目录，**只要目录里有 docx 就能打开**。",
+					"",
+					"## 硬性约束",
+					"- 回写 observed 必须是**真实读到的现象**，不能把预期抄成观察。",
+					"- 找不到证据标「未确认」，不冒充 runner 证据。",
+					"- 编译错误、依赖缺失视为失败，不是通过。",
+					"- 报告里不出现测试代码与函数名。"
+				].join("\n");
+				prefillToComposer(text, "已把「一键执行」的话术填进对话输入框，审阅后按回车发送。");
 			}
 
 			/**
@@ -6229,7 +6781,6 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 												h("th", { style: { width: "52px" } }, "序号"),
 												h("th", { style: { width: "26%" } }, "用例名称"),
 												h("th", null, "用例描述"),
-												h("th", { style: { width: "96px" } }, "生成时间"),
 												h("th", { style: { width: "78px" } }, "操作")
 											)
 										),
@@ -6266,9 +6817,8 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 													h("span", { className: "it-name-text" }, record.title || "—")
 												),
 												h("td", { className: "it-left" },
-													h("p", { className: "it-cell-2", title: record.description || "" }, record.description || "—")
+													h("p", { className: "it-cell-full", title: record.description || "" }, record.description || "—")
 												),
-												h("td", null, itDate(record.createdAt)),
 												h("td", null,
 													h("div", { className: "it-ops" },
 														h(IconButton, { name: "edit", label: "编辑", "data-it": "edit-btn-" + record.id, onClick: function () { setDetail({ mode: "edit", record: record }); } }),
@@ -6474,7 +7024,6 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 												h("th", null, "输入步骤"),
 												h("th", null, "预期结果"),
 												h("th", { style: { width: "80px" } }, "执行结果"),
-												h("th", { style: { width: "92px" } }, "生成日期"),
 												h("th", { style: { width: "78px" } }, "操作")
 											)
 										),
@@ -6504,7 +7053,19 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 													),
 													h("td", { className: "it-left" },
 														h("span", { className: "it-name-text" }, record.title || "—"),
-														itStepCount(record) > 0 ? h("span", { className: "it-case-tag" }, String(itStepCount(record))) : null
+														/*
+														 * 角标 = 这一行下面子表里**有几条执行记录**，不是步骤数。
+														 *
+														 * 用途是让用户不展开也能看出「这条跑过几次」；0 条就不显示，
+														 * 免得每行都挂个 0 反而看不出差别。
+														 */
+														itRunCount(record) > 0
+															? h("span", {
+																className: "it-case-tag",
+																"data-it": "run-count-" + record.id,
+																title: "已执行 " + itRunCount(record) + " 次"
+															}, String(itRunCount(record)))
+															: null
 													),
 													h("td", null, (first && first.action) || "—"),
 													h("td", { className: "it-left" }, stepLines(record, "operation") || h("span", { className: "it-muted" }, "—")),
@@ -6517,17 +7078,16 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 														var latest = IT_STATUS[itLatestResult(record)] || IT_STATUS.none;
 														return h("span", { className: "it-pill", "data-tone": latest.tone, "data-it": "result-cell-" + record.id }, latest.label);
 													})()),
-													h("td", null, itDate(record.createdAt)),
 													h("td", null,
 														h("div", { className: "it-ops" },
-															h(IconButton, { name: "play", label: "执行 " + (record.title || ""), "data-it": "run-" + record.id, onClick: function () { notConnected("执行"); } }),
+															h(IconButton, { name: "play", label: "执行 " + (record.title || ""), "data-it": "run-" + record.id, onClick: function () { runStepPrompt(record); } }),
 															h(IconButton, { name: "edit", label: "编辑步骤 " + (record.title || ""), "data-it": "edit-btn-" + record.id, onClick: function () { setDetail({ kind: "steps", record: record }); } })
 														)
 													)
 												),
 												open
 													? h("tr", { className: "it-expand-row" },
-														h("td", { colSpan: 8, "data-it": "step-runs-" + record.id },
+														h("td", { colSpan: 7, "data-it": "step-runs-" + record.id },
 															h("div", { className: "it-expand-box" },
 																h("table", { className: "it-mini it-mini-runs" },
 																	h("thead", null,
@@ -6561,9 +7121,9 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 																				h("td", null, itTime(run.at)),
 																				h("td", null,
 																					h("div", { className: "it-ops" },
-																						h(IconButton, { name: "doc", label: "查看报告", "data-it": "report-sub", onClick: function () { notConnected("查看报告"); } }),
-																						h(IconButton, { name: "download", label: "导出报告", onClick: function () { notConnected("导出报告"); } }),
-																						h(IconButton, { name: "trash", danger: true, label: "删除记录", onClick: function () { notConnected("删除执行记录"); } })
+																						h(IconButton, { name: "doc", label: "查看报告", "data-it": "report-sub-" + run.runId, onClick: function () { viewRunReport(run, record.caseId); } }),
+																						h(IconButton, { name: "download", label: "导出报告", "data-it": "export-sub-" + run.runId, onClick: function () { exportRunReport(run, record.caseId); } }),
+																						h(IconButton, { name: "trash", danger: true, label: "删除记录", "data-it": "del-run-" + run.runId, onClick: function () { removeRunRecord(record, run); } })
 																					)
 																				)
 																			);
@@ -6605,19 +7165,43 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			 * 分组头可点，收起后只留汇总行 —— 场景多的时候一眼能扫完通过率。
 			 */
 			function reportsView() {
-var rows = baseCurrent.filter(function (record) { return (record.records || []).length > 0; });
+				/*
+				 * 报告页只放**一键执行**产生的结果。
+				 *
+				 * 单步执行的记录留在测试步骤页的子表里（用户明确要求：单条执行不进报告页）。
+				 * 所以这里按记录的 source 过滤：
+				 *   · source === "all"      → 一键执行，进报告页
+				 *   · source === "step"     → 单步执行，**不进报告页**
+				 *   · 没有 source（旧数据）  → 按「单步」处理，宁可少显示也不混进来
+				 * 每条记录在写入时都会带上 source，见 runStepPrompt / 执行汇报要求。
+				 */
+				var rows = baseCurrent.filter(function (record) {
+					return (record.records || []).some(function (run) {
+						return run && run.source === "all";
+					});
+				});
 				// 按功能项归组，保持侧栏里的顺序（全部 → 各功能项按名称）。
 				var groups = [];
 				scenarios.forEach(function (item) {
 					if (item.name === IT_SCENARIOS_ALL) return;
 					var members = rows.filter(function (record) { return itScenarioOf(record) === item.name; });
 					if (members.length === 0) return;
+					/*
+					 * 统计只数「一键执行」的记录，单步执行的不算进来 ——
+					 * 否则「共 N 条报告」会把步骤页的单条记录也算进去，数字虚高。
+					 */
+					var pullRecords = function (r) {
+						return (Array.isArray(r.records) ? r.records : []).filter(function (run) {
+							return run && run.source === "all";
+						});
+					};
+					var allRuns = members.reduce(function (list, r) { return list.concat(pullRecords(r)); }, []);
 					groups.push({
 						name: item.name,
 						records: members,
-						passed: members.filter(function (r) { return r.status === "pass"; }).length,
-						failed: members.filter(function (r) { return r.status === "fail"; }).length,
-						reports: members.reduce(function (sum, r) { return sum + (r.records || []).length; }, 0)
+						passed: allRuns.filter(function (run) { return run.result === "pass"; }).length,
+						failed: allRuns.filter(function (run) { return run.result !== "pass"; }).length,
+						reports: allRuns.length
 					});
 				});
 
@@ -6667,9 +7251,24 @@ var rows = baseCurrent.filter(function (record) { return (record.records || []).
 							h("button", { type: "button", className: "it-multi-link", "data-it": "multi-clear", onClick: function () { setSelected([]); } }, "清空")
 						)
 						: h("div", { className: "it-overview-stat" },
-							h("span", null, "报告 ", h("b", null, String(rows.reduce(function (sum, record) { return sum + (record.records || []).length; }, 0))), " 份"),
-							h("span", null, "通过 ", h("b", null, String(rows.filter(function (r) { return r.status === "pass"; }).length)), " 条"),
-							h("span", null, "未通过 ", h("b", null, String(rows.filter(function (r) { return r.status === "fail"; }).length)), " 条"),
+							/*
+							 * 统计口径与 reportsView 一致：只数一键执行的记录。
+							 * 「通过/未通过」不能直接用 record.status（那是含单步执行在内的汇总值），
+							 * 否则会出现「报告 1 份、通过 3 条」这种对不上的数字。
+							 */
+							(function () {
+								var allRuns = [];
+								rows.forEach(function (record) {
+									(Array.isArray(record.records) ? record.records : []).forEach(function (run) {
+										if (run && run.source === "all") allRuns.push(run);
+									});
+								});
+								return [
+									h("span", { key: "total" }, "报告 ", h("b", null, String(allRuns.length)), " 份"),
+									h("span", { key: "pass" }, "通过 ", h("b", null, String(allRuns.filter(function (run) { return run.result === "pass"; }).length)), " 条"),
+									h("span", { key: "fail" }, "未通过 ", h("b", null, String(allRuns.filter(function (run) { return run.result !== "pass"; }).length)), " 条")
+								];
+							})(),
 							// 「多选」是文字按钮，点开才进入多选态（对齐原型）
 							h("button", {
 								type: "button",
@@ -6749,6 +7348,17 @@ var rows = baseCurrent.filter(function (record) { return (record.records || []).
 													var meta = IT_STATUS[record.status] || IT_STATUS.none;
 													var first = (record.steps || [])[0];
 													var checked = selected.indexOf(record.id) !== -1;
+													/*
+													 * 报告页显示的是**一键执行**那一条记录的结果与时间，
+													 * 不能直接用 record.status（那是含单步执行在内的汇总值）。
+													 */
+													var allRuns = (Array.isArray(record.records) ? record.records : []).filter(function (run) {
+														return run && run.source === "all";
+													});
+													var shownRun = allRuns[0] || null;
+													if (shownRun) {
+														meta = IT_STATUS[shownRun.result] || IT_STATUS.none;
+													}
 													return h("tr", { key: record.id, "data-case-row": record.id },
 														multiSelect
 															? h("td", null,
@@ -6774,11 +7384,11 @@ var rows = baseCurrent.filter(function (record) { return (record.records || []).
 														),
 														h("td", null, (first && first.action) || "—"),
 														h("td", null, h("span", { className: "it-pill", "data-tone": meta.tone }, meta.label)),
-														h("td", null, itDate(record.lastRunAt)),
+														h("td", null, itDate(shownRun ? shownRun.at : record.lastRunAt)),
 														h("td", null,
 															h("div", { className: "it-ops" },
-																h(IconButton, { name: "eye", label: "查看报告 " + (record.title || ""), "data-it": "report-" + record.id, onClick: function () { notConnected("查看报告"); } }),
-																h(IconButton, { name: "download", label: "导出报告 " + (record.title || ""), "data-it": "export-" + record.id, onClick: function () { notConnected("导出报告"); } })
+																h(IconButton, { name: "eye", label: "查看报告 " + (record.title || ""), "data-it": "report-" + record.id, onClick: function () { viewLatestReportOfCase(record); } }),
+																h(IconButton, { name: "download", label: "导出报告 " + (record.title || ""), "data-it": "export-" + record.id, onClick: function () { viewLatestReportOfCase(record); } })
 															)
 														)
 													);
@@ -6842,7 +7452,17 @@ var rows = baseCurrent.filter(function (record) { return (record.records || []).
 			var TAB_COUNTS = {
 				cases: records.length,
 				steps: records.reduce(function (sum, record) { return sum + itStepCount(record); }, 0),
-				reports: records.reduce(function (sum, record) { return sum + (record.records || []).length; }, 0)
+				/*
+				 * 报告数只算**一键执行**产生的记录（source === "all"）。
+				 *
+				 * 单步执行的记录留在步骤页子表里，不进报告页 —— 所以这里也不能把它们
+				 * 算进「测试报告」的数字，否则会看到「60 条用例却 63 份报告」这种虚高。
+				 * 与 reportsView() 的过滤条件必须保持一致。
+				 */
+				reports: records.reduce(function (sum, record) {
+					var runs = Array.isArray(record.records) ? record.records : [];
+					return sum + runs.filter(function (run) { return run && run.source === "all"; }).length;
+				}, 0)
 			};
 
 			return h("div", {
@@ -7033,26 +7653,38 @@ var rows = baseCurrent.filter(function (record) { return (record.records || []).
 							/*
 							 * 主操作按子页给不同的东西：
 							 *   测试用例 —— 新增用例（primary，唯一的颜色强调）+ 生成测试步骤
-							 *   测试步骤 —— 执行
+							 *   测试步骤 —— 一键执行
 							 *   测试报告 —— 总体报告（汇总视图）
-							 * 原来的「全部执行」在这里点了只会弹一句「还没接入后端」，
-							 * 而这一轮明确用例页不承载执行，所以不再摆这个按钮。
 							 */
 							tab === "reports"
-								? h(Button, { variant: "ghost", "data-it": "overview", onClick: function () { setOverview(true); } }, "总体报告")
+								? h(Button, {
+									variant: "ghost",
+									"data-it": "overview",
+									/*
+									 * 「总体报告」直接开 tab 页展示整项目那份 Word 报告。
+									 *
+									 * 用户的要求是「打开一个 tab 页」，不是在弹窗里看一份 HTML 汇总：
+									 * 真正的总体报告是按配置项测试模板整体排版、含所有用例步骤表汇总的
+									 * 那份 docx，只有打开它才能看到完整内容。
+									 *
+									 * 弹窗（IntegrationOverview）保留为「选择纳入范围」的辅助入口，
+									 * 但主入口直接开报告。
+									 */
+									onClick: function () { openOverallReport(records); }
+								}, "总体报告")
 								: null,
 							tab === "cases"
 								? h(Button, {
 									variant: "ghost",
 									"data-it": "generate-steps",
-									onClick: function () { notConnected("生成测试步骤"); }
+									onClick: function () { generateSteps(); }
 								}, "生成测试步骤")
 								: null,
 							tab === "steps"
 								? h(Button, {
 									variant: "ghost",
 									"data-it": "run-steps",
-									onClick: function () { notConnected("执行"); }
+									onClick: function () { runAllIntegrationPrompt(); }
 								}, "一键执行")
 								: null,
 							tab === "cases"
@@ -7100,7 +7732,12 @@ var rows = baseCurrent.filter(function (record) { return (record.records || []).
 					? h(IntegrationOverview, {
 						records: records,
 						onClose: function () { setOverview(false); },
-						onNotice: setNotice
+						onNotice: setNotice,
+						/*
+						 * 总体报告的「导出」：打开**整项目那份**报告（按配置项测试模板
+						 * 整体排版、含所有用例步骤表汇总），不是某条用例的单条报告。
+						 */
+						onExport: function (shown) { exportOverallReport(shown); }
 					})
 					: null,
 				// 删除确认：短确认框，只删演示数据。
@@ -7669,6 +8306,43 @@ var rows = baseCurrent.filter(function (record) { return (record.records || []).
 				if (file && typeof file.name === "string" && /\.docx$/i.test(file.name) && file.path) return file;
 			}
 			return null;
+		}
+
+		/**
+		 * 从报告目录里挑一份 docx。
+		 *
+		 * 一键执行的目录里同时有「总体报告」和「每条用例的单条报告」：
+		 *   overall → 文件名含「整项目」，按配置项测试模板整体排版
+		 *   case    → 放在 cases/ 子目录，文件名含 caseId，只含 4.1.1 那张表
+		 *
+		 * 面板的「查看报告」要打开的永远是**这条用例的单条报告**（用户明确要求：
+		 * 单条报告只看那一张表）。所以这里优先按 caseId 匹配文件名，
+		 * 匹配不到再退到 kind === 'case' 的任意一份，最后才退到 overall。
+		 *
+		 * @param detail  /data-panel/run/report 的返回
+		 * @param caseId  想要哪条用例的报告（空串表示不挑，取第一份）
+		 */
+		function docxFor(detail, caseId) {
+			if (!detail || !Array.isArray(detail.files)) return null;
+			var files = detail.files.filter(function (file) {
+				return file && typeof file.name === "string" && /\.docx$/i.test(file.name) && file.path;
+			});
+			if (files.length === 0) return null;
+			var wanted = typeof caseId === "string" ? caseId.trim() : "";
+
+			// ① 文件名里带 caseId 的那份（最准）
+			if (wanted !== "") {
+				var exact = files.filter(function (file) { return file.name.indexOf(wanted) !== -1; });
+				if (exact.length > 0) return exact[0];
+			}
+			// ② 子目录里的单条报告（有多份时取第一份，但**绝不退到 overall**）
+			var singles = files.filter(function (file) { return file.kind === "case"; });
+			if (singles.length > 0) return singles[0];
+			// ③ 总体报告（only overall 的场景）
+			var overall = files.filter(function (file) { return file.kind === "overall"; });
+			if (overall.length > 0) return overall[0];
+			// ④ 兜底：第一份
+			return files[0];
 		}
 
 		/** 优先把报告开在右侧栏（better-sidebar 会把 docx 交给 DSH 的文档预览）。 */
@@ -8241,6 +8915,7 @@ var rows = baseCurrent.filter(function (record) { return (record.records || []).
 			itLatestResult: itLatestResult,
 			itVersionValue: itVersionValue,
 			buildIntegrationSeed: buildIntegrationSeed,
+				docxFor: docxFor,
 			itFilterRecords: itFilterRecords,
 			itScenarioRows: itScenarioRows,
 			fmtDuration: fmtDuration,
