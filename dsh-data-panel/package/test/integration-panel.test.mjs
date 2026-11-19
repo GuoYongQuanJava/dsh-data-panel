@@ -62,11 +62,11 @@ function harness() {
     activeVersion: 'V0.0.1',
     byVersion: {
       'V0.0.1': [
-        { id: 'it-1', caseId: 'V0_0_1-IT-001', title: '手机号验证码登录', scenario: '用户与登录', type: 'functional', description: '登录链路', steps: [{ no: 1, action: '打开', operation: '进入', expected: '显示' }], records: [{ runId: 'run-1', at: '2026-11-17T10:00:00Z', result: 'pass', durationMs: 1200 }] },
+        { id: 'it-1', caseId: 'V0_0_1-IT-001', title: '手机号验证码登录', scenario: '用户与登录', type: 'functional', description: '登录链路', steps: [{ no: 1, action: '打开', operation: '进入', expected: '显示' }], records: [{ runId: 'run-1', at: '2026-11-17T10:00:00Z', result: 'pass', durationMs: 1200, source: 'all' }] },
         { id: 'it-2', caseId: 'V0_0_1-IT-002', title: '账号密码登录失败锁定', scenario: '用户与登录', type: 'functional', description: '锁定 5 次', steps: [{ no: 1, action: '登录', operation: '错 5 次', expected: '锁定' }], records: [] },
         { id: 'it-3', caseId: 'V0_0_1-IT-003', title: '退出登录清除会话', scenario: '用户与登录', type: 'functional', description: '清除凭证', steps: [], records: [] },
-        { id: 'it-4', caseId: 'V0_0_1-IT-004', title: '商品加入购物车', scenario: '商品与购物车', type: 'functional', description: '加购', steps: [{ no: 1, action: '加购', operation: '点击', expected: '成功' }], records: [{ runId: 'run-2', at: '2026-11-17T10:05:00Z', result: 'fail', durationMs: 800 }] },
-        { id: 'it-5', caseId: 'V0_0_1-IT-005', title: '购物车数量上限校验', scenario: '商品与购物车', type: 'boundary', description: '超库存拦截', steps: [{ no: 1, action: '改量', operation: '输 999', expected: '拦截' }], records: [{ runId: 'run-3', at: '2026-11-17T10:10:00Z', result: 'pass', durationMs: 500 }] },
+        { id: 'it-4', caseId: 'V0_0_1-IT-004', title: '商品加入购物车', scenario: '商品与购物车', type: 'functional', description: '加购', steps: [{ no: 1, action: '加购', operation: '点击', expected: '成功' }], records: [{ runId: 'run-2', at: '2026-11-17T10:05:00Z', result: 'fail', durationMs: 800, source: 'all' }] },
+        { id: 'it-5', caseId: 'V0_0_1-IT-005', title: '购物车数量上限校验', scenario: '商品与购物车', type: 'boundary', description: '超库存拦截', steps: [{ no: 1, action: '改量', operation: '输 999', expected: '拦截' }], records: [{ runId: 'run-3', at: '2026-11-17T10:10:00Z', result: 'pass', durationMs: 500, source: 'all' }] },
         { id: 'it-6', caseId: 'V0_0_1-IT-006', title: '结算优惠券抵扣', scenario: '商品与购物车', type: 'api', description: '满减', steps: [], records: [] },
       ],
       'V0.0.2': [
@@ -350,15 +350,15 @@ test('步骤表有「执行结果」列，取该用例最新一次执行的结�
   find(render(), 'tab-steps').props.onClick()
   const tree = render()
 
-  // 表头要有「执行结果」，且排在「生成日期」左边
+  // 表头要有「执行结果」；「生成日期」已按要求移除（同一批生成时间相同，没有信息量）
   const heads = nodes(tree)
     .filter(n => n.type === 'th')
     .map(n => n.children.filter(c => typeof c === 'string').join(''))
     .filter(Boolean)
   const atResult = heads.indexOf('执行结果')
-  const atDate = heads.indexOf('生成日期')
   assert.ok(atResult >= 0, '要有「执行结果」列：' + JSON.stringify(heads))
-  assert.ok(atDate > atResult, '执行结果应排在生成日期左边')
+  assert.equal(heads.indexOf('生成日期'), -1, '步骤主表不再有「生成日期」列（执行日期在子表里）')
+  assert.equal(heads[heads.length - 1], '操作', '最后一列是操作')
 
   // 每行都有一个结果 pill
   const id = rowIds(tree)[0]
@@ -660,4 +660,74 @@ test('用例页与步骤页的表格都包在 .it-card 里', () => {
   // 步骤页
   find(render(), 'tab-steps').props.onClick()
   assert.equal(hasCard(render()), true, '步骤页的表格要包在卡片里')
+})
+
+/*
+ * 用例数据与「步骤」「执行记录」是**三份文件**（cases.json / steps.json /
+ * exec-records.json）。面板靠 caseId 把它们合并进一条用例。
+ *
+ * 这条测试直接对源码里的合并逻辑做断言，因为它正是曾经漏掉的一环：
+ * 只合并了 steps 没合并 records，结果磁盘上跑过的记录在子表和角标里都看不见。
+ */
+test('加载后端数据时按 caseId 合并步骤与执行记录（缺一不可）', async () => {
+  const h = harness()
+  const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
+  assert.match(source, /stepByCaseId/, '要按 caseId 把 steps 合并进用例')
+  assert.match(source, /execByCaseId/, '要按 caseId 把执行记录合并进用例')
+  assert.match(source, /next\.records = execByCaseId/, '执行记录要落到 record.records（子表与角标都靠它）')
+
+  // 合并后角标显示的是执行记录条数，不是步骤数
+  const seed = {
+    versions: [{ name: 'V0.0.1', at: '2026-11-16T09:00:00Z', status: 'current' }],
+    activeVersion: 'V0.0.1',
+    byVersion: {
+      'V0.0.1': [
+        { id: 'x', caseId: 'V0_0_1-IT-001', title: '跑过两次', scenario: '登录', type: 'functional',
+          steps: [{ no: 1, action: 'a', operation: 'o', expected: 'e' }],
+          records: [{ runId: 'r1', at: '2026-11-19T10:00:00Z', result: 'pass', durationMs: 1 },
+                    { runId: 'r2', at: '2026-11-19T11:00:00Z', result: 'error', durationMs: 1 }] },
+        { id: 'y', caseId: 'V0_0_1-IT-002', title: '没跑过', scenario: '登录', type: 'api',
+          steps: [{ no: 1, action: 'a', operation: 'o', expected: 'e' }], records: [] },
+      ],
+    },
+  }
+  const render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a', initialSeed: seed })
+  find(render(), 'tab-steps').props.onClick()
+  const tree = render()
+  const badgeX = find(tree, 'run-count-x')
+  const badgeY = find(tree, 'run-count-y')
+  assert.ok(badgeX, '跑了 2 次的用例要有角标')
+  assert.equal(String(badgeX.children[0]), '2', '角标显示执行记录条数（2），不是步骤数（1）')
+  assert.equal(badgeY, undefined, '0 条执行记录不显示角标')
+})
+/*
+ * 一键执行的报告目录里同时有「总体报告」和「每条用例的单条报告」。
+ * 「查看报告」必须挑这条用例那一份（只含 4.1.1 那张表），
+ * 「总体报告 → 导出」必须挑整项目那份（整本模板）。
+ * 挑错就会看到「单条报告里是整本模板」——这正是曾经出现过的问题。
+ */
+test('docxFor 按 caseId 挑单条报告，pickOverall 挑整项目报告', () => {
+  const h = harness()
+  const files = [
+    { name: '集成测试报告-项目-整项目-V0.0.1.docx', path: '/r/overall.docx', kind: 'overall' },
+    { name: '集成测试报告-V0_0_1-IT-001-全步骤-V0.0.1.docx', path: '/r/cases/it1.docx', kind: 'case' },
+    { name: '集成测试报告-V0_0_1-IT-002-全步骤-V0.0.1.docx', path: '/r/cases/it2.docx', kind: 'case' },
+    { name: 'report-data.json', path: '/r/report-data.json', kind: 'meta' },
+  ]
+  const detail = { files }
+
+  // ① 按 caseId 命中单条报告，不能拿到 overall
+  assert.equal(h.api.docxFor(detail, 'V0_0_1-IT-002').path, '/r/cases/it2.docx')
+  assert.equal(h.api.docxFor(detail, 'V0_0_1-IT-001').path, '/r/cases/it1.docx')
+
+  // ② 不传 caseId 且有多份 case 时，不能误拿总体报告（第一份是 overall）
+  const picked = h.api.docxFor(detail, '')
+  assert.ok(picked.path !== '/r/overall.docx' || detail.files.filter(f => f.kind === 'case').length === 0,
+    '有多份单条报告时不该返回总体报告')
+
+  // ③ 只有总体报告时（老数据），兜底返回它而不是 null
+  assert.equal(h.api.docxFor({ files: [files[0]] }, 'V0_0_1-IT-009').path, '/r/overall.docx')
+
+  // ④ 没有任何 docx 时返回 null
+  assert.equal(h.api.docxFor({ files: [files[3]] }, 'x'), null)
 })

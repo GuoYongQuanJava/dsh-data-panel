@@ -1592,13 +1592,47 @@ async function handleRunReport(req, res) {
         return
       }
       const files = []
-      for (const name of entries.sort()) {
+      /*
+       * 递归读一层子目录。
+       *
+       * 一键执行的报告目录长这样：
+       *   reports/<runId>/
+       *     集成测试报告-<项目>-整项目-V0.0.1.docx   ← 总体报告（整本模板）
+       *     cases/集成测试报告-<caseId>-全步骤-….docx  ← 每条用例一份（只含 4.1.1 那张表）
+       *
+       * 面板要能区分「总体报告」和「某条用例的单条报告」，所以子目录里的文件
+       * 也要列出来，并在 `kind` 上标明：'overall' | 'case'。
+       */
+      const pushFile = async (filePath, name, kind) => {
         try {
-          const info = await stat(join(dir, name))
-          files.push({ name, size: info.size, updatedAt: info.mtime.toISOString(), path: join(dir, name) })
+          const info = await stat(filePath)
+          files.push({ name, size: info.size, updatedAt: info.mtime.toISOString(), path: filePath, kind })
         } catch {
           // 单个文件读不到就跳过。
         }
+      }
+      for (const name of entries.sort()) {
+        const full = join(dir, name)
+        let info = null
+        try {
+          info = await stat(full)
+        } catch {
+          continue
+        }
+        if (info.isDirectory()) {
+          // 子目录（目前只有 cases/）：里面的都是单条用例报告。
+          let subEntries = []
+          try {
+            subEntries = await readdir(full)
+          } catch {
+            continue
+          }
+          for (const sub of subEntries.sort()) {
+            await pushFile(join(full, sub), sub, 'case')
+          }
+          continue
+        }
+        await pushFile(full, name, /\.docx$/i.test(name) ? 'overall' : 'meta')
       }
       let data = null
       try {
@@ -2080,6 +2114,9 @@ export const __test = {
   handleRunLog,
   handleRunDelete,
   handleIntegration,
+  handleRunReport,
+  handleRunReportLatest,
+  docxForTest: null,
   readIntegration: readAll,
   integrationRoot,
   createIntegrationVersion: createVersion,
