@@ -267,6 +267,54 @@ out = validate(data)
 case = out["phases"][0]["functions"][0]["cases"][0]
 print(f"  PASS  缺省填充 stub={case['stub']!r} issue={case['issue']!r} bugId={case['bugId']!r}")
 
+
+print("\n== 人员回落 ==")
+
+
+def people_case(phase_people=None, func_people=None, case_people=None, meta_people=True):
+    data = copy.deepcopy(BASE)
+    if meta_people:
+        data["meta"]["people"] = {"designer": "M-D", "reviewer": "M-R", "tester": "M-T"}
+    phase = data["phases"][0]
+    func = phase["functions"][0]
+    case = func["cases"][0]
+    if phase_people:
+        phase.update(phase_people)
+    if func_people:
+        func.update(func_people)
+    if case_people:
+        case.update(case_people)
+    return validate(data)["phases"][0]["functions"][0]["cases"][0]
+
+
+def expect(label, got, want):
+    if got == want:
+        ok(f"{label} → {got!r}")
+    else:
+        print(f"  FAIL  {label} —— 期望 {want!r}，实际 {got!r}")
+        failures.append(label)
+
+
+c = people_case()
+expect("只用 meta.people",
+       (c["designer"], c["reviewer"], c["tester"]), ("M-D", "M-R", "M-T"))
+
+c = people_case(phase_people={"designer": "P-D"})
+expect("阶段级覆盖 meta.people",
+       (c["designer"], c["tester"]), ("P-D", "M-T"))
+
+c = people_case(phase_people={"designer": "P-D"}, func_people={"designer": "F-D"})
+expect("函数级覆盖阶段级",
+       (c["designer"], c["tester"]), ("F-D", "M-T"))
+
+c = people_case(phase_people={"designer": "P-D"}, func_people={"designer": "F-D"},
+                case_people={"designer": "C-D"})
+expect("用例级覆盖全部",
+       (c["designer"], c["tester"]), ("C-D", "M-T"))
+
+c = people_case(meta_people=False)
+expect("都没有时留空（由 filler 显示未记录）",
+       (c["designer"], c["reviewer"], c["tester"]), ("", "", ""))
 print()
 if failures:
     print(f"FAILED {len(failures)}: {failures}")

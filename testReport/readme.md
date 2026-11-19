@@ -39,11 +39,12 @@ pip3 install -r requirements.txt
 python report-tool/cmd.py `
   --template templates/单元测试报告模板.docx `
   --data examples/auth-demo.json `
-  --skill <可选的项目专属Skill目录> `
   -o 示例报告.docx
 ```
 
 （macOS / Linux 把 `python` 换成 `python3`，反引号换行改成 `\`）
+
+人员（设计者/校对者/测试人员）写在数据 JSON 的 `meta.people`；也可用 `--config testReport/skills/<工作区名>.md` 传入项目配置。`--skill` 仅为兼容旧调用保留，传了不生效。
 
 看到这个就成功了：
 
@@ -73,7 +74,7 @@ ALL CHECKS PASSED
 用 Word 打开 `示例报告.docx`。应该看到：
 
 - 目录有 5 条，页码正确，**没有弹窗**
-- 3 个模块章节
+- 3 个阶段章节
 - 8 张用例表，其中 1 条未通过（红色异常描述）、1 条未执行（勾在「未执行」）
 
 ---
@@ -90,7 +91,7 @@ ALL CHECKS PASSED
 │   ├── builder.py                   流程编排：清空模板 → 按数据重建章节和表格
 │   ├── filler.py                    单表填充：写值、勾选框、变量行增删
 │   ├── schema.py                    输入 JSON 校验
-│   ├── skill_meta.py                从 skill 读设计者/校对者/测试人员
+│   ├── skill_meta.py                （已废弃）旧版从 skill 读人员，v2 不再使用
 │   ├── toc_refresh.py               用 Word 重算目录
 │   ├── make_blank_template.py       把样例模板清空成空白表单
 │   ├── GENERATE-DATA.md             ★ 数据契约（造数据必读）
@@ -126,8 +127,8 @@ ALL CHECKS PASSED
 | 要替换的 | 换成什么 |
 |---|---|
 | `templates/单元测试报告模板.docx` | 客户的模板（先用 `make_blank_template.py` 清空，见 4.3） |
-| 可选项目专属 `SKILL.md` | 项目报告规则及默认人员资料；通用包不附带具体项目示例 |
-| 模块或用例的 `designer` / `reviewer` / `tester` | 实际人员信息；优先级高于项目专属 Skill |
+| 项目配置 `testReport/skills/<工作区名>.md` | 人员与软件信息默认值；用 `--config` 传入 |
+| 用例/函数/阶段级的 `designer` / `reviewer` / `tester` | 实际人员信息；优先级高于项目配置 |
 | `examples/auth-demo.json` | 自己的执行结果数据 |
 
 ### 4.2 数据怎么写
@@ -138,7 +139,7 @@ ALL CHECKS PASSED
 {
   "schemaVersion": "2.0",
   "meta": { "project": "订单服务单元测试", "executedAt": "2026-11-14" },
-  "summary": { "total": 2, "passed": 1, "failed": 1, "notRun": 0 },
+  "summary": { "total": 1, "passed": 1, "failed": 0, "notRun": 0 },
   "phases": [{
     "phaseId": "phase-1",
     "name": "第1阶段",
@@ -146,7 +147,7 @@ ALL CHECKS PASSED
     "functions": [{
       "functionId": "价格计算单元测试",
       "name": "价格计算单元测试",
-      "summary": { "total": 2, "passed": 1, "failed": 1, "notRun": 0 },
+      "summary": { "total": 1, "passed": 1, "failed": 0, "notRun": 0 },
       "coverage": "-S 92.1%",
       "cases": [{
         "id": "ORD-PRICE-0001",
@@ -162,7 +163,7 @@ ALL CHECKS PASSED
 }
 ```
 
-**三个人名（设计者/校对者/测试人员）不写进数据**，放在 skill 里。
+**人员（设计者/校对者/测试人员）写在 `meta.people`**；也可放进项目配置（`--config`）传入。回落顺序：用例级 → 函数级 → 阶段级 → `meta.people`。`inputs` / `outputs` 必须是数组，没有值时写 `[]`。
 
 ### 4.3 模板换了怎么办
 
@@ -177,7 +178,7 @@ python report-tool/make_blank_template.py `
 它会：
 
 1. 只留第一张表作为原型，删掉其余
-2. 只留第一个模块章节
+2. 只留第一个示例单元章节
 3. 清空所有数据值，保留结构标签
 4. 把三个原型段落换成占位符 `<MODULE-NAME>` / `<CASE-ID>` / `<ISSUE-TEXT>`
 
@@ -224,7 +225,7 @@ python report-tool/make_blank_template.py `
 
 模板既没有 `<CASE-ID>` 占位符，也没有 `.....CTD` 样例段落。你的模板没经过清理，用 `make_blank_template.py` 处理一下。
 
-### Q：报错 `modules[x].cases[y].xxx: ...`
+### Q：报错 `phases[x].functions[y].cases[z].xxx: ...`
 
 数据不合契约。报错里带精确路径，按路径改 JSON 即可。
 
@@ -236,7 +237,7 @@ python report-tool/make_blank_template.py `
 ### Q：怎么验证报告填得对
 
 ```powershell
-python report-tool/verify_report.py 报告.docx 你的数据.json 模板.docx [skill目录]
+python report-tool/verify_report.py 报告.docx 你的数据.json 模板.docx
 ```
 
 它不复用生成逻辑，独立读 docx 逐个单元格比对，输出几百条 `PASS` 或具体 `FAIL`。

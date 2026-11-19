@@ -56,8 +56,7 @@ def main(argv: list = None):
         "--skill",
         default=None,
         type=Path,
-        help="path to the procedure's SKILL.md (or its directory); supplies "
-        "designer/reviewer/tester and module metadata",
+        help="（已废弃）旧版从 SKILL.md 读人员；v2 数据自包含，本参数不生效，仅为兼容旧调用保留",
     )
     parser.add_argument(
         "--config",

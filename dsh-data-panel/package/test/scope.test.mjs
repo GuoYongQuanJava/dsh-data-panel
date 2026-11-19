@@ -79,6 +79,28 @@ test('排除目录按完整路径段匹配，避免 src/app 误排除 src/applic
   assert.ok(paths.some(p => p.startsWith('src/application/')))
 })
 
+test('被排除目录本身就是 sourceRoots 时也不得扫描', () => {
+  const project = fixture()
+  mkdirSync(join(project, 'lib'))
+  writeFileSync(join(project, 'lib/x.cpp'), 'int x() { return 1; }')
+  // 根与排除完全相同：整棵跳过
+  assert.deepEqual(scopeInventory(project, ['lib'], ['lib']).files, [])
+  // 根就是排除的上级目录：子目录被跳，兄弟目录保留
+  writeFileSync(join(project, 'src/keep.cpp'), 'int k() { return 1; }')
+  const kept = scopeInventory(project, ['.'], ['lib']).files.map(f => f.path)
+  assert.ok(!kept.some(p => p.startsWith('lib/')))
+  assert.ok(kept.includes('src/keep.cpp'))
+})
+
+test('多个扫描根中命中排除的那个整棵跳过', () => {
+  const project = fixture()
+  mkdirSync(join(project, 'lib'))
+  writeFileSync(join(project, 'lib/y.cpp'), 'int y() { return 1; }')
+  const paths = scopeInventory(project, ['lib', 'src'], ['lib']).files.map(f => f.path)
+  assert.ok(!paths.some(p => p.startsWith('lib/')))
+  assert.ok(paths.includes('src/a.cpp'))
+})
+
 test('排除目录必须在项目内，越界拒绝', () => {
   const project = fixture()
   assert.throws(() => scanSourceFiles(project, ['src'], ['..']), /项目内/)

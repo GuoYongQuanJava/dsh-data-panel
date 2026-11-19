@@ -13,7 +13,7 @@ v2 变化：
                      [--out  <会话>/reports/<runId>/report-data.json]
 
 然后交给报告工具:
-    python report-tool/cmd.py --template ... --data report-data.json --skill ... -o <会话>/reports/<runId>/<项目>-测试报告.docx
+    python report-tool/cmd.py --template ... --data report-data.json -o <会话>/reports/<runId>/<项目>-测试报告.docx
 
 设计原则（重要）：
 * **不重跑测试**。报告只消费 `--run` 指定的那一次执行结果，保证报告和日志是同一件事。

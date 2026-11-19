@@ -68,11 +68,19 @@ export function scanSourceFiles(project, sourceRoots = ['.'], excludeDirs = []) 
   const base = realpathSync(project)
   if (!Array.isArray(sourceRoots) || sourceRoots.length === 0 || sourceRoots.some((root) => typeof root !== 'string')) throw new Error('sourceRoots 必须是非空路径数组')
   const excluded = normalizeExcludes(base, excludeDirs)
+  const excludedList = [...excluded]
+  // 被排除的目录一律不进：无论它是 sourceRoots 本身，还是扫描中途遇到的子目录。
+  const isExcluded = (realPath) => {
+    const rel = key(relative(base, realPath)).replace(/\/+$/, '')
+    if (!rel) return false
+    return excludedList.some((prefix) => (rel + '/').startsWith(prefix))
+  }
   const files = new Map()
   const visited = new Set()
   function walk(path) {
     const real = realpathSync(path)
     if (!inside(base, real)) throw new Error('扫描路径必须位于项目内')
+    if (isExcluded(real)) return
     if (visited.has(real)) return
     visited.add(real)
     if (visited.size > 50000) throw new Error('扫描超过 50000 个路径，请明确业务源码目录后重试，不得将截断扫描当作全量')
@@ -80,12 +88,8 @@ export function scanSourceFiles(project, sourceRoots = ['.'], excludeDirs = []) 
     if (info.isDirectory()) {
       for (const entry of readdirSync(real, { withFileTypes: true })) {
         if (entry.isSymbolicLink()) continue
-        if (entry.isDirectory()) {
-          if (OMIT_DIRECTORIES.has(entry.name)) continue
-          // 用户配置的排除目录：按完整目录段匹配，避免 src/app 误排除 src/application
-          const childRel = key(relative(base, resolve(real, entry.name))) + '/'
-          if ([...excluded].some((prefix) => childRel.startsWith(prefix))) continue
-        }
+        // 排除目录由 walk() 入口统一判断，这里只处理内置忽略目录
+        if (entry.isDirectory() && OMIT_DIRECTORIES.has(entry.name)) continue
         walk(resolve(real, entry.name))
       }
     } else if (SOURCE_EXTENSIONS.has(extname(real).toLowerCase())) {

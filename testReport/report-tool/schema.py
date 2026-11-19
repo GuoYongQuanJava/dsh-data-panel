@@ -42,6 +42,17 @@ def _opt_str(value: Any, default: str = "", max_len: int = 0, path: str = "") ->
         return default
     return _str(value, max_len, path)
 
+PEOPLE_FIELDS = ("designer", "reviewer", "tester")
+
+
+def _people_of(source: Any, path: str = "") -> Dict[str, str]:
+    """读某一层声明的 designer/reviewer/tester；缺省为空串，不强制必填。"""
+    if not isinstance(source, dict):
+        return {key: "" for key in PEOPLE_FIELDS}
+    return {
+        key: _opt_str(source.get(key), "", 80, f"{path}.{key}" if path else key)
+        for key in PEOPLE_FIELDS
+    }
 
 def _iso_date(value: str, path: str = "") -> str:
     where = f"{path}: " if path else ""
@@ -187,6 +198,7 @@ def validate(raw: Any, skill_meta: Optional[Dict[str, str]] = None) -> Dict[str,
         norm_meta["people"] = {
             k: str(people.get(k) or "") for k in ("designer", "reviewer", "tester")
         }
+    meta_people = norm_meta.get("people") or {key: "" for key in PEOPLE_FIELDS}
     for field, label in (("durationMs", "durationMs 必须是整数或 null"),
                           ("exitCode", "exitCode 必须是整数或 null")):
         v = norm_meta[field]
@@ -239,6 +251,7 @@ def validate(raw: Any, skill_meta: Optional[Dict[str, str]] = None) -> Dict[str,
         phase_order = phase.get("order")
         _check(isinstance(phase_order, int) and phase_order >= 1,
                f"{pp}.order 必须是正整数")
+        phase_people = _people_of(phase, pp)
 
         functions_raw = phase.get("functions")
         _check(isinstance(functions_raw, list) and len(functions_raw) > 0,
@@ -254,6 +267,7 @@ def validate(raw: Any, skill_meta: Optional[Dict[str, str]] = None) -> Dict[str,
             all_func_ids.add(func_id)
 
             func_name = _str(func.get("name"), 200, f"{fp}.name")
+            func_people = _people_of(func, fp)
             source_file = _opt_str(func.get("sourceFile"), "未记录源文件", 500, f"{fp}.sourceFile")
 
             # function.summary
@@ -319,9 +333,15 @@ def validate(raw: Any, skill_meta: Optional[Dict[str, str]] = None) -> Dict[str,
                 not_run_reason = _opt_str(case.get("notRunReason"), "", 500, f"{cp}.notRunReason")
                 issue = _opt_str(case.get("issue"), "未记录异常", 4000, f"{cp}.issue")
                 bug_id = _opt_str(case.get("bugId"), "未记录", 80, f"{cp}.bugId")
-                designer = _opt_str(case.get("designer"), "", 80, f"{cp}.designer")
-                reviewer = _opt_str(case.get("reviewer"), "", 80, f"{cp}.reviewer")
-                tester = _opt_str(case.get("tester"), "", 80, f"{cp}.tester")
+                case_people = _people_of(case, cp)
+                # 人员回落：用例级 → 函数级 → 阶段级 → meta.people → 空。
+                # 最终值写回 case，filler / verify_report 只需读 case 字段。
+                designer = (case_people["designer"] or func_people["designer"]
+                            or phase_people["designer"] or meta_people.get("designer", ""))
+                reviewer = (case_people["reviewer"] or func_people["reviewer"]
+                            or phase_people["reviewer"] or meta_people.get("reviewer", ""))
+                tester = (case_people["tester"] or func_people["tester"]
+                          or phase_people["tester"] or meta_people.get("tester", ""))
                 case_exec_at = _opt_str(case.get("executedAt"), "", 40, f"{cp}.executedAt")
 
                 gcount[status_val] += 1

@@ -12,10 +12,9 @@
 # 准备一个 python-docx 环境，或用 DSH 自带的
 $py = 'C:\Users\PC\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe'
 
-# 生成报告（可选传入项目专属 Skill）
+# 生成报告
 & $py cmd.py --template "../templates/单元测试报告模板.docx" `
              --data results.json `
-             --skill "C:\项目\report-skill" `
              -o report.docx
 ```
 
@@ -27,60 +26,59 @@ phases=3  functions=3  cases=8  passed=7  failed=1  notRun=0  unconfirmed=0  toc
 报告已生成：D:\1\report-tool\report.docx
 ```
 
-包内不提供写死项目和姓名的示例 Skill，但保留 `--skill` 扩展点。当前脚本从项目 Skill 读取 `designer` / `reviewer` / `tester` 默认值；报告 JSON 中的模块或用例值优先。省略时直接使用 JSON，仍缺失的人员字段留空。
+**人员（designer / reviewer / tester）不从 Skill 读取**：v2 数据自包含，人员写在 JSON 的 `meta.people`；也可用 `--config` 指定项目配置，脚本会把其中的人员合并进 `meta.people`。`--skill` 参数仅为兼容旧调用保留，传了也不会改变输出。
 
 也支持从标准输入读数据（宿主进程管道调用，不落临时文件）：
 
 ```powershell
-Get-Content results.json -Raw | & $py cmd.py --template t.docx --data - --skill sk.md -o r.docx
+Get-Content results.json -Raw | & $py cmd.py --template t.docx --data - -o r.docx
 ```
 
 ---
 
-## 人员字段：来自 skill 文件
+## 人员字段：来自数据或项目配置
 
-**设计者、校对者、测试人员**三个字段来自 skill 文件。其余字段——单元标识、设计追溯、驱动模块、覆盖率、问题描述——都是**本次执行的技术产出**，必须由执行系统写进数据 JSON。
+**设计者、校对者、测试人员**来自数据：优先级为用例级 → 函数级 → 阶段级 → `meta.people`（含 `--config` 合并）。其余字段——单元标识、设计追溯、驱动模块、覆盖率、问题描述——都是**本次执行的技术产出**，必须由执行系统写进数据 JSON。
 
-### skill 怎么写
+### 人员怎么写
 
-frontmatter（推荐）：
+写在数据 JSON 里：
 
-```yaml
----
-name: user-report-metadata
-description: 用户认证服务单元测试流程
+```jsonc
+"meta": {
+  "people": {
+    "designer": "张伟",
+    "reviewer": "刘洋",
+    "tester": "王芳"
+  }
+}
+```
+
+也可以放在项目配置 `testReport/skills/<工作区名>.md` 里，用 `--config` 传入：
+
+```markdown
 designer: 张伟
 reviewer: 刘洋
 tester: 王芳
----
 ```
 
-或正文表格：
+`--config` 只补 JSON 里缺失的人员；JSON 里写了的优先，不会被配置覆盖。
 
-```markdown
-| 角色 | 姓名 |
-| --- | --- |
-| 设计者 | 张伟 |
-| 校对者 | 刘洋 |
-| 测试人员 | 王芳 |
-```
-
-DSH 的 skill 加载器只读 `name` / `description`，其他键会被忽略，所以放这三个人员字段不影响 skill 正常调用。
-
-**skill 里写 `coverage` / `driver` / `unitId` / `trace` 之类的键会被脚本忽略**，不会静默改变报告内容。
+`meta.people` 只认这三个键，写别的键会被忽略，不会静默改变报告内容。
 
 ### 取值优先级
 
 ```
-执行数据（用例级） > 执行数据（模块级） > skill 文件 > 空
+执行数据（用例级） > 执行数据（函数级） > 执行数据（阶段级） > meta.people（含 --config 合并） > 空
 ```
 
-三个人员字段都适用这条规则。数据里写了就覆盖 skill 的值，适用于临时换人。
+三个人员字段都适用这条规则。数据里写了就覆盖 `meta.people` 的值，适用于临时换人。
 
 | 字段 | 来源 |
 |---|---|
-| `designer` / `reviewer` / `tester` | 用例级 → 模块级 → **skill** → 空 |
-| `name` / `unitId` / `trace` / `driver` / `coverage` / `issues` / `inconsistent` | 模块级（有默认值，但真实值应由系统采集） |
+| `designer` / `reviewer` / `tester` | 用例级 → 函数级 → 阶段级 → **meta.people（含 --config）** → 空 |
+| `name` / `unitId` / `trace` / `driver` / `coverage` | 函数级（有默认值，但真实值应由系统采集） |
+| `phaseIssues` / `phaseInconsistent` | 阶段级 |
 
 ---
 
@@ -89,9 +87,9 @@ DSH 的 skill 加载器只读 `name` / `description`，其他键会被忽略，�
 | 文件 | 职责 | 说明 |
 |---|---|---|
 | `schema.py` | 输入校验 | 字段、类型、枚举、唯一性、统计一致性；错误带字段路径 |
-| `skill_meta.py` | skill 元信息 | 从 `SKILL.md` 读人员/覆盖率/驱动模块，frontmatter + 正文表格双支持 |
+| `skill_meta.py` | （已废弃） | 旧版从 `SKILL.md` 读人员；v2 已不使用，仅保留兼容（`check_skill.py` 冒烟） |
 | `filler.py` | 单表填充 | 单元格写入保留格式；勾选框用 EQ 域；变量行按需增删 |
-| `builder.py` | 流程编排 | 截断模板正文 → 按模块/用例循环克隆标题与表格 → 组装 |
+| `builder.py` | 流程编排 | 截断模板正文 → 按阶段/函数/用例循环克隆标题与表格 → 组装 |
 | `toc_refresh.py` | 目录自动重建 | 用 Word COM 重算目录并清掉 `updateFields`，打开文档不弹提示 |
 | `make_blank_template.py` | 清空模板 | 把客户原始模板清理成空白表单（保留结构标签 + 占位符） |
 | `cmd.py` | CLI 入口 | 参数解析、退出码、stdin 支持、文件占用提示 |
@@ -105,7 +103,7 @@ DSH 的 skill 加载器只读 `name` / `description`，其他键会被忽略，�
 | `test_skill.py` / `check_skill.py` | 配置解析单测 | 两种写法、注释/引号/首值优先、缺失不编值；含 skill_meta 兼容冒烟 |
 | `../examples/auth-demo.json` | 演示数据（v2） | 认证服务 3 阶段 8 用例（含 1 条未执行） |
 | `../examples/calculator-data.json` | 演示数据（v2） | Calculator 3 阶段 12 用例（全部通过） |
-| `../examples/paygate-demo.json` | 演示数据（v2） | 支付网关 3 阶段 16 用例（含失败与未执行，带模块级问题与不一致项） |
+| `../examples/paygate-demo.json` | 演示数据（v2） | 支付网关 3 阶段 16 用例（含失败与未执行，带阶段级问题与不一致项） |
 
 ---
 
@@ -151,27 +149,35 @@ DSH 的 skill 加载器只读 `name` / `description`，其他键会被忽略，�
 
 ```jsonc
 {
+  "schemaVersion": "2.0",          // 必填，固定 2.0
   "meta": {
     "project": "订单中心单元测试",              // 必填
     "executedAt": "2026-11-13T20:10:00+08:00", // 必填，ISO-8601 或 yyyy/mm/dd
     "executor": "gtest-1.14 / gcc-13.2"        // 可选，默认 dsh-test-harness
   },
   "summary": {
-    "total": 8,     // 必填，必须等于所有模块用例数之和
-    "passed": 7,    // 必填
-    "failed": 1,    // 必填
+    "total": 1,     // 必填，必须等于所有阶段用例数之和
+    "passed": 1,    // 必填
+    "failed": 0,    // 必填
     "notRun": 0     // 可选，未执行数；total = passed + failed + notRun
   },
-  "modules": [                                  // 必填，非空
+  "phases": [                                     // 必填，非空
     {
-      "name": "订单金额计算单元测试",             // 必填 → 「编号标题3」
-      "unitId": "订单金额计算单元测试",           // 可选 → 表格行0「单元标识」，默认取 name
-      "trace": "详细设计 5.9.2 订单金额",         // 可选 → 行0「设计追溯」，默认 "-"
-      "driver": "无",                            // 可选 → 行0「驱动模块」，默认 "无"
-      "coverage": "-S 92% -B 85% -MCDC n/a",     // 可选 → 行0「覆盖率记录」，默认 "-"（不推断）
-      "issues": "无。",                          // 可选 → 「遇到的问题」正文
-      "inconsistent": "无。",                    // 可选 → 「与测试用例/规程的不一致」正文
-      "cases": [                                // 必填，非空
+      "phaseId": "phase-1",                       // 必填，全局唯一
+      "name": "第1阶段",                          // 必填 → 阶段标题
+      "order": 1,                                 // 必填，正整数，决定顺序
+      "phaseIssues": "无。",                      // 可选 → 「遇到的问题」正文
+      "phaseInconsistent": "无。",                // 可选 → 「与测试用例/规程的不一致」正文
+      "functions": [                              // 必填，非空
+        {
+          "functionId": "订单金额计算单元测试",     // 必填，跨阶段唯一
+          "name": "订单金额计算",                  // 必填 → 「编号标题3」
+          "unitId": "订单金额计算单元测试",        // 可选 → 表格行0「单元标识」，默认取 name
+          "trace": "详细设计 5.9.2 订单金额",      // 可选 → 行0「设计追溯」，默认 "-"
+          "driver": "无",                        // 可选 → 行0「驱动模块」，默认 "无"
+          "coverage": "-S 92% -B 85% -MCDC n/a", // 可选 → 行0「覆盖率记录」，默认 "-"（不推断）
+          "summary": {"total": 1, "passed": 1, "failed": 0, "notRun": 0},  // 必填，需与本函数用例数一致
+          "cases": [                             // 必填，非空
         {
           "id": "ORD-CALC-0001",                // 必填，全局唯一
           "name": "三件商品订单金额计算",          // 必填
@@ -180,17 +186,19 @@ DSH 的 skill 加载器只读 `name` / `description`，其他键会被忽略，�
           "funcDesc": "订单金额计算",             // 可选 → 行0「功能描述」，默认取 name
           "stub": "库存服务（StubStockService）", // 可选 → 行0「打桩模块」+「活动桩」
           "inserted": "无",                      // 可选 → 「插入代码」
-          "inputs":  [["items_count", "3"]],     // 可选，[变量名, 取值]
-          "outputs": [["subtotal", "59.70", "59.70"]], // 可选，[变量名, 预期, 实际]
+          "inputs":  [["items_count", "3"]],     // 必填，必须是数组；[变量名, 取值]，无值时写 []
+          "outputs": [["subtotal", "59.70", "59.70"]], // 必填，必须是数组；[变量名, 预期, 实际]，无值时写 []
           "passed": true,                        // 必填，passed 与 status 需自洽
           "status": "passed",                    // 可选：passed | failed | notRun
           "notRunReason": "",                    // 可选：未执行原因
           "issue": "无",                         // 可选 → 异常现象描述
           "bugId": "BUG-ORD-0042",               // 可选 → 软件问题单编号
-          "designer": "李航",                    // 可选
-          "reviewer": "周敏",                    // 可选 → 校对者
-          "tester": "李航",                      // 可选 → 测试人员
+          "designer": "李航",                    // 可选，覆盖函数/阶段/meta.people
+          "reviewer": "周敏",                    // 可选 → 校对者，覆盖上级
+          "tester": "李航",                      // 可选 → 测试人员，覆盖上级
           "executedAt": "2026/11/13"             // 可选 → 测试执行时间
+            }
+          ]
         }
       ]
     }
@@ -224,23 +232,23 @@ DSH 的 skill 加载器只读 `name` / `description`，其他键会被忽略，�
 它做三件事：
 
 1. **只留一张表**作为原型，删掉其余 11 张
-2. **只留第一个模块章节**，删掉其余 5 个
+2. **只留第一个示例单元章节**，删掉其余 5 个
 3. **清空所有数据值，保留结构标签**，并把三个原型段落换成占位符：
-   - 模块标题 `RingBuffer单元测试` → `<MODULE-NAME>`
+   - 单元标题 `RingBuffer单元测试` → `<MODULE-NAME>`
    - 用例标识 `GN-ZZKZ-RINGBUFFER-T001.CTD` → `<CASE-ID>`
    - 问题正文 `无。` → `<ISSUE-TEXT>`
 
 | 位置 | 内容 | 用途 |
 |---|---|---|
 | `编号标题2` 段落 | 「通用模块」 | 保留到此为止，之后内容全部重建 |
-| `编号标题3` 段落 | `<MODULE-NAME>` | 克隆成每个模块标题 |
+| `编号标题3` 段落 | `<MODULE-NAME>` | 克隆成每个函数标题 |
 | `编号标题4` 段落 | 「测试结果总结」 | 克隆成总结/问题/不一致三个小标题 |
 | `<CASE-ID>` 段落 | 占位符 | 克隆成每条用例的标识标签 |
 | `<ISSUE-TEXT>` 段落 | 占位符 | 克隆成统计行与问题正文 |
 | 第一张表格 | 用例表原型（已清空数据） | 深拷贝成每一条用例的表 |
 
 > 代码定位顺序：**先找占位符，找不到再回退到原始模板的样例文字**（`.CTD` / `无。`），
-> 所以两种模板都能用。
+> 所以正式模板与旧部署遗留模板都能被定位；但只有 `单元测试报告模板.docx` 是随包提供的正式模板。
 
 ### 清空模板时必须保留什么
 

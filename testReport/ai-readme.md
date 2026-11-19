@@ -77,15 +77,15 @@ python report-tool/doctor.py
 
 要点：
 1. 造一个和示例数据完全无关的真实场景（不要用 RingBuffer / 支付网关那些）
-2. 新建 skills/<你的场景>/SKILL.md，frontmatter 只写 designer / reviewer / tester
-3. 数据 JSON 里不写这三个人，留给 skill 提供
-4. 至少包含：3 个模块、6~9 条用例、1 条失败、1 条未执行、变量组数不等
+2. 人员写在数据 JSON 的 `meta.people`（或项目配置 `testReport/skills/<工作区名>.md`，用 `--config` 传入）
+3. 用例级不写 designer / reviewer / tester，交给 `meta.people` 回落
+4. 至少包含：3 个阶段、6~9 条用例、1 条失败、1 条未执行、变量组数不等
 5. 跑：
    python report-tool/cmd.py --template templates/单元测试报告模板.docx `
-          --data <你的数据>.json --skill skills/<你的场景> -o <你的报告>.docx
+          --data <你的数据>.json -o <你的报告>.docx
 6. 校验：
    python report-tool/verify_report.py <你的报告>.docx <你的数据>.json `
-          templates/单元测试报告模板.docx skills/<你的场景>
+          templates/单元测试报告模板.docx
 7. 最后一行必须是 ALL CHECKS PASSED，否则按报错改 JSON 重跑
 
 不要修改 report-tool 下的 .py 文件和 templates 下的模板。
@@ -142,10 +142,10 @@ python report-tool/doctor.py
 1. **`doctor.py` 是否全绿**
 2. **校验器最后一行是否 `ALL CHECKS PASSED`**
 3. **打开 docx 抽查**：
-   - 目录条目数 = 模块数 + 2
+   - 目录应包含全部阶段标题与函数标题（条目数由数据决定，不给固定公式）
    - 表格数 = 用例数
    - 表头的「覆盖率记录」和「设计追溯」是不是真的从数据来的（不是 `-`）
-   - 三个人名是否与 skill 一致
+   - 三个人名是否与 `meta.people` / 项目配置一致
 
 第 3 点最重要 —— 前两项只是自动检查，模板里该填的地方有没有真的填对，还得人看一眼。
 

@@ -35,15 +35,15 @@
 
 | 字段 | 来源 | 说明 |
 |---|---|---|
-| **`designer` / `reviewer` / `tester`** | **skill 文件** | 只有这三个人员字段来自 skill。「谁设计、谁校对、谁执行」是流程属性，项目定一次就固定 |
+| **`designer` / `reviewer` / `tester`** | **数据 `meta.people`（可由 `--config` 合并）** | 回落顺序：用例级 → 函数级 → 阶段级 → `meta.people` → 空；不从 Skill 读取 |
 | `name` / `functionId` / `unitId` / `trace` / `driver` / `coverage` | **执行数据（函数级）** | 系统分析代码、查设计文档、调覆盖率工具得到 |
 | `phaseIssues` / `phaseInconsistent` | **执行数据（阶段级）** | 执行过程中汇总的问题 |
 | 用例的全部字段（`id`/`name`/`type`/`inputs`/`outputs`/`passed`/`status`/`issue`/`bugId`/`executedAt`） | **执行数据（用例级）** | 用例与结果 |
 
-**除三个人员字段外，其余一律写进 JSON，不要指望 skill 提供。**
-skill 里就算写了 `coverage` / `driver` 之类的键，脚本也会忽略。
+**人员可写在 `meta.people`，也可放在上级（函数/阶段）或项目配置里**；其余字段一律写进 JSON。
+`meta.people` 只认 `designer` / `reviewer` / `tester` 三个键，写别的键会被忽略。
 
-人员字段也可以在数据里覆盖 skill（用例级 > 函数级 > 阶段级 > skill），用于临时换人。
+人员回落顺序：**用例级 → 函数级 → 阶段级 → `meta.people`（含 `--config` 合并）→ 空**，用于临时换人或统一填写。
 
 ---
 
@@ -112,21 +112,21 @@ skill 里就算写了 `coverage` / `driver` 之类的键，脚本也会忽略。
   "funcDesc": "订单金额计算",           // 可选 → 表头「功能描述」，默认取 name
   "stub": "库存服务（StubStockService）", // 可选 → 「打桩模块」+「活动桩」
   "inserted": "无",                    // 可选 → 「插入代码」
-  "inputs":  [["items_count", "3"]],   // 可选，[变量名, 取值]
-  "outputs": [["subtotal", "59.70", "59.70"]], // 可选，[变量名, 预期输出, 实际输出]
+  "inputs":  [["items_count", "3"]],   // 必填，必须是数组；[变量名, 取值]，无值时写 []
+  "outputs": [["subtotal", "59.70", "59.70"]], // 必填，必须是数组；[变量名, 预期输出, 实际输出]，无值时写 []
   "passed": true,                      // 必填，布尔
   "status": "passed",                  // 可选：passed | failed | notRun
   "notRunReason": "",                  // 可选，未执行原因
   "issue": "无",                       // 可选 → 「异常现象描述」
   "bugId": "BUG-ORD-0042",             // 可选 → 「软件问题单编号」
-  "designer": "张伟",                  // 可选 → 「设计者」，默认取函数级 → skill
-  "reviewer": "刘洋",                  // 可选 → 「校对者」，默认取函数级 → skill
-  "tester": "王芳",                    // 可选 → 「测试人员」，默认取函数级 → skill
+  "designer": "张伟",                  // 可选 → 「设计者」，覆盖上级与 meta.people
+  "reviewer": "刘洋",                  // 可选 → 「校对者」，覆盖上级与 meta.people
+  "tester": "王芳",                    // 可选 → 「测试人员」，覆盖上级与 meta.people
   "executedAt": "2026/11/13"           // 可选 → 测试执行时间
 }
 ```
 
-> 三个人员字段通常都不写，留给 skill 提供 —— 这样能验证 skill 注入确实生效。
+> 三个人员字段通常都不写，交给 `meta.people` —— 这样能验证数据外置的人员回落确实生效。
 
 ### 硬性约束
 
@@ -175,7 +175,7 @@ skill 里就算写了 `coverage` / `driver` 之类的键，脚本也会忽略。
 | 输入组数与输出组数不相等 | 验证列不对齐时的处理 |
 | 五种 `type` 至少覆盖 4 种 | 验证类型勾选位置 |
 | 各函数 `coverage` 数值不同 | 验证表头按函数取值，而不是取同一份 |
-| 故意不给用例级 `designer`/`reviewer`/`tester` | 验证 skill 注入生效 |
+| 故意不给用例级 `designer`/`reviewer`/`tester` | 验证 `meta.people` 回落生效 |
 
 ---
 
@@ -197,30 +197,26 @@ $py = 'C:\Users\PC\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\pyt
       -o D:\1\report-tool\your-report.docx
 ```
 
-### 3. 或先建 skill 再生成（三个人员字段从 skill 读，数据里不写）
+### 3. 或从项目配置读人员（数据里不写）
 
 ```powershell
-# 先写 D:\1\skills\<项目>\SKILL.md，frontmatter 里放 designer/reviewer/tester
+# 先写 testReport/skills/<工作区名>.md，里面放 designer/reviewer/tester
 & $py D:\1\report-tool\cmd.py `
       --template templates/单元测试报告模板.docx `
       --data D:\1\report-tool\your-data.json `
-      --skill D:\1\skills\<项目> `
+      --config D:\1\testReport\skills\<工作区名>.md `
       -o D:\1\report-tool\your-report.docx
 ```
 
-skill 文件最小形态：
+配置文件最小内容：
 
 ```markdown
----
-name: your-project-unit-test
-description: 某模块单元测试流程
 designer: 张伟
 reviewer: 刘洋
 tester: 王芳
----
 ```
 
-**当前只有这三个人员字段会从可选的项目专属 Skill 读取**，写别的键会被忽略。包内不提供具体项目示例；项目特有的其他字段应进入结构化报告 JSON，并同步扩展 schema 白名单和取值逻辑，不能依赖解析 Skill 任意正文。
+**`--config` 只补充 JSON 中缺失的人员**；JSON 里写了的优先，配置不会覆盖。包内不提供具体项目示例；项目特有的其他字段应进入结构化报告 JSON，并同步扩展 schema 白名单和取值逻辑。
 
 ### 4. 校验产物
 
@@ -231,7 +227,7 @@ tester: 王芳
       templates/单元测试报告模板.docx
 ```
 
-最后一行必须是 `ALL CHECKS PASSED`。如果用了 `--skill`，把 skill 路径作为第 4 个参数补上。
+最后一行必须是 `ALL CHECKS PASSED`。
 
 ---
 
@@ -247,8 +243,7 @@ phases=3  functions=3  cases=8  passed=6  failed=1  notRun=1  unconfirmed=0  toc
 |---|---|---|
 | `phases / functions / cases` | 你数据里的阶段数、函数数与用例数，应当对得上 | 对不上 → 数据被截断 |
 | `passed / failed / notRun` | 三种状态的实际计数 | 与 summary 不一致（校验器已拦） |
-| `removed` | 从模板删掉的样例元素个数 | 原始模板固定 74，空白模板固定 10；变了说明模板被改过 |
-| `toc_cleared` | 清掉的目录缓存节点数 | 原始模板 29，空白模板 0 |
+| `toc_cleared` | 清掉的目录缓存节点数，取决于模板里残留的旧目录条目 | 不是 0 也正常，不是失败条件 |
 | `目录：已重建` | Word 已重算目录，打开无提示 | 正常 |
 | `目录：未重建，回退到 updateFields` | 本机没 Word | **不是失败**，只是降级 |
 
@@ -268,8 +263,8 @@ phases=3  functions=3  cases=8  passed=6  failed=1  notRun=1  unconfirmed=0  toc
 schema 报错样例（会带精确路径）：
 
 ```
-输入数据不符合约定：modules[0].cases[1].inputs[0]: 必须是长度为 2 的数组 [变量名, 取值]
-输入数据不符合约定：modules[1].cases[0].status=notRun 但 passed=True；未执行的用例不可能「通过」，请把 passed 设为 false
+输入数据不符合约定：phases[0].functions[0].cases[1].inputs[0]: 必须是长度为 2 的数组 [变量名, 取值]
+输入数据不符合约定：phases[1].functions[0].cases[0].status=notRun 但 passed=True；未执行的用例不可能「通过」，请把 passed 设为 false
 ```
 
 ---
