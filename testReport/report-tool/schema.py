@@ -394,7 +394,8 @@ def validate(raw: Any, skill_meta: Optional[Dict[str, str]] = None) -> Dict[str,
         if v is not None:
             result[sec] = v
     # ── 模型分析字段（report-notes.json 合并而来），原样透传给 builder ──
-    for key in ("overallAssessment", "environmentImpact", "improvements", "staticItems"):
+    for key in ("overallAssessment", "environmentImpact", "improvements",
+                "staticItems", "staticMetrics"):
         value = data.get(key)
         if value is not None:
             result[key] = value

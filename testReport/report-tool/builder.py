@@ -247,34 +247,78 @@ def _load_ringbuffer_prototype() -> Tuple[Document, Any]:
 #  模板三张固定表：T0 软件信息 / T1 圈复杂度 / T2 覆盖率
 # ════════════════════════════════════════════════════════════════════════
 
+def _resize_table_rows(table: Table, data_rows: int) -> None:
+    """把表格调成「表头 + data_rows 个数据行」，多删少补（克隆最后一行）。"""
+    data_rows = max(data_rows, 1)
+    current = len(table.rows) - 1
+    if current > data_rows:
+        for tr in [table.rows[i]._tr for i in range(len(table.rows) - 1, data_rows, -1)]:
+            tr.getparent().remove(tr)
+    elif current < data_rows:
+        template_tr = table.rows[-1]._tr
+        previous = template_tr
+        for _ in range(data_rows - current):
+            new_tr = deepcopy(template_tr)
+            previous.addnext(new_tr)
+            previous = new_tr
+
+
+def _set_table_font_size(table: Table, size_pt: float) -> None:
+    """把表格里所有 run 的字号统一（含 set_cell_text 新建的 run）。"""
+    from docx.shared import Pt
+
+    for row in table.rows:
+        for cell in row.cells:
+            for paragraph in cell.paragraphs:
+                for run in paragraph.runs:
+                    run.font.size = Pt(size_pt)
+
 def _fill_table_T0(doc: Document, meta: Dict[str, Any], data: Dict[str, Any]) -> bool:
-    """T0 软件信息表（6×9）。表头 R0，数据写 R1。"""
-    t0 = next((t for t in doc.tables if len(t.rows) == 6 and len(t.columns) == 9), None)
+    """T0 软件信息表（9 列）：一个测试阶段一行，共用列纵向合并。
+
+    模板只保留表头 + 1 个数据行，行数按阶段数动态克隆。
+    - 每行独立：测试阶段（列 1）、软件规模（列 3，= 该阶段函数数）
+    - 纵向合并：被测软件名称、软件版本、编程语言、开发环境、
+      运行环境、重要度、研制单位（所有阶段共用同一值）
+    """
+    t0 = next((t for t in doc.tables if len(t.columns) == 9), None)
     if t0 is None:
         return False
 
-    phases = data.get('phases') or []
-    phase_names = '、'.join(p.get('name', '') for p in phases if p.get('name')) or '未提供'
-    functions = sum(len(p.get('functions') or []) for p in phases)
-    summary = data.get('summary') or {}
-    scale = f'{functions} 函数 / {summary.get("total", 0)} 用例'
-    executor = (meta.get('executor') or '').strip()
+    phases = [p for p in (data.get('phases') or []) if isinstance(p, dict)] or [{}]
+    meta = meta or {}
+    executor = (meta.get('executor') or '').strip() or '未记录'
 
-    values = [
-        meta.get('project', '未提供'),
-        phase_names,
-        meta.get('softwareVersion', '未提供'),
-        scale,
-        meta.get('language', '未提供'),
-        executor or '未记录',
-        executor or '未记录',
-        meta.get('importance', '未提供'),
-        meta.get('devUnit', '未提供'),
-    ]
-    row = t0.rows[1]
-    for idx, val in enumerate(values):
-        if idx < len(row.cells):
-            set_cell_text(row.cells[idx], val)
+    # 共用列（列号 → 值）：软件版本来自项目配置文件，其余也来自 meta
+    shared = {
+        0: meta.get('project') or '未提供',
+        2: meta.get('softwareVersion') or '未提供',
+        4: meta.get('language') or '未提供',
+        5: executor,
+        6: executor,
+        7: meta.get('importance') or '未提供',
+        8: meta.get('devUnit') or '未提供',
+    }
+
+    _resize_table_rows(t0, len(phases))
+
+    # 每行写自己的阶段与规模（规模 = 该阶段包含几个函数）
+    for index, phase in enumerate(phases):
+        row = t0.rows[index + 1]
+        set_cell_text(row.cells[1], str(phase.get('name') or '未提供'))
+        func_count = len(phase.get('functions') or [])
+        set_cell_text(row.cells[3], f'{func_count} 个函数')
+
+    # 共用列：多个阶段时纵向合并成一格，只写一次值
+    last_row = len(phases)
+    for col, value in shared.items():
+        cell = t0.cell(1, col)
+        if last_row > 1:
+            cell = cell.merge(t0.cell(last_row, col))
+        set_cell_text(cell, str(value))
+
+    # 9 列要装下 9 个表头，字号统一降到 9pt，否则「测试阶段」这类 4 字表头会被迫折行
+    _set_table_font_size(t0, 9)
     return True
 
 
@@ -292,7 +336,16 @@ def _fill_table_T1(doc: Document, data: Dict[str, Any]) -> bool:
         set_cell_text(t1.rows[1].cells[2], '—')
         return True
 
-    for i, item in enumerate(items[: len(t1.rows) - 1]):
+    # 3.1 话术说的是「圈复杂度大于 10 的函数」，所以只列 CC>10 的（与话术一致）。
+    risky = [it for it in items if int(it.get('complexity') or 0) > 10]
+    if not risky:
+        _resize_table_rows(t1, 1)
+        merged = t1.rows[1].cells[0].merge(t1.rows[1].cells[2])
+        set_cell_text(merged, '本软件源代码中不存在圈复杂度大于 10 的函数。')
+        return True
+
+    _resize_table_rows(t1, len(risky))
+    for i, item in enumerate(risky):
         row = t1.rows[i + 1]
         set_cell_text(row.cells[0], str(i + 1))
         set_cell_text(row.cells[1], str(item.get('function', '')))
@@ -354,28 +407,124 @@ def _insert_after(anchor, element):
 
 
 def _fill_chapter1(body_els: list, meta: Dict[str, Any], proto_body) -> None:
-    """1.1 标识 / 1.2 系统概述 正文。"""
-    p_1_1 = _find_para(body_els, '标识')
-    if p_1_1 is not None and proto_body is not None:
-        parts = [f"被测软件：{meta.get('project', '未提供')}"]
-        if meta.get('projectPackage') and meta.get('projectPackage') != '未填写':
-            parts.append(f"项目包：{meta['projectPackage']}")
-        if meta.get('softwareVersion') and meta.get('softwareVersion') != '未填写':
-            parts.append(f"软件版本：{meta['softwareVersion']}")
-        parts.append(f"本次运行标识：{meta.get('runId', '未记录')}")
-        _insert_after(p_1_1, _make_paragraph(proto_body, '；'.join(parts) + '。'))
+    """1.1 标识 / 1.2 系统概述：按客户模板要求**不写正文**。
 
-    p_1_2 = _find_para(body_els, '系统概述')
-    if p_1_2 is not None and proto_body is not None:
-        overview = (
-            f"本报告针对 {meta.get('project', '未提供')} 开展单元测试，"
-            f"软件版本 {meta.get('softwareVersion', '未提供')}，"
-            f"编程语言 {meta.get('language', '未提供')}，"
-            f"研制单位 {meta.get('devUnit', '未提供')}，"
-            f"软件重要度 {meta.get('importance', '未提供')}。"
-        )
-        _insert_after(p_1_2, _make_paragraph(proto_body, overview))
+    1.2 下面直接就是表 1 软件信息表（表格是模板自带的 body 元素，不在这里插）。
+    1.1 和 1.3 同理，只留标题，不填说明性文字。
+    """
+    return
 
+
+def _cn_date(value: str) -> tuple:
+    """'2026-11-19T17:01:04+08:00' → (2026, 11, 19)；解析不了就全部 None。"""
+    import re
+
+    match = re.match(r'(\d{4})-(\d{1,2})-(\d{1,2})', str(value or ''))
+    if not match:
+        return (None, None, None)
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+
+
+def _short_software_name(project: str) -> str:
+    """'cpp-gtest-demo 单元测试' → 'cpp-gtest-demo'（话术里只需要软件名）。"""
+    name = str(project or '').strip()
+    for suffix in (' 单元测试', '单元测试'):
+        if name.endswith(suffix):
+            return name[: -len(suffix)].strip() or name
+    return name
+
+
+
+
+def _mcdc_unmet_count(data: Dict[str, Any]):
+    """分支/MCDC 覆盖率未达到 100% 的函数数；没有 MCDC 数据时返回 None。
+
+    只有采集器真的给了分支或 MCDC 指标时才能算，否则写「未能判定」而不是编一个数。
+    """
+    coverage = data.get('coverage') or {}
+    if not coverage.get('available'):
+        return None
+    metric = coverage.get('mcdc') or coverage.get('branch') or {}
+    if not metric or metric.get('total') in (None, 0):
+        return None
+    percent = metric.get('percent')
+    if percent is None:
+        return None
+    # 只有整体未达 100% 时，才能说“有函数未达到”；具体几个函数得逐函数数据，
+    # 当前运行级采集不提供，所以只要整体达标就返回 0，否则返回 None（无法逐函数判定）。
+    return 0 if float(percent) >= 100.0 else None
+def _build_assessment(data: Dict[str, Any]) -> str:
+    """3.1 对被测试软件的总体评估：客户固定话术，只把数据填进去。
+
+    没采集到的指标写「未采集」，不编造数字。
+    """
+    meta = data.get('meta') or {}
+    summary = data.get('summary') or {}
+    issues = data.get('issues') or {}
+    phases = data.get('phases') or []
+
+    start_y, start_m, start_d = _cn_date(meta.get('executedAt') or '')
+    end_y, end_m, end_d = _cn_date(meta.get('finishedAt') or meta.get('executedAt') or '')
+    if start_y and end_y:
+        date_text = f"{start_y}年{start_m}月{start_d}日至{end_y}年{end_m}月{end_d}日"
+    else:
+        date_text = "测试日期未记录"
+
+    software = _short_software_name(meta.get('project') or '')
+    phase_count = len(phases)
+    func_count = sum(len(p.get('functions') or []) for p in phases)
+
+    total = int(summary.get('total') or 0)
+    passed = int(summary.get('passed') or 0)
+    failed = int(summary.get('failed') or 0)
+    not_run = int(summary.get('notRun') or 0)
+    executed = total - not_run
+
+    doc_issues = len(issues.get('docIssues') or [])
+    static_issues = len(issues.get('staticIssues') or [])
+    code_issues = len(issues.get('codeIssues') or [])
+    dynamic_issues = len(issues.get('dynamicIssues') or [])
+
+    # 注释率与 MCDC 未达标函数数：当前只有旧版 VS 采集器（不提供 MCDC）与静态分析（不统计注释），
+    # 没有真数据就写「未采集」，绝不推测。
+    comment_rate = ((data.get('staticMetrics') or {}).get('commentRate'))
+    comment_text = f"{comment_rate}%" if comment_rate not in (None, '') else '未采集'
+    mcdc_count = _mcdc_unmet_count(data)
+
+    # MCDC 那句话：有数据就用数字，没数据就如实说明无法判定（旧版 VS 采集器不提供）
+    if mcdc_count is not None:
+        mcdc_clause = (f"导致{mcdc_count}个函数单元分支覆盖率MCDC覆盖率未达到100%。"
+                       "具体问题详细信息见附录E。")
+    else:
+        mcdc_clause = ("本次采集器不提供 MCDC（修正条件判定覆盖）数据，"
+                       "无法判定函数单元是否达到100%；相关用例明细见附录E。")
+
+    def issue_clause(count: int, appendix: str, subject: str) -> str:
+        if count > 0:
+            return (f"{subject}共发现{count}个问题，均为一般问题，"
+                    f"具体问题详细信息见附录{appendix}。")
+        return f"{subject}未发现问题。"
+
+    return (
+        f"{date_text}，测试人员分{phase_count}个迭代阶段，"
+        f"对开发人员提供的{software}软件源程序。及{software}软件研制任务书、"
+        "需求规格说明、设计说明进行单元测试，主要进行了文档审查、静态分析、"
+        "代码审查和动态单元测试。整体测试结果总结如下，"
+        + issue_clause(doc_issues, 'B', '文档审查')
+        + issue_clause(static_issues, 'C', '静态分析')
+        + issue_clause(code_issues, 'D', '代码审查')
+        + (f"动态单元测试共选取了{func_count}个函数单元，作为本次单元测试的重点单元，"
+           f"共设计了{total}个测试用例，实际执行{executed}个测试用例，"
+           f"执行通过测试用例{passed}个，未通过测试用例{failed}个。")
+        + f"测试过程中共发现{dynamic_issues}个程序问题，"
+        + mcdc_clause
+        + "通过软件测试结果可得，被测软件并无重大设计类缺陷，不影响软件和系统设计。"
+        "经本阶段单元测试，软件函数单元的设计实现符合软件设计说明的要求，"
+        "软件编码符合编码规范，"
+        + f"{software}软件代码注释率为{comment_text}。"
+        + "符合软件代码有效注释率不小于30%的要求，"
+        "本软件源代码中圈复杂度大于10的函数及其圈复杂度如下表所示："
+    )
 
 def _fill_chapter3(body_els: list, data: Dict[str, Any], proto_body) -> None:
     """3.1 总体评估 / 3.2 环境影响 / 3.3 改进建议 正文。"""
@@ -391,13 +540,7 @@ def _fill_chapter3(body_els: list, data: Dict[str, Any], proto_body) -> None:
     exec_rate = summary.get('executionRate', 0)
     pass_rate = summary.get('passRate', 0)
 
-    assessment = data.get('overallAssessment') or (
-        f"本次单元测试共设计 {total} 条用例，已执行 {total - not_run} 条"
-        f"（执行率 {exec_rate:.1f}%），通过 {passed} 条（通过率 {pass_rate:.1f}%），"
-        f"失败 {failed} 条，未执行 {not_run} 条"
-        + (f"，未确认 {unconfirmed} 条" if unconfirmed else "")
-        + "。"
-    )
+    assessment = data.get('overallAssessment') or _build_assessment(data)
     p_3_1 = _find_para(body_els, '总体评估')
     if p_3_1 is not None:
         _insert_after(p_3_1, _make_paragraph(proto_body, assessment))
@@ -423,37 +566,13 @@ def _fill_chapter3(body_els: list, data: Dict[str, Any], proto_body) -> None:
 
 
 def _fill_chapter2(body_els: list, meta: Dict[str, Any], proto_body) -> None:
-    """2 引用文档：按配置里提供的真实文档列出。"""
-    p = _find_para(body_els, '引用文档')
-    if p is None or proto_body is None:
-        return
-    refs = meta.get('references') or []
-    items = [r for r in refs if isinstance(r, dict) and str(r.get('name') or '').strip()]
-    if items:
-        parts = []
-        for i, r in enumerate(items, 1):
-            ver = str(r.get('version') or '').strip()
-            ver_text = f'（{ver}）' if ver else '（版本未提供）'
-            parts.append(f"{i}. {r.get('type') or '文档'}：{r['name']}{ver_text}")
-        text = '；'.join(parts) + '。'
-    else:
-        text = '未提供引用文档：本次未收到任务书、需求规格说明或设计说明等受控文档。'
-    _insert_after(p, _make_paragraph(proto_body, text))
+    """2 引用文档：客户模板要求不写说明性文字，只留章节标题。"""
+    return
 
 
 def _fill_doc_overview(body_els: list, data: Dict[str, Any], proto_body) -> None:
-    """1.3 文档概述：说明报告目的、范围与适用限制。"""
-    p = _find_para(body_els, '文档概述')
-    if p is None or proto_body is None:
-        return
-    phases = data.get('phases') or []
-    text = (
-        "本报告说明本次单元测试的范围、依据、执行结果与发现的问题，"
-        f"按测试阶段与被测函数组织，共 {len(phases)} 个阶段。"
-        "报告内容仅来源于本次真实执行记录及其快照；未开展的工作与未采集的数据均已如实标注，"
-        "分析性结论与执行证据分开标注，不代表额外已执行的测试。"
-    )
-    _insert_after(p, _make_paragraph(proto_body, text))
+    """1.3 文档概述：客户模板要求不写正文。"""
+    return
 
 
 def _move_regressions(body_els: list, data: Dict[str, Any], proto_body,

@@ -99,6 +99,7 @@ from config_file import load_key_values as load_config  # noqa: E402
 # 圈复杂度：优先用本机 lizard，没有就用 testReport 自带的 vendor 副本。
 # 实现集中在 complexity.py（CLI 与 bridge 共用一份）。
 from complexity import analyze as analyze_complexity
+from complexity import comment_ratio
 from complexity import load_lizard
 
 
@@ -586,6 +587,10 @@ def main() -> int:
     _lizard_kind = load_lizard()[1] if static_items else ""
     if _lizard_kind:
         print(f"   圈复杂度：{len(static_items)} 个函数（lizard={_lizard_kind}）")
+    # 注释率：3.1 总体评估的固定话术要用到，读源码算真实值。
+    comment_rate = comment_ratio(project_dir) if project_dir and project_dir.is_dir() else None
+    if comment_rate is not None:
+        print(f"   代码注释率：{comment_rate}%")
 
     report = {
         "schemaVersion": "2.0",
@@ -606,6 +611,8 @@ def main() -> int:
                 'tester': cfg.get('tester') or '',
             },
             "executedAt": result.get("startedAt", ""),
+            # 3.1 总体评估需要「起止日期」，所以两个都带上（单次运行它们通常同一天）
+            "finishedAt": result.get("finishedAt", ""),
             "executor": runner_label(result),
             "runId": run_id,
             "status": overall_status,
@@ -676,6 +683,7 @@ def main() -> int:
             "notes": "未开展回归测试",
         },
         "staticItems": static_items,
+        "staticMetrics": {"commentRate": comment_rate},
     }
 
     out_path.parent.mkdir(parents=True, exist_ok=True)

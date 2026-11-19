@@ -140,5 +140,70 @@ def main(argv: Optional[List[str]] = None) -> int:
     return 0
 
 
+
+
+# 语言 → 行注释符；支持块注释的都是 C 系
+LINE_COMMENT = {
+    '.c': '//', '.h': '//', '.cc': '//', '.cpp': '//', '.cxx': '//', '.hpp': '//',
+    '.hh': '//', '.hxx': '//', '.cs': '//', '.java': '//', '.js': '//', '.jsx': '//',
+    '.ts': '//', '.tsx': '//', '.go': '//', '.rs': '//', '.swift': '//', '.kt': '//',
+    '.scala': '//', '.m': '//', '.mm': '//',
+    '.py': '#', '.sh': '#', '.rb': '#', '.pl': '#', '.r': '#',
+}
+BLOCK_COMMENT_EXTS = {'.c', '.h', '.cc', '.cpp', '.cxx', '.hpp', '.hh', '.hxx',
+                       '.cs', '.java', '.js', '.jsx', '.ts', '.tsx',
+                       '.go', '.rs', '.swift', '.kt', '.scala', '.m', '.mm'}
+
+
+def comment_ratio(project_dir: Path) -> Optional[float]:
+    """代码注释率（%）= 注释行 / (注释行 + 代码行) × 100。
+
+    只统计源码目录下的已知语言（见 LINE_COMMENT）；空行不计入分母。
+    目录不存在或没有可统计文件时返回 None（调用方写「未采集」，不编数字）。
+    """
+    src = resolve_source_dir(Path(project_dir))
+    if src is None:
+        return None
+
+    comment_lines = 0
+    code_lines = 0
+    for path in sorted(src.rglob('*')):
+        if not path.is_file():
+            continue
+        ext = path.suffix.lower()
+        if ext not in LINE_COMMENT:
+            continue
+        try:
+            text = path.read_text(encoding='utf-8', errors='replace')
+        except OSError:
+            continue
+        marker = LINE_COMMENT[ext]
+        supports_block = ext in BLOCK_COMMENT_EXTS
+        in_block = False
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            if in_block:
+                comment_lines += 1
+                if '*/' in line:
+                    in_block = False
+                continue
+            if supports_block and line.startswith('/*'):
+                comment_lines += 1
+                if '*/' not in line:
+                    in_block = True
+                continue
+            if line.startswith(marker):
+                comment_lines += 1
+                continue
+            code_lines += 1
+
+    total = comment_lines + code_lines
+    if total == 0:
+        return None
+    return round(comment_lines / total * 100, 1)
+
+
 if __name__ == "__main__":
     sys.exit(main())
