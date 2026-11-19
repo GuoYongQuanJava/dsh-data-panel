@@ -1178,7 +1178,8 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 		 *   步骤：action（动作）/ operation（输入步骤）/ expected（预期结果）
 		 *   报告：一个用例可有多份历史报告，用 records[] 承载
 		 *
-		 * 版本 V0.0.1 是完整示例；V0.0.2 只有 4 条，用来验证「切版本后数据隔离」。
+		 * 初始数据为空（见 buildIntegrationSeed 的说明）：需要拿真实项目跑技能时，
+		 * 自带示例会干扰「哪些是模型生成的」这类判断，所以不再内置示例用例。
 		 */
 		var IT_SCENARIOS_ALL = "全部用例";
 		var IT_SCENARIOS_NONE = "未分组";
@@ -1242,227 +1243,28 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 		 * （改一个版本的数据会串到别处）。
 		 */
 		function buildIntegrationSeed() {
-			function steps(list) {
-				return list.map(function (item, index) {
-					return {
-						no: index + 1,
-						action: item[0],
-						operation: item[1],
-						expected: item[2]
-					};
-				});
-			}
-			function record(id, at, result, durationMs) {
-				return { runId: id, at: at, result: result, durationMs: durationMs };
-			}
-
-			var v1 = [
-				{
-					id: "it-1",
-					caseId: "IT-001",
-					title: "商品加入购物车",
-					scenario: "商品与购物车",
-					type: "functional",
-					description: "在商品详情页选择规格后点击加入购物车，商品应进入购物车并给出成功提示",
-					precondition: "已登录，商品处于上架状态且库存充足",
-					expectedResult: "购物车数量 +1，右上角角标同步更新，提示「已加入购物车」",
-					status: "pass",
-					lastRunAt: "2026-11-17T10:24:00",
-					steps: steps([
-						["打开页面", "进入电商首页，等待轮播图加载完成", "首页正常展示，顶部出现登录用户昵称"],
-						["搜索商品", "输入「无线蓝牙耳机」并回车，点击首个结果", "进入商品详情页，标题与价格正常展示"],
-						["选择规格", "选择颜色「曜石黑」，数量保持 1", "所选规格高亮，价格随规格更新"],
-						["加入购物车", "点击「加入购物车」按钮", "提示「已加入购物车」，角标由 0 变为 1"]
-					]),
-					records: [
-						record("it-1-r2", "2026-11-17T10:24:00", "pass", 4820),
-						record("it-1-r1", "2026-11-16T16:02:00", "fail", 6310)
-					]
-				},
-				{
-					id: "it-2",
-					caseId: "IT-002",
-					title: "购物车数量修改与库存上限校验",
-					scenario: "商品与购物车",
-					type: "functional",
-					description: "在购物车页修改商品数量，超过库存时应有拦截提示",
-					precondition: "购物车已有该商品，库存为 5 件",
-					expectedResult: "数量可改为 1~5；输入 6 时提示「超出库存」，自动回到 5",
-					status: "pass",
-					lastRunAt: "2026-11-17T10:31:00",
-					steps: steps([
-						["打开页面", "点击右上角购物车图标", "列表展示已加入的商品，数量为 1"],
-						["增加数量", "连续点击「+」4 次", "数量依次变为 2/3/4/5，小计同步变化"],
-						["超出库存", "数量为 5 时再点一次「+」", "提示「超出库存」，数量保持 5"],
-						["删除商品", "点击「删除」并确认", "商品移出列表，合计金额归零"]
-					]),
-					records: [record("it-2-r1", "2026-11-17T10:31:00", "pass", 3910)]
-				},
-				{
-					id: "it-3",
-					caseId: "IT-003",
-					title: "优惠券抵扣结算",
-					scenario: "订单与支付",
-					type: "functional",
-					description: "结算页选择满 100 减 20 的优惠券，应付金额应正确抵扣",
-					precondition: "已登录，账户有「满 100 减 20」券，商品合计 129 元",
-					expectedResult: "优惠显示 20 元，应付 109 元，订单详情记录该券",
-					status: "pass",
-					lastRunAt: "2026-11-17T11:05:00",
-					steps: steps([
-						["打开结算页", "购物车点击「去结算」", "结算页展示清单，合计 129 元"],
-						["打开优惠券", "点击「选择优惠券」", "弹出面板，「满 100 减 20」可用"],
-						["使用优惠券", "点击该券并确认", "优惠显示 -20 元，应付 109 元"],
-						["提交订单", "点击「提交订单」", "进入支付页，详情显示已用该券"]
-					]),
-					records: [record("it-3-r1", "2026-11-17T11:05:00", "pass", 7240)]
-				},
-				{
-					id: "it-4",
-					caseId: "IT-004",
-					title: "提交订单后取消订单",
-					scenario: "订单与支付",
-					type: "functional",
-					description: "对待支付订单执行取消，订单状态应变为已取消",
-					precondition: "已登录，存在一笔待支付订单",
-					expectedResult: "状态变为「已取消」，库存回滚，优惠券退回账户",
-					status: "fail",
-					lastRunAt: "2026-11-17T11:22:00",
-					steps: steps([
-						["打开页面", "个人中心进入「我的订单」筛选「待支付」", "列表展示至少一笔待支付订单"],
-						["取消订单", "点击「取消订单」并确认", "弹窗关闭，状态更新为「已取消」"],
-						["校验库存", "返回商品详情页查看库存", "库存比下单前增加，可再次下单"],
-						["校验优惠券", "进入优惠券列表查看", "该券回到可用状态，有效期不变"]
-					]),
-					records: [
-						record("it-4-r1", "2026-11-17T11:22:00", "fail", 9130),
-						record("it-4-r0", "2026-11-16T17:40:00", "pass", 8400)
-					]
-				},
-				{
-					id: "it-5",
-					caseId: "IT-005",
-					title: "新增收货地址并设为默认",
-					scenario: "账户与会员",
-					type: "functional",
-					description: "在个人中心新增收货地址并勾选设为默认",
-					precondition: "已登录，当前没有默认地址",
-					expectedResult: "地址新增成功并置顶，标记「默认」，下单自动选中",
-					status: "none",
-					lastRunAt: "",
-					steps: steps([
-						["打开页面", "个人中心 > 收货地址，点「新增地址」", "弹出新增地址表单"],
-						["填写地址", "填收货人、手机号、地区与详细地址，勾选设为默认", "表单校验通过，无红色报错"],
-						["保存并校验", "点击「保存」", "地址置顶并标记「默认」，下单页自动选中"]
-					]),
-					records: []
-				},
-				{
-					id: "it-6",
-					caseId: "IT-006",
-					title: "会员积分展示与累计",
-					scenario: "账户与会员",
-					type: "boundary",
-					description: "完成一笔 129 元订单后，积分应按 1 元 1 分累计",
-					precondition: "已登录，当前积分 200",
-					expectedResult: "积分变为 329，明细新增一条 +129 记录",
-					status: "pass",
-					lastRunAt: "2026-11-16T15:18:00",
-					steps: steps([
-						["查看积分", "进入个人中心查看积分卡片", "当前积分显示 200"],
-						["完成支付", "支付一笔 129 元订单", "支付成功，跳转结果页"],
-						["校验积分", "返回个人中心查看积分与明细", "积分变为 329，首条为「订单支付 +129」"]
-					]),
-					records: [record("it-6-r1", "2026-11-16T15:18:00", "pass", 5620)]
-				},
-				{
-					id: "it-7",
-					caseId: "IT-007",
-					title: "手机号验证码登录",
-					scenario: "用户与登录",
-					type: "api",
-					description: "使用手机号 + 短信验证码完成登录，校验 token 是否正常下发",
-					precondition: "手机号已注册，可接收短信",
-					expectedResult: "登录成功并返回 access_token，有效期 2 小时",
-					status: "pass",
-					lastRunAt: "2026-11-17T09:12:00",
-					steps: steps([
-						["获取验证码", "POST /api/sms/code，传已注册手机号", "返回 200，60 秒内收到 6 位验证码"],
-						["提交登录", "POST /api/login，传手机号与验证码", "返回 200，响应体含 access_token"],
-						["校验会话", "带 token 请求 /api/profile", "返回 200，用户信息与手机号一致"]
-					]),
-					records: [record("it-7-r1", "2026-11-17T09:12:00", "pass", 2180)]
-				},
-				{
-					id: "it-8",
-					caseId: "IT-008",
-					title: "账号密码登录失败锁定",
-					scenario: "用户与登录",
-					type: "api",
-					description: "连续输错密码 5 次后账号应被临时锁定，锁定期间正确密码也不放行",
-					precondition: "账号存在且未锁定",
-					expectedResult: "第 5 次返回「密码错误次数过多」，后续 15 分钟内登录均被拒绝",
-					status: "fail",
-					lastRunAt: "2026-11-17T09:40:00",
-					steps: steps([
-						["连续输错", "连续 5 次 POST /api/login 传错误密码", "前 4 次返回 401，第 5 次返回锁定提示"],
-						["锁定校验", "锁定期间用正确密码登录", "仍返回锁定提示，不放行"],
-						["到期解锁", "等待 15 分钟后再次登录", "恢复正常登录，返回 token"]
-					]),
-					records: [record("it-8-r1", "2026-11-17T09:40:00", "fail", 3350)]
-				},
-				{
-					id: "it-9",
-					caseId: "IT-009",
-					title: "退出登录清除会话",
-					scenario: "用户与登录",
-					type: "functional",
-					description: "退出登录后本地凭证必须清除，不能通过浏览器后退恢复访问",
-					precondition: "已登录",
-					expectedResult: "返回登录页，token 已清除，后退也无法进入需登录页面",
-					status: "none",
-					lastRunAt: "",
-					steps: steps([
-						["触发退出", "「我的 > 设置」点击「退出登录」", "弹出二次确认"],
-						["确认退出", "点击「确定」", "返回登录页，本地 token 已清除"],
-						["回退校验", "用浏览器后退键回上一页", "仍停留在登录页"]
-					]),
-					records: []
-				}
-			];
 			/*
-			 * 生成时间：用例表要展示「生成时间」列，报告页也按它排序。
-			 * 手写在每条用例上容易漏，这里按顺序统一补一份（越靠前越早生成），
-			 * 并在编辑保存时保留原值（见 saveCase）。
+			 * 集成测试初始数据：**空**。
+			 *
+			 * 历史：这里曾经写死 9 条示例用例（V0.0.1）+ 2 条（V0.0.2），
+			 * 用来验证「页面能看到、点得动」「切版本后数据隔离」。
+			 * 现在要拿真实项目跑集成测试 Skill，示例数据会干扰判断
+			 * （分不清哪些是模型生成的、哪些是自带演示的），所以整份清空。
+			 *
+			 * 保留一个空版本 V0.0.1 作为起点：
+			 *   - 面板需要「当前版本」才能渲染，完全没有版本会到处显示未就绪；
+			 *   - 空版本比无版本更接近真实首次使用（用户还没生成过任何用例）。
+			 *
+			 * 不再提供 V0.0.2：没有数据可切，留着反而是噪音。
+			 * 真实版本由「生成用例」动作按技能流程追加。
 			 */
-			var createdBase = Date.parse("2026-11-16T09:10:00");
-			v1.forEach(function (item, index) {
-				var at = new Date(createdBase + index * 37 * 60 * 1000);
-				function pad(n) { return n < 10 ? "0" + n : String(n); }
-				item.createdAt = at.getFullYear() + "-" + pad(at.getMonth() + 1) + "-" + pad(at.getDate()) +
-					"T" + pad(at.getHours()) + ":" + pad(at.getMinutes()) + ":00";
-			});
-
-			// V0.0.2 只保留 2 条，用来验证「切版本后数据隔离」：条数明显不同才好确认。
-			var v2 = v1.slice(0, 2).map(function (item) {
-				return JSON.parse(JSON.stringify(item));
-			});
-			v2[0].id = "it2-1";
-			v2[0].caseId = "IT2-001";
-			v2[0].records = [];
-			v2[1].id = "it2-2";
-			v2[1].caseId = "IT2-002";
-			v2[1].records = [];
-
 			return {
 				versions: [
-					{ name: "V0.0.2", at: "2026-11-17T12:00:00", status: "current" },
-					{ name: "V0.0.1", at: "2026-11-16T09:00:00", status: "archived" }
+					{ name: "V0.0.1", at: new Date().toISOString(), status: "current" }
 				],
 				activeVersion: "V0.0.1",
 				byVersion: {
-					"V0.0.1": v1,
-					"V0.0.2": v2
+					"V0.0.1": []
 				}
 			};
 		}
