@@ -442,7 +442,7 @@ def _fill_table_T2(doc: Document, data: Dict[str, Any]) -> bool:
 
     # 口径：旧版 VS 采集器只给块/行，报告要语句/分支；按客户要求行→语句、块→分支，
     # 并在「分析结果」列明写口径。
-    note = '本次运行整体采集（行→语句、块→分支代标）' if cov.get('available') else '未采集'
+    note = '行→语句、块→分支代标' if cov.get('available') else '未采集'
 
     def pct(key: str) -> str:
         block = cov.get(key) or {}
@@ -469,13 +469,16 @@ def _fill_table_T2(doc: Document, data: Dict[str, Any]) -> bool:
         funcs = phase.get('functions') or []
         set_cell_text(row.cells[0], str(i + 1))
         set_cell_text(row.cells[1], phase.get('name', ''))
-        set_cell_text(row.cells[2], '、'.join(f.get('name', '') for f in funcs) or '—')
+        # 函数列用短名（去掉 src/xxx.cpp:: 前缀），否则 8 列表格会被挤成竖排
+        short_names = [str(f.get('name') or '').split('::')[-1] for f in funcs]
+        set_cell_text(row.cells[2], '、'.join(n for n in short_names if n) or '—')
         # 列序：序号|阶段|函数|语句|分支|MCDC|版本|分析结果
         set_cell_text(row.cells[3], pct('line'))     # 语句覆盖率 ← 行覆盖率代标
         set_cell_text(row.cells[4], pct('block'))    # 分支覆盖率 ← 块覆盖率代标
         set_cell_text(row.cells[5], 'n/a')
         set_cell_text(row.cells[6], version)
         set_cell_text(row.cells[7], note)
+    _set_table_font_size(t2, 9)
     return True
 
 
