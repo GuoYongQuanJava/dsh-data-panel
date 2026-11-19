@@ -9,9 +9,65 @@ const OMIT_DIRECTORIES = new Set(['.git', '.dsh', '.codex-tmp', 'node_modules', 
 const inside = (root, file) => { const path = relative(root, file); return path !== '..' && !path.startsWith('../') && !path.startsWith('..\\') && !isAbsolute(path) }
 const key = (path) => path.replace(/\\/g, '/')
 
-export function scanSourceFiles(project, sourceRoots = ['.']) {
+/**
+ * 用例编号归一化：去掉 .CTD 后缀与首尾空白，忽略大小写。
+ * 历史数据里「带 .CTD」「不带」两种写法都存在，关联时必须能对上。
+ */
+export function normalizeCaseId(id) {
+  return String(id ?? '').trim().replace(/\.ctd$/i, '').toLowerCase()
+}
+
+/**
+ * 同类告警折叠：保留前 keep 条 + 总数，避免一次执行刷出几十条重复告警。
+ */
+function collapseWarnings(warnings, keep = 3) {
+  const groups = new Map()
+  const order = []
+  for (const text of warnings) {
+    const sep = text.indexOf('：')
+    const label = sep > 0 ? text.slice(0, sep) : text
+    if (!groups.has(label)) { groups.set(label, []); order.push(label) }
+    groups.get(label).push(text)
+  }
+  const out = []
+  for (const label of order) {
+    const items = groups.get(label)
+    if (items.length <= keep) { out.push(...items); continue }
+    out.push(...items.slice(0, keep))
+    out.push(`${label}：另有 ${items.length - keep} 条同类告警，已折叠`)
+  }
+  return out
+}
+
+/**
+ * 排除目录规范化：必须是项目内路径，按完整目录段前缀匹配。
+ * 不存在的排除目录也允许登记（可能在后续迭代才创建），只是当前没有文件可排除。
+ */
+function normalizeExcludes(base, excludeDirs) {
+  const normalized = new Set()
+  if (!Array.isArray(excludeDirs)) return normalized
+  for (const dir of excludeDirs) {
+    if (typeof dir !== 'string' || !dir.trim()) continue
+    const absDir = resolve(base, dir)
+    if (!inside(base, absDir)) throw new Error(`排除目录必须在项目内：${dir}`)
+    let realDir = absDir
+    try {
+      realDir = realpathSync(absDir)
+    } catch {
+      // 目录尚不存在：保留解析后的路径继续，不因为还没创建就拒绝配置
+    }
+    if (!inside(base, realDir)) throw new Error(`排除目录必须在项目内：${dir}`)
+    const rel = key(relative(base, realDir)).replace(/\/+$/, '')
+    if (!rel) continue  // 排除项目根没有意义，忽略
+    normalized.add(rel + '/')
+  }
+  return normalized
+}
+
+export function scanSourceFiles(project, sourceRoots = ['.'], excludeDirs = []) {
   const base = realpathSync(project)
   if (!Array.isArray(sourceRoots) || sourceRoots.length === 0 || sourceRoots.some((root) => typeof root !== 'string')) throw new Error('sourceRoots 必须是非空路径数组')
+  const excluded = normalizeExcludes(base, excludeDirs)
   const files = new Map()
   const visited = new Set()
   function walk(path) {
@@ -24,7 +80,12 @@ export function scanSourceFiles(project, sourceRoots = ['.']) {
     if (info.isDirectory()) {
       for (const entry of readdirSync(real, { withFileTypes: true })) {
         if (entry.isSymbolicLink()) continue
-        if (entry.isDirectory() && OMIT_DIRECTORIES.has(entry.name)) continue
+        if (entry.isDirectory()) {
+          if (OMIT_DIRECTORIES.has(entry.name)) continue
+          // 用户配置的排除目录：按完整目录段匹配，避免 src/app 误排除 src/application
+          const childRel = key(relative(base, resolve(real, entry.name))) + '/'
+          if ([...excluded].some((prefix) => childRel.startsWith(prefix))) continue
+        }
         walk(resolve(real, entry.name))
       }
     } else if (SOURCE_EXTENSIONS.has(extname(real).toLowerCase())) {
@@ -36,8 +97,14 @@ export function scanSourceFiles(project, sourceRoots = ['.']) {
   return [...files.values()].sort((a, b) => a.path.localeCompare(b.path))
 }
 
-export function scopeInventory(project, sourceRoots = ['.']) {
-  return { version: 1, sourceRoots, omittedDirectories: [...OMIT_DIRECTORIES], files: scanSourceFiles(project, sourceRoots) }
+export function scopeInventory(project, sourceRoots = ['.'], excludeDirs = []) {
+  return {
+    version: 1,
+    sourceRoots,
+    excludeDirs: Array.isArray(excludeDirs) ? [...excludeDirs] : [],
+    omittedDirectories: [...OMIT_DIRECTORIES],
+    files: scanSourceFiles(project, sourceRoots, excludeDirs),
+  }
 }
 
 export function assessScope(project, document, cases, selectedCaseIds = cases.map((item) => item.caseId)) {
@@ -47,10 +114,11 @@ export function assessScope(project, document, cases, selectedCaseIds = cases.ma
   if (!document) return { status: 'missing', warnings: ['未提供 scope.json，不能据此认定本次覆盖整个项目'], summary, selectedCaseIds }
   try {
     if (document.version !== 1 || !Array.isArray(document.files)) throw new Error('范围清单需要 version=1 和 files 数组')
-    const scanned = scanSourceFiles(project, document.sourceRoots)
+    const scanned = scanSourceFiles(project, document.sourceRoots, document.excludeDirs)
     summary.scannedFiles = scanned.length
     if (scanned.length === 0) warnings.push('源码扫描为空，请核对 sourceRoots')
-    const records = new Map(cases.map((item) => [item.caseId, item]))
+    // 面板用例按归一化编号建索引：.CTD 带不带都能对上
+    const records = new Map(cases.map((item) => [normalizeCaseId(item.caseId), item]))
     const declared = new Map()
     for (const item of document.files) {
       if (!item || typeof item.path !== 'string') { warnings.push('范围清单存在缺少 path 的条目'); continue }
@@ -59,7 +127,7 @@ export function assessScope(project, document, cases, selectedCaseIds = cases.ma
       declared.set(path, item)
     }
     const seenSymbols = new Set()
-    const selected = new Set(selectedCaseIds)
+    const selected = new Set(selectedCaseIds.map(normalizeCaseId))
     const linkedCaseIds = new Set()
     for (const source of scanned) {
       const item = declared.get(source.path)
@@ -94,7 +162,9 @@ export function assessScope(project, document, cases, selectedCaseIds = cases.ma
         if (!fn || typeof fn.subjectFunction !== 'string' || !fn.subjectFunction.trim()) { warnings.push(`函数字段无效：${source.path}`); continue }
         if (seenSymbols.has(fn.subjectFunction)) warnings.push(`函数重复：${fn.subjectFunction}`)
         seenSymbols.add(fn.subjectFunction)
-        const ids = Array.isArray(fn.caseIds) ? [...new Set(fn.caseIds)] : []
+        // 只有 tested 文件的函数才要求有用例；excluded/declaration 本来就不会有用例
+        if (item.status !== 'tested') continue
+        const ids = Array.isArray(fn.caseIds) ? [...new Set(fn.caseIds.map(normalizeCaseId))] : []
         const matches = ids.filter((id) => records.get(id)?.subjectFunction === fn.subjectFunction)
         if (matches.length === 0) warnings.push(`函数没有匹配的面板用例：${fn.subjectFunction}`)
         else { summary.linkedFunctions++; matches.forEach((id) => linkedCaseIds.add(id)) }
@@ -102,8 +172,18 @@ export function assessScope(project, document, cases, selectedCaseIds = cases.ma
       }
     }
     for (const path of declared.keys()) warnings.push(`范围条目不在当前源码扫描中：${path}`)
-    for (const id of selected) if (!linkedCaseIds.has(id)) warnings.push(`本次用例未关联范围清单中的函数：${id}`)
-    return { status: warnings.length ? 'warning' : 'reviewed', warnings, summary, selectedCaseIds, inventory: document, proofEvidence, note: '文件清单由磁盘校验；函数枚举和排除结论仍需审查。此统计不是语句/分支覆盖率。' }
+    if (selected.size > 0) for (const id of selected) if (!linkedCaseIds.has(id)) warnings.push(`本次用例未关联范围清单中的函数：${id}`)
+    const rawWarnings = [...warnings]
+    return {
+      status: warnings.length ? 'warning' : 'reviewed',
+      warnings: collapseWarnings(warnings),
+      rawWarnings,
+      summary,
+      selectedCaseIds,
+      inventory: document,
+      proofEvidence,
+      note: '文件清单由磁盘校验；函数枚举和排除结论仍需审查。此统计不是语句/分支覆盖率。',
+    }
   } catch (error) {
     return { status: 'invalid', warnings: [error.message], summary, selectedCaseIds }
   }
@@ -111,8 +191,18 @@ export function assessScope(project, document, cases, selectedCaseIds = cases.ma
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
-    const [, , project, ...roots] = process.argv
-    if (!project) throw new Error('用法：node scope.js <项目绝对路径> [源码目录 ...]；只输出清单，不写项目文件')
-    process.stdout.write(JSON.stringify(scopeInventory(project, roots.length ? roots : ['.']), null, 2) + '\n')
+    // 兼容旧用法：位置参数是项目路径 + 源码根；--exclude 之后的参数是排除目录，可多次给出
+    const roots = []
+    const excludeDirs = []
+    let collectingExcludes = false
+    for (const arg of process.argv.slice(2)) {
+      if (arg === '--exclude') { collectingExcludes = true; continue }
+      if (arg.startsWith('-')) { collectingExcludes = false; continue }
+      if (collectingExcludes) excludeDirs.push(arg)
+      else roots.push(arg)
+    }
+    const project = roots.shift()
+    if (!project) throw new Error('用法：node scope.js <项目绝对路径> [源码目录 ...] [--exclude <排除目录 ...>]；只输出清单，不写项目文件')
+    process.stdout.write(JSON.stringify(scopeInventory(project, roots.length ? roots : ['.'], excludeDirs), null, 2) + '\n')
   } catch (error) { process.stderr.write(error.message + '\n'); process.exitCode = 1 }
 }

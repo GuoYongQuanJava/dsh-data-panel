@@ -1,4 +1,4 @@
-﻿# 让 AI 模型来跑这套流程
+# 让 AI 模型来跑这套流程
 
 适用场景：你（人）只做验收，中间「造数据 → 出报告 → 自检」全部交给一个大模型。
 
@@ -81,11 +81,11 @@ python report-tool/doctor.py
 3. 数据 JSON 里不写这三个人，留给 skill 提供
 4. 至少包含：3 个模块、6~9 条用例、1 条失败、1 条未执行、变量组数不等
 5. 跑：
-   python report-tool/cmd.py --template templates/RingBuffer-test-blank.docx `
+   python report-tool/cmd.py --template templates/单元测试报告模板.docx `
           --data <你的数据>.json --skill skills/<你的场景> -o <你的报告>.docx
 6. 校验：
    python report-tool/verify_report.py <你的报告>.docx <你的数据>.json `
-          templates/RingBuffer-test-blank.docx skills/<你的场景>
+          templates/单元测试报告模板.docx skills/<你的场景>
 7. 最后一行必须是 ALL CHECKS PASSED，否则按报错改 JSON 重跑
 
 不要修改 report-tool 下的 .py 文件和 templates 下的模板。
@@ -128,7 +128,7 @@ python report-tool/doctor.py
 |---|---|---|
 | **模型用绝对路径** | 命令里写 `D:\1\...`，在它机器上不存在 | 命令全部用相对路径，且工作区必须是包根 |
 | **模型去改代码** | 报错后改 `filler.py` / `builder.py` 绕过 | 明确写「不要修改 .py」，并让它先跑 `verify_report.py` 定位问题 |
-| **误判 `removed=` 值** | 用空白模板应是 10，它以为是 74 | `GENERATE-DATA.md` 已写明两种模板的期望值 |
+| **误读输出字段** | 把 `toc_cleared` 非 0 当成失败 | 它是诊断信息，不影响出报告 |
 | **目录没重建就以为失败** | 看到 `目录：未重建，回退到 updateFields` 当成错误 | 文档已标注「不是失败，只是降级」 |
 | **抄示例数据** | 直接复制 `auth-demo.json` 改几个数 | 要求「和示例完全无关的场景」并列出禁用词 |
 | **summary 数错** | 手写 `total` 与实际用例数不符 | 校验器会拦，报错精确到数字 |

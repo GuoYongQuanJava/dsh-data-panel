@@ -4,7 +4,7 @@
 Usage::
 
     python cmd.py \
-        --template "RingBuffer-test(1).docx" \
+        --template "单元测试报告模板.docx" \
         --data results.json \
         -o report.docx
 

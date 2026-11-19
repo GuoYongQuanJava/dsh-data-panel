@@ -45,8 +45,8 @@ def find_assets():
         candidates.append(Path(env))
     here = Path(__file__).resolve().parent
     candidates += [
-        here.parents[2] / "dsh-data-panel" / "package" / "assets",  # 仓库布局
-        here.parents[2] / "package" / "assets",
+        here.parents[1] / "dsh-data-panel" / "package" / "assets",  # 仓库布局
+        here.parents[1] / "package" / "assets",
         here / "assets",
     ]
     for candidate in candidates:

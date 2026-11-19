@@ -259,21 +259,32 @@ def _insert_before_sectpr(body, element):
 #  RingBuffer 13×11 用例表原型
 # ════════════════════════════════════════════════════════════════════════
 
-def _load_ringbuffer_prototype() -> Tuple[Document, Any]:
+def _load_ringbuffer_prototype(doc: Document = None) -> Tuple[Document, Any]:
+    """取 13×11 用例表原型。
+
+    优先用**正式模板自带的那张 11 列表**（新模板里就嵌了），不依赖外部原型文件；
+    模板里没有时才回退到旧的 RingBuffer 样本（兼容老部署）。
+    """
+    if doc is not None:
+        own = next((t for t in doc.tables if len(t.columns) == 11), None)
+        if own is not None:
+            return doc, own._tbl
+
     base = Path(__file__).resolve().parent
     candidates = [
         base.parent / 'templates' / 'RingBuffer-test.docx',
         base.parent / 'templates' / 'RingBuffer-test-blank.docx',
-        base.parents[3] / '单元测试资料' / '报告' / 'RingBuffer-test(1).docx',
     ]
     for p in candidates:
         if p.is_file():
             proto_doc = Document(str(p))
-            if proto_doc.tables:
-                return proto_doc, proto_doc.tables[0]._tbl
+            for table in proto_doc.tables:
+                if len(table.columns) == 11:
+                    return proto_doc, table._tbl
+
     raise BuilderError(
-        '找不到 RingBuffer 13×11 用例表原型。请确认以下文件之一存在：\n'
-        + '\n'.join(f'  • {c}' for c in candidates)
+        '找不到 13×11 用例表原型：正式模板里没有 11 列表，也没有 RingBuffer 样本可回退。\n'
+        '  请用 templates/单元测试报告模板.docx 作为模板（它自带用例表格式）。'
     )
 
 
@@ -573,8 +584,12 @@ def _build_assessment(data: Dict[str, Any]) -> str:
 
     # 注释率与 MCDC 未达标函数数：当前只有旧版 VS 采集器（不提供 MCDC）与静态分析（不统计注释），
     # 没有真数据就写「未采集」，绝不推测。
-    comment_rate = ((data.get('staticMetrics') or {}).get('commentRate'))
-    comment_text = f"{comment_rate}%" if comment_rate not in (None, '') else '未采集'
+    comment_rate_raw = ((data.get('staticMetrics') or {}).get('commentRate'))
+    try:
+        comment_rate_val = float(comment_rate_raw) if comment_rate_raw not in (None, '') else None
+    except (ValueError, TypeError):
+        comment_rate_val = None
+    comment_text = f"{comment_rate_val}%" if comment_rate_val is not None else '未采集'
     mcdc_count = _mcdc_unmet_count(data)
 
     # MCDC 那句话：有数据就用数字，没数据就如实说明无法判定（旧版 VS 采集器不提供）
@@ -590,6 +605,14 @@ def _build_assessment(data: Dict[str, Any]) -> str:
             return (f"{subject}共发现{count}个问题，均为一般问题，"
                     f"具体问题详细信息见附录{appendix}。")
         return f"{subject}未发现问题。"
+
+    if comment_rate_val is not None:
+        if comment_rate_val >= 30:
+            comment_clause = "符合软件代码有效注释率不小于30%的要求，"
+        else:
+            comment_clause = f"不符合软件代码有效注释率不小于30%的要求（实际 {comment_rate_val}%），"
+    else:
+        comment_clause = ""
 
     return (
         f"{date_text}，测试人员分{phase_count}个迭代阶段，"
@@ -608,8 +631,8 @@ def _build_assessment(data: Dict[str, Any]) -> str:
         "经本阶段单元测试，软件函数单元的设计实现符合软件设计说明的要求，"
         "软件编码符合编码规范，"
         + f"{software}软件代码注释率为{comment_text}。"
-        + "符合软件代码有效注释率不小于30%的要求，"
-        "本软件源代码中圈复杂度大于10的函数及其圈复杂度如下表所示："
+        + comment_clause
+        + "本软件源代码中圈复杂度大于10的函数及其圈复杂度如下表所示："
     )
 
 def _fill_chapter3(body_els: list, data: Dict[str, Any], proto_body) -> None:
@@ -632,6 +655,71 @@ def _fill_chapter2(body_els: list, meta: Dict[str, Any], proto_body) -> None:
 def _fill_doc_overview(body_els: list, data: Dict[str, Any], proto_body) -> None:
     """1.3 文档概述：客户模板要求不写正文。"""
     return
+
+
+def _fill_scope_section(body_els: list, data: Dict[str, Any], proto_body, sid_h2: str) -> None:
+    """3.4 测试范围与排除：把本次冻结的 testScope 写成正文。
+
+    只列已提供的真实清单；没有清单时如实说明“无范围清单”，不声称覆盖全工程。
+    """
+    if proto_body is None:
+        return
+    source = (data.get('scope') or {}).get('sourceScope') or {}
+    # 插在 3.3 改进建议 之后
+    anchor = _find_para(body_els, '改进建议')
+    if anchor is None:
+        return
+    heading = _make_paragraph(anchor, '测试范围与排除', sid_h2)
+    _append_after(anchor, heading)
+    previous = heading
+
+    def add(text: str) -> None:
+        nonlocal previous
+        p = _make_paragraph(proto_body, text)
+        _append_after(previous, p)
+        previous = p
+
+    if not source.get('available'):
+        add(str(source.get('reason') or '本次执行没有范围清单，不能据此声称覆盖整个工程。'))
+        return
+
+    roots = '、'.join(source.get('sourceRoots') or []) or '未记录'
+    summary = source.get('summary') or {}
+    add(f"本次扫描根：{roots}。共扫描 {summary.get('scannedFiles', 0)} 个源码文件："
+        f"纳入测试 {summary.get('testedFiles', 0)} 个，排除 {summary.get('excludedFiles', 0)} 个，"
+        f"仅声明 {summary.get('declarationFiles', 0)} 个，未处理 {summary.get('deferredFiles', 0)} 个；"
+        f"共枚举 {summary.get('declaredFunctions', 0)} 个函数，"
+        f"其中 {summary.get('linkedFunctions', 0)} 个已关联到本次用例。")
+
+    files = source.get('files') or []
+    tested = [f for f in files if f.get('status') == 'tested']
+    if tested:
+        names = '、'.join(f"{f.get('path')}（{f.get('functionCount', 0)} 个函数）" for f in tested)
+        add(f"纳入测试的源码文件：{names}。")
+
+    excluded = [f for f in files if f.get('status') == 'excluded']
+    if excluded:
+        for item in excluded:
+            proof = ''
+            if item.get('exitCode') is not None:
+                proof = f"（独立编译探针退出码 {item['exitCode']}，日志 {item.get('logFile') or '未记录'}）"
+            add(f"排除：{item.get('path')}。理由：{item.get('reason') or '未说明'} {proof}".strip())
+    else:
+        add('本次没有排除任何源码文件。')
+
+    decl = [f for f in files if f.get('status') == 'declaration']
+    if decl:
+        add('仅声明、无逻辑的文件：' + '、'.join(f.get('path', '') for f in decl) + '。')
+
+    pending = [f for f in files if f.get('status') not in ('tested', 'excluded', 'declaration')]
+    if pending:
+        add('尚未纳入或验证的源码：' + '、'.join(f"{f.get('path')}（{f.get('reason') or '未说明'}）" for f in pending) + '。')
+
+    warnings = source.get('warnings') or []
+    if warnings:
+        shown = '；'.join(warnings[:10])
+        more = f"；另有 {len(warnings) - 10} 条同类告警，详见本次 scope.json" if len(warnings) > 10 else ''
+        add(f"范围校验告警：{shown}{more}。")
 
 
 def _move_regressions(body_els: list, data: Dict[str, Any], proto_body,
@@ -777,12 +865,53 @@ def _append_after(anchor, element):
 # ════════════════════════════════════════════════════════════════════════
 
 def _fill_appendices(body_els: list, data: Dict[str, Any], proto_body) -> None:
-    """附录A 未开展文档审查时，在标题后注明。"""
+    """附录A：把模板里的「文档名称：xxx（版本号：B）」换成配置里的真实文档。
+
+    每个引用文档一行，名称与版本号都取自项目配置（reqDoc* / designDoc*），
+    没提供时如实写「未提供」，不编。
+    """
     reviews = data.get('reviews') or {}
+    meta = data.get('meta') or {}
     p_app_a = _find_para(body_els, '附录A')
-    if p_app_a is None or proto_body is None:
-        return
-    if not reviews.get('docReviewDone'):
+
+    # 找到附录A 与 附录B 之间的「文档名称：」行
+    doc_line = None
+    started = False
+    for el in body_els:
+        if el.tag != qn('w:p'):
+            continue
+        flat = _flat(el).strip()
+        if flat.startswith('附录A'):
+            started = True
+            continue
+        if started and flat.startswith('附录B'):
+            break
+        if started and flat.startswith('文档名称'):
+            doc_line = el
+            break
+
+    refs = [r for r in (meta.get('references') or [])
+            if isinstance(r, dict) and str(r.get('name') or '').strip()]
+    if doc_line is not None:
+        lines = []
+        for ref in refs:
+            version = str(ref.get('version') or '').strip()
+            lines.append(f"文档名称：{ref['name']}（版本号：{version or '未提供'}）")
+        if not lines:
+            lines = ['文档名称：未提供']
+
+        _replace_para_text(doc_line, lines[0])
+        previous = doc_line
+        for text in lines[1:]:
+            if proto_body is None:
+                break
+            new_p = _make_paragraph(proto_body, text)
+            _append_after(previous, new_p)
+            previous = new_p
+
+    # 只有「真的没有引用文档」时才注明未开展；否则会和上面的文档名称行自相矛盾
+    if (p_app_a is not None and proto_body is not None
+            and not reviews.get('docReviewDone') and not refs):
         _insert_after(
             p_app_a,
             _make_paragraph(proto_body, '未开展文档审查：本次未提供待审查文档，附录A 审查单未填写。'),
@@ -1042,7 +1171,9 @@ def build(
     body_els = list(body)
     meta = data.get('meta') or {}
 
-    rb_doc, rb_tbl = _load_ringbuffer_prototype()
+    # 用例表原型优先取模板自带的 11 列表；立即深拷贝，因为后面要删掉第4章示例区
+    rb_doc, _rb_proto = _load_ringbuffer_prototype(doc)
+    rb_tbl = deepcopy(_rb_proto)
 
     # ── 样式 ID ──
     sid_h1 = _style_id(doc, STYLE_H1)
@@ -1095,7 +1226,8 @@ def build(
     _fill_doc_overview(body_els, data, proto_body)
     _fill_chapter2(body_els, meta, proto_body)
     _fill_chapter3(body_els, data, proto_body)
-    # 3.4 回归测试不生成（客户模板里没有这一节，也不要求）
+    # 3.4 测试范围与排除：把本次冻结的源码范围与排除证据写进报告
+    _fill_scope_section(body_els, data, proto_body, sid_h2)
 
     # 先把模板里会被重新生成的样例段落删掉（3.1 样例正文、圈复杂度说明段）
     _strip_template_samples(body_els)

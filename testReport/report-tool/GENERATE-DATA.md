@@ -20,14 +20,14 @@
 | 工作区 | `D:\1` |
 | Python | `C:\Users\PC\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe`（已装 python-docx） |
 | 模板（正式，唯一可用） | `D:\1\templates\单元测试报告模板.docx` |
-| 用例表原型（仅参考） | `templates\RingBuffer-test.docx` / `-blank.docx`，**不能拿来出报告** |
+| 用例表原型 | 正式模板自带（13×11），无需单独准备 |
 | 生成脚本 | `D:\1\report-tool\cmd.py` |
 | 校验器 | `D:\1\report-tool\verify_report.py` |
 | skill 目录 | `D:\1\skills\<你的项目名>\SKILL.md` |
 
 有 Microsoft Word 时，`cmd.py` 会自动重建目录（打开文档不弹提示）。
 
-**两种模板产物完全等价**（逐单元格一致），只是 `removed=` 不同：空白模板约 10，原始模板 74。
+正式模板自带 13×11 用例表原型，生成时直接用模板里那张表。
 
 ---
 
@@ -36,14 +36,14 @@
 | 字段 | 来源 | 说明 |
 |---|---|---|
 | **`designer` / `reviewer` / `tester`** | **skill 文件** | 只有这三个人员字段来自 skill。「谁设计、谁校对、谁执行」是流程属性，项目定一次就固定 |
-| `name` / `unitId` / `trace` / `driver` / `coverage` | **执行数据（模块级）** | 系统分析代码、查设计文档、调覆盖率工具得到 |
-| `issues` / `inconsistent` | **执行数据（模块级）** | 执行过程中汇总的问题 |
+| `name` / `functionId` / `unitId` / `trace` / `driver` / `coverage` | **执行数据（函数级）** | 系统分析代码、查设计文档、调覆盖率工具得到 |
+| `phaseIssues` / `phaseInconsistent` | **执行数据（阶段级）** | 执行过程中汇总的问题 |
 | 用例的全部字段（`id`/`name`/`type`/`inputs`/`outputs`/`passed`/`status`/`issue`/`bugId`/`executedAt`） | **执行数据（用例级）** | 用例与结果 |
 
 **除三个人员字段外，其余一律写进 JSON，不要指望 skill 提供。**
 skill 里就算写了 `coverage` / `driver` 之类的键，脚本也会忽略。
 
-人员字段也可以在数据里覆盖 skill（用例级 > 模块级 > skill），用于临时换人。
+人员字段也可以在数据里覆盖 skill（用例级 > 函数级 > 阶段级 > skill），用于临时换人。
 
 ---
 
@@ -53,34 +53,48 @@ skill 里就算写了 `coverage` / `driver` 之类的键，脚本也会忽略。
 
 ```jsonc
 {
+  "schemaVersion": "2.0",
   "meta": {
     "project": "项目名",                          // 必填
     "executedAt": "2026-11-14T10:00:00+08:00",   // 必填，ISO-8601 或 yyyy/mm/dd
     "executor": "gtest-1.14 / gcc-13.2 / Linux"  // 可选
   },
   "summary": {
-    "total": 8,        // 必填 = 所有模块用例数之和
+    "total": 8,        // 必填 = 所有阶段用例数之和
     "passed": 6,       // 必填
     "failed": 1,       // 必填
     "notRun": 1        // 可选，未执行数；total = passed + failed + notRun
   },
-  "modules": [ /* 见下 */ ]
+  "phases": [ /* 见下 */ ]
 }
 ```
 
-### 模块
+### 阶段与函数
+
+阶段（phase）是报告顶层的迭代分组：
 
 ```jsonc
 {
-  "name": "订单金额计算单元测试",        // 必填 → 生成章节标题
-  "unitId": "订单金额计算单元测试",      // 可选 → 表头「单元标识」，默认取 name
-  "trace": "详细设计 5.9.2 订单金额",    // 可选 → 表头「设计追溯」，默认 "-"
-  "driver": "测试驱动（TestDriver）",   // 可选 → 表头「驱动模块」，默认 "无"
-  "coverage": "-S 94.2% -B 88.6%",      // 可选 → 表头「覆盖率记录」，默认 "-"
-  "designer": "张伟",                   // 可选 → 各用例「设计者」的默认值，通常不写（走 skill）
-  "reviewer": "刘洋",                   // 可选 → 各用例「校对者」的默认值，通常不写（走 skill）
-  "issues": "无。",                      // 可选 → 「遇到的问题」
-  "inconsistent": "无。",                // 可选 → 「与测试用例/规程的不一致」
+  "phaseId": "phase-1",                 // 必填，全局唯一
+  "name": "第1阶段",                    // 必填 → 生成阶段标题
+  "order": 1,                           // 必填，正整数，决定阶段顺序
+  "phaseIssues": "无。",                 // 可选 → 「遇到的问题」
+  "phaseInconsistent": "无。",           // 可选 → 「与测试用例/规程的不一致」
+  "functions": [ /* 至少 1 个 */ ]
+}
+```
+
+函数（function）是报告章节的三级标题：
+
+```jsonc
+{
+  "functionId": "订单金额计算单元测试",   // 必填，跨阶段唯一
+  "name": "订单金额计算",                 // 必填 → 生成三级标题
+  "unitId": "订单金额计算单元测试",        // 可选 → 表头「单元标识」，默认取 name
+  "trace": "详细设计 5.9.2 订单金额",      // 可选 → 表头「设计追溯」，默认 "-"
+  "driver": "测试驱动（TestDriver）",     // 可选 → 表头「驱动模块」，默认 "无"
+  "coverage": "-S 94.2% -B 88.6%",       // 可选 → 表头「覆盖率记录」，默认 "-"
+  "summary": { "total": 3, "passed": 3, "failed": 0, "notRun": 0 },  // 必填，必须与本函数用例数一致
   "cases": [ /* 至少 1 条 */ ]
 }
 ```
@@ -105,9 +119,9 @@ skill 里就算写了 `coverage` / `driver` 之类的键，脚本也会忽略。
   "notRunReason": "",                  // 可选，未执行原因
   "issue": "无",                       // 可选 → 「异常现象描述」
   "bugId": "BUG-ORD-0042",             // 可选 → 「软件问题单编号」
-  "designer": "张伟",                  // 可选 → 「设计者」，默认取模块级 → skill
-  "reviewer": "刘洋",                  // 可选 → 「校对者」，默认取模块级 → skill
-  "tester": "王芳",                    // 可选 → 「测试人员」，默认取模块级 → skill
+  "designer": "张伟",                  // 可选 → 「设计者」，默认取函数级 → skill
+  "reviewer": "刘洋",                  // 可选 → 「校对者」，默认取函数级 → skill
+  "tester": "王芳",                    // 可选 → 「测试人员」，默认取函数级 → skill
   "executedAt": "2026/11/13"           // 可选 → 测试执行时间
 }
 ```
@@ -154,13 +168,13 @@ skill 里就算写了 `coverage` / `driver` 之类的键，脚本也会忽略。
 
 | 场景 | 为什么 |
 |---|---|
-| 3 个模块 / 6~9 条用例 | 验证章节按数据重建，而不是照抄模板的 6 个模块 |
+| 3 个阶段 / 6~9 条用例 | 验证章节按数据重建，而不是照抄模板的样例 |
 | 1~2 条 `failed`，带 `issue` 和 `bugId` | 验证未通过勾选与问题单号 |
 | 1 条 `notRun`，带 `notRunReason` | 验证「未执行」状态（大模型漏测场景） |
 | 变量组数各不相同（1 组 / 3 组 / 5 组） | 验证变量行动态增删 |
 | 输入组数与输出组数不相等 | 验证列不对齐时的处理 |
 | 五种 `type` 至少覆盖 4 种 | 验证类型勾选位置 |
-| 各模块 `coverage` 数值不同 | 验证表头按模块取值，而不是取同一份 |
+| 各函数 `coverage` 数值不同 | 验证表头按函数取值，而不是取同一份 |
 | 故意不给用例级 `designer`/`reviewer`/`tester` | 验证 skill 注入生效 |
 
 ---
@@ -224,14 +238,14 @@ tester: 王芳
 ## 命令输出怎么看
 
 ```
-modules=3  cases=8  passed=6  failed=1  notRun=1  removed=74  toc_cleared=29
+phases=3  functions=3  cases=8  passed=6  failed=1  notRun=1  unconfirmed=0  toc_cleared=0
 目录：已重建（OK toc=1 pages=9）
 报告已生成：D:\1\report-tool\your-report.docx
 ```
 
 | 字段 | 含义 | 什么时候要警觉 |
 |---|---|---|
-| `modules / cases` | 你数据里的模块数与用例数，应当对得上 | 对不上 → 数据被截断 |
+| `phases / functions / cases` | 你数据里的阶段数、函数数与用例数，应当对得上 | 对不上 → 数据被截断 |
 | `passed / failed / notRun` | 三种状态的实际计数 | 与 summary 不一致（校验器已拦） |
 | `removed` | 从模板删掉的样例元素个数 | 原始模板固定 74，空白模板固定 10；变了说明模板被改过 |
 | `toc_cleared` | 清掉的目录缓存节点数 | 原始模板 29，空白模板 0 |
@@ -274,11 +288,11 @@ schema 报错样例（会带精确路径）：
 
 `D:\1\report-tool\auth-demo.json` 是一份合格的样例：
 
-- 3 个模块、8 条用例
+- 3 个阶段、8 条用例
 - 6 通过 / 1 未通过 / 1 未执行
 - 变量组数 2~4 组不等
-- 三个模块的 `coverage` 各不相同（96.1% / 92.4% / 94.0%）
-- 模块级给了 `designer` / `reviewer`，用例级故意不写 `tester`
+- 三个函数的 `coverage` 各不相同（96.1% / 92.4% / 94.0%）
+- 函数级给了 `designer` / `reviewer`，用例级故意不写 `tester`
 - 标识 `AUTH-PWD-0001` 风格，与模板零重叠
 
-人员资料可直接写入 JSON，也可由项目专属 Skill 提供默认值；JSON 中的模块或用例值优先，仍缺失的字段保持空白。
+人员资料可直接写入 JSON，也可由项目专属 Skill 提供默认值；JSON 中的函数或用例值优先，仍缺失的字段保持空白。

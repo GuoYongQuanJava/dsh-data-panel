@@ -28,6 +28,7 @@ import hashlib
 import json
 import random
 import sys
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -155,12 +156,17 @@ def actual_outputs(case: dict, evidence: dict | None) -> list:
     """构建 [[name, expected, actual], ...] 输出变量列表。"""
     expected = named_values(case.get("expectedOutputs"))
     values = evidence.get("actualOutputs") if isinstance(evidence, dict) else None
-    if not isinstance(values, dict):
-        values = {}
+    # 实际输出与 expectedOutputs 同为 [{name, value}] 列表；同时兼容旧版字典写法
+    actual_map: dict = {}
+    if isinstance(values, list):
+        actual_map = {name: value for name, value in named_values(values)}
+    elif isinstance(values, dict):
+        actual_map = {name: value for name, value in values.items()
+                      if isinstance(name, str) and isinstance(value, str)}
     # 旧 ACTUAL 标记只是一条未命名原始值；仅当用例明确只有一个输出变量时才能对应。
-    if len(expected) == 1 and expected[0][0] not in values and evidence and isinstance(evidence.get("actual"), str):
-        values = {**values, expected[0][0]: evidence["actual"]}
-    return [[name, wanted, values[name] if isinstance(values.get(name), str) else "未采集"]
+    if len(expected) == 1 and expected[0][0] not in actual_map and evidence and isinstance(evidence.get("actual"), str):
+        actual_map = {**actual_map, expected[0][0]: evidence["actual"]}
+    return [[name, wanted, actual_map[name] if isinstance(actual_map.get(name), str) else "未采集"]
             for name, wanted in expected]
 
 
@@ -305,6 +311,152 @@ def load_or_create_phase_plan(
     return plan, plan_path, seed
 
 
+
+
+STATUS_TEXT_SCOPE = {
+    'tested': '已纳入测试',
+    'excluded': '已排除',
+    'declaration': '仅声明',
+    'deferred': '尚未处理',
+}
+
+
+def build_source_scope(result: dict) -> dict:
+    """把 prepare 冻结的 testScope 整理成报告能直接渲染的源码范围。
+
+    只搬运本次 run 的真实记录，不重新扫描、不猜结论。
+    """
+    ts = result.get('testScope') if isinstance(result, dict) else None
+    if not isinstance(ts, dict) or not ts:
+        return {'available': False, 'reason': '本次执行没有范围清单（scope.json）'}
+    ts_status = str(ts.get('status') or '')
+    if ts_status in ('missing', 'invalid'):
+        return {'available': False, 'reason': f'范围清单状态为 {ts_status}，不可用'}
+    inventory = ts.get('inventory') if isinstance(ts.get('inventory'), dict) else {}
+    if not inventory.get('files'):
+        return {'available': False, 'reason': '范围清单没有有效文件记录'}
+    files = []
+    for item in inventory.get('files') or []:
+        if not isinstance(item, dict):
+            continue
+        proof = item.get('proof') if isinstance(item.get('proof'), dict) else {}
+        status = str(item.get('status') or 'deferred')
+        files.append({
+            'path': str(item.get('path') or ''),
+            'status': status,
+            'statusText': STATUS_TEXT_SCOPE.get(status, status),
+            'reason': str(item.get('reason') or ''),
+            'functionCount': len(item.get('functions') or []),
+            'exitCode': proof.get('exitCode'),
+            'logFile': str(proof.get('logFile') or ''),
+        })
+    return {
+        'available': True,
+        'sourceRoots': [str(x) for x in (inventory.get('sourceRoots') or [])],
+        'summary': ts.get('summary') if isinstance(ts.get('summary'), dict) else {},
+        'status': str(ts.get('status') or ''),
+        'files': files,
+        'warnings': [str(x) for x in (ts.get('warnings') or [])],
+        'rawWarnings': [str(x) for x in (ts.get('rawWarnings') or ts.get('warnings') or [])],
+    }
+
+
+FUNCTION_COVERAGE_UNAVAILABLE = '本次未按函数拆分采集'
+
+
+def load_function_coverage(result: dict) -> dict:
+    """从本次 coverage.xml 读**函数级**行/块覆盖率，返回 {别名: '-L 80.0% (4/5) -BK 60.0% (3/5)'}。
+
+    VS 的 coverage.xml 里 <function> 节点自带 line_coverage / block_coverage，
+    这是函数自己的真实数字（不是把项目级抄下来）。没有报告、解析失败或没有可用
+    数字时返回空 dict，调用方继续写占位说明——不推测、不造假。
+    """
+    cov = result.get('coverage')
+    if not isinstance(cov, dict) or not cov.get('available'):
+        return {}
+    xml_path = str(cov.get('sourceFile') or cov.get('source') or '').strip()
+    if not xml_path or not Path(xml_path).is_file():
+        return {}
+    try:
+        root = ET.parse(xml_path).getroot()
+    except Exception as exc:  # 解析失败不能让报告生成失败
+        print(f'   函数级覆盖率：解析 {Path(xml_path).name} 失败（{exc}），保持未拆分说明')
+        return {}
+
+    table: dict = {}
+    ambiguous: set = set()
+
+    def _put(alias: str, text: str) -> None:
+        alias = alias.strip()
+        if not alias:
+            return
+        if alias in table and table[alias] != text:
+            ambiguous.add(alias)   # 同名函数口径不一致，不猜
+        else:
+            table[alias] = text
+
+    def _span(covered, not_covered) -> str:
+        if str(covered).isdigit() and str(not_covered).isdigit():
+            total = int(covered) + int(not_covered)
+            return f'({covered}/{total})'
+        return ''
+
+    for func in root.iter('function'):
+        # VS 的 name 可能带参数，如 round2(double) → round2
+        raw_name = (func.get('name') or '').split('(', 1)[0].strip()
+        if not raw_name:
+            continue
+        try:
+            line_pct = float(func.get('line_coverage')) if func.get('line_coverage') is not None else None
+            block_pct = float(func.get('block_coverage')) if func.get('block_coverage') is not None else None
+        except (TypeError, ValueError):
+            continue
+
+        parts = []
+        if line_pct is not None:
+            parts.append(f"-L {line_pct:.1f}% {_span(func.get('lines_covered'), func.get('lines_not_covered'))}".strip())
+        if block_pct is not None:
+            parts.append(f"-BK {block_pct:.1f}% {_span(func.get('blocks_covered'), func.get('blocks_not_covered'))}".strip())
+        text = ' '.join(p for p in parts if p)
+        if not text:
+            continue
+
+        type_name = (func.get('type_name') or '').strip()
+        _put(raw_name, text)                       # addLine
+        if type_name:
+            _put(f'{type_name}::{raw_name}', text)   # Order::addLine（VS 原生）
+            _put(f'{type_name}.{raw_name}', text)    # Order.addLine（subjectFunction 常见写法）
+
+    for alias in ambiguous:
+        table.pop(alias, None)
+    return table
+
+
+def lookup_function_coverage(table: dict, subject: str) -> str:
+    """按 subjectFunction 查函数级覆盖率；匹配不到返回空串。
+
+    subjectFunction 常见三种写法：
+      src/order.cpp::Order::addLine
+      src/order.cpp::Order.addLine
+      addLine
+    """
+    text = str(subject or '').strip()
+    if not table or not text:
+        return ''
+    parts = [p for p in text.split('::') if p]
+    candidates = []
+    if len(parts) >= 2:
+        candidates.append('::'.join(parts[-2:]))        # Order::addLine
+        candidates.append('.'.join(parts[-2:]))         # Order.addLine
+    if parts:
+        candidates.append(parts[-1])                   # addLine
+        bare = parts[-1].split('.')[-1]
+        candidates.append(bare)                        # addLine（再去一层类名）
+    for key in candidates:
+        if key in table:
+            return table[key]
+    return ''
+
 def build_coverage_object(result: dict) -> dict:
     """从 result.json.coverage 构建 v2 格式的 structured coverage 对象。"""
     cov = result.get("coverage")
@@ -396,6 +548,11 @@ def main() -> int:
 
     # ── 按函数分组 ──
     function_groups = group_cases_by_function(cases)
+
+    # 函数级覆盖率：从本次 coverage.xml 的 <function> 节点读，供每个函数行使用
+    function_coverage = load_function_coverage(result)
+    if function_coverage:
+        print(f"   函数级覆盖率：读到 {len(function_coverage)} 个函数别名")
 
     # ── 加载或生成阶段计划 ──
     phase_plan, plan_path, plan_seed = load_or_create_phase_plan(
@@ -494,8 +651,16 @@ def main() -> int:
                 notes.append("预期结果（原始记录）：" + str(case["expected"]))
             if not outputs and evidence and evidence.get("actual") and status != "notRun":
                 notes.append("实际输出（原始记录）：" + str(evidence["actual"]))
-            if evidence and isinstance(evidence.get("actualOutputs"), dict) and status != "notRun":
-                extra_actuals = {name: value for name, value in evidence["actualOutputs"].items()
+            # 额外实际输出：新格式为 [{name,value}] 列表，旧格式为字典，两种都兼容
+            actual_extra = evidence.get("actualOutputs") if isinstance(evidence, dict) else None
+            if status != "notRun" and actual_extra:
+                if isinstance(actual_extra, list):
+                    extra_pairs = named_values(actual_extra)
+                elif isinstance(actual_extra, dict):
+                    extra_pairs = [(k, v) for k, v in actual_extra.items() if isinstance(v, str)]
+                else:
+                    extra_pairs = []
+                extra_actuals = {name: value for name, value in extra_pairs
                                  if name not in {output[0] for output in outputs}}
                 if extra_actuals:
                     notes.append("其他实际输出（运行记录）：" + json.dumps(extra_actuals, ensure_ascii=False))
@@ -519,6 +684,7 @@ def main() -> int:
                 "passed": status == "passed",
                 "status": status,
                 "notRunReason": reason if status == "notRun" else "",
+
                 "issue": reason or "未记录异常",
                 "bugId": "未记录",
                 "designer": str(case.get("designer") or cfg.get('designer') or "未提供"),
@@ -544,10 +710,11 @@ def main() -> int:
             "unitId": func_name,
             "trace": "未提供设计追溯",
             "driver": "未记录驱动模块",
-            # 函数级覆盖率：本次采集是**运行整体**口径，没有按函数拆分，
-            # 所以不能把项目级数字抄到每个函数上（那会让读者误以为每个函数都单独测了）。
-            # 函数自己的覆盖率如实写「未拆分」，运行整体覆盖率在顶层 coverage 里给。
-            "coverage": "本次未按函数拆分采集",
+            # 函数级覆盖率：优先用本次 coverage.xml 里**该函数自己**的数字；
+            # 匹配不到才写占位说明，绝不把项目级数字抄到函数上。
+            # 运行整体覆盖率仍在顶层 coverage 里给。
+            "coverage": (lookup_function_coverage(function_coverage, func_name)
+                         or FUNCTION_COVERAGE_UNAVAILABLE),
             "cases": cases_out,
         }
 
@@ -593,12 +760,19 @@ def main() -> int:
 
     # 圈复杂度：纯静态分析，不需要编译。有 lizard 就跑，没有就如实写“未开展”。
     project_dir = Path(str(result.get("project") or "")) if result.get("project") else run_path.parent.parent.parent.parent
-    static_items = analyze_complexity(project_dir) if project_dir and project_dir.is_dir() else []
+    # 用 subjectFunction 里的相对路径当提示，把「工作区根」收敛到真正被測的工程目录
+    source_hints = []
+    for case in cases:
+        subject = str(case.get('subjectFunction') or '').strip()
+        rel = subject.split('::')[0].strip() if '::' in subject else ''
+        if rel and ('/' in rel or '\\' in rel) and rel not in source_hints:
+            source_hints.append(rel)
+    static_items = analyze_complexity(project_dir, source_hints) if project_dir and project_dir.is_dir() else []
     _lizard_kind = load_lizard()[1] if static_items else ""
     if _lizard_kind:
         print(f"   圈复杂度：{len(static_items)} 个函数（lizard={_lizard_kind}）")
     # 注释率：3.1 总体评估的固定话术要用到，读源码算真实值。
-    comment_rate = comment_ratio(project_dir) if project_dir and project_dir.is_dir() else None
+    comment_rate = comment_ratio(project_dir, source_hints) if project_dir and project_dir.is_dir() else None
     if comment_rate is not None:
         print(f"   代码注释率：{comment_rate}%")
 
@@ -649,6 +823,8 @@ def main() -> int:
             "excludeReasons": excluded_reasons,
             "sourceFiles": source_files,
             "functionCount": len(function_groups),
+            # 源码范围（来自 prepare 冻结的 testScope）：哪些文件纳入/排除及证据
+            "sourceScope": build_source_scope(result),
         },
         "summary": {
             "total": total,

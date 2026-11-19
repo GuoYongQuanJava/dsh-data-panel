@@ -27,3 +27,9 @@ designDocVersion: ""     # 设计文档版本号
 # sourceFiles: []
 # functionCount: 0
 # excludedFunctions: []
+
+# ── 源码范围（可选，推荐写：决定扫描哪些目录）──
+# 不写时默认扫 src / source / lib / app / include；写了就按这里扫。
+# sourceRoots: ["src"]
+# 明确不纳入范围的目录（如演示界面、第三方代码），扫描时作为 --exclude 参数传入，写进 scope.json 的 excludeDirs。
+# excludeDirs: ["src/app", "third_party"]

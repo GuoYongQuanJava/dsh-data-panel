@@ -28,7 +28,30 @@ def build_report(tmp_path, case, test):
     assert proc.returncode == 0, proc.stderr
     payload = json.loads((tmp_path / "reports" / "run-1" / "report-data.json").read_text(encoding="utf-8"))
     validate(payload)
-    return payload["modules"][0]["cases"][0]
+    return payload["phases"][0]["functions"][0]["cases"][0]
+
+
+def build_scope_report(tmp_path, test_scope):
+    """构造含 testScope 的 result，跑 bridge，返回 sourceScope 部分。"""
+    case = {"caseId": "TC-S", "title": "scope-test", "testType": "functional", "testFunc": "test_scope"}
+    test = {"caseId": "TC-S", "func": "test_scope", "outcome": "passed"}
+    run_dir = tmp_path / "runs" / "run-1"
+    snapshot = run_dir / "snapshot"
+    snapshot.mkdir(parents=True)
+    (snapshot / "cases.json").write_text(json.dumps({"cases": [case]}, ensure_ascii=False), encoding="utf-8")
+    result = {
+        "runId": "run-1", "status": "passed", "startedAt": "2026-11-16T01:00:00Z",
+        "project": str(tmp_path / "project"), "cases": [case["caseId"]], "tests": [test],
+        "testScope": test_scope,
+    }
+    result_path = run_dir / "result.json"
+    result_path.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(BRIDGE), "--run", str(result_path)], capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    payload = json.loads((tmp_path / "reports" / "run-1" / "report-data.json").read_text(encoding="utf-8"))
+    validate(payload)
+    return payload["scope"]["sourceScope"]
+
 
 
 def test_named_values_follow_runtime_evidence(tmp_path):
@@ -39,7 +62,7 @@ def test_named_values_follow_runtime_evidence(tmp_path):
         "expectedOutputs": [{"name": "discount", "value": "50.0"}],
     }
     test = {"caseId": "TC-1", "func": "test_discount", "outcome": "failed",
-            "actualOutputs": {"discount": "40.0"}, "message": "期望 50.0，得到 40.0"}
+            "actualOutputs": [{"name": "discount", "value": "40.0"}], "message": "期望 50.0，得到 40.0"}
     output = build_report(tmp_path, case, test)
     assert output["inputs"] == [["member_level", "Platinum"]]
     assert output["outputs"] == [["discount", "50.0", "40.0"]]
@@ -78,5 +101,37 @@ def test_runner_parses_only_valid_named_json():
     parsed = module.parse_actuals('ACTUAL_JSON[TC-1]: {"discount": 40.0, "ok": true, "items": [1, 2]}\n'
                                   'ACTUAL_JSON[TC-2]: {not-json}\n'
                                   'ACTUAL[TC-1]: raw value')
-    assert parsed["named"] == {"TC-1": {"discount": "40.0", "ok": "true", "items": "[1, 2]"}}
+    assert parsed["named"] == {
+        "TC-1": [
+            {"name": "discount", "value": "40.0"},
+            {"name": "ok", "value": "true"},
+            {"name": "items", "value": "[1, 2]"},
+        ]
+    }
     assert parsed["tagged"]["TC-1"] == "raw value"
+
+
+def test_missing_scope_returns_available_false(tmp_path):
+    source_scope = build_scope_report(tmp_path, {"status": "missing"})
+    assert source_scope["available"] is False
+
+
+def test_invalid_scope_returns_available_false(tmp_path):
+    source_scope = build_scope_report(tmp_path, {"status": "invalid"})
+    assert source_scope["available"] is False
+
+
+def test_empty_inventory_returns_available_false(tmp_path):
+    source_scope = build_scope_report(tmp_path, {"inventory": {"files": []}})
+    assert source_scope["available"] is False
+
+
+def test_rawWarnings_preserved_in_scope(tmp_path):
+    source_scope = build_scope_report(tmp_path, {
+        "status": "warning",
+        "inventory": {"files": [{"path": "src/a.cpp", "status": "tested", "functions": []}]},
+        "warnings": ["foo"],
+        "rawWarnings": ["bar", "baz"],
+    })
+    assert source_scope["available"] is True
+    assert source_scope["rawWarnings"] == ["bar", "baz"]

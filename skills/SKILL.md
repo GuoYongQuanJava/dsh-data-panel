@@ -124,7 +124,16 @@ Invoke-RestMethod "$env:DSH_WEB_URL/data-panel/tools?project=$PWD" | ConvertTo-J
 
 为每个纳入测试的函数确定唯一 `subjectFunction`（路径、类名、函数名），列出函数与预计场景数。后续生成前核对清单，不能漏掉已纳入的函数；不能测试的函数说明原因，不生成占位假用例。
 
-**全量范围清单：** 生成用例前按 [全量测试范围与排除证据](references/test-scope.md) 从磁盘扫描工程源码，逐文件枚举业务函数，生成会话 `scope.json`，记录纳入、仅声明、排除及暂缓项。排除需理由、真实探针命令/退出码及日志证据，不能直接相信“依赖某库就不能测”。不能只盘点决定测试的几个函数；未枚举或未验证的文件必须保留为缺口。后续 prepare 会核对并冻结清单，缺失或不一致只告警，不在执行中途暂停确认。
+**全量范围清单：** 生成用例前按 [全量测试范围与排除证据](references/test-scope.md) 从磁盘扫描工程源码，逐文件枚举业务函数，生成会话 `scope.json`，记录纳入、仅声明、排除及暂缓项。
+
+**扫描根以项目配置为准：** 先看项目配置（`testReport/skills/<工作区名>.md`）里有没有 `sourceRoots` / `excludeDirs`：
+- 有 `sourceRoots` 就只扫这些目录，不自己扩大或缩小；
+- 有 `excludeDirs` 就把这些目录从范围内整体除去（如演示界面、第三方代码）：把它们作为 `--exclude` 参数传给扫描器，命令形如 `node <插件目录>/lib/scope.js <项目根> src --exclude src/app third_party`。排除目录按完整目录段匹配（`src/app` 不会误伤 `src/application`），会写入 `scope.json` 的 `excludeDirs`；内置构建/缓存目录另行记入 `omittedDirectories`。不静默漏掉；
+- 两个都没写就按 `src / source / lib / app / include` 默认扫描。
+
+不要把「能编译但业务上不测」的文件扫进来再排除——优先用 `excludeDirs` 从范围上就不包含，`excluded` 只留给真在范围内、但确实无法执行的文件。
+
+排除需理由、真实探针命令/退出码及日志证据，不能直接相信“依赖某库就不能测”。探针只验证可编译性，**不决定测不测**：探针通过却仍排除的，必须写业务理由。不能只盘点决定测试的几个函数；未枚举或未验证的文件必须保留为缺口。后续 prepare 会核对并冻结清单，缺失或不一致只告警，不在执行中途暂停确认。
 
 #### Step 1.5: 确认被测语言与工具（必做，不要跳过）
 
@@ -427,8 +436,8 @@ if (-not (Test-Path -LiteralPath $template -PathType Leaf)) {
 | 模板文件 | 用途 | 能否生成报告 |
 | --- | --- | --- |
 | `单元测试报告模板.docx` | 正式单元测试报告（章节/附录/用例表） | ✅ **唯一可用** |
-| `RingBuffer-test.docx` | 客户历史报告样本，仅作 13×11 用例表格式原型 | ❌ |
-| `RingBuffer-test-blank.docx` | 空白用例表原型 | ❌ |
+| `RingBuffer-test.docx` | 客户历史报告样本，仅作 13×11 用例表格式原型（旧部署兼容回退，不随包提供） | ❌ (仅 builder 兼容回退) |
+| `RingBuffer-test-blank.docx` | 空白用例表原型（旧部署兼容回退，不随包提供） | ❌ (仅 builder 兼容回退) |
 
 选错模板会得到「模板缺少阶段标题原型（找不到「项目测试结果」段落）」这类错误；这时**不是模板坏了，而是选错了**，改用 `单元测试报告模板.docx` 重新生成，不要去找新模板、不要改模板结构。
 把 RingBuffer 模板当报告模板用、或修改它去迎合 builder，都是错的。

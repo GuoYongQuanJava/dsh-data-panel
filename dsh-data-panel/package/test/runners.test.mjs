@@ -568,7 +568,9 @@ test('正式执行中非法实际 JSON 只告警，后续用例照常执行，�
   assert.equal(result.passed, 2)
   assert.equal(result.actualOutputValidation.valid, false)
   assert.ok(result.actualOutputValidation.issues.some((issue) => issue.caseId === 'TC-1'))
-  assert.equal(result.tests.find((item) => item.caseId === 'TC-2').actualOutputs.result, '6')
+  // actualOutputs 现在与 expectedOutputs 同为 [{name, value}] 列表
+  const tc2 = result.tests.find((item) => item.caseId === 'TC-2')
+  assert.deepEqual(tc2.actualOutputs, [{ name: 'result', value: '6' }])
   assert.match(readFileSync(join(runDir, 'run.log'), 'utf8'), /实际输出 JSON 告警/)
 })
 

@@ -62,3 +62,40 @@ test('缺少清单、错误格式、越界扫描均明确告警', () => {
   assert.equal(assessScope(project, {}, cases).status, 'invalid')
   assert.throws(() => scanSourceFiles(project, ['..']), /项目内/)
 })
+
+test('排除目录按完整路径段匹配，避免 src/app 误排除 src/application', () => {
+  const project = fixture()
+  mkdirSync(join(project, 'src/app'))
+  mkdirSync(join(project, 'src/application'))
+  writeFileSync(join(project, 'src/app/a.cpp'), 'int bar() { return 1; }')
+  writeFileSync(join(project, 'src/application/b.cpp'), 'int baz() { return 2; }')
+  const inventory = scopeInventory(project, ['src'], ['src/app'])
+  assert.equal(inventory.excludeDirs.length, 1)
+  assert.equal(inventory.excludeDirs[0], 'src/app')
+  const paths = inventory.files.map(f => f.path)
+  // src/app 被排除，不应出现
+  assert.ok(!paths.some(p => p.startsWith('src/app/')))
+  // src/application 不应被误排除
+  assert.ok(paths.some(p => p.startsWith('src/application/')))
+})
+
+test('排除目录必须在项目内，越界拒绝', () => {
+  const project = fixture()
+  assert.throws(() => scanSourceFiles(project, ['src'], ['..']), /项目内/)
+})
+
+test('assessScope 返回 rawWarnings 保留完整告警', () => {
+  const project = fixture()
+  writeFileSync(join(project, 'src/unlisted.cpp'), 'int orphan() { return 1; }')
+  const inventory = scopeInventory(project, ['src'])
+  const result = assessScope(project, inventory, cases)
+  assert.ok(Array.isArray(result.rawWarnings), 'rawWarnings 必须是数组')
+  assert.ok(result.rawWarnings.length >= result.warnings.length, 'rawWarnings 不少于折叠后的 warnings')
+})
+
+test('scopeInventory 记录 excludeDirs 到输出', () => {
+  const project = fixture()
+  const inventory = scopeInventory(project, ['src'], ['src/app', 'third_party'])
+  assert.deepEqual(inventory.excludeDirs, ['src/app', 'third_party'])
+  assert.ok(inventory.sourceRoots.includes('src'))
+})

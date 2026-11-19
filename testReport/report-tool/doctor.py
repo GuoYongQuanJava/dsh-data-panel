@@ -5,7 +5,8 @@
     python report-tool/doctor.py
 
 逐项检查环境、文件、数据契约、Word 能力，最后给出结论。
-每一项都是 ✅ / ⚠️ / ❌，⚠️ 表示可选能力缺失（不影响出报告）。
+每一项都是 [OK] / [WARN] / [FAIL]，[WARN] 表示可选能力缺失（不影响出报告）。
+输出用 ASCII 标记、不用 emoji：Windows 中文终端（GBK/cp936）无法编码 emoji，会直接崩在 print 上。
 
 任何模型或人拿到这个包，第一步都该跑它。
 """
@@ -23,7 +24,7 @@ results = []
 
 def add(level, name, detail=""):
     results.append((level, name, detail))
-    mark = {"ok": "✅", "warn": "⚠️ ", "bad": "❌"}[level]
+    mark = {"ok": "[OK]", "warn": "[WARN]", "bad": "[FAIL]"}[level]
     print(f"  {mark} {name}" + (f" — {detail}" if detail else ""))
 
 
@@ -134,13 +135,13 @@ warn = [r for r in results if r[0] == "warn"]
 
 print("\n" + "=" * 60)
 if bad:
-    print(f"❌ 有 {len(bad)} 项阻塞问题，先解决这些再跑：")
+    print(f"[FAIL] 有 {len(bad)} 项阻塞问题，先解决这些再跑：")
     for _, name, detail in bad:
         print(f"   - {name}" + (f"：{detail}" if detail else ""))
     print("\n修好后重新运行: python report-tool/doctor.py")
     sys.exit(1)
 
-print("✅ 环境可用，可以生成报告")
+print("[OK] 环境可用，可以生成报告")
 if warn:
     print(f"   （{len(warn)} 项可选能力缺失，不影响出报告）")
 print("\n下一步：")
@@ -149,6 +150,6 @@ print("         --data examples/auth-demo.json `")
 print("         -o 示例报告.docx")
 print()
 print("（只有 templates/单元测试报告模板.docx 能出正式报告；")
-print("  RingBuffer-test*.docx 是用例表原型，仅供原型参考，不要拿来出报告。）")
+print("  旧部署留下的 RingBuffer-test*.docx 仅为用例表原型，不要拿来出报告。")
 print("\n（Windows 命令换行用反引号 ` 而不是 \\）")
 sys.exit(0)

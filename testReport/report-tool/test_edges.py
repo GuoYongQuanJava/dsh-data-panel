@@ -207,6 +207,38 @@ r = run(["--template", str(TEMPLATE), "--data", "-", "-o", str(tmp / "stdin.docx
 check(r.returncode == 0, f"stdin 输入退出码 0（实际 {r.returncode}）")
 check((tmp / "stdin.docx").is_file(), "stdin 模式生成文件")
 
+print()
+print("== 注释率边界 ==")
+
+# 1. 注释率达标（>= 30%）
+payload_ok = make_payload([{"name": "第一阶段", "functions": [mkfunction("F", [mkcase("CR-1.CTD", [], [])])]}])
+payload_ok["staticMetrics"] = {"commentRate": 35.0}
+out_cr1 = tmp / "cr_ok.docx"
+build(str(TEMPLATE), payload_ok, str(out_cr1), refresh_toc=False)
+doc1 = Document(str(out_cr1))
+text1 = "".join(p.text for p in doc1.paragraphs)
+check("符合软件代码有效注释率不小于30%" in text1,
+      f"注释率 35% → 报告含「符合」要求（{text1.count('注释率')} 处提到注释率）")
+
+# 2. 注释率不达标（< 30%）
+payload_bad = make_payload([{"name": "第一阶段", "functions": [mkfunction("F", [mkcase("CR-2.CTD", [], [])])]}])
+payload_bad["staticMetrics"] = {"commentRate": 8.8}
+out_cr2 = tmp / "cr_bad.docx"
+build(str(TEMPLATE), payload_bad, str(out_cr2), refresh_toc=False)
+doc2 = Document(str(out_cr2))
+text2 = "".join(p.text for p in doc2.paragraphs)
+check("不符合软件代码有效注释率不小于30%的要求（实际 8.8%）" in text2,
+      f"注释率 8.8% → 报告含「不符合」及实际值（{text2.count('注释率')} 处提到注释率）")
+
+# 3. 注释率未采集（staticMetrics 缺失）
+payload_none = make_payload([{"name": "第一阶段", "functions": [mkfunction("F", [mkcase("CR-3.CTD", [], [])])]}])
+out_cr3 = tmp / "cr_none.docx"
+build(str(TEMPLATE), payload_none, str(out_cr3), refresh_toc=False)
+doc3 = Document(str(out_cr3))
+text3 = "".join(p.text for p in doc3.paragraphs)
+check("不小于30%" not in text3,
+      "注释率未采集 → 报告不含「不小于30%」声称")
+
 shutil.rmtree(tmp, ignore_errors=True)
 
 print()

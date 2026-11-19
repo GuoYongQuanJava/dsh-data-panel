@@ -37,7 +37,7 @@ pip3 install -r requirements.txt
 
 ```powershell
 python report-tool/cmd.py `
-  --template templates/RingBuffer-test-blank.docx `
+  --template templates/单元测试报告模板.docx `
   --data examples/auth-demo.json `
   --skill <可选的项目专属Skill目录> `
   -o 示例报告.docx
@@ -48,7 +48,7 @@ python report-tool/cmd.py `
 看到这个就成功了：
 
 ```
-modules=3  cases=8  passed=6  failed=1  notRun=1  removed=10  toc_cleared=0
+phases=3  functions=3  cases=8  passed=6  failed=1  notRun=1  unconfirmed=0  toc_cleared=0
 目录：已重建（OK toc=1 pages=9）
 报告已生成：示例报告.docx
 ```
@@ -59,7 +59,7 @@ modules=3  cases=8  passed=6  failed=1  notRun=1  removed=10  toc_cleared=0
 python report-tool/verify_report.py `
   示例报告.docx `
   examples/auth-demo.json `
-  templates/RingBuffer-test-blank.docx
+  templates/单元测试报告模板.docx
 ```
 
 最后一行必须是：
@@ -99,9 +99,7 @@ ALL CHECKS PASSED
 │   ├── 来源对照表.md                 报告里每个字段从哪来的对照表
 │   └── test_*.py                    单元测试（3 个文件）
 ├── templates/
-│   ├── 单元测试报告模板.docx        ★ 正式模板（只有它能出正式报告）
-│   ├── RingBuffer-test.docx         用例表原型（13×11），仅参考
-│   └── RingBuffer-test-blank.docx   用例表原型空白版，仅参考
+│   └── 单元测试报告模板.docx        ★ 正式模板（唯一可用，自带用例表原型）
 ├── vendor/lizard/                   圈复杂度分析（本机没装 lizard 时自动用它）
 └── examples/
     ├── auth-demo.json               3 阶段 8 用例（含未执行）
@@ -127,7 +125,7 @@ ALL CHECKS PASSED
 
 | 要替换的 | 换成什么 |
 |---|---|
-| `templates/RingBuffer-test-blank.docx` | 客户的模板（先用 `make_blank_template.py` 清空，见 4.3） |
+| `templates/单元测试报告模板.docx` | 客户的模板（先用 `make_blank_template.py` 清空，见 4.3） |
 | 可选项目专属 `SKILL.md` | 项目报告规则及默认人员资料；通用包不附带具体项目示例 |
 | 模块或用例的 `designer` / `reviewer` / `tester` | 实际人员信息；优先级高于项目专属 Skill |
 | `examples/auth-demo.json` | 自己的执行结果数据 |
@@ -138,28 +136,27 @@ ALL CHECKS PASSED
 
 ```json
 {
+  "schemaVersion": "2.0",
   "meta": { "project": "订单服务单元测试", "executedAt": "2026-11-14" },
   "summary": { "total": 2, "passed": 1, "failed": 1, "notRun": 0 },
-  "modules": [{
-    "name": "价格计算单元测试",
-    "trace": "详细设计 3.2",
-    "driver": "无",
-    "coverage": "-S 92.1%",
-    "issues": "无。",
-    "inconsistent": "无。",
-    "cases": [{
-      "id": "ORD-PRICE-0001",
-      "name": "三件商品总价",
-      "type": "功能测试",
-      "description": "按单价乘数量求和，验证总价。",
-      "funcDesc": "价格计算",
-      "stub": "无",
-      "inputs": [["unit_price", "19.90"], ["quantity", "3"]],
-      "outputs": [["total", "59.70", "59.70"]],
-      "passed": true,
-      "issue": "无",
-      "bugId": "无",
-      "executedAt": "2026/11/14"
+  "phases": [{
+    "phaseId": "phase-1",
+    "name": "第1阶段",
+    "order": 1,
+    "functions": [{
+      "functionId": "价格计算单元测试",
+      "name": "价格计算单元测试",
+      "summary": { "total": 2, "passed": 1, "failed": 1, "notRun": 0 },
+      "coverage": "-S 92.1%",
+      "cases": [{
+        "id": "ORD-PRICE-0001",
+        "name": "三件商品总价",
+        "type": "功能测试",
+        "description": "按单价乘数量求和，验证总价。",
+        "inputs": [["unit_price", "19.90"], ["quantity", "3"]],
+        "outputs": [["total", "59.70", "59.70"]],
+        "passed": true
+      }]
     }]
   }]
 }
@@ -231,12 +228,10 @@ python report-tool/make_blank_template.py `
 
 数据不合契约。报错里带精确路径，按路径改 JSON 即可。
 
-### Q：`removed=` 不是 10 或 74
+### Q：输出里的 `toc_cleared` 不是 0
 
-- 用空白模板：应该是 **10**
-- 用原始模板：应该是 **74**
-
-数字变了说明模板被改过，从 `templates/` 重新拷一份。
+`toc_cleared` 是清掉的目录缓存节点数，取决于模板里残留多少旧目录条目。
+它是诊断信息，不是失败条件；不为 0 也能正常出报告。
 
 ### Q：怎么验证报告填得对
 

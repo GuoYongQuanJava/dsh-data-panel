@@ -162,10 +162,13 @@ def parse_actuals(text: str) -> dict:
                 invalid.append({"caseId": structured.group(1).strip() if structured else "", "line": line_number, "reason": str(error)})
                 values = None
             if isinstance(values, dict) and all(isinstance(key, str) for key in values):
-                named[structured.group(1).strip()] = {
-                    key: value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+                # 统一成与 expectedOutputs 相同的 [{name, value}] 列表，
+                # 避免「期望是列表、实际是字典」两边结构不一致。
+                named[structured.group(1).strip()] = [
+                    {"name": key,
+                     "value": value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)}
                     for key, value in values.items()
-                }
+                ]
             continue
         match = ACTUAL_LINE.search(line)
         if not match:
@@ -192,7 +195,15 @@ def validate_actual_json(text: str, cases=None) -> dict:
         expected = {item.get("name") for item in outputs if isinstance(item, dict) and item.get("name")}
         if not expected:
             continue
-        missing = sorted(expected - set(parsed["named"].get(case_id, {})))
+        # named[caseId] 现为 [{name, value}] 列表（旧数据可能是字典），两种都能取字段名
+        entry = parsed["named"].get(case_id)
+        if isinstance(entry, list):
+            actual_names = {item.get("name") for item in entry if isinstance(item, dict)}
+        elif isinstance(entry, dict):
+            actual_names = set(entry)
+        else:
+            actual_names = set()
+        missing = sorted(expected - actual_names)
         if missing:
             issues.append({"caseId": case_id, "reason": "缺少实际输出字段：" + ", ".join(missing)})
     if not parsed["named"] and not case_list and not issues:
@@ -986,7 +997,7 @@ def main() -> int:
                     "message": hit.get("message") or "",
                     "detail": hit.get("detail") or "",
                     "actual": actual,
-                    "actualOutputs": actuals["named"].get(case_id, {}),
+                     "actualOutputs": actuals["named"].get(case_id, []),
                     "durationMs": hit.get("timeMs"),
                 })
 
@@ -1057,7 +1068,7 @@ def main() -> int:
             "func": func,
             "outcome": outcome,
             "actual": actual,
-            "actualOutputs": actuals["named"].get(item.get("caseId", ""), {}),
+             "actualOutputs": actuals["named"].get(item.get("caseId", ""), []),
             "message": message,
             "exitCode": run["code"],
             "durationMs": run["durationMs"],

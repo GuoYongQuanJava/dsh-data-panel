@@ -13,7 +13,7 @@
 $py = 'C:\Users\PC\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe'
 
 # 生成报告（可选传入项目专属 Skill）
-& $py cmd.py --template "C:\Users\PC\Desktop\RingBuffer-test(1).docx" `
+& $py cmd.py --template "../templates/单元测试报告模板.docx" `
              --data results.json `
              --skill "C:\项目\report-skill" `
              -o report.docx
@@ -22,7 +22,7 @@ $py = 'C:\Users\PC\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\pyt
 输出：
 
 ```
-modules=3  cases=8  passed=7  failed=1  notRun=0  removed=74  toc_cleared=29
+phases=3  functions=3  cases=8  passed=7  failed=1  notRun=0  unconfirmed=0  toc_cleared=0
 目录：已重建（OK toc=1 pages=9）
 报告已生成：D:\1\report-tool\report.docx
 ```
@@ -205,14 +205,11 @@ DSH 的 skill 加载器只读 `name` / `description`，其他键会被忽略，�
 
 ## 模板约定
 
-代码**不识别**任意模板，而是要求模板满足固定结构。支持两种模板：
+代码**不识别**任意模板，而是要求模板满足固定结构。正式模板为：
 
-| 模板 | 特点 | `removed=` |
-|---|---|---|
-| `templates/RingBuffer-test.docx` | 客户原始样例（12 张表、6 个模块的 RingBuffer 数据） | 74 |
-| `templates/RingBuffer-test-blank.docx` | 已清空的空白表单（1 张空表 + 占位符） | 10 |
+| `templates/单元测试报告模板.docx` | 正式模板（自带 13×11 用例表原型），**唯一可用** | ~0 |
 
-两者生成的报告**逐单元格完全一致**。
+正式模板内置用例表原型，生成时直接使用。
 
 ### 空白模板怎么来的
 
@@ -220,8 +217,8 @@ DSH 的 skill 加载器只读 `name` / `description`，其他键会被忽略，�
 
 ```powershell
 & $py make_blank_template.py `
-      D:\1\templates\RingBuffer-test.docx `
-      D:\1\templates\RingBuffer-test-blank.docx
+      客户的原始模板.docx `
+      templates/新模板-blank.docx
 ```
 
 它做三件事：
