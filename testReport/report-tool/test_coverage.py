@@ -252,19 +252,31 @@ def check_bridge():
         "branch": stat(30, 40),
         "block": stat(13, 28),
     })
-    cov_text = func_of(data)["coverage"]
-    check("-L 80.0%" in cov_text, f"行覆盖率用 -L 标签：{cov_text}")
-    check("-B 75.0%" in cov_text, f"分支覆盖率用 -B 标签：{cov_text}")
-    check("-BK 46.4%" in cov_text, f"块覆盖率用 -BK 标签：{cov_text}")
-    check("-S " not in cov_text, "行覆盖率没有被错写成 -S")
+    # 函数级写「未拆分」（不能把项目级数字抄到每个函数），真实数字在顶层 coverage。
+    check(func_of(data)["coverage"] == "本次未按函数拆分采集",
+          f"函数级覆盖率如实写未拆分：{func_of(data)['coverage']!r}")
+    top = data.get("coverage") or {}
+    check(top.get("available") is True, "顶层 coverage.available=True")
+    check((top.get("line") or {}).get("percent") == 80.0,
+          f"顶层行覆盖率 80.0%（实际 {(top.get('line') or {}).get('percent')}）")
+    check((top.get("branch") or {}).get("percent") == 75.0,
+          f"顶层分支覆盖率 75.0%（实际 {(top.get('branch') or {}).get('percent')}）")
+    check((top.get("block") or {}).get("percent") == 46.4,
+          f"顶层块覆盖率 46.4%（实际 {(top.get('block') or {}).get('percent')}）")
+    # 反例：所有函数都是同一个带百分比的字符串 → 属于把项目级数字复制到函数
+    same = [f.get("coverage") for _, f in [(p, f) for p in data["phases"] for f in p["functions"]]]
+    check(len(set(same)) == 1 and "%" not in same[0],
+          f"函数级没有带百分比的相同值（{set(same)}）")
 
     data = do_bridge(tmp / "b2", {"available": False, "reason": "本次未配置覆盖率采集"})
-    cov_text = func_of(data)["coverage"]
-    check(cov_text.startswith("未采集"), f"未采集如实标注：{cov_text}")
-    check("未配置" in cov_text, "未采集附带原因")
+    top = data.get("coverage") or {}
+    check(top.get("available") is False, "未采集时顶层 available=False")
+    check("未配置" in (top.get("reason") or ""), f"未采集附带原因：{top.get('reason')!r}")
+    check(func_of(data)["coverage"] == "本次未按函数拆分采集", "函数级仍写未拆分")
 
     data = do_bridge(tmp / "b3", None)
-    check(func_of(data)["coverage"] == "未采集", "完全没有覆盖率字段时写未采集")
+    top = data.get("coverage") or {}
+    check(top.get("available") is False, "完全没有覆盖率字段时顶层 available=False")
 
 
 # ──────────────────── 端到端：runner 采集 → result.json ────────────────────

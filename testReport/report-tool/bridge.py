@@ -75,42 +75,10 @@ def _force_utf8_output() -> None:
             pass
 
 
-def coverage_text(result: dict) -> str:
-    """把 result.json 里的真实覆盖率统计写成模板那一行。
+# 注：v1 时代用 coverage_text() 把运行整体覆盖率拼成 -L/-BK 字符串写进每个函数，
+# 那是把项目级数字复制到函数，v2 已取消。运行整体数据在顶层 coverage 对象里，
+# 由 builder 直接渲染到表 3；函数级只写「本次未按函数拆分采集」。
 
-    v2 修正：
-    - -L 用于行覆盖率（旧版错误地用了 -S）
-    - -S 用于语句覆盖率
-    - -B 用于分支覆盖率
-    - -BK 用于块覆盖率
-
-    数据来源：runner 执行时解析出来并写进 result["coverage"] 的统计块。
-    没有数据就写「未采集」并附上原因 —— 绝不自己编一个数字。
-    """
-    cov = result.get("coverage")
-    if not isinstance(cov, dict) or not cov.get("available"):
-        reason = ""
-        if isinstance(cov, dict):
-            reason = str(cov.get("reason") or "").strip()
-        text = f"{COVERAGE_UNAVAILABLE}（{reason}）" if reason else COVERAGE_UNAVAILABLE
-        return text[:200]
-
-    parts = []
-    line = cov.get("line") or {}
-    statement = cov.get("statement") or {}
-    branch = cov.get("branch") or {}
-    block = cov.get("block") or {}
-
-    if line.get("total"):
-        parts.append(f"-L {line.get('percent')}%")
-    if statement.get("total"):
-        parts.append(f"-S {statement.get('percent')}%")
-    if branch.get("total"):
-        parts.append(f"-B {branch.get('percent')}%")
-    if block.get("total"):
-        parts.append(f"-BK {block.get('percent')}%")
-
-    return (" ".join(parts) if parts else COVERAGE_UNAVAILABLE)[:200]
 
 
 def load_cases(path: Path) -> list:
@@ -565,7 +533,10 @@ def main() -> int:
             "unitId": func_name,
             "trace": "未提供设计追溯",
             "driver": "未记录驱动模块",
-            "coverage": coverage_text(result),
+            # 函数级覆盖率：本次采集是**运行整体**口径，没有按函数拆分，
+            # 所以不能把项目级数字抄到每个函数上（那会让读者误以为每个函数都单独测了）。
+            # 函数自己的覆盖率如实写「未拆分」，运行整体覆盖率在顶层 coverage 里给。
+            "coverage": "本次未按函数拆分采集",
             "cases": cases_out,
         }
 

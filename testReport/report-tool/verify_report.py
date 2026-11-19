@@ -10,9 +10,14 @@ Usage::
 import json
 import re
 import sys
+from pathlib import Path
 
-from docx import Document
-from docx.oxml.ns import qn
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from docx import Document  # noqa: E402
+from docx.oxml.ns import qn  # noqa: E402
+
+from schema import SchemaError, validate  # noqa: E402
 
 failures = []
 
@@ -54,7 +59,14 @@ def main():
     data_path = sys.argv[2]
     template_path = sys.argv[3] if len(sys.argv) > 3 else None
 
-    data = json.load(open(data_path, encoding="utf-8"))
+    # 先过一遍 schema 归一化：builder 看到的也是归一化后的数据，这样缺省字段
+    # （unitId / trace / driver / coverage 等）两边口径一致，不会因为原始文件省字段就 KeyError。
+    raw = json.load(open(data_path, encoding="utf-8"))
+    try:
+        data = validate(raw)
+    except SchemaError as exc:
+        print(f"数据不符合 v2 约定：{exc}", file=sys.stderr)
+        return 2
     doc = Document(report_path)
 
     phases = data["phases"]
@@ -107,10 +119,17 @@ def main():
         cov_values = [f.get("coverage", "") for _, f in all_funcs]
         unique = set(cov_values)
         all_same = len(unique) == 1
-        check(
-            not all_same,
-            f"覆盖率值未在所有 {len(all_funcs)} 个函数间串用（{len(unique)} 种不同值）",
-        )
+        # 所有函数都是「未采集」时，相同是正确结果（本来就没数据），不能当成串用。
+        # 只有真有覆盖率数据时，「每个函数数字完全一样」才是把项目级数字复制到函数的迹象。
+        # 只有真带百分比数字时，「每个函数数字完全一样」才是把项目级数字复制到函数的迹象。
+        has_data = any("%" in (v or "") for v in cov_values)
+        if not has_data:
+            check(True, f"覆盖率全部未采集，无需比较串用（{len(all_funcs)} 个函数）")
+        else:
+            check(
+                not all_same,
+                f"覆盖率值未在所有 {len(all_funcs)} 个函数间串用（{len(unique)} 种不同值）",
+            )
     else:
         check(True, "仅 1 个函数，覆盖率值唯一无需检查串用")
 
@@ -190,19 +209,27 @@ def main():
 
             # Header block (row 0) — metadata from function level
             header = table.rows[0].cells[0]
+            # 与 filler._fill_header_block 保持一致：v2 一共 8 个字段（比 v1 多了「被测函数」），
+            # 模板表头只有 7 个段落时，filler 会整个单元格换行拼成 1 个段落。
+            # 所以这里按「文本行」比对，不假设段落数。
+            coverage_text_v = (func.get('coverage') or '未采集').replace('-S', '-L')
+            # 与 filler._func_title 一致：优先 function.name，取 :: 后的短名。
+            raw_title = (func.get('name') if isinstance(func, dict) else '') or ''
+            function_title = raw_title.split('::')[-1] or raw_title or '未记录'
             expected_lines = [
                 f"单元标识：{func['unitId']}",
                 f"设计追溯：{func['trace']}",
-                f"功能描述：{case.get('funcDesc') or case['name']}",
+                f"功能描述：{function_title} 功能测试",
+                f"被测函数：{case.get('subjectFunction') or case.get('functionId') or '未记录'}",
                 f"驱动模块：{func['driver']}",
-                f"打桩模块：{case.get('stub') or '无'}",
-                f"覆盖率记录：{func['coverage']}",
+                f"打桩模块：{case.get('stub') or '未记录'}",
+                f"覆盖率记录：{coverage_text_v}",
                 f"备注：本单元共有{func['summary']['total']}个测试用例",
             ]
-            actual_lines = [p.text for p in header.paragraphs]
+            actual_lines = [line for line in cell_text(header).splitlines() if line.strip()]
             check(
                 actual_lines == expected_lines,
-                f"{tag} 行0 七个字段逐段一致",
+                f"{tag} 行0 八个字段逐段一致",
             )
             if actual_lines != expected_lines:
                 for want, got in zip(expected_lines, actual_lines):
@@ -210,8 +237,8 @@ def main():
                         print(f"          期望 {want!r}")
                         print(f"          实际 {got!r}")
             check(
-                len(header.paragraphs) == 7,
-                f"{tag} 行0 保留 7 段落结构（{len(header.paragraphs)}）",
+                len(actual_lines) == 8,
+                f"{tag} 行0 有 8 个字段行（{len(actual_lines)}）",
             )
 
             # Type row (row 2)

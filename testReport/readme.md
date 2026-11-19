@@ -99,11 +99,14 @@ ALL CHECKS PASSED
 │   ├── 来源对照表.md                 报告里每个字段从哪来的对照表
 │   └── test_*.py                    单元测试（3 个文件）
 ├── templates/
-│   ├── RingBuffer-test.docx         客户原始模板（含样例数据，12 张表）
-│   └── RingBuffer-test-blank.docx   ★ 空白表单模板（推荐用这个）
+│   ├── 单元测试报告模板.docx        ★ 正式模板（只有它能出正式报告）
+│   ├── RingBuffer-test.docx         用例表原型（13×11），仅参考
+│   └── RingBuffer-test-blank.docx   用例表原型空白版，仅参考
+├── vendor/lizard/                   圈复杂度分析（本机没装 lizard 时自动用它）
 └── examples/
-    ├── auth-demo.json               3 模块 8 用例（含未执行）
-    └── paygate-demo.json            6 模块 16 用例
+    ├── auth-demo.json               3 阶段 8 用例（含未执行）
+    ├── calculator-data.json         3 阶段 12 用例（全部通过）
+    └── paygate-demo.json            3 阶段 16 用例（含失败与未执行）
 ```
 
 **先看哪个文件**：

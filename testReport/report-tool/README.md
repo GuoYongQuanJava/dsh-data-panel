@@ -103,10 +103,9 @@ DSH 的 skill 加载器只读 `name` / `description`，其他键会被忽略，�
 | `test_coverage.py` | 覆盖率链路 | 6 种格式 + 旧版 VS XML、两段采集（postCommand）、bridge 标签、失败不篡结论 |
 | `test_complexity.py` | 圈复杂度链路 | system/vendored 两种来源、vendor 缺失降级、CLI 与 bridge 集成 |
 | `test_skill.py` / `check_skill.py` | 配置解析单测 | 两种写法、注释/引号/首值优先、缺失不编值；含 skill_meta 兼容冒烟 |
-| `auth-demo.json` | 全新演示数据 | 认证服务 8 条用例（含 1 条未执行），与模板样例零重叠 |
-| `fresh-demo.json` | 演示数据 | 订单中心 8 条用例 |
-| `demo.json` | 旧演示数据 | RingBuffer 5 条用例（保留做回归） |
-| `demo-nopeople.json` | 无人员数据 | 用于验证 skill 注入 |
+| `../examples/auth-demo.json` | 演示数据（v2） | 认证服务 3 阶段 8 用例（含 1 条未执行） |
+| `../examples/calculator-data.json` | 演示数据（v2） | Calculator 3 阶段 12 用例（全部通过） |
+| `../examples/paygate-demo.json` | 演示数据（v2） | 支付网关 3 阶段 16 用例（含失败与未执行，带模块级问题与不一致项） |
 
 ---
 
@@ -355,11 +354,15 @@ new.append(node)
 ## 测试
 
 ```powershell
-& $py test_schema.py        # 18 条校验场景
-& $py test_skill.py         # skill 解析与注入优先级
-& $py test_edges.py         # 变量行、多模块、模板损坏、CLI 退出码
-& $py cmd.py --template RingBuffer-test.docx --data fresh-demo.json -o report.docx
-& $py verify_report.py report.docx fresh-demo.json RingBuffer-test.docx
+& $py test_schema.py        # 输入校验（v2 契约）
+& $py test_edges.py         # 变量行、多阶段多函数、模板缺标记、CLI 退出码
+& $py test_coverage.py      # 覆盖率解析与两段采集
+& $py test_complexity.py    # 圈复杂度（本机 lizard / vendor 副本）
+& $py test_skill.py         # 项目配置文件解析
+
+# 用演示数据出一份报告（正式模板）
+& $py cmd.py --template "../templates/单元测试报告模板.docx" --data ../examples/auth-demo.json -o 示例报告.docx
+& $py verify_report.py 示例报告.docx ../examples/auth-demo.json "../templates/单元测试报告模板.docx"
 ```
 
 ---

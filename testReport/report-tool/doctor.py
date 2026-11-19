@@ -1,4 +1,4 @@
-﻿"""环境自检：判断当前机器能不能跑通报告生成流程。
+"""环境自检：判断当前机器能不能跑通报告生成流程。
 
 用法::
 
@@ -83,7 +83,9 @@ try:
     add(
         "ok",
         "示例数据通过校验",
-        f"{len(data['modules'])} 模块 / {data['summary']['total']} 用例",
+        f"{len(data['phases'])} 阶段 / "
+        f"{sum(len(p['functions']) for p in data['phases'])} 函数 / "
+        f"{data['summary']['total']} 用例",
     )
 except SchemaError as exc:
     add("bad", "示例数据校验失败", str(exc))
@@ -142,8 +144,11 @@ print("✅ 环境可用，可以生成报告")
 if warn:
     print(f"   （{len(warn)} 项可选能力缺失，不影响出报告）")
 print("\n下一步：")
-print("  python report-tool/cmd.py --template templates/RingBuffer-test-blank.docx \\")
-print("         --data examples/auth-demo.json \\")
+print("  python report-tool/cmd.py --template \"templates/单元测试报告模板.docx\" `")
+print("         --data examples/auth-demo.json `")
 print("         -o 示例报告.docx")
+print()
+print("（只有 templates/单元测试报告模板.docx 能出正式报告；")
+print("  RingBuffer-test*.docx 是用例表原型，仅供原型参考，不要拿来出报告。）")
 print("\n（Windows 命令换行用反引号 ` 而不是 \\）")
 sys.exit(0)

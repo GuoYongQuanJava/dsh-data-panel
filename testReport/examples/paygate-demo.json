@@ -1,576 +1,701 @@
 {
+  "schemaVersion": "2.0",
   "meta": {
     "project": "支付网关单元测试",
     "executedAt": "2026-11-14T09:30:00+08:00",
-    "executor": "gtest-1.14 / clang-17 / macOS-arm64"
+    "executor": "gtest-1.14 / clang-17 / macOS-arm64",
+    "language": "示例",
+    "importance": "中"
   },
   "summary": {
     "total": 16,
     "passed": 11,
     "failed": 3,
-    "notRun": 2
+    "notRun": 2,
+    "unconfirmed": 0
   },
-  "modules": [
+  "phases": [
     {
-      "name": "签名校验单元测试",
-      "trace": "支付网关详细设计 3.1 签名算法",
-      "driver": "接口驱动（InterfaceDriver）",
-      "coverage": "-S 98.1% -B 94.5% -MCDC n/a",
-      "issues": "无。",
-      "inconsistent": "无。",
-      "cases": [
+      "phaseId": "phase-1",
+      "name": "第1阶段",
+      "order": 1,
+      "functions": [
         {
-          "id": "PAY-SIGN-0001",
-          "name": "RSA256 签名通过校验",
-          "type": "功能测试",
-          "description": "使用合法私钥签名、平台公钥验签，验证签名校验通过。",
-          "funcDesc": "签名验证",
-          "stub": "无",
-          "inputs": [
-            [
-              "algorithm",
-              "RSA256"
-            ],
-            [
-              "key_length",
-              "2048"
-            ]
-          ],
-          "outputs": [
-            [
-              "verified",
-              "true",
-              "true"
-            ],
-            [
-              "error_code",
-              "NONE",
-              "NONE"
-            ]
-          ],
-          "passed": true,
-          "issue": "无",
-          "bugId": "无",
-          "executedAt": "2026/11/14"
+          "functionId": "签名校验单元测试",
+          "name": "签名校验单元测试",
+          "summary": {
+            "total": 3,
+            "passed": 3,
+            "failed": 0,
+            "notRun": 0,
+            "unconfirmed": 0
+          },
+          "trace": "支付网关详细设计 3.1 签名算法",
+          "driver": "接口驱动（InterfaceDriver）",
+          "coverage": "-S 98.1% -B 94.5% -MCDC n/a",
+          "cases": [
+            {
+              "id": "PAY-SIGN-0001",
+              "name": "RSA256 签名通过校验",
+              "type": "功能测试",
+              "description": "使用合法私钥签名、平台公钥验签，验证签名校验通过。",
+              "funcDesc": "签名验证",
+              "stub": "无",
+              "inputs": [
+                [
+                  "algorithm",
+                  "RSA256"
+                ],
+                [
+                  "key_length",
+                  "2048"
+                ]
+              ],
+              "outputs": [
+                [
+                  "verified",
+                  "true",
+                  "true"
+                ],
+                [
+                  "error_code",
+                  "NONE",
+                  "NONE"
+                ]
+              ],
+              "passed": true,
+              "issue": "无",
+              "bugId": "无",
+              "executedAt": "2026/11/14",
+              "status": "passed"
+            },
+            {
+              "id": "PAY-SIGN-0002",
+              "name": "签名被篡改后拒绝",
+              "type": "逻辑测试",
+              "description": "修改报文体一个字节后重新验签，应返回签名不一致。",
+              "funcDesc": "签名验证",
+              "stub": "无",
+              "inputs": [
+                [
+                  "algorithm",
+                  "RSA256"
+                ],
+                [
+                  "tampered",
+                  "true"
+                ]
+              ],
+              "outputs": [
+                [
+                  "verified",
+                  "false",
+                  "false"
+                ],
+                [
+                  "error_code",
+                  "ERR_SIGN_MISMATCH",
+                  "ERR_SIGN_MISMATCH"
+                ]
+              ],
+              "passed": true,
+              "issue": "无",
+              "bugId": "无",
+              "executedAt": "2026/11/14",
+              "status": "passed"
+            },
+            {
+              "id": "PAY-SIGN-0003",
+              "name": "空签名边界处理",
+              "type": "边界测试",
+              "description": "签名字段为空字符串时应拒绝并返回参数错误，不应抛未捕获异常。",
+              "funcDesc": "签名验证",
+              "stub": "无",
+              "inputs": [
+                [
+                  "signature",
+                  ""
+                ]
+              ],
+              "outputs": [
+                [
+                  "verified",
+                  "false",
+                  "false"
+                ],
+                [
+                  "error_code",
+                  "ERR_EMPTY_SIGN",
+                  "ERR_EMPTY_SIGN"
+                ]
+              ],
+              "passed": true,
+              "issue": "无",
+              "bugId": "无",
+              "executedAt": "2026/11/14",
+              "status": "passed"
+            }
+          ]
         },
         {
-          "id": "PAY-SIGN-0002",
-          "name": "签名被篡改后拒绝",
-          "type": "逻辑测试",
-          "description": "修改报文体一个字节后重新验签，应返回签名不一致。",
-          "funcDesc": "签名验证",
-          "stub": "无",
-          "inputs": [
-            [
-              "algorithm",
-              "RSA256"
-            ],
-            [
-              "tampered",
-              "true"
-            ]
-          ],
-          "outputs": [
-            [
-              "verified",
-              "false",
-              "false"
-            ],
-            [
-              "error_code",
-              "ERR_SIGN_MISMATCH",
-              "ERR_SIGN_MISMATCH"
-            ]
-          ],
-          "passed": true,
-          "issue": "无",
-          "bugId": "无",
-          "executedAt": "2026/11/14"
-        },
-        {
-          "id": "PAY-SIGN-0003",
-          "name": "空签名边界处理",
-          "type": "边界测试",
-          "description": "签名字段为空字符串时应拒绝并返回参数错误，不应抛未捕获异常。",
-          "funcDesc": "签名验证",
-          "stub": "无",
-          "inputs": [
-            [
-              "signature",
-              ""
-            ]
-          ],
-          "outputs": [
-            [
-              "verified",
-              "false",
-              "false"
-            ],
-            [
-              "error_code",
-              "ERR_EMPTY_SIGN",
-              "ERR_EMPTY_SIGN"
-            ]
-          ],
-          "passed": true,
-          "issue": "无",
-          "bugId": "无",
-          "executedAt": "2026/11/14"
+          "functionId": "订单金额转换单元测试",
+          "name": "订单金额转换单元测试",
+          "summary": {
+            "total": 3,
+            "passed": 1,
+            "failed": 2,
+            "notRun": 0,
+            "unconfirmed": 0
+          },
+          "trace": "支付网关详细设计 3.2 金额精度",
+          "driver": "接口驱动（InterfaceDriver）",
+          "coverage": "-S 95.7% -B 89.1% -MCDC n/a",
+          "cases": [
+            {
+              "id": "PAY-AMT-0001",
+              "name": "整数元转分",
+              "type": "功能测试",
+              "description": "100 元转换为 10000 分，验证无精度损失。",
+              "funcDesc": "金额单位转换",
+              "stub": "无",
+              "inputs": [
+                [
+                  "amount_yuan",
+                  "100"
+                ],
+                [
+                  "currency",
+                  "CNY"
+                ]
+              ],
+              "outputs": [
+                [
+                  "amount_cent",
+                  "10000",
+                  "10000"
+                ]
+              ],
+              "passed": true,
+              "issue": "无",
+              "bugId": "无",
+              "executedAt": "2026/11/14",
+              "status": "passed"
+            },
+            {
+              "id": "PAY-AMT-0002",
+              "name": "小数元转分精度",
+              "type": "逻辑测试",
+              "description": "0.07 元转换应得到 7 分，验证浮点运算不产生 6 分或 8 分。",
+              "funcDesc": "金额单位转换",
+              "stub": "无",
+              "inputs": [
+                [
+                  "amount_yuan",
+                  "0.07"
+                ],
+                [
+                  "currency",
+                  "CNY"
+                ]
+              ],
+              "outputs": [
+                [
+                  "amount_cent",
+                  "7",
+                  "6"
+                ]
+              ],
+              "passed": false,
+              "issue": "0.07 元转换结果为 6 分，浮点数乘法后取整丢失 1 分。",
+              "bugId": "BUG-PAY-0213",
+              "executedAt": "2026/11/14",
+              "status": "failed"
+            },
+            {
+              "id": "PAY-AMT-0003",
+              "name": "超大数据金额转换",
+              "type": "边界测试",
+              "description": "金额接近 int64 上限时转换应报溢出而不是静默截断。",
+              "funcDesc": "金额单位转换",
+              "stub": "无",
+              "inputs": [
+                [
+                  "amount_yuan",
+                  "92233720368547"
+                ]
+              ],
+              "outputs": [
+                [
+                  "异常类型",
+                  "OverflowError",
+                  "无异常"
+                ]
+              ],
+              "passed": false,
+              "issue": "超大金额转换发生整数溢出，返回负数而非抛出 OverflowError。",
+              "bugId": "BUG-PAY-0214",
+              "executedAt": "2026/11/14",
+              "status": "failed"
+            }
+          ]
         }
       ]
     },
     {
-      "name": "订单金额转换单元测试",
-      "trace": "支付网关详细设计 3.2 金额精度",
-      "driver": "接口驱动（InterfaceDriver）",
-      "coverage": "-S 95.7% -B 89.1% -MCDC n/a",
-      "issues": "分转元存在浮点精度丢失。",
-      "inconsistent": "无。",
-      "cases": [
+      "phaseId": "phase-2",
+      "name": "第2阶段",
+      "order": 2,
+      "functions": [
         {
-          "id": "PAY-AMT-0001",
-          "name": "整数元转分",
-          "type": "功能测试",
-          "description": "100 元转换为 10000 分，验证无精度损失。",
-          "funcDesc": "金额单位转换",
-          "stub": "无",
-          "inputs": [
-            [
-              "amount_yuan",
-              "100"
-            ],
-            [
-              "currency",
-              "CNY"
-            ]
-          ],
-          "outputs": [
-            [
-              "amount_cent",
-              "10000",
-              "10000"
-            ]
-          ],
-          "passed": true,
-          "issue": "无",
-          "bugId": "无",
-          "executedAt": "2026/11/14"
+          "functionId": "退款流程单元测试",
+          "name": "退款流程单元测试",
+          "summary": {
+            "total": 3,
+            "passed": 3,
+            "failed": 0,
+            "notRun": 0,
+            "unconfirmed": 0
+          },
+          "trace": "支付网关详细设计 4.1 退款状态机",
+          "driver": "接口驱动（InterfaceDriver）",
+          "coverage": "-S 91.3% -B 84.7% -MCDC n/a",
+          "cases": [
+            {
+              "id": "PAY-REF-0001",
+              "name": "全额退款成功",
+              "type": "功能测试",
+              "description": "已支付订单发起全额退款，验证订单状态转为已退款。",
+              "funcDesc": "退款状态流转",
+              "stub": "订单服务（StubOrderRepo）",
+              "inputs": [
+                [
+                  "order_amount",
+                  "5000"
+                ],
+                [
+                  "refund_amount",
+                  "5000"
+                ]
+              ],
+              "outputs": [
+                [
+                  "order_status",
+                  "REFUNDED",
+                  "REFUNDED"
+                ],
+                [
+                  "refund_status",
+                  "SUCCESS",
+                  "SUCCESS"
+                ]
+              ],
+              "passed": true,
+              "issue": "无",
+              "bugId": "无",
+              "executedAt": "2026/11/14",
+              "status": "passed"
+            },
+            {
+              "id": "PAY-REF-0002",
+              "name": "部分退款",
+              "type": "功能测试",
+              "description": "订单发起部分退款后状态应为部分退款，剩余金额仍可继续退。",
+              "funcDesc": "退款状态流转",
+              "stub": "订单服务（StubOrderRepo）",
+              "inputs": [
+                [
+                  "order_amount",
+                  "5000"
+                ],
+                [
+                  "refund_amount",
+                  "1200"
+                ]
+              ],
+              "outputs": [
+                [
+                  "order_status",
+                  "PART_REFUNDED",
+                  "PART_REFUNDED"
+                ],
+                [
+                  "remain",
+                  "3800",
+                  "3800"
+                ]
+              ],
+              "passed": true,
+              "issue": "无",
+              "bugId": "无",
+              "executedAt": "2026/11/14",
+              "status": "passed"
+            },
+            {
+              "id": "PAY-REF-0003",
+              "name": "超额退款拒绝",
+              "type": "边界测试",
+              "description": "退款金额超过订单金额时应拒绝并保持原状态。",
+              "funcDesc": "退款金额校验",
+              "stub": "订单服务（StubOrderRepo）",
+              "inputs": [
+                [
+                  "order_amount",
+                  "5000"
+                ],
+                [
+                  "refund_amount",
+                  "6000"
+                ]
+              ],
+              "outputs": [
+                [
+                  "order_status",
+                  "PAID",
+                  "PAID"
+                ],
+                [
+                  "error_code",
+                  "ERR_OVER_REFUND",
+                  "ERR_OVER_REFUND"
+                ]
+              ],
+              "passed": true,
+              "issue": "无",
+              "bugId": "无",
+              "executedAt": "2026/11/14",
+              "status": "passed"
+            }
+          ]
         },
         {
-          "id": "PAY-AMT-0002",
-          "name": "小数元转分精度",
-          "type": "逻辑测试",
-          "description": "0.07 元转换应得到 7 分，验证浮点运算不产生 6 分或 8 分。",
-          "funcDesc": "金额单位转换",
-          "stub": "无",
-          "inputs": [
-            [
-              "amount_yuan",
-              "0.07"
-            ],
-            [
-              "currency",
-              "CNY"
-            ]
-          ],
-          "outputs": [
-            [
-              "amount_cent",
-              "7",
-              "6"
-            ]
-          ],
-          "passed": false,
-          "issue": "0.07 元转换结果为 6 分，浮点数乘法后取整丢失 1 分。",
-          "bugId": "BUG-PAY-0213",
-          "executedAt": "2026/11/14"
-        },
-        {
-          "id": "PAY-AMT-0003",
-          "name": "超大数据金额转换",
-          "type": "边界测试",
-          "description": "金额接近 int64 上限时转换应报溢出而不是静默截断。",
-          "funcDesc": "金额单位转换",
-          "stub": "无",
-          "inputs": [
-            [
-              "amount_yuan",
-              "92233720368547"
-            ]
-          ],
-          "outputs": [
-            [
-              "异常类型",
-              "OverflowError",
-              "无异常"
-            ]
-          ],
-          "passed": false,
-          "issue": "超大金额转换发生整数溢出，返回负数而非抛出 OverflowError。",
-          "bugId": "BUG-PAY-0214",
-          "executedAt": "2026/11/14"
+          "functionId": "回调通知单元测试",
+          "name": "回调通知单元测试",
+          "summary": {
+            "total": 3,
+            "passed": 2,
+            "failed": 1,
+            "notRun": 0,
+            "unconfirmed": 0
+          },
+          "trace": "支付网关详细设计 5.3 异步通知",
+          "driver": "消息驱动（MessageDriver）",
+          "coverage": "-S 89.5% -B 81.2% -MCDC n/a",
+          "cases": [
+            {
+              "id": "PAY-NOTIFY-0001",
+              "name": "首次回调成功",
+              "type": "接口测试",
+              "description": "商户返回 SUCCESS 后应停止重试并标记通知完成。",
+              "funcDesc": "异步通知投递",
+              "stub": "商户回调桩（StubMerchant）",
+              "inputs": [
+                [
+                  "merchant_response",
+                  "SUCCESS"
+                ],
+                [
+                  "retry_count",
+                  "0"
+                ]
+              ],
+              "outputs": [
+                [
+                  "notify_status",
+                  "DONE",
+                  "DONE"
+                ]
+              ],
+              "passed": true,
+              "issue": "无",
+              "bugId": "无",
+              "executedAt": "2026/11/14",
+              "status": "passed"
+            },
+            {
+              "id": "PAY-NOTIFY-0002",
+              "name": "商户无响应重试",
+              "type": "逻辑测试",
+              "description": "商户超时无响应时按退避策略重试，验证重试次数符合设计。",
+              "funcDesc": "异步通知重试",
+              "stub": "商户回调桩（StubMerchant）",
+              "inputs": [
+                [
+                  "merchant_response",
+                  "TIMEOUT"
+                ],
+                [
+                  "max_retry",
+                  "5"
+                ]
+              ],
+              "outputs": [
+                [
+                  "actual_retries",
+                  "5",
+                  "3"
+                ],
+                [
+                  "notify_status",
+                  "FAILED",
+                  "FAILED"
+                ]
+              ],
+              "passed": false,
+              "issue": "实际只重试 3 次即放弃，与设计文档要求的 5 次不符。",
+              "bugId": "BUG-PAY-0220",
+              "executedAt": "2026/11/14",
+              "status": "failed"
+            },
+            {
+              "id": "PAY-NOTIFY-0003",
+              "name": "重复回调幂等性",
+              "type": "逻辑测试",
+              "description": "同一笔交易重复回调时，第二次通知不应重复记账。",
+              "funcDesc": "通知幂等处理",
+              "stub": "商户回调桩（StubMerchant）",
+              "inputs": [
+                [
+                  "notify_times",
+                  "2"
+                ],
+                [
+                  "trade_no",
+                  "T20261114001"
+                ]
+              ],
+              "outputs": [
+                [
+                  "ledger_entries",
+                  "1",
+                  "1"
+                ]
+              ],
+              "passed": true,
+              "issue": "无",
+              "bugId": "无",
+              "executedAt": "2026/11/14",
+              "status": "passed"
+            }
+          ]
         }
       ]
     },
     {
-      "name": "退款流程单元测试",
-      "trace": "支付网关详细设计 4.1 退款状态机",
-      "driver": "接口驱动（InterfaceDriver）",
-      "coverage": "-S 91.3% -B 84.7% -MCDC n/a",
-      "issues": "无。",
-      "inconsistent": "无。",
-      "cases": [
+      "phaseId": "phase-3",
+      "name": "第3阶段",
+      "order": 3,
+      "functions": [
         {
-          "id": "PAY-REF-0001",
-          "name": "全额退款成功",
-          "type": "功能测试",
-          "description": "已支付订单发起全额退款，验证订单状态转为已退款。",
-          "funcDesc": "退款状态流转",
-          "stub": "订单服务（StubOrderRepo）",
-          "inputs": [
-            [
-              "order_amount",
-              "5000"
-            ],
-            [
-              "refund_amount",
-              "5000"
-            ]
-          ],
-          "outputs": [
-            [
-              "order_status",
-              "REFUNDED",
-              "REFUNDED"
-            ],
-            [
-              "refund_status",
-              "SUCCESS",
-              "SUCCESS"
-            ]
-          ],
-          "passed": true,
-          "issue": "无",
-          "bugId": "无",
-          "executedAt": "2026/11/14"
+          "functionId": "对账文件解析单元测试",
+          "name": "对账文件解析单元测试",
+          "summary": {
+            "total": 2,
+            "passed": 2,
+            "failed": 0,
+            "notRun": 0,
+            "unconfirmed": 0
+          },
+          "trace": "支付网关详细设计 6.2 对账文件",
+          "driver": "文件驱动（FileDriver）",
+          "coverage": "-S 93.8% -B 87.4% -MCDC n/a",
+          "cases": [
+            {
+              "id": "PAY-BILL-0001",
+              "name": "标准对账文件解析",
+              "type": "功能测试",
+              "description": "解析 3 行标准对账文件，验证记录数与金额汇总正确。",
+              "funcDesc": "对账文件解析",
+              "stub": "文件系统桩（StubFileSystem）",
+              "inputs": [
+                [
+                  "line_count",
+                  "3"
+                ],
+                [
+                  "encoding",
+                  "GBK"
+                ]
+              ],
+              "outputs": [
+                [
+                  "parsed_count",
+                  "3",
+                  "3"
+                ],
+                [
+                  "total_amount",
+                  "1500.00",
+                  "1500.00"
+                ]
+              ],
+              "passed": true,
+              "issue": "无",
+              "bugId": "无",
+              "executedAt": "2026/11/14",
+              "status": "passed"
+            },
+            {
+              "id": "PAY-BILL-0002",
+              "name": "空文件解析",
+              "type": "边界测试",
+              "description": "零行文件应返回空结果而不是报错。",
+              "funcDesc": "对账文件解析",
+              "stub": "文件系统桩（StubFileSystem）",
+              "inputs": [
+                [
+                  "line_count",
+                  "0"
+                ]
+              ],
+              "outputs": [
+                [
+                  "parsed_count",
+                  "0",
+                  "0"
+                ],
+                [
+                  "total_amount",
+                  "0.00",
+                  "0.00"
+                ]
+              ],
+              "passed": true,
+              "issue": "无",
+              "bugId": "无",
+              "executedAt": "2026/11/14",
+              "status": "passed"
+            }
+          ]
         },
         {
-          "id": "PAY-REF-0002",
-          "name": "部分退款",
-          "type": "功能测试",
-          "description": "订单发起部分退款后状态应为部分退款，剩余金额仍可继续退。",
-          "funcDesc": "退款状态流转",
-          "stub": "订单服务（StubOrderRepo）",
-          "inputs": [
-            [
-              "order_amount",
-              "5000"
-            ],
-            [
-              "refund_amount",
-              "1200"
-            ]
-          ],
-          "outputs": [
-            [
-              "order_status",
-              "PART_REFUNDED",
-              "PART_REFUNDED"
-            ],
-            [
-              "remain",
-              "3800",
-              "3800"
-            ]
-          ],
-          "passed": true,
-          "issue": "无",
-          "bugId": "无",
-          "executedAt": "2026/11/14"
-        },
-        {
-          "id": "PAY-REF-0003",
-          "name": "超额退款拒绝",
-          "type": "边界测试",
-          "description": "退款金额超过订单金额时应拒绝并保持原状态。",
-          "funcDesc": "退款金额校验",
-          "stub": "订单服务（StubOrderRepo）",
-          "inputs": [
-            [
-              "order_amount",
-              "5000"
-            ],
-            [
-              "refund_amount",
-              "6000"
-            ]
-          ],
-          "outputs": [
-            [
-              "order_status",
-              "PAID",
-              "PAID"
-            ],
-            [
-              "error_code",
-              "ERR_OVER_REFUND",
-              "ERR_OVER_REFUND"
-            ]
-          ],
-          "passed": true,
-          "issue": "无",
-          "bugId": "无",
-          "executedAt": "2026/11/14"
-        }
-      ]
-    },
-    {
-      "name": "回调通知单元测试",
-      "trace": "支付网关详细设计 5.3 异步通知",
-      "driver": "消息驱动（MessageDriver）",
-      "coverage": "-S 89.5% -B 81.2% -MCDC n/a",
-      "issues": "重试次数边界与文档不一致。",
-      "inconsistent": "设计文档写最多重试 5 次，实现为 3 次，需确认以哪个为准。",
-      "cases": [
-        {
-          "id": "PAY-NOTIFY-0001",
-          "name": "首次回调成功",
-          "type": "接口测试",
-          "description": "商户返回 SUCCESS 后应停止重试并标记通知完成。",
-          "funcDesc": "异步通知投递",
-          "stub": "商户回调桩（StubMerchant）",
-          "inputs": [
-            [
-              "merchant_response",
-              "SUCCESS"
-            ],
-            [
-              "retry_count",
-              "0"
-            ]
-          ],
-          "outputs": [
-            [
-              "notify_status",
-              "DONE",
-              "DONE"
-            ]
-          ],
-          "passed": true,
-          "issue": "无",
-          "bugId": "无",
-          "executedAt": "2026/11/14"
-        },
-        {
-          "id": "PAY-NOTIFY-0002",
-          "name": "商户无响应重试",
-          "type": "逻辑测试",
-          "description": "商户超时无响应时按退避策略重试，验证重试次数符合设计。",
-          "funcDesc": "异步通知重试",
-          "stub": "商户回调桩（StubMerchant）",
-          "inputs": [
-            [
-              "merchant_response",
-              "TIMEOUT"
-            ],
-            [
-              "max_retry",
-              "5"
-            ]
-          ],
-          "outputs": [
-            [
-              "actual_retries",
-              "5",
-              "3"
-            ],
-            [
-              "notify_status",
-              "FAILED",
-              "FAILED"
-            ]
-          ],
-          "passed": false,
-          "issue": "实际只重试 3 次即放弃，与设计文档要求的 5 次不符。",
-          "bugId": "BUG-PAY-0220",
-          "executedAt": "2026/11/14"
-        },
-        {
-          "id": "PAY-NOTIFY-0003",
-          "name": "重复回调幂等性",
-          "type": "逻辑测试",
-          "description": "同一笔交易重复回调时，第二次通知不应重复记账。",
-          "funcDesc": "通知幂等处理",
-          "stub": "商户回调桩（StubMerchant）",
-          "inputs": [
-            [
-              "notify_times",
-              "2"
-            ],
-            [
-              "trade_no",
-              "T20261114001"
-            ]
-          ],
-          "outputs": [
-            [
-              "ledger_entries",
-              "1",
-              "1"
-            ]
-          ],
-          "passed": true,
-          "issue": "无",
-          "bugId": "无",
-          "executedAt": "2026/11/14"
-        }
-      ]
-    },
-    {
-      "name": "对账文件解析单元测试",
-      "trace": "支付网关详细设计 6.2 对账文件",
-      "driver": "文件驱动（FileDriver）",
-      "coverage": "-S 93.8% -B 87.4% -MCDC n/a",
-      "issues": "无。",
-      "inconsistent": "无。",
-      "cases": [
-        {
-          "id": "PAY-BILL-0001",
-          "name": "标准对账文件解析",
-          "type": "功能测试",
-          "description": "解析 3 行标准对账文件，验证记录数与金额汇总正确。",
-          "funcDesc": "对账文件解析",
-          "stub": "文件系统桩（StubFileSystem）",
-          "inputs": [
-            [
-              "line_count",
-              "3"
-            ],
-            [
-              "encoding",
-              "GBK"
-            ]
-          ],
-          "outputs": [
-            [
-              "parsed_count",
-              "3",
-              "3"
-            ],
-            [
-              "total_amount",
-              "1500.00",
-              "1500.00"
-            ]
-          ],
-          "passed": true,
-          "issue": "无",
-          "bugId": "无",
-          "executedAt": "2026/11/14"
-        },
-        {
-          "id": "PAY-BILL-0002",
-          "name": "空文件解析",
-          "type": "边界测试",
-          "description": "零行文件应返回空结果而不是报错。",
-          "funcDesc": "对账文件解析",
-          "stub": "文件系统桩（StubFileSystem）",
-          "inputs": [
-            [
-              "line_count",
-              "0"
-            ]
-          ],
-          "outputs": [
-            [
-              "parsed_count",
-              "0",
-              "0"
-            ],
-            [
-              "total_amount",
-              "0.00",
-              "0.00"
-            ]
-          ],
-          "passed": true,
-          "issue": "无",
-          "bugId": "无",
-          "executedAt": "2026/11/14"
-        }
-      ]
-    },
-    {
-      "name": "费率计算单元测试",
-      "trace": "支付网关详细设计 7.1 费率规则",
-      "driver": "接口驱动（InterfaceDriver）",
-      "coverage": "-",
-      "issues": "该模块用例依赖费率配置中心，本期环境未部署。",
-      "inconsistent": "无。",
-      "cases": [
-        {
-          "id": "PAY-FEE-0001",
-          "name": "标准费率计算",
-          "type": "功能测试",
-          "description": "按 0.6% 费率计算 10000 分交易的手续费。",
-          "funcDesc": "手续费计算",
-          "stub": "费率中心（StubRateCenter）",
-          "inputs": [
-            [
-              "amount_cent",
-              "10000"
-            ],
-            [
-              "rate",
-              "0.006"
-            ]
-          ],
-          "outputs": [
-            [
-              "fee_cent",
-              "60",
-              ""
-            ]
-          ],
-          "passed": false,
-          "status": "notRun",
-          "notRunReason": "费率配置中心未部署，执行集跳过本模块全部用例。",
-          "issue": "无",
-          "bugId": "无",
-          "executedAt": ""
-        },
-        {
-          "id": "PAY-FEE-0002",
-          "name": "费率上限封顶",
-          "type": "边界测试",
-          "description": "大额交易手续费应被上限截断。",
-          "funcDesc": "手续费计算",
-          "stub": "费率中心（StubRateCenter）",
-          "inputs": [
-            [
-              "amount_cent",
-              "100000000"
-            ],
-            [
-              "rate",
-              "0.006"
-            ]
-          ],
-          "outputs": [
-            [
-              "fee_cent",
-              "2500",
-              ""
-            ]
-          ],
-          "passed": false,
-          "status": "notRun",
-          "notRunReason": "费率配置中心未部署，执行集跳过本模块全部用例。",
-          "issue": "无",
-          "bugId": "无",
-          "executedAt": ""
+          "functionId": "费率计算单元测试",
+          "name": "费率计算单元测试",
+          "summary": {
+            "total": 2,
+            "passed": 0,
+            "failed": 0,
+            "notRun": 2,
+            "unconfirmed": 0
+          },
+          "trace": "支付网关详细设计 7.1 费率规则",
+          "driver": "接口驱动（InterfaceDriver）",
+          "coverage": "-",
+          "cases": [
+            {
+              "id": "PAY-FEE-0001",
+              "name": "标准费率计算",
+              "type": "功能测试",
+              "description": "按 0.6% 费率计算 10000 分交易的手续费。",
+              "funcDesc": "手续费计算",
+              "stub": "费率中心（StubRateCenter）",
+              "inputs": [
+                [
+                  "amount_cent",
+                  "10000"
+                ],
+                [
+                  "rate",
+                  "0.006"
+                ]
+              ],
+              "outputs": [
+                [
+                  "fee_cent",
+                  "60",
+                  ""
+                ]
+              ],
+              "passed": false,
+              "status": "notRun",
+              "notRunReason": "费率配置中心未部署，执行集跳过本模块全部用例。",
+              "issue": "无",
+              "bugId": "无",
+              "executedAt": ""
+            },
+            {
+              "id": "PAY-FEE-0002",
+              "name": "费率上限封顶",
+              "type": "边界测试",
+              "description": "大额交易手续费应被上限截断。",
+              "funcDesc": "手续费计算",
+              "stub": "费率中心（StubRateCenter）",
+              "inputs": [
+                [
+                  "amount_cent",
+                  "100000000"
+                ],
+                [
+                  "rate",
+                  "0.006"
+                ]
+              ],
+              "outputs": [
+                [
+                  "fee_cent",
+                  "2500",
+                  ""
+                ]
+              ],
+              "passed": false,
+              "status": "notRun",
+              "notRunReason": "费率配置中心未部署，执行集跳过本模块全部用例。",
+              "issue": "无",
+              "bugId": "无",
+              "executedAt": ""
+            }
+          ]
         }
       ]
     }
-  ]
+  ],
+  "coverage": {
+    "available": false,
+    "reason": "示例数据不含真实覆盖率报告（每个函数的 -S/-B 见函数覆盖率字段）"
+  },
+  "reviews": {
+    "docReviewDone": false,
+    "staticAnalysisDone": false,
+    "codeReviewDone": false,
+    "dynamicTestDone": true
+  },
+  "issues": {
+    "docIssues": [],
+    "staticIssues": [],
+    "codeIssues": [],
+    "dynamicIssues": [
+      {
+        "id": "订单金额转换单元测试-1",
+        "title": "分转元存在浮点精度丢失。",
+        "severity": "未记录",
+        "status": "未记录"
+      },
+      {
+        "id": "回调通知单元测试-1",
+        "title": "重试次数边界与文档不一致。",
+        "severity": "未记录",
+        "status": "未记录"
+      },
+      {
+        "id": "费率计算单元测试-1",
+        "title": "该模块用例依赖费率配置中心，本期环境未部署。",
+        "severity": "未记录",
+        "status": "未记录"
+      }
+    ],
+    "resolvedIssues": []
+  },
+  "consistency": {
+    "checked": false,
+    "discrepancies": [
+      {
+        "scope": "回调通知单元测试",
+        "detail": "设计文档写最多重试 5 次，实现为 3 次，需确认以哪个为准。"
+      }
+    ]
+  },
+  "regressions": {
+    "conducted": false,
+    "previousRunId": "",
+    "notes": "未开展回归测试"
+  }
 }
