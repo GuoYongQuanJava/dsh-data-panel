@@ -322,7 +322,7 @@ def _fill_table_T0(doc: Document, meta: Dict[str, Any], data: Dict[str, Any]) ->
     return True
 
 
-def _fill_table_T1(doc: Document, data: Dict[str, Any]) -> bool:
+def _fill_table_T1(doc: Document, data: Dict[str, Any], proto_body=None) -> bool:
     """T1 圈复杂度表（7×3）。未开展静态分析时明确写“未开展”。"""
     t1 = next((t for t in doc.tables if len(t.rows) == 7 and len(t.columns) == 3), None)
     if t1 is None:
@@ -350,22 +350,78 @@ def _fill_table_T1(doc: Document, data: Dict[str, Any]) -> bool:
         set_cell_text(row.cells[0], str(i + 1))
         set_cell_text(row.cells[1], str(item.get('function', '')))
         set_cell_text(row.cells[2], str(item.get('complexity', '')))
+    _append_t1_note(t1, risky, proto_body)
     return True
 
 
+def _append_t1_note(t1, risky: list, proto_body) -> None:
+    """圈复杂度表后面那段固定说明（客户话术，只填真实算出来的数）。"""
+    if not risky:
+        return  # 没有 CC>10 的函数就不说这段话
+
+    total_stmt = sum(int(it.get('nloc') or 0) for it in risky)
+    total_branch = sum(max(int(it.get('complexity') or 0) - 1, 0) for it in risky)
+    top_cc = max(int(it.get('complexity') or 0) for it in risky)
+    level = '较为复杂' if top_cc <= 20 else '复杂'
+    text = (
+        "经与开发人员确认，以上函数由多个"
+        f"{total_stmt}条"
+        "语句中多个"
+        f"{total_branch}个"
+        "分支构成的，使得圈复杂度"
+        f"最高达{top_cc}"
+        "，代码逻辑"
+        f"{level}"
+        "，不会对后续软件维护与测试产生不良影响。"
+    )
+
+    if proto_body is not None:
+        paragraph = _make_paragraph(proto_body, text)
+    else:
+        paragraph = OxmlElement('w:p')
+        run = OxmlElement('w:r')
+        node = OxmlElement('w:t')
+        node.text = text
+        run.append(node)
+        paragraph.append(run)
+
+    t1._tbl.addnext(paragraph)
+
+
 def _fill_table_T2(doc: Document, data: Dict[str, Any]) -> bool:
-    """T2 覆盖率统计表（5×10）。按阶段逐行；run 级覆盖率不复制给每个函数。"""
-    t2 = next((t for t in doc.tables if len(t.rows) == 5 and len(t.columns) == 10), None)
+    """T2 覆盖率统计表（5×8，列序与客户模板一致）。
+
+    表头：序号|测试阶段|函数|语句覆盖率|分支覆盖率|MCDC覆盖率|软件版本号|分析结果
+
+    旧版 VS CodeCoverage.exe 只输出块/行覆盖率，没有语句、分支、MC-DC 口径；
+    行≠语句，不能冒充，所以语句/分支写「未采集」，MC/DC 按客户要求写 n/a。
+    真采到的行/块数据写进「分析结果」列，不额外加列。
+    """
+    t2 = next((t for t in doc.tables if len(t.rows) == 5 and len(t.columns) == 8), None)
     if t2 is None:
         return False
 
     cov = data.get('coverage') or {}
     phases = data.get('phases') or []
+    version = (data.get('meta') or {}).get('softwareVersion') or '未提供'
+
+    # 真采到的行/块写进「分析结果」列（不占额外列）；语句/分支采集器不提供
+    if cov.get('available'):
+        bits = []
+        cov_line = cov.get('line') or {}
+        cov_block = cov.get('block') or {}
+        if cov_line.get('percent') is not None:
+            bits.append(f'行 {cov_line.get("percent")}%')
+        if cov_block.get('percent') is not None:
+            bits.append(f'块 {cov_block.get("percent")}%')
+        note = ('本次运行整体采集（' + '、'.join(bits) + '）' if bits else '本次运行已采集') + '；语句/分支采集器不提供'
+    else:
+        note = '未采集'
 
     def pct(key: str) -> str:
         block = cov.get(key) or {}
         if block.get('percent') is None:
-            return '未提供'
+            return '未采集'
         return f'{block.get("percent")}%'
 
     if not cov.get('available'):
@@ -373,26 +429,27 @@ def _fill_table_T2(doc: Document, data: Dict[str, Any]) -> bool:
         set_cell_text(t2.rows[1].cells[0], '1')
         set_cell_text(t2.rows[1].cells[1], '全部阶段')
         set_cell_text(t2.rows[1].cells[2], '全部函数')
-        for col in (3, 4, 5, 6, 7):
-            set_cell_text(t2.rows[1].cells[col], '未采集')
-        set_cell_text(t2.rows[1].cells[8], (data.get('meta') or {}).get('softwareVersion', '未提供'))
-        set_cell_text(t2.rows[1].cells[9], f'未采集：{reason}')
+        set_cell_text(t2.rows[1].cells[3], '未采集')
+        set_cell_text(t2.rows[1].cells[4], '未采集')
+        set_cell_text(t2.rows[1].cells[5], 'n/a')
+        set_cell_text(t2.rows[1].cells[6], version)
+        set_cell_text(t2.rows[1].cells[7], f'未采集：{reason}')
+        _resize_table_rows(t2, 1)
         return True
 
+    _resize_table_rows(t2, len(phases))
     for i, phase in enumerate(phases[: len(t2.rows) - 1]):
         row = t2.rows[i + 1]
         funcs = phase.get('functions') or []
         set_cell_text(row.cells[0], str(i + 1))
         set_cell_text(row.cells[1], phase.get('name', ''))
         set_cell_text(row.cells[2], '、'.join(f.get('name', '') for f in funcs) or '—')
-        # 列序：序号|阶段|函数|行|块|语句|分支|MCDC|版本|分析结果
-        set_cell_text(row.cells[3], pct('line'))
-        set_cell_text(row.cells[4], pct('block'))
-        set_cell_text(row.cells[5], pct('statement'))
-        set_cell_text(row.cells[6], pct('branch'))
-        set_cell_text(row.cells[7], pct('mcdc'))
-        set_cell_text(row.cells[8], (data.get('meta') or {}).get('softwareVersion', '未提供'))
-        set_cell_text(row.cells[9], '本次运行采集（run 级同口径）')
+        # 列序：序号|阶段|函数|语句|分支|MCDC|版本|分析结果
+        set_cell_text(row.cells[3], pct('statement'))
+        set_cell_text(row.cells[4], pct('branch'))
+        set_cell_text(row.cells[5], 'n/a')
+        set_cell_text(row.cells[6], version)
+        set_cell_text(row.cells[7], note)
     return True
 
 
@@ -794,7 +851,7 @@ def build(
 
     # ── 固定表 ──
     _fill_table_T0(doc, meta, data)
-    _fill_table_T1(doc, data)
+    _fill_table_T1(doc, data, proto_body)
     _fill_table_T2(doc, data)
 
     # ── 清掉模板第 4 章示例区（阶段内容动态生成） ──
