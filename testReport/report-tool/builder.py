@@ -576,42 +576,15 @@ def _build_assessment(data: Dict[str, Any]) -> str:
     )
 
 def _fill_chapter3(body_els: list, data: Dict[str, Any], proto_body) -> None:
-    """3.1 总体评估 / 3.2 环境影响 / 3.3 改进建议 正文。"""
+    """3.1 总体评估写固定话术；3.2 测试环境的影响 / 3.3 改进建议 按客户要求**空着**。"""
     if proto_body is None:
         return
-
-    summary = data.get('summary') or {}
-    total = summary.get('total', 0)
-    passed = summary.get('passed', 0)
-    failed = summary.get('failed', 0)
-    not_run = summary.get('notRun', 0)
-    unconfirmed = summary.get('unconfirmed', 0)
-    exec_rate = summary.get('executionRate', 0)
-    pass_rate = summary.get('passRate', 0)
 
     assessment = data.get('overallAssessment') or _build_assessment(data)
     p_3_1 = _find_para(body_els, '总体评估')
     if p_3_1 is not None:
         _insert_after(p_3_1, _make_paragraph(proto_body, assessment))
-
-    env_text = data.get('environmentImpact') or (
-        f"测试环境：{data.get('meta', {}).get('language', '未记录')}；"
-        f"执行器：{data.get('meta', {}).get('executor', '未记录')}。"
-    )
-    p_3_2 = _find_para(body_els, '测试环境的影响')
-    if p_3_2 is not None:
-        _insert_after(p_3_2, _make_paragraph(proto_body, env_text))
-
-    improvements = data.get('improvements')
-    if not improvements:
-        imp_text = '未提供改进建议。'
-    elif isinstance(improvements, list):
-        imp_text = '；'.join(str(x) for x in improvements) + '。'
-    else:
-        imp_text = str(improvements)
-    p_3_3 = _find_para(body_els, '改进建议')
-    if p_3_3 is not None:
-        _insert_after(p_3_3, _make_paragraph(proto_body, imp_text))
+    # 3.2、3.3 不写任何正文（客户模板只要标题）
 
 
 def _fill_chapter2(body_els: list, meta: Dict[str, Any], proto_body) -> None:
@@ -682,6 +655,12 @@ def _generate_phases(
         h1 = _make_paragraph(proto_h1, phase.get('name', '未命名阶段'), sid_h1)
         insert_point.addprevious(h1)
         last = h1
+
+        # 4.x 章节开头的固定话术（客户模板，只填真数据）
+        intro = _build_phase_assessment(data, phase)
+        intro_p = _make_paragraph(proto_body, intro)
+        last.addnext(intro_p)
+        last = intro_p
 
         functions = phase.get('functions') or []
         for func in functions:
@@ -773,6 +752,66 @@ def _fill_appendices(body_els: list, data: Dict[str, Any], proto_body) -> None:
         )
 
 
+
+def _build_phase_assessment(data: Dict[str, Any], phase: Dict[str, Any]) -> str:
+    """第 4 章（各阶段「项目测试结果」）开头的固定话术，只填真数据。
+
+    日期/问题数是运行级的（本次运行就是一次真实执行），
+    函数数/用例数按**本阶段**统计。
+    """
+    meta = data.get('meta') or {}
+    issues = data.get('issues') or {}
+    people = meta.get('people') or {}
+
+    start_y, start_m, start_d = _cn_date(meta.get('executedAt') or '')
+    end_y, end_m, end_d = _cn_date(meta.get('finishedAt') or meta.get('executedAt') or '')
+    if start_y and end_y:
+        date_text = f"{start_y}年{start_m}月{start_d}日至{end_y}年{end_m}月{end_d}日"
+    else:
+        date_text = "测试日期未记录"
+    # 交付日期没有独立字段，暂用执行日期（要区分就加配置项 deliveryDate）
+    delivery_text = date_text.split('至')[0] if '至' in date_text else '日期未记录'
+
+    tester = str(people.get('tester') or '').strip() or '测试人员未记录'
+    software = _short_software_name(meta.get('project') or '')
+    version = str(meta.get('softwareVersion') or '').strip()
+    version_text = f"（{version}）" if version and version != '未配置' else ''
+
+    funcs = phase.get('functions') or []
+    func_count = len(funcs)
+    total = passed = failed = not_run = 0
+    for func in funcs:
+        summary = func.get('summary') or {}
+        total += int(summary.get('total') or 0)
+        passed += int(summary.get('passed') or 0)
+        failed += int(summary.get('failed') or 0)
+        not_run += int(summary.get('notRun') or 0)
+    executed = total - not_run
+
+    doc_issues = len(issues.get('docIssues') or [])
+    static_issues = len(issues.get('staticIssues') or [])
+    code_issues = len(issues.get('codeIssues') or [])
+
+    def issue_clause(count: int, appendix: str, subject: str) -> str:
+        if count > 0:
+            return (f"{subject}共发现{count}个问题，均为一般问题，"
+                    f"具体问题详细信息见附录{appendix}。")
+        return f"{subject}未发现问题。"
+
+    return (
+        f"{date_text}，测试人员{tester}，对开发人员于{delivery_text}提供的"
+        f"{software}源程序{version_text}进行单元测试，主要进行了文件审查、静态分析、"
+        "代码审查和动态单元测试。"
+        + issue_clause(doc_issues, 'B', '文档审查')
+        + issue_clause(static_issues, 'C', '静态分析')
+        + issue_clause(code_issues, 'D', '代码审查')
+        + (f"动态单元测试共选取了{func_count}个函数单元作为本次单元测试的重点单元，"
+           f"共设计了{total}个测试用例，实际执行{executed}个测试用例，"
+           f"执行通过测试用例{passed}个。"
+           f"未通过测试用例{failed}个，其余用例全部执行通过。")
+    )
+
+
 # ════════════════════════════════════════════════════════════════════════
 #  主入口
 # ════════════════════════════════════════════════════════════════════════
@@ -839,7 +878,7 @@ def build(
     _fill_doc_overview(body_els, data, proto_body)
     _fill_chapter2(body_els, meta, proto_body)
     _fill_chapter3(body_els, data, proto_body)
-    _move_regressions(body_els, data, proto_body, sid_h2)
+    # 3.4 回归测试不生成（客户模板里没有这一节，也不要求）
 
     # ── 固定表 ──
     _fill_table_T0(doc, meta, data)
