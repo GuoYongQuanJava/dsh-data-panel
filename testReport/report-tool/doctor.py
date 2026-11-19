@@ -61,7 +61,7 @@ print("\n[3/6] 包内文件")
 required = [
     "report-tool/cmd.py",
     "report-tool/verify_report.py",
-    "templates/RingBuffer-test-blank.docx",
+    "templates/单元测试报告模板.docx",
     "examples/auth-demo.json",
 ]
 missing = [p for p in required if not (ROOT / p).is_file()]

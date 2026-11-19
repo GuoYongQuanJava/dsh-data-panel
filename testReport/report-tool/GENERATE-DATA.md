@@ -1,4 +1,4 @@
-﻿# 给「生成测试数据」的模型看的任务说明
+# 给「生成测试数据」的模型看的任务说明
 
 > 如果你是被要求「生成一份测试执行结果 JSON，然后跑通报告生成」的模型，按本文档执行。
 > 你是**数据供给侧**，不是报告代码的作者。不要改 `report-tool/` 里的任何 `.py` 文件。
@@ -19,8 +19,8 @@
 |---|---|
 | 工作区 | `D:\1` |
 | Python | `C:\Users\PC\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe`（已装 python-docx） |
-| 模板（推荐） | `D:\1\templates\RingBuffer-test-blank.docx`（已清空的空白表单） |
-| 模板（原始） | `D:\1\templates\RingBuffer-test.docx`（客户原始样例模板，也能用） |
+| 模板（正式，唯一可用） | `D:\1\templates\单元测试报告模板.docx` |
+| 用例表原型（仅参考） | `templates\RingBuffer-test.docx` / `-blank.docx`，**不能拿来出报告** |
 | 生成脚本 | `D:\1\report-tool\cmd.py` |
 | 校验器 | `D:\1\report-tool\verify_report.py` |
 | skill 目录 | `D:\1\skills\<你的项目名>\SKILL.md` |
@@ -136,7 +136,7 @@ skill 里就算写了 `coverage` / `driver` 之类的键，脚本也会忽略。
 
 ## 关键要求：不要抄模板里的内容
 
-模板 `RingBuffer-test.docx` 里 12 张样例表全是 `GN-ZZKZ-*` 的 RingBuffer 测试数据。**你的数据必须和它们毫无关系**：
+正式模板里自带 RingBuffer 样例内容（用例表、附录问题单），**你的数据必须和它们毫无关系**：
 
 - ❌ 不要用 `RingBuffer`、`push`、`pickNew`、`pickPWL`、`clearSaveNewOne`、`clearAll` 作模块名
 - ❌ 不要用 `GN-ZZKZ-xxx-T001.CTD` 这类标识
@@ -178,7 +178,7 @@ skill 里就算写了 `coverage` / `driver` 之类的键，脚本也会忽略。
 ```powershell
 $py = 'C:\Users\PC\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe'
 & $py D:\1\report-tool\cmd.py `
-      --template D:\1\templates\RingBuffer-test.docx `
+      --template templates/单元测试报告模板.docx `
       --data D:\1\report-tool\your-data.json `
       -o D:\1\report-tool\your-report.docx
 ```
@@ -188,7 +188,7 @@ $py = 'C:\Users\PC\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\pyt
 ```powershell
 # 先写 D:\1\skills\<项目>\SKILL.md，frontmatter 里放 designer/reviewer/tester
 & $py D:\1\report-tool\cmd.py `
-      --template D:\1\templates\RingBuffer-test.docx `
+      --template templates/单元测试报告模板.docx `
       --data D:\1\report-tool\your-data.json `
       --skill D:\1\skills\<项目> `
       -o D:\1\report-tool\your-report.docx
@@ -214,7 +214,7 @@ tester: 王芳
 & $py D:\1\report-tool\verify_report.py `
       D:\1\report-tool\your-report.docx `
       D:\1\report-tool\your-data.json `
-      D:\1\templates\RingBuffer-test.docx
+      templates/单元测试报告模板.docx
 ```
 
 最后一行必须是 `ALL CHECKS PASSED`。如果用了 `--skill`，把 skill 路径作为第 4 个参数补上。
@@ -263,7 +263,7 @@ schema 报错样例（会带精确路径）：
 ## 禁止事项
 
 - 不要修改 `report-tool/` 下的 `.py` 文件（除非任务明确要求改代码）
-- 不要修改 `templates/RingBuffer-test.docx`
+- 不要修改 `templates/单元测试报告模板.docx`
 - 不要填 AI 猜测的覆盖率数字（`coverage` 留空或写 `-`）
 - 不要把「没执行」的用例写成「通过」
 - **不要指望 skill 提供 tester 以外的字段** —— 它只负责测试人员
