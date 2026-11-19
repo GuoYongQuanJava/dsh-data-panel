@@ -82,12 +82,46 @@ def _find_para_index(body_els: list, text: str) -> int:
     return -1
 
 
+def _find_heading_index(body_els: list, text: str, mode: str = 'exact') -> int:
+    """按标题文本找位置，避免被正文误匹配。
+
+    mode: exact=整行相等；suffix=行尾结尾（如「项目测试结果」）；contains=包含。
+    （正文里的「注释率」曾经把「注释」章节误匹配到 3.1，所以不能用 contains）
+    """
+    for i, el in enumerate(body_els):
+        if el.tag != qn('w:p'):
+            continue
+        flat = _flat(el).strip()
+        if mode == 'exact' and flat == text:
+            return i
+        if mode == 'suffix' and flat.endswith(text):
+            return i
+        if mode == 'contains' and text in flat:
+            return i
+    return -1
+
+
 def _style_id(doc: Document, name: str) -> str:
     """按样式名查 styleId；找不到返回空串。"""
     for st in doc.styles.element.findall(qn('w:style')):
         n = st.find(qn('w:name'))
         if n is not None and n.get(qn('w:val')) == name:
             return st.get(qn('w:styleId')) or ''
+
+
+def _para_style_name(doc: Document, p_el) -> str:
+    """段落元素的样式名（通过 pStyle → styleId → w:name 反查）；无样式返回空串。"""
+    pPr = p_el.find(qn('w:pPr'))
+    if pPr is None:
+        return ''
+    ps = pPr.find(qn('w:pStyle'))
+    if ps is None:
+        return ''
+    style_id = ps.get(qn('w:val')) or ''
+    for st in doc.styles.element.findall(qn('w:style')):
+        if st.get(qn('w:styleId')) == style_id:
+            n = st.find(qn('w:name'))
+            return n.get(qn('w:val')) if n is not None else ''
     return ''
 
 
@@ -753,6 +787,177 @@ def _fill_appendices(body_els: list, data: Dict[str, Any], proto_body) -> None:
 
 
 
+def _strip_template_samples(body_els: list) -> None:
+    """删掉模板里会被我们重新生成的样例段落（保留表题/引导句）。
+
+    - 3.1 总体评估下面那段样例正文（以四位年份开头）
+    - 圈复杂度表后面那段「经与开发人员确认 ... xxx」样例说明（我们自己会生成）
+    """
+    for el in list(body_els):
+
+
+        if el.tag != qn('w:p'):
+            continue
+        flat = _flat(el).strip()
+        if not flat:
+            continue
+        if flat.startswith('经与开发人员确认'):
+            el.getparent().remove(el)
+            continue
+        # 3.1 样例正文：形如「2026年3月1日至…测试人员分四个迭代阶段」
+        if flat[:4].isdigit() and '迭代阶段' in flat and 'xxxxxxxx' in flat:
+            el.getparent().remove(el)
+
+
+
+
+# 新模板附件表里带的样例编号，必须清掉否则会泄到报告里
+SAMPLE_TOKENS = ('ZZKZDC-JT-WT', 'WTCLD-ZZKZDC-JT-WT', 'xxxxx')
+
+
+def _scrub_sample_tables(doc: Document) -> int:
+    """清掉附录表里的示例编号/占位符；返回清了几格。
+
+    只动命中样例词的单元格，不碰已填的业务内容。
+    """
+    cleaned = 0
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                text = cell.text.strip()
+                if not text:
+                    continue
+                if any(token in text for token in SAMPLE_TOKENS):
+                    set_cell_text(cell, '')
+                    cleaned += 1
+    return cleaned
+def _renumber_captions(body_els: list) -> int:
+    """把模板里的「表x」表题按文档顺序编号成表1、表2…；返回改了几处。"""
+    number = 0
+    for el in body_els:
+        if el.tag != qn('w:p'):
+            continue
+        flat = _flat(el).strip()
+        if not flat.startswith('表x'):
+            continue
+        number += 1
+        new_text = flat.replace('表x', f'表{number}', 1)
+        runs = el.findall(qn('w:r'))
+        if not runs:
+            continue
+        for extra in runs[1:]:
+            el.remove(extra)
+        first = runs[0]
+        for child in list(first):
+            if child.tag != qn('w:rPr'):
+                first.remove(child)
+        node = OxmlElement('w:t')
+        node.text = new_text
+        node.set(qn('xml:space'), 'preserve')
+        first.append(node)
+    return number
+
+
+def _generate_phases_v2(body, insert_point, proto_h1, proto_h2, proto_h3,
+                       proto_body, sid_h1: str, sid_h2: str, sid_h3: str,
+                       data: Dict[str, Any], rb_doc: Document, rb_tbl) -> None:
+    """按客户新模板的层级生成阶段章节：
+
+        SprintN项目测试结果      （编号标题1）
+          【阶段说明正文】
+          测试结果总结            （编号标题2）
+            函数名                （编号标题3）
+              用例标识段落 + 用例表
+          遇到的问题              （编号标题2）
+          与测试用例/规程不一致    （编号标题2）
+          回归测试                （编号标题2）
+    """
+    for phase in data.get('phases') or []:
+        phase_name = phase.get('name') or '未命名阶段'
+        title = phase_name if '项目测试结果' in phase_name else f'{phase_name}项目测试结果'
+        h1 = _make_paragraph(proto_h1, title, sid_h1)
+        insert_point.addprevious(h1)
+        last = h1
+
+        # 章节开头的固定话术
+        intro_p = _make_paragraph(proto_body, _build_phase_assessment(data, phase))
+        last.addnext(intro_p)
+        last = intro_p
+
+        # 测试结果总结：函数级三级标题 + 逐用例表格
+        h2 = _make_paragraph(proto_h2, '测试结果总结', sid_h2)
+        last.addnext(h2)
+        last = h2
+
+        for func in phase.get('functions') or []:
+            h3 = _make_paragraph(proto_h3, func.get('name', '未命名函数'), sid_h3)
+            last.addnext(h3)
+            last = h3
+
+            for case in func.get('cases') or []:
+                case_id = case.get('id', '')
+                label = _make_paragraph(proto_body, case_id)
+                last.addnext(label)
+                last = label
+
+                table_el = deepcopy(rb_tbl)
+                table = Table(table_el, rb_doc)
+                if not fill_table(table, case, function=func):
+                    raise BuilderError(f'用例表填充失败：{case_id}')
+                last.addnext(table_el)
+                last = table_el
+
+        # 阶段级三节
+        for heading, text in (
+            ('遇到的问题', _phase_issues_text(phase)),
+            ('与测试用例/规程不一致', _phase_inconsistent_text(phase)),
+            ('回归测试', _phase_regression_text(phase)),
+        ):
+            h2 = _make_paragraph(proto_h2, heading, sid_h2)
+            _append_after(last, h2)
+            last = h2
+            body_p = _make_paragraph(proto_body, text)
+            _append_after(last, body_p)
+            last = body_p
+
+
+def _phase_issues_text(phase: Dict[str, Any]) -> str:
+    """阶段「遇到的问题」：从失败/未确认用例的真实 issue 文字汇总而来。"""
+    items = []
+    for func in phase.get('functions') or []:
+        for case in func.get('cases') or []:
+            if case.get('status') not in ('failed', 'unconfirmed'):
+                continue
+            text = str(case.get('issue') or '').strip()
+            if not text or text in ('未记录异常', '未记录'):
+                continue
+            items.append(f"{case.get('id')}：{text}")
+    if items:
+        joined = '；'.join(items[:20])
+        return joined if joined.endswith(('。', '！', '？')) else joined + '。'
+    if phase.get('phaseIssues'):
+        return str(phase['phaseIssues'])
+    return '本阶段未发现异常。'
+
+
+def _phase_inconsistent_text(phase: Dict[str, Any]) -> str:
+    """阶段「与测试用例/规程不一致」：优先用数据里的不一致项。"""
+    if phase.get('phaseInconsistent'):
+        return str(phase['phaseInconsistent'])
+    return '本阶段未发现与测试用例/规程不一致的情况。'
+
+
+def _phase_regression_text(phase: Dict[str, Any]) -> str:
+    """阶段「回归测试」：有未通过用例就如实说回归待开展，否则说无需回归。"""
+    failed = 0
+    for func in phase.get('functions') or []:
+        failed += int((func.get('summary') or {}).get('failed') or 0)
+    if failed:
+        return f'本阶段存在{failed}条未通过用例，回归测试待开展。'
+    return '本阶段所有测试用例一次执行通过，无需进行回归测试。'
+
+
+
 def _build_phase_assessment(data: Dict[str, Any], phase: Dict[str, Any]) -> str:
     """第 4 章（各阶段「项目测试结果」）开头的固定话术，只填真数据。
 
@@ -859,7 +1064,16 @@ def build(
     if proto_h2 is None:
         raise BuilderError('模板缺少函数级标题原型（找不到「测试结果总结」段落）')
 
-    proto_h3 = proto_h2  # 三级标题以二级为蓝本，靠样式区分
+    # 三级标题原型：新模板里就是函数名那一行（样式 编号标题3）
+    proto_h3 = _find_para(body_els, 'RingBuffer单元测试')
+    if proto_h3 is None:
+        proto_h3 = next(
+            (p for p in body_els
+             if p.tag == qn('w:p') and _para_style_name(doc, p) == STYLE_H3),
+            None,
+        )
+    if proto_h3 is None:
+        proto_h3 = proto_h2  # 最后兑底：以二级为蓝本，靠样式区分
 
     proto_body = _find_para(body_els, '各函数语句覆盖率')
     if proto_body is None:
@@ -880,14 +1094,22 @@ def build(
     _fill_chapter3(body_els, data, proto_body)
     # 3.4 回归测试不生成（客户模板里没有这一节，也不要求）
 
+    # 先把模板里会被重新生成的样例段落删掉（3.1 样例正文、圈复杂度说明段）
+    _strip_template_samples(body_els)
+
+    # 表题「表x」按文档顺序编号成 表1/表2/…
+    _renumber_captions(body_els)
+    # 附录表里的样例编号/占位符也一并清掉
+    _scrub_sample_tables(doc)
     # ── 固定表 ──
     _fill_table_T0(doc, meta, data)
     _fill_table_T1(doc, data, proto_body)
     _fill_table_T2(doc, data)
 
     # ── 清掉模板第 4 章示例区（阶段内容动态生成） ──
-    ch4_idx = _find_para_index(body_els, '项目测试结果')
-    ch5_idx = _find_para_index(body_els, '注释')
+    # 章节边界必须按「标题」精确匹配：正文里的「注释率」不能被当成「注释」章节
+    ch4_idx = _find_heading_index(body_els, '项目测试结果', mode='suffix')
+    ch5_idx = _find_heading_index(body_els, '注释', mode='exact')
     if ch4_idx < 0 or ch5_idx < 0 or ch5_idx <= ch4_idx:
         raise BuilderError('模板结构异常：找不到「项目测试结果」或「注释」章节')
     insert_point = body_els[ch5_idx]
@@ -898,8 +1120,8 @@ def build(
             pass
 
     # ── 生成阶段章节（插到「注释」之前） ──
-    _generate_phases(
-        body, insert_point, proto_h1, proto_h2, proto_h3, proto_body, None,
+    _generate_phases_v2(
+        body, insert_point, proto_h1, proto_h2, proto_h3, proto_body,
         sid_h1, sid_h2, sid_h3, data, rb_doc, rb_tbl,
     )
 

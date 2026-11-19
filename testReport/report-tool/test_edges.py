@@ -131,15 +131,17 @@ check(len(doc.tables) == TEMPLATE_TABLES + case_count,
 
 h1 = [p.text.strip() for p in doc.paragraphs if p.style.name == "编号标题1" and p.text.strip()]
 for name in ("第1阶段", "第2阶段", "第3阶段"):
-    check(name in h1, f"阶段标题存在：{name}")
+    check(f"{name}项目测试结果" in h1, f"阶段标题存在：{name}项目测试结果")
 
 h2 = [p.text.strip() for p in doc.paragraphs if p.style.name == "编号标题2" and p.text.strip()]
-check(sum(1 for x in h2 if x.startswith("F")) == 6, f"6 个函数各成节（实际 {sum(1 for x in h2 if x.startswith('F'))}）")
+h3 = [p.text.strip() for p in doc.paragraphs if p.style.name == "编号标题3" and p.text.strip()]
 
-print("\n== 通过/失败统计 ==")
-stats = [p.text.strip() for p in doc.paragraphs if p.text.strip().startswith("共 ") and "条用例" in p.text]
-check(len(stats) == 6, f"每个函数一条统计行（实际 {len(stats)}）")
-check(stats[0] == "共 2 条用例，通过 1 条，失败 1 条。", f"统计行正确：{stats[0]!r}")
+check(h2.count("测试结果总结") == 3, f"每个阶段一个「测试结果总结」（实际 {h2.count('测试结果总结')}）")
+check(h3 and sum(1 for x in h3 if x.startswith("F")) == 6,
+      f"6 个函数各成三级标题（实际 {sum(1 for x in h3 if x.startswith('F'))}）")
+for section in ("遇到的问题", "与测试用例/规程不一致", "回归测试"):
+    check(h2.count(section) == 3, f"每个阶段一节「{section}」（实际 {h2.count(section)}）")
+
 
 print("\n== 模板异常 ==")
 broken = tmp / "broken.docx"
@@ -148,7 +150,6 @@ for p in d.paragraphs:
     if "项目测试结果" in p.text:
         for run in p.runs:
             run.text = ""
-        break
 d.save(str(broken))
 try:
     build(str(broken), make_payload([{"name": "第一阶段", "functions": [mkfunction("F", [mkcase("X-1.CTD", [], [])])]}]),

@@ -246,7 +246,7 @@ def generate_phase_plan(function_groups: dict, phase_count: int, seed: int) -> d
         "phases": [
             {
                 "phaseId": f"phase-{i + 1}",
-                "name": f"第{i + 1}阶段",
+                "name": f"Sprint{i + 1}",
                 "order": i + 1,
                 "functionIds": phases[i]["functions"],
             }
@@ -272,6 +272,16 @@ def load_or_create_phase_plan(
         try:
             plan = json.loads(plan_path.read_text(encoding="utf-8"))
             seed = plan.get("seed", 0)
+            # 旧版计划里的阶段名是「第N阶段」，统一成客户模板要求的 SprintN（不改阶段分配）
+            changed = False
+            for item in plan.get("phases") or []:
+                name = str(item.get("name") or "")
+                if name.startswith("第") and name.endswith("阶段"):
+                    item["name"] = f"Sprint{item.get('order') or 0}"
+                    changed = True
+            if changed:
+                plan_path.write_text(
+                    json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
             return plan, plan_path, seed
         except Exception:
             pass  # 损坏了就重新生成
@@ -408,7 +418,7 @@ def main() -> int:
         order = p.get("order", 0)
         phase_map[order] = {
             "phaseId": p.get("phaseId", f"phase-{order}"),
-            "name": p.get("name", f"第{order}阶段"),
+            "name": p.get("name", f"Sprint{order}"),
             "order": order,
             "functions": [],
         }
@@ -421,7 +431,7 @@ def main() -> int:
         if phase_order not in phase_map:
             phase_map[phase_order] = {
                 "phaseId": f"phase-{phase_order}",
-                "name": f"第{phase_order}阶段",
+                "name": f"Sprint{phase_order}",
                 "order": phase_order,
                 "functions": [],
             }
