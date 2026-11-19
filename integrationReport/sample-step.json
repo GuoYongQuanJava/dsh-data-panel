@@ -1,0 +1,56 @@
+{
+  "people": {
+    "designer": "张三",
+    "reviewer": "李四",
+    "tester": "王五"
+  },
+  "feature": {
+    "code": "F-001",
+    "name": "商品与购物车"
+  },
+  "case": {
+    "caseId": "V0_0_2-IT-001",
+    "stepNo": 2,
+    "title": "商品加入购物车",
+    "type": "functional",
+    "requirement": "SRS-3.2.1 购物车管理",
+    "description": "验证用户在商品详情页选择规格后加入购物车的完整链路",
+    "precondition": "测试环境已部署，已登录用户 test_user，商品 SKU-1001 库存 50",
+    "executedAt": "2026.11.18 14:22",
+    "outcome": "passed",
+    "steps": [
+      {
+        "no": 1,
+        "action": "打开商品详情页",
+        "operation": "浏览器访问 /product/SKU-1001",
+        "expected": "页面标题显示「无线蓝牙耳机」，价格 ¥299",
+        "observed": "页面加载完成，标题「无线蓝牙耳机」，价格 ¥299，库存充足",
+        "outcome": "passed"
+      },
+      {
+        "no": 2,
+        "action": "选择商品规格",
+        "operation": "点击「颜色：黑色」、点击「数量：2」",
+        "expected": "规格选中态生效，总价更新为 ¥598",
+        "observed": "黑色规格高亮，数量显示 2，总价 ¥598",
+        "outcome": "passed"
+      },
+      {
+        "no": 3,
+        "action": "加入购物车",
+        "operation": "点击「加入购物车」按钮",
+        "expected": "提示「已加入购物车」，右上角角标由 0 变为 2",
+        "observed": "未执行（本次只执行第 2 步）",
+        "outcome": "notRun"
+      },
+      {
+        "no": 4,
+        "action": "核对购物车",
+        "operation": "打开购物车页面",
+        "expected": "列表中有 SKU-1001 × 2，小计 ¥598",
+        "observed": "未执行（本次只执行第 2 步）",
+        "outcome": "notRun"
+      }
+    ]
+  }
+}

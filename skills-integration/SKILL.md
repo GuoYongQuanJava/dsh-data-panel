@@ -734,10 +734,10 @@ margin       / 余量测试
 
 ## ★ 报告必须调原型，不许自己写填表逻辑
 
-**报告生成器（原型）**：
+**报告生成器**：
 
 ```
-F:\插件开发\集成报告原型\integration_report.py
+<仓库根>\integrationReport\integration_report.py
 ```
 
 它对外只有两个函数，**报告一律从这里出**：
@@ -753,7 +753,7 @@ F:\插件开发\集成报告原型\integration_report.py
 import importlib.util
 from pathlib import Path
 
-PROTOTYPE = r"F:\插件开发\集成报告原型\integration_report.py"
+PROTOTYPE = r"<仓库根>\integrationReport\integration_report.py"
 spec = importlib.util.spec_from_file_location("ir", PROTOTYPE)
 proto = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(proto)
@@ -770,10 +770,10 @@ proto.build_single_step(Path(TEMPLATE), data, Path(out_path))
 2. **不许把原型复制一份改**。
    复制出去改 = 规范分叉，以后改了原型那份不跟随。**要改就改原型本身**。
 
-3. **原型缺失时明确报错，不许降级**。
+3. **报告生成器缺失时明确报错，不许降级**。
    ```
-   报告生成器缺失：F:\插件开发\集成报告原型\integration_report.py
-   请确认该文件存在；不要在缺原型的情况下自己实现报告生成。
+   报告生成器缺失：<仓库根>\integrationReport\integration_report.py
+   请确认该文件存在（它随仓库分发，见 integrationReport/README.md）；不要在缺生成器的情况下自己实现报告生成。
    ```
    不许静默退回「自己写个简单版」——那样出来的报告不符合规范，而且没人会发现。
 
@@ -1011,8 +1011,8 @@ if (-not (Test-Path -LiteralPath $reportRoot -PathType Container)) {
 
 > ⚠️ **本机当前状态**：`~/.dsh/tools/testReport` **未部署**（已实测不存在），但模板与生成器原型在仓库内可用。Step 6 之前必须先确认部署，不要默认它存在。
 > 报告字段的 24 条待定规范仍需等真实测试项目逐条确认，不要自行编造口径。
-> 可直接参照的已跑通产物：`F:\插件开发\集成报告原型\输出\样例1-整项目完整报告.docx`（全部报告）、`样例2-单个测试步骤报告.docx`（单条报告）。
-> 生成器原型：`F:\插件开发\集成报告原型\integration_report.py`（独立实现，不 import 也不修改 `testReport/`）。
+> 可直接参照的已跑通产物：把 `integrationReport\sample-project.json` / `sample-step.json` 跑一遍生成的那两份 docx（见 `integrationReport/README.md`）。
+> 生成器：`<仓库根>\integrationReport\integration_report.py`（独立实现，不 import 也不修改 `testReport/`）。
 
 ---
 
@@ -1213,7 +1213,7 @@ POST /data-panel/integration { sessionId, kind, op, ... }
 - **单步执行也必须生成单条报告**（`integration/reports/<runId>/`，只取 4.1.1 那张表）；「不进报告页」不等于「不出报告」
 - **子表挂在测试步骤主表的每一行下面**：主表一行 = 一条用例，子表 = 这条用例的执行记录；一条记录一次执行（单步算一条、一键也算一条），**混在同一个子表里，靠时间区分**
 - **执行记录只存 `runId` / `at` / `result` / `durationMs` 四个字段**，不存 `observed`、不存逐步骤明细（那些在 `runs/<runId>/` 里）
-- **报告必须调原型** `F:\插件开发\集成报告原型\integration_report.py`（`build_single_step` / `build_full`），**不许自己写填表逻辑、不许复制原型改、原型缺失要报错**
+- **报告必须调生成器** `<仓库根>\integrationReport\integration_report.py`（`build_single_step` / `build_full`），**不许自己写填表逻辑、不许复制生成器改、生成器缺失要报错**
 - **单条报告只取 4.1.1「测试结果总结」那一张表**，用 `build_single_step()`，落 `reports/<runId>/cases/`（60 条用例 = 60 份）
 - **总体报告按配置项测试模板整体编排**，用 `build_full()`，落 `reports/<runId>/`（整项目只有 1 份）
 - **单条报告要列出整条用例的全部步骤**，未执行的标 `notRun` 并注明「未执行（本次只执行第 N 步）」
@@ -1250,7 +1250,7 @@ POST /data-panel/integration { sessionId, kind, op, ... }
     ↓
 插件自己跑：node lib/report.js --run <runId> --type overall|case
     ↓
-内部调 Python 原型（原型随插件分发，放 assets/）
+内部调 Python 生成器（随仓库分发，见 integrationReport/）
     ↓
 出 docx
 ```
@@ -1263,9 +1263,15 @@ POST /data-panel/integration { sessionId, kind, op, ... }
 
 ### 届时改造清单
 
-1. `integration_report.py` 挪进 `dsh-data-panel/package/assets/`
-2. 加进 `package.json` 的 `files` 数组
+1. ~~`integration_report.py` 挪进仓库~~ ✅ **已完成**：现位于仓库根 `integrationReport/`，
+   与单元测试的 `testReport/` 平级、互不干扰（2026-11-20 完成，含 sample 与 README）
+2. ~~让生成器随仓库分发~~ ✅ **已完成**：`integrationReport/` 已纳入 git
 3. 新增 `lib/report.js`：读 `runs/<runId>/` 数据 → 组装 → 调 Python → 出 docx
 4. 走 `/data-panel/run/report` 或新接口暴露给前端
 5. Skill 报告章节大幅精简，只说「调插件生成」
 6. 话术去掉所有格式细节
+
+> 注：第 3 步若要让生成器随**插件包**分发（而不是仅随仓库），还需把它挪进
+> `dsh-data-panel/package/assets/` 并加进 `package.json` 的 `files` 数组。
+> 当前 `<仓库根>\integrationReport\` 的定位与单元测试的 `testReport/` 一致：
+> 随仓库走、不进插件包。

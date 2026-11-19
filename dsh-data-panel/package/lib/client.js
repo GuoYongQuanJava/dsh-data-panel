@@ -735,8 +735,15 @@ window.__ModuleLoader__.load({
 
 /* 场景侧栏 + 表格 */
 .it-board { display: flex; align-items: flex-start; gap: 10px; }
-.it-side { flex: 0 0 auto; width: 118px; padding: 7px 5px; border: 1px solid var(--dp-border); border-radius: 11px; background: var(--dp-bg); }
-.it-side-title { padding: 0 6px 6px; color: var(--dp-text3); font-size: 10.5px; font-weight: 650; letter-spacing: .06em; text-transform: uppercase; }
+.it-side { display: flex; flex-direction: column; flex: 0 0 auto; width: 128px; padding: 8px 6px; border: 1px solid var(--dp-border); border-radius: 12px; background: var(--dp-bg); transition: width .16s ease, padding .16s ease; }
+/* 侧栏头部：标题 + 「新建功能项」按钮，与单元测试 .dp-sidebar-head 同构 */
+.it-side-head { display: flex; flex: 0 0 auto; align-items: center; justify-content: space-between; gap: 6px; margin-bottom: 4px; }
+.it-side-title { padding: 0; color: var(--dp-text3); font-size: 11px; font-weight: 650; letter-spacing: .08em; text-transform: uppercase; white-space: nowrap; }
+.it-side-tools { display: flex; align-items: center; gap: 2px; }
+.it-side-tools .dp-icon-btn { width: 20px; height: 20px; }
+/* 功能项列表：唯一可滚动区，撑满头部以下的剩余高度 */
+.it-side-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; }
+.it-side-empty { padding: 4px 6px 6px; color: var(--dp-text3); font-size: 11px; line-height: 1.5; }
 .it-side-item { display: flex; align-items: center; justify-content: space-between; gap: 5px; width: 100%; padding: 5px 7px; border: 0; border-radius: 7px; background: transparent; color: var(--dp-text2); font: inherit; font-size: 12px; text-align: left; cursor: pointer; }
 .it-side-item:hover { background: var(--dp-bg2); color: var(--dp-text); }
 .it-side-item.is-active { background: color-mix(in srgb, var(--dp-brand) 9%, transparent); color: var(--dp-brand); font-weight: 600; }
@@ -744,6 +751,9 @@ window.__ModuleLoader__.load({
 .it-side-count { flex: 0 0 auto; color: var(--dp-text3); font-size: 10.5px; font-variant-numeric: tabular-nums; }
 .it-side-item.is-active .it-side-count { color: var(--dp-brand); }
 .it-main { flex: 1 1 auto; min-width: 0; }
+/* 拖动调宽时的全局态：光标统一、禁止选中，与单元测试 .dp-board.is-resizing 一致 */
+.it-board.is-resizing, .it-board.is-resizing * { cursor: col-resize !important; user-select: none; }
+.it-board.is-resizing .it-side { transition: none; }
 
 /* 集成测试表：复用 dp-table 观感，列少、可横向滚动 */
 .it-table-wrap { border: 1px solid var(--dp-border); border-radius: 12px; background: var(--dp-bg); overflow-x: auto; overscroll-behavior-x: contain; }
@@ -758,6 +768,48 @@ window.__ModuleLoader__.load({
 .it-card > .it-table-wrap { border: 0; border-radius: 0; }
 /* 卡片底部：分页条固定在这一条里，和单元测试的 .dp-card-foot 一致 */
 .it-card > .it-pager { margin: 0; padding: 10px 14px 11px; border-top: 1px solid var(--dp-border); background: var(--dp-bg); }
+/*
+ * 「测试用例 / 测试步骤」两页：表格占满可用高度、分页条永远贴底。
+ * 与单元测试（.dp-root:not(.it-root) 那一段）同一套做法，只是换成集成页的选择器。
+ *
+ * ★ 只作用于带 .it-board-fill 的容器 —— 这两个子页的 .it-board 才加了这个 class。
+ *   报告页没有 .it-board（它是 .it-report-groups），也刻意不参与这套高度分配：
+ *   报告页每个功能项各自带分页条，没有唯一的全局分页条可贴底，
+ *   硬套 flex + min-height:0 + overflow 会让内容参与父级高度争夺而被压缩。
+ *
+ * 高度来源：.it-board-fill 的高度由 JS 实测写进 inline style（见 IntegrationPanel
+ * 的 useEffect），这里只负责把这一个像素值沿 flex 链传下去：
+ *   .it-board-fill（定高）→ .it-main（弹性列）→ .it-card（撑满）→ .it-table-wrap（唯一滚动）
+ * 注意：绝不动 .dp-shell —— 它是三个子页共用的壳，改它会波及报告页。
+ */
+.it-board.it-board-fill { align-items: stretch; }
+.it-board.it-board-fill > .it-main {
+	display: flex;
+	flex-direction: column;
+	align-self: stretch;
+	min-height: 0;
+}
+.it-board.it-board-fill .it-subbar,
+.it-board.it-board-fill .it-filter-bar { flex: 0 0 auto; }
+.it-board.it-board-fill > .it-main > .it-card {
+	display: flex;
+	flex-direction: column;
+	flex: 1 1 auto;
+	min-height: 0;
+}
+/* 表格区是卡片里唯一可滚动的部分：表头吸顶，分页条留在卡片底沿 */
+.it-board.it-board-fill .it-card > .it-table-wrap {
+	flex: 1 1 auto;
+	min-height: 0;
+	overflow-y: auto;
+}
+.it-board.it-board-fill .it-card > .it-table-wrap > .it-table thead th {
+	position: sticky;
+	top: 0;
+	z-index: 2;
+	box-shadow: inset 0 -1px 0 var(--dp-border);
+}
+.it-board.it-board-fill .it-card > .it-pager { flex: 0 0 auto; }
 .it-table { width: 100%; min-width: 520px; border-collapse: collapse; font-size: 12px; }
 .it-table th { padding: 8px 7px; border-bottom: 1px solid var(--dp-border); background: var(--dp-bg2); color: var(--dp-text3); font-size: 11px; font-weight: 600; letter-spacing: .04em; text-align: center; white-space: nowrap; }
 .it-table td { padding: 9px 7px; border-bottom: 1px solid var(--dp-border2); color: var(--dp-text2); vertical-align: middle; text-align: center; }
@@ -784,7 +836,11 @@ window.__ModuleLoader__.load({
  * 步骤页的序号格：箭头 + 数字。箭头是整行唯一的下拉入口，
  * 放在序号左边才不会和右侧操作列抢注意力。
  */
-.it-no-cell { display: inline-flex; align-items: center; gap: 3px; }
+.it-no-cell { display: inline-flex; align-items: center; gap: 4px; }
+/* 步骤行的展开箭头 / 执行次数角标：直接复用单元测试的 .dp-expand-btn 与 .dp-run-count，
+   不再各写一套（原来是 .it-row-toggle 18px 小箭头 + .it-case-tag 灰标签，两边度量不一致）。 */
+.it-no-cell .dp-expand-btn { margin-top: 0; }
+.it-table .it-name-text + .dp-run-count { margin-left: 5px; }
 /*
  * 拖拽手柄：6 个灰点（3×2）、透明背景，只在测试用例页出现。
  * 鼠标移到行上才显现，避免整列都是点、看着吵；用 grab / grabbing 光标提示可拖。
@@ -797,10 +853,6 @@ window.__ModuleLoader__.load({
 .it-drag-handle.is-active { cursor: grabbing; color: var(--dp-brand); }
 /* 拖拽中的行：底色加重，明确「这一行正在被搬动」 */
 .it-table tr.is-dragging > td { background: color-mix(in srgb, var(--dp-brand) 7%, transparent); }
-.it-row-toggle { display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; padding: 0; border: 0; border-radius: 5px; background: transparent; color: var(--dp-text3); cursor: pointer; transition: background .12s, color .12s, transform .14s; }
-.it-row-toggle:hover { background: var(--dp-bg3); color: var(--dp-text); }
-.it-row-toggle svg { transition: transform .14s; }
-.it-row-toggle.is-open svg { transform: rotate(90deg); }
 /* 展开行：整行是一格，里面挂执行结果子表 */
 .it-expand-row > td { padding: 0; background: var(--dp-bg2); }
 .it-expand-box { padding: 8px 10px 10px; }
@@ -1416,12 +1468,28 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			return name === "" ? IT_SCENARIOS_NONE : name;
 		}
 
-		/** 场景清单：全部用例固定第一，其余按名称排，空场景落到「未分组」。 */
-		function itScenarioRows(records) {
+		/**
+		 * 场景清单：全部用例固定第一，其余按名称排，空场景落到「未分组」。
+		 *
+		 * @param records 用例列表
+		 * @param names   features.json 里的显式功能项名（可选）
+		 *
+		 * 口径与单元测试的 `layerRows()` 一致：**显式清单 ∪ 用例里实际用到的**。
+		 * 只按用例聚合的话，新建出来但还没放用例的功能项会立刻消失 ——
+		 * 用户点完「新建」什么也看不到，会以为没生效。
+		 */
+		function itScenarioRows(records, names) {
 			var counts = Object.create(null);
 			(Array.isArray(records) ? records : []).forEach(function (record) {
 				var name = itScenarioOf(record);
 				counts[name] = (counts[name] || 0) + 1;
+			});
+			// 显式清单先并进来，用 0 兜底 —— 空的功能项也要出现在侧栏里。
+			(Array.isArray(names) ? names : []).forEach(function (name) {
+				if (typeof name !== "string") return;
+				var trimmed = name.trim();
+				if (trimmed === "") return;
+				if (counts[trimmed] === undefined) counts[trimmed] = 0;
 			});
 			var rows = [{ key: "__all__", name: IT_SCENARIOS_ALL, count: (records || []).length }];
 			Object.keys(counts).sort(function (a, b) {
@@ -2564,6 +2632,52 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 					)
 					: h(FunctionField, { value: value, functions: props.functions, listId: "dp-bulk-functions", onChange: function (next) { setValue(next); setError(""); } }),
 				layerMode ? null : h("p", { className: "dp-hint" }, "填写已有或新的被测函数；清空后确定可解除所选用例的函数关联。"),
+				error ? h("p", { className: "dp-hint", style: { color: "var(--dp-danger)" } }, error) : null
+			);
+		}
+
+		/**
+		 * 新建功能项弹窗（集成测试）。
+		 *
+		 * 为什么不直接复用 CategoryPrompt：它的校验文案是「层级名不能为空」，
+		 * 在集成侧会让人以为改到了单元测试的层级。这里字段名、提示、上限都按功能项来，
+		 * 上限 30 与用例编辑器里的 `scenario: 30` 同一口径 —— 超了会被用例表单拒掉。
+		 */
+		function FeaturePrompt(props) {
+			var valueState = useState("");
+			var value = valueState[0];
+			var setValue = valueState[1];
+			var errorState = useState("");
+			var error = errorState[0];
+			var setError = errorState[1];
+
+			function submit() {
+				var name = value.trim();
+				if (name === "") { setError("功能项名称不能为空"); return; }
+				if (name.length > 30) { setError("功能项名称最多 30 个字符"); return; }
+				props.onSubmit(name);
+			}
+
+			return h(Modal, {
+				title: "新建功能项",
+				subtitle: "功能项是用例的分组维度，属于当前用例版本",
+				onClose: props.onClose,
+				footer: [
+					h(Button, { key: "cancel", onClick: props.onClose }, "取消"),
+					h(Button, { key: "ok", variant: "primary", "data-it": "feature-name-ok", onClick: submit }, "确定")
+				]
+			},
+				h(Field, { label: "功能项名称", full: true, hint: "建好后可以把用例归到这一项下；名称在当前版本内不能重复。" },
+					h("input", {
+						className: "dp-input",
+						value: value,
+						maxLength: 30,
+						placeholder: "例如：商品与购物车",
+						"data-it": "feature-name-input",
+						onChange: function (event) { setValue(event.target.value); setError(""); },
+						onKeyDown: function (event) { if (event.key === "Enter") submit(); }
+					})
+				),
 				error ? h("p", { className: "dp-hint", style: { color: "var(--dp-danger)" } }, error) : null
 			);
 		}
@@ -5704,6 +5818,43 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			var tabState = useState("cases");
 			var tab = tabState[0];
 			var setTab = tabState[1];
+			/*
+			 * 左栏宽度与拖拽态。
+			 *
+			 * 宽度是**用例页和步骤页共用的一份**：两个子页的侧栏是同一个东西，
+			 * 各存一份的话，用户在用例页拖好宽度、切到步骤页又变回默认，会以为没生效。
+			 * 0 表示沿用 CSS 默认宽度（128px），拖动后锁成用户选的像素值。
+			 */
+			var sideWidthState = useState(0);
+			var sideWidth = sideWidthState[0];
+			var setSideWidth = sideWidthState[1];
+			var sideResizingState = useState(false);
+			var sideResizing = sideResizingState[0];
+			var setSideResizing = sideResizingState[1];
+			/*
+			 * 显式功能项清单（features.json 里的 name 列表）。
+			 *
+			 * 侧栏的可选项 = 这份清单 ∪ 用例里用到的 scenario（见 itScenarioRows）。
+			 * 只存名字不存 id：面板不改动功能项的 id/code/description，
+			 * 写回时按名字对回原对象，对不上的才新建一条。
+			 */
+			var featureNamesState = useState([]);
+			var featureNames = featureNamesState[0];
+			var setFeatureNames = featureNamesState[1];
+			// 新建功能项弹窗：null = 关闭，弹窗内部自己管输入与校验。
+			var featurePromptState = useState(null);
+			var featurePrompt = featurePromptState[0];
+			var setFeaturePrompt = featurePromptState[1];
+			/*
+			 * 用例页 / 步骤页的表格容器（.it-board-fill）。
+			 *
+			 * 这两个子页要做「分页条贴底」：容器高度 = 窗口高度 - 容器顶边，实测后写进
+			 * inline style，再由 CSS 的 flex 链传到卡片底部。不写死 vh - 固定值，
+			 * 换分辨率 / 缩放都对（与单元测试 DataPanelView 里那段同源）。
+			 *
+			 * 报告页不用这个 ref —— 它没有 .it-board，也不需要贴底。
+			 */
+			var fillRef = useRef(null);
 			// 场景筛选 + 搜索 + 类型/状态筛选。
 			var scenarioState = useState(IT_SCENARIOS_ALL);
 			var scenario = scenarioState[0];
@@ -5957,6 +6108,13 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 							return next;
 						});
 						setRemote({ kinds: kinds, features: features });
+						/*
+						 * 显式功能项清单进状态：侧栏的「新建功能项」要往这份清单里加，
+						 * 清单本身也要能写回 features.json。取 name，忽略没有 name 的脏数据。
+						 */
+						setFeatureNames(features
+							.map(function (item) { return item && typeof item.name === "string" ? item.name.trim() : ""; })
+							.filter(function (name) { return name !== ""; }));
 						setSeed(function () {
 							/*
 							 * 后端没有版本时保留一个空 V0.0.1，与 buildIntegrationSeed 的
@@ -6000,6 +6158,43 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 				if (loadState === "idle") loadIntegration(false);
 				return undefined;
 			}, [active]);
+
+			/*
+			 * 用例页 / 步骤页：把「容器顶边到窗口底」这段高度实测出来，写进 .it-board-fill。
+			 *
+			 * 为什么测的是这一段而不是卡片自己：卡片内容少时卡片也矮，分页条就贴不住底。
+			 * 测到的是「可用空间」，与表格里有多少行无关 —— 3 条用例时分页条照样在底部。
+			 *
+			 * 报告页没有 .it-board-fill（fillRef 为 null），这段逻辑对它是空转，不会干扰。
+			 * 依赖里带 tab：切换子页后布局不同，要重新量一次。
+			 */
+			useEffect(function () {
+				if (typeof window === "undefined") return undefined;
+				if (!active) return undefined;
+				var frame = 0;
+				function apply() {
+					frame = 0;
+					var node = fillRef.current;
+					if (!node) return;
+					var top = node.getBoundingClientRect().top;
+					if (!(top > 0)) return;
+					var avail = Math.round(window.innerHeight - top - 16);
+					if (avail < 240) avail = 240;
+					node.style.height = avail + "px";
+				}
+				function schedule() {
+					if (frame) return;
+					if (typeof requestAnimationFrame === "function") frame = requestAnimationFrame(apply);
+					else apply();
+				}
+				apply();
+				window.addEventListener("resize", schedule);
+				return function () {
+					window.removeEventListener("resize", schedule);
+					if (frame && typeof cancelAnimationFrame === "function") cancelAnimationFrame(frame);
+					frame = 0;
+				};
+			}, [active, tab, notice, loadState]);
 
 			/** 改当前版本的数据；其他版本原样保留。 */
 			function patchRecords(next) {
@@ -6601,6 +6796,142 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 					});
 			}
 
+			/**
+			 * 把功能项清单写回 `case-versions/<V>/features.json`。
+			 *
+			 * 为什么按名字对回原对象：面板只提供「新建一个功能项」这一种改动，
+			 * 不改 id / code / description。已经存在的条目原样保留（连字段顺序都不动），
+			 * 只有清单里新增的名字才生成一条 `ft_*` 新条目。
+			 *
+			 * `source` 固定写 "manual"：它与 Skill 的三种来源（requirement / skill /
+			 * code-derived）区分开，报告侧一眼能看出「这条是人在面板上手动加的」。
+			 */
+			function persistFeatures(nextNames) {
+				if (typeof fetch !== "function") return;
+				if (sessionId === "") return;
+				if (loadState !== "ready") return;
+
+				var existing = (remote && Array.isArray(remote.features)) ? remote.features : [];
+				var byName = Object.create(null);
+				existing.forEach(function (item) {
+					if (item && typeof item.name === "string") byName[item.name.trim()] = item;
+				});
+				var usedIds = Object.create(null);
+				existing.forEach(function (item) {
+					if (item && typeof item.id === "string") usedIds[item.id] = true;
+				});
+				var nextFeatures = nextNames.map(function (name) {
+					if (byName[name]) return byName[name];
+					var id = "ft_manual_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 6);
+					while (usedIds[id]) id += "x";
+					usedIds[id] = true;
+					return { id: id, name: name, source: "manual" };
+				});
+
+				fetch("/data-panel/integration", {
+					method: "POST",
+					headers: { "content-type": "application/json", accept: "application/json" },
+					body: JSON.stringify({
+						sessionId: sessionId,
+						kind: "case",
+						op: "saveVersion",
+						version: version,
+						features: nextFeatures
+					})
+				})
+					.then(function (response) {
+						return response.json().catch(function () { return {}; }).then(function (data) {
+							if (!response.ok || data.ok === false) {
+								throw new Error((data && data.error) || ("保存失败（HTTP " + response.status + "）"));
+							}
+							return data;
+						});
+					})
+					.then(function () {
+						// 写盘成功后把内存里的清单也对齐，避免下次保存又按旧数据重算 id。
+						setRemote(function (previous) {
+							if (!previous) return previous;
+							return Object.assign({}, previous, { features: nextFeatures });
+						});
+						setNotice("");
+					})
+					.catch(function (error) {
+						setNotice("功能项保存到磁盘失败：" + (error && error.message ? error.message : String(error)) + "。界面上的改动还在，可以再点一次保存。");
+					});
+			}
+
+			/** 新建功能项：先改界面（侧栏立刻出现一条 0 条目的功能项），再写盘。 */
+			function createFeature(name) {
+				var trimmed = String(name || "").trim();
+				if (trimmed === "") return;
+				// 重名直接跳过，不产生重复条目。名字是功能项在侧栏里的唯一标识。
+				if (featureNames.indexOf(trimmed) !== -1) {
+					setFeaturePrompt(null);
+					setNotice("功能项「" + trimmed + "」已存在，没有重复新建。");
+					return;
+				}
+				var next = featureNames.concat([trimmed]);
+				setFeatureNames(next);
+				persistFeatures(next);
+				setFeaturePrompt(null);
+				// 新建完直接切到这一项，否则列表里多一行却还停在「全部用例」，看不出变化。
+				setScenario(trimmed);
+				resetPages();
+			}
+
+			/**
+			 * 左栏拖拽调宽：与单元测试 `startSidebarResize` 同一套做法。
+			 *
+			 * 拖动时直接改 DOM 宽度（不逐帧 setState，避免整张表格重渲染），松手后再写回状态。
+			 * 把手正好盖在两栏间距上，所以取「把手的前一个兄弟节点」就是侧栏。
+			 */
+			function startSideResize(event) {
+				if (!event || (event.pointerType === "mouse" && event.button !== 0)) return;
+				var handle = event.currentTarget;
+				var aside = handle ? handle.previousElementSibling : null;
+				if (!aside) return;
+				event.preventDefault();
+				var board = handle.parentElement;
+				var startX = event.clientX;
+				var startWidth = Math.round(aside.getBoundingClientRect().width) || 128;
+				var lastWidth = startWidth;
+				var clientX = startX;
+				var frame = 0;
+				setSideResizing(true);
+				handle.classList.add("is-dragging");
+
+				function apply() {
+					frame = 0;
+					var boardWidth = board ? board.getBoundingClientRect().width : 0;
+					// 至少给右侧表格留 280px；极窄时仍保证左栏 96px。与单元测试同口径。
+					var maxWidth = Math.max(96, Math.min(420, boardWidth - 280));
+					var next = Math.round(startWidth + (clientX - startX));
+					if (next < 96) next = 96;
+					if (next > maxWidth) next = maxWidth;
+					lastWidth = next;
+					aside.style.width = next + "px";
+				}
+				function move(moveEvent) {
+					clientX = moveEvent.clientX;
+					if (frame) return;
+					if (typeof requestAnimationFrame === "function") frame = requestAnimationFrame(apply);
+					else apply();
+				}
+				function stop() {
+					if (frame && typeof cancelAnimationFrame === "function") cancelAnimationFrame(frame);
+					frame = 0;
+					window.removeEventListener("pointermove", move);
+					window.removeEventListener("pointerup", stop);
+					window.removeEventListener("pointercancel", stop);
+					handle.classList.remove("is-dragging");
+					setSideResizing(false);
+					setSideWidth(lastWidth);
+				}
+				window.addEventListener("pointermove", move);
+				window.addEventListener("pointerup", stop);
+				window.addEventListener("pointercancel", stop);
+			}
+
 			/** 保存用例（新增或编辑）。 */
 			function saveCase(next) {
 				var exists = records.some(function (record) { return record.id === next.id; });
@@ -6635,7 +6966,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 				confirmSet(null);
 			}
 
-			var scenarios = itScenarioRows(records);
+			var scenarios = itScenarioRows(records, featureNames);
 			var typeCounts = {};
 			IT_TYPE_KEYS.forEach(function (key) { typeCounts[key] = 0; });
 			records.forEach(function (record) {
@@ -6662,19 +6993,39 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 
 			/** 场景侧栏。 */
 			function sidebar() {
-				return h("aside", { className: "it-side" },
-					h("div", { className: "it-side-title" }, "功能项"),
-					scenarios.map(function (row) {
-						return h("button", {
-							key: row.key,
-							type: "button",
-							className: cn("it-side-item", scenario === row.name ? "is-active" : ""),
-							onClick: function () { setScenario(row.name); resetPages(); }
-						},
-							h("span", { className: "it-side-name" }, row.name),
-							h("span", { className: "it-side-count" }, String(row.count))
-						);
-					})
+				return h("aside", {
+					className: "it-side",
+					// 宽度跟拖动结果走；没拖过就用 CSS 默认宽度。
+					style: sideWidth > 0 ? { width: sideWidth + "px" } : null
+				},
+					h("div", { className: "it-side-head" },
+						h("span", { className: "it-side-title" }, "功能项"),
+						h("div", { className: "it-side-tools" },
+							h(IconButton, {
+								name: "plus",
+								label: "新建功能项",
+								"data-it": "feature-create",
+								onClick: function () { setFeaturePrompt({}); }
+							})
+						)
+					),
+					h("div", { className: "it-side-scroll" },
+						scenarios.length <= 1
+							? h("div", { className: "it-side-empty" }, "还没有功能项，点上边的 + 新建一个。")
+							: null,
+						scenarios.map(function (row) {
+							return h("button", {
+								key: row.key,
+								type: "button",
+								className: cn("it-side-item", scenario === row.name ? "is-active" : ""),
+								"data-it": "scenario-" + row.name,
+								onClick: function () { setScenario(row.name); resetPages(); }
+							},
+								h("span", { className: "it-side-name" }, row.name),
+								h("span", { className: "it-side-count" }, String(row.count))
+							);
+						})
+					)
 				);
 			}
 
@@ -6752,8 +7103,17 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 				var rows = baseCurrent;
 				var shown = pageRows(rows, casePage);
 				return h(React.Fragment, null,
-					h("div", { className: "it-board" },
+					h("div", { className: cn("it-board", "it-board-fill", sideResizing ? "is-resizing" : ""), ref: fillRef },
 						sidebar(),
+						h("div", {
+							className: "dp-resizer",
+							role: "separator",
+							"aria-orientation": "vertical",
+							"aria-label": "拖动调整功能项宽度",
+							title: "拖动调整宽度",
+							"data-it": "side-resizer",
+							onPointerDown: startSideResize
+						}),
 						h("div", { className: "it-main" },
 							/* 和单元测试一样：表格 + 分页条包在一张卡片里（.dp-card 的观感） */
 							h("div", { className: "it-card" },
@@ -6991,8 +7351,17 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 				var rows = current;
 				var shown = pageRows(rows, stepPage);
 				return h(React.Fragment, null,
-					h("div", { className: "it-board" },
+					h("div", { className: cn("it-board", "it-board-fill", sideResizing ? "is-resizing" : ""), ref: fillRef },
 						sidebar(),
+						h("div", {
+							className: "dp-resizer",
+							role: "separator",
+							"aria-orientation": "vertical",
+							"aria-label": "拖动调整功能项宽度",
+							title: "拖动调整宽度",
+							"data-it": "side-resizer",
+							onPointerDown: startSideResize
+						}),
 						h("div", { className: "it-main" },
 							/*
 							 * 主表上方：左边「测试步骤」说明，右边「筛选」按钮；勾选后下面多一条提示条。
@@ -7042,12 +7411,14 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 														h("div", { className: "it-no-cell" },
 															h("button", {
 																type: "button",
-																className: cn("it-row-toggle", open ? "is-open" : ""),
+																// 复用单元测试的 .dp-expand-btn：30×30 按钮、19px 图标、展开整体转 90°
+																className: "dp-expand-btn",
+																"data-open": open ? "true" : "false",
 																"aria-expanded": open,
 																title: open ? "收起执行结果" : "展开执行结果",
 																"data-it": "expand-" + record.id,
 																onClick: function () { toggleStepOpen(record.id); }
-															}, h(Icon, { name: "chevron", size: 12 })),
+															}, h(Icon, { name: "chevron", size: 19 })),
 															h("span", null, String((currentPage - 1) * pageSize + index + 1))
 														)
 													),
@@ -7061,7 +7432,8 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 														 */
 														itRunCount(record) > 0
 															? h("span", {
-																className: "it-case-tag",
+																// 复用单元测试的 .dp-run-count（18px 高、10.5px 字、500 字重）
+																className: "dp-run-count",
 																"data-it": "run-count-" + record.id,
 																title: "已执行 " + itRunCount(record) + " 次"
 															}, String(itRunCount(record)))
@@ -7738,6 +8110,13 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 						 * 整体排版、含所有用例步骤表汇总），不是某条用例的单条报告。
 						 */
 						onExport: function (shown) { exportOverallReport(shown); }
+					})
+					: null,
+				// 新建功能项：弹窗。
+				featurePrompt !== null
+					? h(FeaturePrompt, {
+						onSubmit: createFeature,
+						onClose: function () { setFeaturePrompt(null); }
 					})
 					: null,
 				// 删除确认：短确认框，只删演示数据。
@@ -8904,6 +9283,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			RunReportModal: RunReportModal,
 			CategorySidebar: CategorySidebar,
 			CategoryPrompt: CategoryPrompt,
+			FeaturePrompt: FeaturePrompt,
 			EmptyState: EmptyState,
 			// 集成测试演示：壳、页签与各层组件。
 			TestPanelHost: TestPanelHost,
