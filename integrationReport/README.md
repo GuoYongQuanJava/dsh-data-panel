@@ -16,13 +16,13 @@
 | `sample-step.json` | 单条步骤报告的样例数据（供 `build_single_step`） |
 | `README.md` | 本文件 |
 
-`输出/` 目录在首次运行时自动创建，存放生成的 docx。
+`输出/` 目录在首次运行时自动创建，存放生成的 docx（已在 `.gitignore` 里，不进库）。
 
 ---
 
 ## 依赖
 
-- **Python 3**（实测 3.12）
+- **Python 3**
 - **python-docx**
 
 DSH 自带的 Python 已经装了 python-docx，可直接用：
@@ -59,7 +59,7 @@ cd <仓库根>\integrationReport
 
 会在 `输出/` 下生成两份 docx：
 
-- `样例1-整项目完整报告.docx` ← `build_full`，按测试阶段分章
+- `样例1-整项目完整报告.docx` ← `build_full`
 - `样例2-单个测试步骤报告.docx` ← `build_single_step`，一张表一页
 
 ### 在真实流程里调用
@@ -67,22 +67,62 @@ cd <仓库根>\integrationReport
 集成测试 Skill 是**写一段 Python 脚本 import 本模块**再调用，不是直接命令行跑：
 
 ```python
-import sys
-sys.path.insert(0, r"<仓库根>\integrationReport")
-from integration_report import build_full, build_single_step
+import importlib.util
 from pathlib import Path
 
-# 整项目报告：data 要按 stages 组织（不是平铺 features）
-data = { "meta": {...}, "people": {...}, "stages": [ { "name": ..., "features": [...],
-         "issues": [...], "inconsistent": [...], "regression": [...] } ] }
-build_full(Path(r"<模板路径>"), data, Path(r"<输出>\报告.docx"))
+PROTOTYPE = r"<仓库根>\integrationReport\integration_report.py"
+spec = importlib.util.spec_from_file_location("ir", PROTOTYPE)
+proto = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(proto)
+
+# 整项目报告
+data = {
+    "meta":   { "softwareName": ..., "projectCode": "JYSG", "source": "SRS", ... },
+    "people": { "designer": ..., "reviewer": ..., "tester": ... },
+    # 二选一，见下面「数据结构」
+    "stages": [ ... ]   # 或 "features": [ ... ]
+}
+proto.build_full(Path("<模板>"), data, Path("<输出>/报告.docx"))
 
 # 单条步骤报告：一张表一页，不带章节号与表题
-build_single_step(Path(r"<模板路径>"), step_data, Path(r"<输出>\单条.docx"))
+proto.build_single_step(Path("<模板>"), step_data, Path("<输出>/单条.docx"))
 ```
 
 > ⚠️ **两个函数不能混用**：单条报告用 `build_single_step`，整项目报告用 `build_full`。
 > 拿 `build_full` 生成单条会套上整本模板（曾踩过：产出 60 份 70KB 的大报告）。
+
+---
+
+## 数据结构
+
+`build_full` 的 `data` **两种结构都吃**，看 `integration_report.py` 第 683 行：
+
+**写法一：`features` 平铺（单阶段）**
+
+```json
+{ "meta": {...}, "people": {...}, "features": [ { "code", "name", "cases": [...] } ] }
+```
+
+只有一个阶段，报告只有一章。完整例子见 `sample-project.json`。
+
+**写法二：`stages` 分阶段（多章）**
+
+```json
+{
+  "meta": {...}, "people": {...},
+  "stages": [
+    {
+      "name": "sprint1",
+      "features": [ { "code", "name", "cases": [...] } ],
+      "issues": [...],
+      "inconsistent": "无",
+      "regression": { "date", "version", "features": [...] }
+    }
+  ]
+}
+```
+
+每个阶段生成一章（4、5、6…）。没给 `stages` 时，脚本会把 `features` 自动包成单个阶段，阶段名取 `meta.testStage`，缺省为「集成测试」。
 
 ---
 
@@ -127,5 +167,7 @@ GN-651-JYSG_SRS_UI_TESTING-1-T001.CTD
 **报 `ModuleNotFoundError: No module named 'docx'`** — 当前 Python 没装 python-docx。换用 DSH 自带那个 python.exe，或 `pip install python-docx`。
 
 **生成的报告打不开 / 提示损坏** — 先确认模板本身能正常打开。模板被别的工具改过（比如另存为）可能破坏 `numbering.xml`，报告依赖它的自动编号。
+
+**生成的报告章节结构不对 / 少了某几章** — 检查 `data` 里有没有 `stages`：有 `stages` 才有多个章节；只给 `features` 时只有一个阶段、一章。
 
 **跟单元测试报告搞混了** — 本目录只产出集成测试报告。单元测试报告在 `testReport/report-tool/`，走 `bridge.py` + `cmd.py`，模板和数据格式都不同。

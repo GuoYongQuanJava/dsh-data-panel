@@ -768,48 +768,6 @@ window.__ModuleLoader__.load({
 .it-card > .it-table-wrap { border: 0; border-radius: 0; }
 /* 卡片底部：分页条固定在这一条里，和单元测试的 .dp-card-foot 一致 */
 .it-card > .it-pager { margin: 0; padding: 10px 14px 11px; border-top: 1px solid var(--dp-border); background: var(--dp-bg); }
-/*
- * 「测试用例 / 测试步骤」两页：表格占满可用高度、分页条永远贴底。
- * 与单元测试（.dp-root:not(.it-root) 那一段）同一套做法，只是换成集成页的选择器。
- *
- * ★ 只作用于带 .it-board-fill 的容器 —— 这两个子页的 .it-board 才加了这个 class。
- *   报告页没有 .it-board（它是 .it-report-groups），也刻意不参与这套高度分配：
- *   报告页每个功能项各自带分页条，没有唯一的全局分页条可贴底，
- *   硬套 flex + min-height:0 + overflow 会让内容参与父级高度争夺而被压缩。
- *
- * 高度来源：.it-board-fill 的高度由 JS 实测写进 inline style（见 IntegrationPanel
- * 的 useEffect），这里只负责把这一个像素值沿 flex 链传下去：
- *   .it-board-fill（定高）→ .it-main（弹性列）→ .it-card（撑满）→ .it-table-wrap（唯一滚动）
- * 注意：绝不动 .dp-shell —— 它是三个子页共用的壳，改它会波及报告页。
- */
-.it-board.it-board-fill { align-items: stretch; }
-.it-board.it-board-fill > .it-main {
-	display: flex;
-	flex-direction: column;
-	align-self: stretch;
-	min-height: 0;
-}
-.it-board.it-board-fill .it-subbar,
-.it-board.it-board-fill .it-filter-bar { flex: 0 0 auto; }
-.it-board.it-board-fill > .it-main > .it-card {
-	display: flex;
-	flex-direction: column;
-	flex: 1 1 auto;
-	min-height: 0;
-}
-/* 表格区是卡片里唯一可滚动的部分：表头吸顶，分页条留在卡片底沿 */
-.it-board.it-board-fill .it-card > .it-table-wrap {
-	flex: 1 1 auto;
-	min-height: 0;
-	overflow-y: auto;
-}
-.it-board.it-board-fill .it-card > .it-table-wrap > .it-table thead th {
-	position: sticky;
-	top: 0;
-	z-index: 2;
-	box-shadow: inset 0 -1px 0 var(--dp-border);
-}
-.it-board.it-board-fill .it-card > .it-pager { flex: 0 0 auto; }
 .it-table { width: 100%; min-width: 520px; border-collapse: collapse; font-size: 12px; }
 .it-table th { padding: 8px 7px; border-bottom: 1px solid var(--dp-border); background: var(--dp-bg2); color: var(--dp-text3); font-size: 11px; font-weight: 600; letter-spacing: .04em; text-align: center; white-space: nowrap; }
 .it-table td { padding: 9px 7px; border-bottom: 1px solid var(--dp-border2); color: var(--dp-text2); vertical-align: middle; text-align: center; }
@@ -5845,16 +5803,6 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			var featurePromptState = useState(null);
 			var featurePrompt = featurePromptState[0];
 			var setFeaturePrompt = featurePromptState[1];
-			/*
-			 * 用例页 / 步骤页的表格容器（.it-board-fill）。
-			 *
-			 * 这两个子页要做「分页条贴底」：容器高度 = 窗口高度 - 容器顶边，实测后写进
-			 * inline style，再由 CSS 的 flex 链传到卡片底部。不写死 vh - 固定值，
-			 * 换分辨率 / 缩放都对（与单元测试 DataPanelView 里那段同源）。
-			 *
-			 * 报告页不用这个 ref —— 它没有 .it-board，也不需要贴底。
-			 */
-			var fillRef = useRef(null);
 			// 场景筛选 + 搜索 + 类型/状态筛选。
 			var scenarioState = useState(IT_SCENARIOS_ALL);
 			var scenario = scenarioState[0];
@@ -6158,43 +6106,6 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 				if (loadState === "idle") loadIntegration(false);
 				return undefined;
 			}, [active]);
-
-			/*
-			 * 用例页 / 步骤页：把「容器顶边到窗口底」这段高度实测出来，写进 .it-board-fill。
-			 *
-			 * 为什么测的是这一段而不是卡片自己：卡片内容少时卡片也矮，分页条就贴不住底。
-			 * 测到的是「可用空间」，与表格里有多少行无关 —— 3 条用例时分页条照样在底部。
-			 *
-			 * 报告页没有 .it-board-fill（fillRef 为 null），这段逻辑对它是空转，不会干扰。
-			 * 依赖里带 tab：切换子页后布局不同，要重新量一次。
-			 */
-			useEffect(function () {
-				if (typeof window === "undefined") return undefined;
-				if (!active) return undefined;
-				var frame = 0;
-				function apply() {
-					frame = 0;
-					var node = fillRef.current;
-					if (!node) return;
-					var top = node.getBoundingClientRect().top;
-					if (!(top > 0)) return;
-					var avail = Math.round(window.innerHeight - top - 16);
-					if (avail < 240) avail = 240;
-					node.style.height = avail + "px";
-				}
-				function schedule() {
-					if (frame) return;
-					if (typeof requestAnimationFrame === "function") frame = requestAnimationFrame(apply);
-					else apply();
-				}
-				apply();
-				window.addEventListener("resize", schedule);
-				return function () {
-					window.removeEventListener("resize", schedule);
-					if (frame && typeof cancelAnimationFrame === "function") cancelAnimationFrame(frame);
-					frame = 0;
-				};
-			}, [active, tab, notice, loadState]);
 
 			/** 改当前版本的数据；其他版本原样保留。 */
 			function patchRecords(next) {
@@ -6630,8 +6541,8 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 					"",
 					"## ★ 必须为这次单条执行生成报告",
 					"- 生成时间：执行结束、拿到结果之后**立即生成**，不要等用户再点一次。",
-					"- **必须调原型生成**：`F:\\插件开发\\集成报告原型\\integration_report.py` 的 `build_single_step()`。",
-					"  **不许自己写填表逻辑，不许复制原型改，原型缺失要明确报错**（不要降级成简化版）。",
+					"- **必须调生成器生成**：`F:\\插件开发\\dsh-data-panel\\integrationReport\\integration_report.py` 的 `build_single_step()`。",
+					"  **不许自己写填表逻辑，不许复制生成器改，生成器缺失要明确报错**（不要降级成简化版）。",
 					"- 存放位置：`integration/reports/<本次 runId>/`（**用这次执行的 runId 建目录**）。",
 					"- **只取「4.1.1 测试结果总结」那一张表**，不要按整本配置项测试模板排版。",
 					"- **不要章节号和表题**：不写「4.1 功能项名」、不写「4.1.1 测试结果总结」、",
@@ -6690,13 +6601,13 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 					"",
 					"## ★ 报告要出什么（两类，别混淆）",
 					"",
-					"### 共用铁律：报告一律调原型，不许自己写填表逻辑",
-					"- 原型路径：`F:\\插件开发\\集成报告原型\\integration_report.py`",
+					"### 共用铁律：报告一律调生成器，不许自己写填表逻辑",
+					"- 生成器路径：`F:\\插件开发\\dsh-data-panel\\integrationReport\\integration_report.py`",
 					"- 它对外只有两个函数：`build_single_step(...)` 单条报告、`build_full(...)` 总体报告。",
 					"- **不许自己实现表格填充**（会漏规范：不要章节号 / 类型映射 / 一页显示 / 人员默认值等）。",
-					"- **不许把原型复制一份改**（规范会分叉）。要改就改原型本身。",
-					"- **原型缺失时明确报错**，不许自己写个简化版冒充。",
-					"- 你的脚本只做「读 json → 组 data → 调原型」，填表交给原型。",
+					"- **不许把生成器复制一份改**（规范会分叉）。要改就改生成器本身。",
+					"- **生成器缺失时明确报错**，不许自己写个简化版冒充。",
+					"- 你的脚本只做「读 json → 组 data → 调生成器」，填表交给生成器。",
 					"",
 					"### A. 每条用例一份「单用列表」报告 —— 只取 4.1.1 那一张表",
 					"- **不要套整本配置项测试模板**，只取模板里 **4.1.1「测试结果总结」那一张表**并填好。",
@@ -7103,7 +7014,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 				var rows = baseCurrent;
 				var shown = pageRows(rows, casePage);
 				return h(React.Fragment, null,
-					h("div", { className: cn("it-board", "it-board-fill", sideResizing ? "is-resizing" : ""), ref: fillRef },
+					h("div", { className: cn("it-board", sideResizing ? "is-resizing" : "") },
 						sidebar(),
 						h("div", {
 							className: "dp-resizer",
@@ -7351,7 +7262,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 				var rows = current;
 				var shown = pageRows(rows, stepPage);
 				return h(React.Fragment, null,
-					h("div", { className: cn("it-board", "it-board-fill", sideResizing ? "is-resizing" : ""), ref: fillRef },
+					h("div", { className: cn("it-board", sideResizing ? "is-resizing" : "") },
 						sidebar(),
 						h("div", {
 							className: "dp-resizer",

@@ -1628,10 +1628,15 @@ async function handleRunReport(req, res) {
             continue
           }
           for (const sub of subEntries.sort()) {
+            if (sub.startsWith('~$')) continue   // 同上：跳过 Word 锁文件
             await pushFile(join(full, sub), sub, 'case')
           }
           continue
         }
+        // Word 的锁文件形如 `~$xxx.docx`（打开文档时生成，关闭后自动消失）。
+        // 必须排除：它只有 162 字节、内容不是 zip，混进列表会让用户点开报
+        // 「文件可能已损坏」，而真正的报告明明就在旁边。
+        if (name.startsWith('~$')) continue
         await pushFile(full, name, /\.docx$/i.test(name) ? 'overall' : 'meta')
       }
       let data = null
@@ -1817,6 +1822,9 @@ async function handleRunReportLatest(req, res) {
     let docx = null
     const files = []
     for (const name of names) {
+      // 跳过 Word 锁文件（`~$xxx.docx`）：它 sort 后排在很前面，
+      // 不排除的话下面「取第一个 .docx」会稳定选中这个 162 字节的临时文件。
+      if (name.startsWith('~$')) continue
       const file = join(dir, name)
       try {
         const info = await stat(file)
