@@ -189,10 +189,9 @@ window.__ModuleLoader__.load({
 .dp-run-table th { padding: 5px 8px; border-bottom: 1px solid var(--dp-border); color: var(--dp-text3); font-weight: 500; text-align: center; white-space: nowrap; }
 /*
  * 表头与内容对齐：
- *   短列（# / 时间 / 结果 / 操作）：th 和 td 都居中，天然对齐。
- *   「实际输出」：**表头居中、内容靠左** —— 长文本左对齐才好读，
- *     而表头只有四个字，放在这一列（很宽）的正中间才像正常表头。
- *     两者对齐基准不同是刻意的，不是 bug。
+ *   # / 时间 / 耗时 / 结果 / 操作：th 和 td 都居中，天然对齐。
+ *   「实际输出」：表头与内容都居中 —— 与其它列统一，避免内容贴左看起来歪掉。
+ *   输入 / 预期输出：表头居中，内容靠左（短文本，左对齐更易读）。
  *
  * 宽度策略（实测四种写法后的结论）：
  * 表格整体 width:100% 铺满整行，配合 table-layout:fixed 让各列严格按
@@ -205,7 +204,6 @@ window.__ModuleLoader__.load({
 /*
  * 报告弹窗那张表（测试函数 / 说明）仍然整列左对齐 —— 两列都是长文本，
  * 表头也左对齐才不会和内容错开。
- * 执行记录表的「实际输出」不用这条：按用户要求是「表头居中、内容靠左」。
  */
 .dp-run-table th.dp-left { text-align: left; }
 .dp-run-table td { padding: 5px 8px; border-bottom: 1px solid var(--dp-border2); color: var(--dp-text2); vertical-align: middle; text-align: center; }
@@ -213,8 +211,8 @@ window.__ModuleLoader__.load({
 .dp-run-table tr:last-child td { border-bottom: 0; }
 /* 操作列内容也居中，和它的表头对齐（表头已经是 text-align:center）。 */
 .dp-run-ops { display: flex; justify-content: center; gap: 2px; }
-/* 「实际输出」单元格里的原始文本。挂在 dp-left 上，和表头的对齐类保持一致。 */
-.dp-run-table td.dp-left pre { margin: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-family: ui-monospace, SFMono-Regular, "Cascadia Code", Consolas, monospace; font-size: 11px; line-height: 1.5; color: var(--dp-text2); }
+/* 「实际输出」单元格里的原始文本：居中显示，超长时省略。 */
+.dp-run-table td pre { margin: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; text-align: center; font-family: ui-monospace, SFMono-Regular, "Cascadia Code", Consolas, monospace; font-size: 11px; line-height: 1.5; color: var(--dp-text2); }
 .dp-run-state { display: inline-block; padding: 0 7px; border-radius: 5px; font-size: 11px; line-height: 18px; }
 .dp-run-state[data-tone="ok"] { background: color-mix(in srgb, #16a34a 14%, transparent); color: #16a34a; }
 .dp-run-state[data-tone="bad"] { background: color-mix(in srgb, var(--dp-danger) 12%, transparent); color: var(--dp-danger); }
@@ -238,6 +236,15 @@ window.__ModuleLoader__.load({
  * 底部固定一条 .dp-cat-pager，列表区自己滚动，两者互不影响。
  */
 .dp-board { display: flex; align-items: flex-start; gap: 12px; margin-top: 4px; }
+/* 左右两栏之间的拖拽调宽手柄：正好盖住两栏间距，平时不可见，悬停/拖动时显形。 */
+.dp-resizer { position: relative; flex: 0 0 auto; align-self: stretch; width: 12px; margin: 0 -12px; cursor: col-resize; touch-action: none; }
+.dp-root.dp-docked .dp-resizer { width: 8px; margin: 0 -8px; }
+.dp-resizer::before { content: ""; position: absolute; top: 8px; bottom: 8px; left: 50%; width: 2px; transform: translateX(-50%); border-radius: 2px; background: transparent; transition: background .12s; }
+.dp-resizer:hover::before,
+.dp-resizer.is-dragging::before { background: color-mix(in srgb, var(--dp-brand) 45%, transparent); }
+.dp-board.is-resizing,
+.dp-board.is-resizing * { cursor: col-resize !important; user-select: none; }
+.dp-board.is-resizing .dp-sidebar { transition: none; }
 .dp-sidebar { display: flex; flex-direction: column; flex: 0 0 auto; width: 128px; max-height: 62vh; padding: 8px 6px; border: 1px solid var(--dp-border); border-radius: 12px; background: var(--dp-bg); transition: width .16s ease, padding .16s ease; }
 /* 层级列表：唯一可滚动区，撑满除表头/分页外的剩余高度。 */
 .dp-cat-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; }
@@ -1030,6 +1037,108 @@ window.__ModuleLoader__.load({
 .it-root.is-narrow .it-grid-2 { grid-template-columns: 1fr; }
 .it-root.is-narrow .it-step-row { grid-template-columns: 20px 1fr auto; }
 .it-root.is-narrow .it-step-row .it-step-col-3 { display: none; }
+
+/* 参考图的淡紫灰视觉：仅覆盖颜色、圆角、边框与阴影，不改变布局和交互。 */
+.dp-root, .dp-detail, .dp-mask {
+	--dp-brand: #7c6ee6;
+	--dp-page: color-mix(in srgb, var(--dp-brand) 4%, var(--dp-bg));
+	--dp-border: color-mix(in srgb, var(--dp-brand) 6%, var(--dsw-alias-border-l1, #e5e6eb));
+	--dp-border2: color-mix(in srgb, var(--dp-brand) 3%, var(--dsw-alias-border-l2, #eef0f3));
+	--dp-control-shadow: 0 2px 6px rgba(64, 56, 120, .04);
+	--dp-card-shadow: 0 6px 22px rgba(64, 56, 120, .055);
+}
+.dp-root, .it-root.dp-root { background: var(--dp-page); }
+.dp-stat {
+	border-color: color-mix(in srgb, var(--dp-brand) 4%, var(--dp-border));
+	border-radius: 8px;
+	box-shadow: var(--dp-control-shadow);
+}
+.dp-stat:first-child {
+	border-color: transparent;
+	background: color-mix(in srgb, var(--dp-brand) 9%, var(--dp-bg));
+}
+.dp-stat:first-child b { color: var(--dp-brand); }
+.dp-stat:first-child span { color: color-mix(in srgb, var(--dp-brand) 72%, var(--dp-text2)); }
+.dp-stat b { font-weight: 600; }
+.dp-root:not(.it-root) .dp-stats .dp-stat:nth-child(6) b,
+.dp-root:not(.it-root) .dp-stats .dp-stat:nth-child(6) span { color: var(--dp-warning); }
+.dp-search input {
+	border-color: color-mix(in srgb, var(--dp-brand) 36%, var(--dp-border));
+	border-radius: 6px;
+	background: var(--dp-bg);
+	box-shadow: var(--dp-control-shadow);
+}
+.dp-search input:hover { border-color: color-mix(in srgb, var(--dp-brand) 62%, var(--dp-border)); }
+.dp-toolbar .dp-select,
+.dp-root .dp-btn,
+.dp-run-all-btn, .dp-report-btn, .dp-log-btn,
+.it-switch-btn, .it-version-btn, .it-filter-btn {
+	border-radius: 6px;
+	box-shadow: var(--dp-control-shadow);
+}
+.dp-root .dp-toolbar .dp-btn-primary {
+	border-color: var(--dp-border);
+	background: var(--dp-bg);
+	color: var(--dp-text);
+}
+.dp-root .dp-toolbar .dp-btn-primary:hover:not(:disabled) {
+	border-color: color-mix(in srgb, var(--dp-brand) 24%, var(--dp-border));
+	background: var(--dp-bg2);
+	color: var(--dp-text);
+	filter: none;
+}
+.dp-sidebar, .it-side { border-color: transparent; background: transparent; box-shadow: none; }
+.dp-sidebar-title, .it-side-title { color: var(--dp-text2); }
+.dp-cat, .dp-cat-main, .it-side-item { border-radius: 6px; }
+.dp-cat.is-active, .it-side-item.is-active { background: color-mix(in srgb, var(--dp-brand) 10%, transparent); }
+.dp-card, .it-card {
+	border-color: var(--dp-border);
+	border-radius: 10px;
+	background: var(--dp-bg);
+	box-shadow: var(--dp-card-shadow);
+}
+.it-table-wrap { border-color: var(--dp-border); border-radius: 10px; }
+.dp-table th, .it-table th {
+	border-bottom-color: var(--dp-border2);
+	background: color-mix(in srgb, var(--dp-brand) 2%, var(--dp-bg2));
+	color: var(--dp-text3);
+	font-weight: 500;
+}
+.dp-table thead th { box-shadow: inset 0 -1px 0 var(--dp-border2); }
+.dp-table td, .it-table td { border-bottom-color: var(--dp-border2); }
+.dp-row:hover, .it-table tbody tr:hover { background: color-mix(in srgb, var(--dp-brand) 3%, var(--dp-bg)); }
+.dp-row.is-open { background: color-mix(in srgb, var(--dp-brand) 5%, var(--dp-bg)); }
+.dp-type {
+	border-color: color-mix(in srgb, var(--dp-brand) 18%, transparent);
+	border-radius: 4px;
+	background: color-mix(in srgb, var(--dp-brand) 8%, transparent);
+}
+.dp-run-count { border-radius: 5px; background: var(--dp-bg3); color: var(--dp-text2); font-weight: 500; }
+.dp-icon-btn { border-radius: 6px; background: var(--dp-bg2); }
+.dp-card-foot, .it-card > .it-pager { border-top-color: var(--dp-border2); }
+.dp-pager-btn, .dp-pager-size select, .it-sp-btn, .it-sp-page, .it-sp-select { border-radius: 6px; }
+.dp-pager-page { border-color: transparent; background: transparent; }
+
+/* ── 单元测试面板：内容区占满可视高度，分页条永远贴底 ── */
+.dp-root:not(.it-root) .dp-shell {
+	display: flex;
+	flex-direction: column;
+	min-height: 100%;
+}
+.dp-root:not(.it-root) .dp-board {
+	flex: 1 1 auto;
+	min-height: 240px;
+}
+.dp-root:not(.it-root) .dp-main {
+	align-self: stretch;
+	display: flex;
+	flex-direction: column;
+	min-height: 0;
+}
+.dp-root:not(.it-root) .dp-card {
+	flex: 1 1 auto;
+	min-height: 0;
+}
 `;
 
 		function ensureStyles() {
@@ -2590,7 +2699,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 							h("td", { className: "dp-left" },
 								h(CellText, { value: run.expected, lines: 1 })
 							),
-							h("td", { className: "dp-left" },
+							h("td", null,
 								h("pre", { title: actualText }, actualText)
 							),
 							h("td", null, h("span", { className: "dp-run-state", "data-tone": tone }, label)),
@@ -3027,7 +3136,13 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			return h("aside", {
 				className: "dp-sidebar",
 				// 高度跟表格走：有量到值就锁死上限，量不到用 CSS 里的兜底 62vh。
-				style: boardHeight > 0 ? { maxHeight: boardHeight + "px" } : null,
+				// 宽度同理：拖动过就锁用户选的宽度，没拖过沿用 CSS 默认值。
+				style: (boardHeight > 0 || props.width > 0)
+					? {
+						maxHeight: boardHeight > 0 ? boardHeight + "px" : undefined,
+						width: props.width > 0 ? props.width + "px" : undefined
+					}
+					: null,
 			},
 				// 表头：标题 + 「新建层级」按钮（只作用于自定义层级那一段）。
 				h("div", { className: "dp-sidebar-head" },
@@ -3426,6 +3541,64 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			var boardHeight = boardHeightState[0];
 			var setBoardHeight = boardHeightState[1];
 			var boardRef = useRef(null);
+			// 左栏宽度：0 表示沿用 CSS 默认宽度（普通 128 / 侧栏 112），拖动后锁成用户选的像素值。
+			var sidebarWidthState = useState(0);
+			var sidebarWidth = sidebarWidthState[0];
+			var setSidebarWidth = sidebarWidthState[1];
+			var resizingState = useState(false);
+			var resizing = resizingState[0];
+			var setResizing = resizingState[1];
+
+			/*
+			 * 左栏拖拽调宽：把手正好盖在两栏间距上。
+			 * 拖动时直接改 DOM 宽度（不逐帧 setState，避免整张表格重渲染），松手后再写回状态。
+			 */
+			function startSidebarResize(event) {
+				if (!event || (event.pointerType === "mouse" && event.button !== 0)) return;
+				var handle = event.currentTarget;
+				var aside = handle ? handle.previousElementSibling : null;
+				if (!aside) return;
+				event.preventDefault();
+				var board = handle.parentElement;
+				var startX = event.clientX;
+				var startWidth = Math.round(aside.getBoundingClientRect().width) || (docked ? 112 : 128);
+				var lastWidth = startWidth;
+				var clientX = startX;
+				var frame = 0;
+				setResizing(true);
+				handle.classList.add("is-dragging");
+
+				function apply() {
+					frame = 0;
+					var boardWidth = board ? board.getBoundingClientRect().width : 0;
+					// 至少给右侧表格留 280px；极窄时仍保证左栏 96px。
+					var maxWidth = Math.max(96, Math.min(420, boardWidth - 280));
+					var next = Math.round(startWidth + (clientX - startX));
+					if (next < 96) next = 96;
+					if (next > maxWidth) next = maxWidth;
+					lastWidth = next;
+					aside.style.width = next + "px";
+				}
+				function move(moveEvent) {
+					clientX = moveEvent.clientX;
+					if (frame) return;
+					if (typeof requestAnimationFrame === "function") frame = requestAnimationFrame(apply);
+					else apply();
+				}
+				function stop() {
+					if (frame && typeof cancelAnimationFrame === "function") cancelAnimationFrame(frame);
+					frame = 0;
+					window.removeEventListener("pointermove", move);
+					window.removeEventListener("pointerup", stop);
+					window.removeEventListener("pointercancel", stop);
+					handle.classList.remove("is-dragging");
+					setResizing(false);
+					setSidebarWidth(lastWidth);
+				}
+				window.addEventListener("pointermove", move);
+				window.addEventListener("pointerup", stop);
+				window.addEventListener("pointercancel", stop);
+			}
 
 			// 删掉了原来那个「卡片高度 → 左栏容量」的 ResizeObserver：
 			// 卡片内容少时高度也跟着矮，左栏层级就被切成一页只放两三层，整个目录缩在顶部。
@@ -3923,12 +4096,16 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 									? "请先勾选要执行的用例"
 									: ("执行选中的 " + picked.length + " 条用例"),
 								onClick: runPicked,
-							}, picked.length > 0 ? ("执行选中 (" + picked.length + ")") : "执行选中"),
+							},
+								h(Icon, { name: "play", size: 15 }),
+								picked.length > 0 ? ("执行选中 (" + picked.length + ")") : "执行选中"),
 							h(Button, {
 								className: "dp-report-btn",
 								onClick: function () { openLatestTotalReport(); },
 								title: "打开最近一次整体执行的 Word 报告"
-							}, "报告"),
+							},
+								h(Icon, { name: "doc", size: 15 }),
+								"报告"),
 							SHOW_REPORT_LIST ? h(Button, {
 								onClick: function () { setReportView(true); },
 								title: "查看已生成的测试报告列表"
@@ -3937,7 +4114,9 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 								className: "dp-log-btn",
 								onClick: function () { setLogView({ record: null }); },
 								title: "查看本节全部用例的执行日志"
-							}, "日志")
+							},
+								h(Icon, { name: "log", size: 15 }),
+								"日志")
 						)
 					),
 					// 勾选反馈放在表格下方（不占表格上方的空间）。
@@ -3957,7 +4136,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 					) : null,
 				// 左栏只与表格平齐：标题、统计卡、工具栏都在它上面。
 				// 表格卡片的高度由 boardRef 量出来，交给左栏算每页能放几层。
-				h("div", { className: "dp-board" },
+				h("div", { className: cn("dp-board", resizing ? "is-resizing" : "") },
 					h(CategorySidebar, {
 						rows: categoryRows,
 						layerRows: layerRowsData,
@@ -3967,6 +4146,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 						pickedCount: picked.length,
 						docked: docked,
 						boardHeight: boardHeight,
+						width: sidebarWidth,
 						onSelect: function (value) {
 							if (axis === "layer") pickLayer(value);
 							else pickFunction(value);
@@ -3975,6 +4155,14 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 						onCreate: function () { setCategoryPrompt({ mode: "layer" }); },
 						onRename: function (name) { setCategoryPrompt({ mode: "rename", from: name }); },
 						onDelete: deleteLayer
+					}),
+					h("div", {
+						className: "dp-resizer",
+						role: "separator",
+						"aria-orientation": "vertical",
+						"aria-label": "拖动调整用例层级宽度",
+						title: "拖动调整宽度",
+						onPointerDown: startSidebarResize
 					}),
 					h("div", { className: "dp-main" },
 						h("div", { className: "dp-card", ref: boardRef },
@@ -4450,7 +4638,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 						: h("p", { className: "dp-summary", style: { color: "var(--dp-text3)" } }, "未填写预期输出。")
 				),
 				h("div", { className: "dp-section" },
-					h("h4", null, "旧代码位置"),
+					h("h4", null, "旧测试代码位置"),
 					record.codeRef
 						? h("p", { className: "dp-summary" }, h("code", { className: "dp-chip-mono" }, record.codeRef))
 						: h("p", { className: "dp-summary", style: { color: "var(--dp-text3)" } }, "未填写；查看测试代码会按测试目标定位。")

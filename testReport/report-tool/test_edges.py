@@ -1,5 +1,7 @@
-"""Edge cases: variable-row counts, module/case scaling, template errors."""
+"""Edge cases（v2）：变量行数、阶段/函数/用例规模、模板异常、CLI 退出码。
 
+运行：python test_edges.py
+"""
 import json
 import shutil
 import subprocess
@@ -14,30 +16,20 @@ from builder import BuilderError, build
 
 qn_table = qn("w:tbl")
 
-TEMPLATE = Path(__file__).resolve().parent.parent / "templates" / "RingBuffer-test.docx"
+TEMPLATE = Path(__file__).resolve().parent.parent / "templates" / "单元测试报告模板.docx"
 if not TEMPLATE.is_file():
-    TEMPLATE = Path(r"C:\Users\PC\Desktop\RingBuffer-test(1).docx")
+    TEMPLATE = Path(r"E:\gongzuo\harness\dshCJ\gitcode\单元测试资料\报告\单元测试报告模板.docx")
 PY = sys.executable
 failures = []
+
+# 模板自带 9 张固定表（软件信息/圈复杂度/覆盖率 + 附录 A~F）
+TEMPLATE_TABLES = 9
 
 
 def check(condition, message):
     print(("  PASS  " if condition else "  FAIL  ") + message)
     if not condition:
         failures.append(message)
-
-
-def make_payload(modules):
-    cases = [c for m in modules for c in m["cases"]]
-    return {
-        "meta": {"project": "边界测试", "executedAt": "2026-11-13", "executor": "h"},
-        "summary": {
-            "total": len(cases),
-            "passed": sum(1 for c in cases if c["passed"]),
-            "failed": sum(1 for c in cases if not c["passed"]),
-        },
-        "modules": modules,
-    }
 
 
 def mkcase(cid, inputs, outputs, passed=True):
@@ -54,14 +46,47 @@ def mkcase(cid, inputs, outputs, passed=True):
     }
 
 
+def mkfunction(fid, cases, coverage="未采集"):
+    passed = sum(1 for c in cases if c["passed"])
+    return {
+        "functionId": fid,
+        "name": fid,
+        "summary": {"total": len(cases), "passed": passed, "failed": len(cases) - passed},
+        "coverage": coverage,
+        "cases": cases,
+    }
+
+
+def make_payload(phases):
+    """phases: [{name, functions:[mkfunction(...)]}]"""
+    all_cases = [c for p in phases for f in p["functions"] for c in f["cases"]]
+    passed = sum(1 for c in all_cases if c["passed"])
+    return {
+        "schemaVersion": "2.0",
+        "meta": {"project": "边界测试", "executedAt": "2026-11-13", "executor": "h"},
+        "summary": {"total": len(all_cases), "passed": passed, "failed": len(all_cases) - passed},
+        "phases": [
+            {
+                "phaseId": f"phase-{i + 1}",
+                "name": p["name"],
+                "order": i + 1,
+                "functions": p["functions"],
+            }
+            for i, p in enumerate(phases)
+        ],
+    }
+
+
 tmp = Path(tempfile.mkdtemp(prefix="rpt-edge-"))
 
 print("== 0 组变量 ==")
-payload = make_payload([{"name": "M", "cases": [mkcase("Z-000.CTD", [], [])]}])
+payload = make_payload([{"name": "第一阶段", "functions": [mkfunction("F", [mkcase("Z-000.CTD", [], [])])]}])
 out = tmp / "zero.docx"
-build(str(TEMPLATE), payload, str(out))
+build(str(TEMPLATE), payload, str(out), refresh_toc=False)
 doc = Document(str(out))
-t = doc.tables[0]
+case_tables = [t for t in doc.tables if len(t.columns) == 11]  # RingBuffer 用例表是唯一的 11 列
+check(len(case_tables) == 1, f"1 条用例 → 1 张用例表（实际 {len(case_tables)}）")
+t = case_tables[0]
 check(len(t.rows) == 13, f"空变量时保留 1 行变量占位（实际 {len(t.rows)} 行）")
 row7 = t.rows[7]
 check(
@@ -73,68 +98,64 @@ print("\n== 1 组到 8 组变量 ==")
 for n in (1, 2, 5, 8):
     inputs = [[f"in{i}", f"v{i}"] for i in range(n)]
     outputs = [[f"out{i}", f"e{i}", f"a{i}"] for i in range(n)]
-    payload = make_payload([{"name": "M", "cases": [mkcase(f"N-{n:03d}.CTD", inputs, outputs)]}])
+    payload = make_payload([{"name": "第一阶段", "functions": [mkfunction("F", [mkcase(f"N-{n:03d}.CTD", inputs, outputs)])]}])
     out = tmp / f"n{n}.docx"
-    build(str(TEMPLATE), payload, str(out))
+    build(str(TEMPLATE), payload, str(out), refresh_toc=False)
     doc = Document(str(out))
-    t = doc.tables[0]
-    expected = 13 + (n - 1)  # template ships 1 variable row
+    t = [x for x in doc.tables if len(x.columns) == 11][0]
+    expected = 13 + (n - 1)  # 模板自带 1 行变量占位
     check(len(t.rows) == expected, f"{n} 组变量 → {len(t.rows)} 行（期望 {expected}）")
-    check(
-        t.rows[8].cells[0].text.strip() == "in1" if n > 1 else True,
-        f"{n} 组时第二行变量名正确",
-    )
+    if n > 1:
+        check(t.rows[8].cells[0].text.strip() == "in1", f"{n} 组时第二行变量名正确")
 
-print("\n== 多模块多用例 ==")
-modules = []
-for mi in range(4):
-    modules.append(
-        {
-            "name": f"模块{mi}",
-            "issues": f"模块{mi}问题",
-            "inconsistent": "无。",
-            "cases": [
-                mkcase(f"M{mi}-C{ci}.CTD", [["a", "1"]], [["b", "2", "2"]], passed=(ci % 2 == 0))
-                for ci in range(3)
-            ],
-        }
-    )
+print("\n== 多阶段 × 多函数 × 多用例 ==")
+phases = []
+for pi in range(3):
+    funcs = []
+    for fi in range(2):
+        funcs.append(
+            mkfunction(
+                f"F{pi}{fi}",
+                [mkcase(f"P{pi}F{fi}C{ci}.CTD", [["a", "1"]], [["b", "2", "2"]], passed=(ci % 2 == 0))
+                 for ci in range(2)],
+            )
+        )
+    phases.append({"name": f"第{pi + 1}阶段", "functions": funcs})
+
 out = tmp / "many.docx"
-build(str(TEMPLATE), make_payload(modules), str(out))
+build(str(TEMPLATE), make_payload(phases), str(out), refresh_toc=False)
 doc = Document(str(out))
-check(len(doc.tables) == 12, f"4 模块 × 3 用例 → 12 张表（实际 {len(doc.tables)}）")
-h3 = [p.text.strip() for p in doc.paragraphs if p.style.name == "编号标题3" and p.text.strip()]
-check(h3 == ["模块0", "模块1", "模块2", "模块3"], f"模块标题顺序正确：{h3}")
-issues = [p.text.strip() for p in doc.paragraphs if p.text.strip().startswith("模块") and "问题" in p.text]
-check(len(issues) == 4, f"4 个模块级问题写入（实际 {len(issues)}）")
+case_count = 3 * 2 * 2
+check(len(doc.tables) == TEMPLATE_TABLES + case_count,
+      f"3 阶段 × 2 函数 × 2 用例 → {TEMPLATE_TABLES + case_count} 张表（实际 {len(doc.tables)}）")
+
+h1 = [p.text.strip() for p in doc.paragraphs if p.style.name == "编号标题1" and p.text.strip()]
+for name in ("第1阶段", "第2阶段", "第3阶段"):
+    check(name in h1, f"阶段标题存在：{name}")
+
+h2 = [p.text.strip() for p in doc.paragraphs if p.style.name == "编号标题2" and p.text.strip()]
+check(sum(1 for x in h2 if x.startswith("F")) == 6, f"6 个函数各成节（实际 {sum(1 for x in h2 if x.startswith('F'))}）")
 
 print("\n== 通过/失败统计 ==")
-stats = [p.text for p in doc.paragraphs if p.text.startswith("共 ")]
-check(stats[0] == "共 3 条用例，通过 2 条，未通过 1 条。", f"统计行正确：{stats[0]!r}")
+stats = [p.text.strip() for p in doc.paragraphs if p.text.strip().startswith("共 ") and "条用例" in p.text]
+check(len(stats) == 6, f"每个函数一条统计行（实际 {len(stats)}）")
+check(stats[0] == "共 2 条用例，通过 1 条，失败 1 条。", f"统计行正确：{stats[0]!r}")
 
 print("\n== 模板异常 ==")
 broken = tmp / "broken.docx"
 d = Document(str(TEMPLATE))
 for p in d.paragraphs:
-    if p.style.name == "编号标题3":
-        p.style = d.styles["Normal"]
+    if "项目测试结果" in p.text:
+        for run in p.runs:
+            run.text = ""
+        break
 d.save(str(broken))
 try:
-    build(str(broken), make_payload([{"name": "M", "cases": [mkcase("X-1.CTD", [], [])]}]), str(tmp / "b.docx"))
-    check(False, "缺少编号标题3 时应抛 BuilderError")
+    build(str(broken), make_payload([{"name": "第一阶段", "functions": [mkfunction("F", [mkcase("X-1.CTD", [], [])])]}]),
+          str(tmp / "b.docx"), refresh_toc=False)
+    check(False, "缺少「项目测试结果」时应抛 BuilderError")
 except BuilderError as exc:
-    check(True, f"缺少编号标题3 抛 BuilderError：{exc}")
-
-no_table = tmp / "notable.docx"
-d = Document(str(TEMPLATE))
-for tbl in list(d.element.body.findall(qn_table)):
-    d.element.body.remove(tbl)
-d.save(str(no_table))
-try:
-    build(str(no_table), make_payload([{"name": "M", "cases": [mkcase("X-2.CTD", [], [])]}]), str(tmp / "b2.docx"))
-    check(False, "模板无表格时应抛错")
-except BuilderError as exc:
-    check(True, f"模板无表格抛 BuilderError：{exc}")
+    check(True, f"缺少「项目测试结果」抛 BuilderError：{str(exc).splitlines()[0]}")
 
 print("\n== CLI 退出码 ==")
 
@@ -151,31 +172,37 @@ def run(args, stdin=None):
 
 
 good = tmp / "good.json"
-good.write_text(json.dumps(make_payload([{"name": "M", "cases": [mkcase("G-1.CTD", [], [])]}]), ensure_ascii=False), encoding="utf-8")
+good.write_text(
+    json.dumps(make_payload([{"name": "第一阶段", "functions": [mkfunction("F", [mkcase("G-1.CTD", [], [])])]}]),
+               ensure_ascii=False),
+    encoding="utf-8",
+)
 
-r = run(["--template", str(TEMPLATE), "--data", str(good), "-o", str(tmp / "ok.docx")])
-check(r.returncode == 0, f"正常路径退出码 0（实际 {r.returncode}）")
+r = run(["--template", str(TEMPLATE), "--data", str(good), "-o", str(tmp / "ok.docx"), "--no-toc-refresh"])
+check(r.returncode == 0, f"正常路径退出码 0（实际 {r.returncode}）{r.stderr.strip()[:80]}")
 
 badj = tmp / "bad.json"
 badj.write_text("{not json", encoding="utf-8")
-r = run(["--template", str(TEMPLATE), "--data", str(badj), "-o", str(tmp / "x.docx")])
+r = run(["--template", str(TEMPLATE), "--data", str(badj), "-o", str(tmp / "x.docx"), "--no-toc-refresh"])
 check(r.returncode == 1, f"JSON 语法错误退出码 1（实际 {r.returncode}）")
 
 schemafail = tmp / "sf.json"
-sf = make_payload([{"name": "M", "cases": [mkcase("S-1.CTD", [], [])]}])
-# keep passed+failed == total so the module-count check is the one that fires
-sf["summary"]["total"] = 99
-sf["summary"]["passed"] = 99
-sf["summary"]["failed"] = 0
+sf = make_payload([{"name": "第一阶段", "functions": [mkfunction("F", [mkcase("S-1.CTD", [], [])])]}])
+sf["summary"] = {"total": 99, "passed": 99, "failed": 0}
 schemafail.write_text(json.dumps(sf, ensure_ascii=False), encoding="utf-8")
-r = run(["--template", str(TEMPLATE), "--data", str(schemafail), "-o", str(tmp / "x.docx")])
+r = run(["--template", str(TEMPLATE), "--data", str(schemafail), "-o", str(tmp / "x.docx"), "--no-toc-refresh"])
 check(r.returncode == 2, f"schema 校验失败退出码 2（实际 {r.returncode}）")
 check("用例总数" in r.stderr, f"stderr 含诊断信息：{r.stderr.strip()[:60]}")
 
-r = run(["--template", str(tmp / "nope.docx"), "--data", str(good), "-o", str(tmp / "x.docx")])
+r = run(["--template", str(broken), "--data", str(good), "-o", str(tmp / "x.docx"), "--no-toc-refresh"])
+check(r.returncode == 3, f"模板不可用退出码 3（实际 {r.returncode}）")
+
+r = run(["--template", str(tmp / "nope.docx"), "--data", str(good), "-o", str(tmp / "x.docx"), "--no-toc-refresh"])
 check(r.returncode == 4, f"模板不存在退出码 4（实际 {r.returncode}）")
 
-r = run(["--template", str(TEMPLATE), "--data", "-", "-o", str(tmp / "stdin.docx")], stdin=json.dumps(make_payload([{"name": "M", "cases": [mkcase("P-1.CTD", [], [])]}]), ensure_ascii=False))
+r = run(["--template", str(TEMPLATE), "--data", "-", "-o", str(tmp / "stdin.docx"), "--no-toc-refresh"],
+        stdin=json.dumps(make_payload([{"name": "第一阶段", "functions": [mkfunction("F", [mkcase("P-1.CTD", [], [])])]}]),
+                         ensure_ascii=False))
 check(r.returncode == 0, f"stdin 输入退出码 0（实际 {r.returncode}）")
 check((tmp / "stdin.docx").is_file(), "stdin 模式生成文件")
 

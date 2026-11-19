@@ -15,10 +15,11 @@ TYPE_OPTIONS = {"功能测试", "接口测试", "边界测试", "逻辑测试", 
 #   notRun  → 执行情况 □ 执行   [√]未执行   执行结果 □ 通过  □ 未通过
 STATUS_OPTIONS = {"passed", "failed", "notRun", "unconfirmed"}
 
+COVERAGE_TYPES = ("line", "block", "statement", "branch", "mcdc")
+
 
 class SchemaError(ValueError):
     """Raised when report data does not conform to the contract."""
-
     pass
 
 
@@ -29,10 +30,8 @@ def _check(condition: bool, message: str, path: str = "") -> None:
 
 def _str(value: Any, max_len: int = 0, path: str = "") -> str:
     where = f"{path}: " if path else ""
-    _check(
-        isinstance(value, str) and len(value) > 0,
-        where + f"期望非空字符串，收到 {type(value).__name__}",
-    )
+    _check(isinstance(value, str) and len(value) > 0,
+           where + f"期望非空字符串，收到 {type(value).__name__}")
     if max_len and len(value) > max_len:
         raise SchemaError(where + f"字符串长度 {len(value)} 超过上限 {max_len}")
     return value
@@ -51,7 +50,6 @@ def _iso_date(value: str, path: str = "") -> str:
     try:
         datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
     except (ValueError, TypeError):
-        # also accept "2026/11/13" as a Chinese date notation
         try:
             datetime.datetime.strptime(value, "%Y/%m/%d")
         except (ValueError, TypeError):
@@ -67,20 +65,11 @@ def _inputs(value: Any, path: str = "inputs") -> List[_Input]:
     _check(isinstance(value, list), "必须是数组", path)
     out: List[_Input] = []
     for index, item in enumerate(value):
-        item_path = f"{path}[{index}]"
-        _check(
-            isinstance(item, list) and len(item) == 2,
-            "必须是长度为 2 的数组 [变量名, 取值]",
-            item_path,
-        )
-        out.append(
-            (
-                _str(item[0], 120, f"{item_path}[0]"),
-                # an input *value* may legitimately be the empty string — e.g.
-                # a boundary test that submits an empty signature or password
-                _opt_str(item[1], "", 2000, f"{item_path}[1]"),
-            )
-        )
+        ipath = f"{path}[{index}]"
+        _check(isinstance(item, list) and len(item) == 2,
+               "必须是长度为 2 的数组 [变量名, 取值]", ipath)
+        out.append((_str(item[0], 120, f"{ipath}[0]"),
+                     _opt_str(item[1], "", 2000, f"{ipath}[1]")))
     return out
 
 
@@ -88,262 +77,326 @@ def _outputs(value: Any, path: str = "outputs") -> List[_Output]:
     _check(isinstance(value, list), "必须是数组", path)
     out: List[_Output] = []
     for index, item in enumerate(value):
-        item_path = f"{path}[{index}]"
-        _check(
-            isinstance(item, list) and len(item) == 3,
-            "必须是长度为 3 的数组 [变量名, 预期输出, 实际输出]",
-            item_path,
-        )
-        out.append(
-            (
-                _str(item[0], 120, f"{item_path}[0]"),
-                _opt_str(item[1], "", 2000, f"{item_path}[1]"),
-                # the actual value is legitimately empty for a case that never
-                # ran — "not measured" is not the same as "measured as blank"
-                _opt_str(item[2], "", 2000, f"{item_path}[2]"),
-            )
-        )
+        ipath = f"{path}[{index}]"
+        _check(isinstance(item, list) and len(item) == 3,
+               "必须是长度为 3 的数组 [变量名, 预期输出, 实际输出]", ipath)
+        out.append((_str(item[0], 120, f"{ipath}[0]"),
+                     _opt_str(item[1], "", 2000, f"{ipath}[1]"),
+                     _opt_str(item[2], "", 2000, f"{ipath}[2]")))
     return out
+
+
+def _validate_summary_block(s: dict, path: str) -> dict:
+    """Validate a {total, passed, failed, notRun, unconfirmed} block."""
+    keys = ("total", "passed", "failed", "notRun", "unconfirmed")
+    vals: Dict[str, int] = {}
+    for k in keys:
+        v = s.get(k, 0) if k in ("notRun", "unconfirmed") else s.get(k)
+        _check(isinstance(v, int) and v >= 0, f"{path}.{k} 必须是非负整数")
+        vals[k] = v
+    _check(vals["passed"] + vals["failed"] + vals["notRun"] + vals["unconfirmed"] == vals["total"],
+           f"{path}: passed+failed+notRun+unconfirmed ≠ total ({vals['total']})")
+    return vals
+
+
+def _validate_coverage(coverage: dict, path: str = "coverage") -> dict:
+    """Validate a coverage block: line, block, statement, branch, mcdc."""
+    available = coverage.get("available")
+    _check(isinstance(available, bool), f"{path}.available 必须是布尔值")
+    normalized: Dict[str, Any] = {"available": available}
+    reason = coverage.get("reason")
+    if reason is not None:
+        normalized["reason"] = _str(reason, 500, f"{path}.reason")
+    has_percent = False
+    for ct in COVERAGE_TYPES:
+        ct_data = coverage.get(ct)
+        if isinstance(ct_data, dict) and ct_data:  # 空对象视为未提供
+            _check(isinstance(ct_data, dict), f"{path}.{ct} 必须是 JSON 对象")
+            for field in ("total", "covered"):
+                v = ct_data.get(field)
+                _check(isinstance(v, (int, float)) and v >= 0,
+                       f"{path}.{ct}.{field} 必须是非负数")
+            pct = ct_data.get("percent")
+            _check(isinstance(pct, (int, float)) and 0 <= pct <= 100,
+                   f"{path}.{ct}.percent 必须在 0-100 之间")
+            normalized[ct] = {"total": ct_data["total"],
+                              "covered": ct_data["covered"],
+                              "percent": pct}
+            if pct > 0:
+                has_percent = True
+    if not available and has_percent:
+        raise SchemaError(f"{path}: available=false 但存在百分比 > 0 的覆盖率数据")
+    sf = coverage.get("sourceFile")
+    if sf is not None:
+        normalized["sourceFile"] = _opt_str(sf, "", 500, f"{path}.sourceFile")
+    return normalized
 
 
 def validate(raw: Any, skill_meta: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     """Return a normalised report object or raise SchemaError.
 
     *skill_meta* is the test procedure's skill file (see :mod:`skill_meta`).
-    It supplies the **three people fields** — designer, reviewer, tester —
-    because who designs, reviews and runs a procedure is decided once when the
-    procedure is set up, not per run.
-
-    Every other report field — unit id, design trace, driver, coverage,
-    issues — is *technical output of the run* and must come from the execution
-    data itself, never from the skill file.  Precedence for the people fields:
-
-        run data (case)  >  run data (module)  >  skill file  >  empty
+    In v2 data the people fields come from the execution data itself;
+    *skill_meta* is kept for compatibility but no longer drives defaults.
     """
-    skill = skill_meta or {}
-    skill_designer = skill.get("designer", "")
-    skill_reviewer = skill.get("reviewer", "")
-    skill_tester = skill.get("tester", "")
     _check(isinstance(raw, dict), "根元素必须是 JSON 对象")
     data = raw
+
+    # ── schemaVersion ──
+    version = data.get("schemaVersion")
+    _check(version == "2.0", f'schemaVersion 必须是 "2.0"，收到 {version!r}')
 
     # ── meta ──
     meta = data.get("meta")
     _check(isinstance(meta, dict), "meta 必须是 JSON 对象")
-    project = _str(meta.get("project"), 200, "meta.project")
-    executed_at = _iso_date(meta.get("executedAt", ""), "meta.executedAt")
-    executor = _opt_str(meta.get("executor"), "未记录执行器", 200, "meta.executor")
+
+    def _meta_str(k, max_len=200):
+        return _str(meta.get(k), max_len, f"meta.{k}")
+    def _meta_opt(k, default="", max_len=200):
+        return _opt_str(meta.get(k), default, max_len, f"meta.{k}")
+
+    norm_meta = {
+        "project": _meta_str("project"),
+        "projectPackage": _meta_opt("projectPackage", "", 80),
+        "softwareVersion": _meta_opt("softwareVersion", "", 40),
+        "devUnit": _meta_opt("devUnit", "", 120),
+        "importance": _meta_opt("importance", "", 20),
+        "language": _meta_opt("language", "", 40),
+        "executedAt": _iso_date(meta.get("executedAt", ""), "meta.executedAt"),
+        "executor": _meta_opt("executor", "未记录执行器"),
+        "runId": _meta_opt("runId"),
+        "status": _meta_opt("status", "", 40),
+        "statusText": _meta_opt("statusText"),
+        "durationMs": meta.get("durationMs"),
+        "exitCode": meta.get("exitCode"),
+        "logPath": _meta_opt("logPath", "", 500),
+        "resultPath": _meta_opt("resultPath", "", 500),
+        "note": _meta_opt("note", "", 2000),
+    }
+    # references / people（可选，由项目配置文件提供）
+    refs = meta.get("references")
+    if isinstance(refs, list):
+        norm_meta["references"] = [
+            {"type": str(r.get("type") or ""),
+             "name": str(r.get("name") or ""),
+             "version": str(r.get("version") or "")}
+            for r in refs if isinstance(r, dict)
+        ]
+    people = meta.get("people")
+    if isinstance(people, dict):
+        norm_meta["people"] = {
+            k: str(people.get(k) or "") for k in ("designer", "reviewer", "tester")
+        }
+    for field, label in (("durationMs", "durationMs 必须是整数或 null"),
+                          ("exitCode", "exitCode 必须是整数或 null")):
+        v = norm_meta[field]
+        _check(isinstance(v, int) or v is None, f"meta.{label}")
+
+    # ── provenance / scope (optional dicts) ──
+    for section in ("provenance", "scope"):
+        s = data.get(section)
+        _check(isinstance(s, (dict, type(None))), f"{section} 必须是 JSON 对象")
 
     # ── summary ──
-    # ``notRun`` is optional so existing payloads (total = passed + failed)
-    # keep working; when present it must balance too.
     summary = data.get("summary")
     _check(isinstance(summary, dict), "summary 必须是 JSON 对象")
-    total = summary.get("total")
-    passed = summary.get("passed")
-    failed = summary.get("failed")
-    not_run_total = summary.get("notRun", 0)
-    unconfirmed_total = summary.get("unconfirmed", 0)
-    _check(isinstance(total, int) and total >= 0, "summary.total 必须是非负整数")
-    _check(isinstance(passed, int) and passed >= 0, "summary.passed 必须是非负整数")
-    _check(isinstance(failed, int) and failed >= 0, "summary.failed 必须是非负整数")
-    _check(
-        isinstance(not_run_total, int) and not_run_total >= 0,
-        "summary.notRun 必须是非负整数",
-    )
-    _check(isinstance(unconfirmed_total, int) and unconfirmed_total >= 0,
-           "summary.unconfirmed 必须是非负整数")
-    _check(
-        passed + failed + not_run_total + unconfirmed_total == total,
-        f"summary.passed ({passed}) + summary.failed ({failed})"
-        f" + summary.notRun ({not_run_total}) + summary.unconfirmed ({unconfirmed_total}) ≠ summary.total ({total})",
-    )
-    if not_run_total:
-        executed = passed + failed + unconfirmed_total
-        coverage_rate = round(executed / total * 100, 1) if total else 0.0
-    else:
-        coverage_rate = 100.0 if total else 0.0
+    sv = _validate_summary_block(summary, "summary")
+    total, passed, failed, not_run, unconfirmed = (sv["total"], sv["passed"],
+        sv["failed"], sv["notRun"], sv["unconfirmed"])
+    executed_count = passed + failed + unconfirmed
+    total_dur = summary.get("totalDurationMs", 0)
+    _check(isinstance(total_dur, int) and total_dur >= 0,
+           "summary.totalDurationMs 必须是非负整数")
 
-    # ── modules ──
-    modules_raw = data.get("modules")
-    _check(isinstance(modules_raw, list) and len(modules_raw) > 0, "modules 必须是非空数组")
-
-    modules: List[Dict[str, Any]] = []
-    case_ids: set = set()
-    for mi, mod in enumerate(modules_raw):
-        prefix = f"modules[{mi}]"
-        _check(isinstance(mod, dict), f"{prefix} 必须是 JSON 对象")
-        mod_name = _str(mod.get("name"), 200, f"{prefix}.name")
-        # Every header field below is technical output of the run and must be
-        # supplied by the producing system — none of it comes from the skill.
-        # Missing header values fall back to explicit "not recorded / not measured"
-        # wording (never a fabricated placeholder such as "-" or "无"), so a minimal
-        # payload still renders without pretending the data exists.
-        unit_id = _opt_str(mod.get("unitId"), "未记录单元标识", 200, f"{prefix}.unitId")
-        trace = _opt_str(mod.get("trace"), "未提供设计追溯", 300, f"{prefix}.trace")
-        driver = _opt_str(mod.get("driver"), "未记录驱动模块", 200, f"{prefix}.driver")
-        coverage = _opt_str(mod.get("coverage"), "未采集", 200, f"{prefix}.coverage")
-        # designer / reviewer / tester default to the skill file, which records who
-        # owns this procedure; a module or case may override any of them.
-        mod_designer = _opt_str(
-            mod.get("designer"), skill_designer, 80, f"{prefix}.designer"
-        )
-        mod_reviewer = _opt_str(
-            mod.get("reviewer"), skill_reviewer, 80, f"{prefix}.reviewer"
-        )
-        mod_tester = _opt_str(mod.get("tester"), skill_tester, 80, f"{prefix}.tester")
-
-        cases_raw = mod.get("cases")
-        _check(
-            isinstance(cases_raw, list) and len(cases_raw) > 0,
-            f"{prefix}.cases 必须是非空数组",
-        )
-
-        cases: List[Dict[str, Any]] = []
-        for ci, case in enumerate(cases_raw):
-            cprefix = f"{prefix}.cases[{ci}]"
-            _check(isinstance(case, dict), f"{cprefix} 必须是 JSON 对象")
-
-            case_id = _str(case.get("id"), 200, f"{cprefix}.id")
-            _check(
-                case_id not in case_ids,
-                f"用例标识 {case_id!r} 重复出现",
-            )
-            case_ids.add(case_id)
-
-            case_name = _str(case.get("name"), 200, f"{cprefix}.name")
-            case_type = _str(case.get("type"), 40, f"{cprefix}.type")
-            _check(
-                case_type in TYPE_OPTIONS,
-                f"测试类型 {case_type!r} 不在 {sorted(TYPE_OPTIONS)} 内",
-            )
-
-            desc = _str(case.get("description"), 12000, f"{cprefix}.description")
-            func_desc = _opt_str(case.get("funcDesc"), case_name, 200, f"{cprefix}.funcDesc")
-            stub = _opt_str(case.get("stub"), "未记录", 200, f"{cprefix}.stub")
-            inserted = _opt_str(case.get("inserted"), "未记录", 200, f"{cprefix}.inserted")
-            inp = _inputs(case.get("inputs"), f"{cprefix}.inputs")
-            out = _outputs(case.get("outputs"), f"{cprefix}.outputs")
-
-            passed_val = case.get("passed")
-            _check(
-                isinstance(passed_val, bool),
-                f"{cprefix}.passed 必须是布尔值",
-            )
-
-            # Execution status: the three states the template's tick boxes can
-            # express.  ``passed`` alone cannot say "never executed", which is
-            # exactly what happens when the generator misses a case.
-            status_raw = case.get("status")
-            if status_raw is None:
-                status = "passed" if passed_val else "failed"
-            else:
-                _check(
-                    isinstance(status_raw, str),
-                    f"{cprefix}.status 必须是字符串",
-                )
-                status = status_raw.strip()
-                _check(
-                    status in STATUS_OPTIONS,
-                    f"执行状态 {status!r} 不在 {sorted(STATUS_OPTIONS)} 内",
-                )
-                # keep ``passed`` and ``status`` consistent
-                if status == "notRun":
-                    _check(
-                        passed_val is False,
-                        f"{cprefix}.status=notRun 但 passed={passed_val}；"
-                        "未执行的用例不可能「通过」，请把 passed 设为 false",
-                    )
-                else:
-                    expect_passed = status == "passed"
-                    _check(
-                        passed_val == expect_passed,
-                        f"{cprefix}.passed={passed_val} 与 status={status!r} 矛盾",
-                    )
-
-            not_run_reason = _opt_str(case.get("notRunReason"), "", 500, f"{cprefix}.notRunReason")
-
-            issue = _opt_str(case.get("issue"), "未记录异常", 4000, f"{cprefix}.issue")
-            bug_id = _opt_str(case.get("bugId"), "未记录", 80, f"{cprefix}.bugId")
-            designer = _opt_str(case.get("designer"), mod_designer, 80, f"{cprefix}.designer")
-            reviewer = _opt_str(case.get("reviewer"), mod_reviewer, 80, f"{cprefix}.reviewer")
-            tester = _opt_str(case.get("tester"), mod_tester, 80, f"{cprefix}.tester")
-            case_exec_at = _opt_str(case.get("executedAt"), "", 40, f"{cprefix}.executedAt")
-
-            cases.append(
-                {
-                    "id": case_id,
-                    "name": case_name,
-                    "type": case_type,
-                    "description": desc,
-                    "funcDesc": func_desc,
-                    "stub": stub,
-                    "inserted": inserted,
-                    "inputs": inp,
-                    "outputs": out,
-                    "passed": passed_val,
-                    "status": status,
-                    "notRunReason": not_run_reason,
-                    "issue": issue,
-                    "bugId": bug_id,
-                    "designer": designer,
-                    "reviewer": reviewer,
-                    "tester": tester,
-                    "executedAt": case_exec_at,
-                }
-            )
-
-        modules.append(
-            {
-                "name": mod_name,
-                "unitId": unit_id,
-                "trace": trace,
-                "driver": driver,
-                "coverage": coverage,
-                "caseCount": len(cases),
-                "issues": _opt_str(mod.get("issues"), "未记录异常。", 4000, f"{prefix}.issues"),
-                "inconsistent": _opt_str(
-                    mod.get("inconsistent"), "未核查。", 4000, f"{prefix}.inconsistent"
-                ),
-                "cases": cases,
-            }
-        )
-
-    actual = sum(len(m["cases"]) for m in modules)
-    _check(actual == total, f"modules 用例总数 ({actual}) ≠ summary.total ({total})")
-
-    # The per-case statuses are the source of truth; summary must agree.
-    counted = {"passed": 0, "failed": 0, "notRun": 0, "unconfirmed": 0}
-    for module in modules:
-        for case in module["cases"]:
-            counted[case["status"]] += 1
-    _check(
-        counted["passed"] == passed,
-        f"用例中 status=passed 的有 {counted['passed']} 条，"
-        f"但 summary.passed={passed}",
-    )
-    _check(
-        counted["failed"] == failed,
-        f"用例中 status=failed 的有 {counted['failed']} 条，"
-        f"但 summary.failed={failed}",
-    )
-    _check(
-        counted["notRun"] == not_run_total,
-        f"用例中 status=notRun 的有 {counted['notRun']} 条，"
-        f"但 summary.notRun={not_run_total}",
-    )
-    _check(counted["unconfirmed"] == unconfirmed_total,
-           f"用例中 status=unconfirmed 的有 {counted['unconfirmed']} 条，但 summary.unconfirmed={unconfirmed_total}")
-
-    return {
-        "meta": {"project": project, "executedAt": executed_at, "executor": executor},
-        "summary": {
-            "total": total,
-            "passed": passed,
-            "failed": failed,
-            "notRun": not_run_total,
-            "unconfirmed": unconfirmed_total,
-            "executedRate": coverage_rate,
-        },
-        "modules": modules,
+    norm_summary = {
+        "total": total, "passed": passed, "failed": failed,
+        "notRun": not_run, "unconfirmed": unconfirmed,
+        "executed": executed_count,
+        "executionRate": round(executed_count / total * 100, 1) if total else 0.0,
+        "passRate": round(passed / executed_count * 100, 1) if executed_count else 0.0,
+        "skipRate": round(not_run / total * 100, 1) if total else 0.0,
+        "totalDurationMs": total_dur,
     }
+
+    # ── phases ──
+    phases_raw = data.get("phases")
+    _check(isinstance(phases_raw, list) and len(phases_raw) > 0,
+           "phases 必须是非空数组")
+
+    phases: List[Dict[str, Any]] = []
+    phase_ids: set = set()
+    all_func_ids: set = set()
+    all_case_ids: set = set()
+    gcount: Dict[str, int] = {"passed": 0, "failed": 0, "notRun": 0, "unconfirmed": 0}
+
+    for pi, phase in enumerate(phases_raw):
+        pp = f"phases[{pi}]"
+        _check(isinstance(phase, dict), f"{pp} 必须是 JSON 对象")
+        phase_id = _str(phase.get("phaseId"), 200, f"{pp}.phaseId")
+        _check(phase_id not in phase_ids, f"phaseId {phase_id!r} 重复出现")
+        phase_ids.add(phase_id)
+        phase_name = _str(phase.get("name"), 200, f"{pp}.name")
+        phase_order = phase.get("order")
+        _check(isinstance(phase_order, int) and phase_order >= 1,
+               f"{pp}.order 必须是正整数")
+
+        functions_raw = phase.get("functions")
+        _check(isinstance(functions_raw, list) and len(functions_raw) > 0,
+               f"{pp}.functions 必须是非空数组")
+
+        functions: List[Dict[str, Any]] = []
+        for fi, func in enumerate(functions_raw):
+            fp = f"{pp}.functions[{fi}]"
+            _check(isinstance(func, dict), f"{fp} 必须是 JSON 对象")
+            func_id = _str(func.get("functionId"), 200, f"{fp}.functionId")
+            _check(func_id not in all_func_ids,
+                   f"functionId {func_id!r} 跨 phase 重复出现")
+            all_func_ids.add(func_id)
+
+            func_name = _str(func.get("name"), 200, f"{fp}.name")
+            source_file = _opt_str(func.get("sourceFile"), "未记录源文件", 500, f"{fp}.sourceFile")
+
+            # function.summary
+            fs = func.get("summary")
+            _check(isinstance(fs, dict), f"{fp}.summary 必须是 JSON 对象")
+            fsv = _validate_summary_block(fs, f"{fp}.summary")
+            ftotal, fpassed, ffailed, fnot, funconf = (fsv["total"], fsv["passed"],
+                fsv["failed"], fsv["notRun"], fsv["unconfirmed"])
+
+            unit_id = _opt_str(func.get("unitId"), "未记录单元标识", 200, f"{fp}.unitId")
+            trace = _opt_str(func.get("trace"), "未提供设计追溯", 300, f"{fp}.trace")
+            driver = _opt_str(func.get("driver"), "未记录驱动模块", 200, f"{fp}.driver")
+            coverage = _opt_str(func.get("coverage"), "未采集", 200, f"{fp}.coverage")
+
+            # ── cases ──
+            cases_raw = func.get("cases")
+            _check(isinstance(cases_raw, list) and len(cases_raw) > 0,
+                   f"{fp}.cases 必须是非空数组")
+
+            cases: List[Dict[str, Any]] = []
+            for ci, case in enumerate(cases_raw):
+                cp = f"{fp}.cases[{ci}]"
+                _check(isinstance(case, dict), f"{cp} 必须是 JSON 对象")
+
+                case_id = _str(case.get("id"), 200, f"{cp}.id")
+                _check(case_id not in all_case_ids, f"用例标识 {case_id!r} 重复出现")
+                all_case_ids.add(case_id)
+
+                case_name = _str(case.get("name"), 200, f"{cp}.name")
+                case_type = _str(case.get("type"), 40, f"{cp}.type")
+                _check(case_type in TYPE_OPTIONS,
+                       f"测试类型 {case_type!r} 不在 {sorted(TYPE_OPTIONS)} 内")
+
+                desc = _str(case.get("description"), 12000, f"{cp}.description")
+                func_desc = _opt_str(case.get("funcDesc"), case_name, 200, f"{cp}.funcDesc")
+                test_func = _opt_str(case.get("testFunc"), "", 200, f"{cp}.testFunc")
+                subject_function = _opt_str(case.get("subjectFunction"), "", 200,
+                                            f"{cp}.subjectFunction")
+                stub = _opt_str(case.get("stub"), "未记录", 200, f"{cp}.stub")
+                inserted = _opt_str(case.get("inserted"), "未记录", 200, f"{cp}.inserted")
+                inp = _inputs(case.get("inputs"), f"{cp}.inputs")
+                out = _outputs(case.get("outputs"), f"{cp}.outputs")
+
+                passed_val = case.get("passed")
+                _check(isinstance(passed_val, bool), f"{cp}.passed 必须是布尔值")
+
+                status_raw = case.get("status")
+                if status_raw is None:
+                    status_val = "passed" if passed_val else "failed"
+                else:
+                    _check(isinstance(status_raw, str), f"{cp}.status 必须是字符串")
+                    status_val = status_raw.strip()
+                    _check(status_val in STATUS_OPTIONS,
+                           f"执行状态 {status_val!r} 不在 {sorted(STATUS_OPTIONS)} 内")
+                    if status_val == "notRun":
+                        _check(passed_val is False,
+                               f"{cp}.status=notRun 但 passed={passed_val}；"
+                               "未执行的用例不可能「通过」，请把 passed 设为 false")
+                    else:
+                        _check(passed_val == (status_val == "passed"),
+                               f"{cp}.passed={passed_val} 与 status={status_val!r} 矛盾")
+
+                not_run_reason = _opt_str(case.get("notRunReason"), "", 500, f"{cp}.notRunReason")
+                issue = _opt_str(case.get("issue"), "未记录异常", 4000, f"{cp}.issue")
+                bug_id = _opt_str(case.get("bugId"), "未记录", 80, f"{cp}.bugId")
+                designer = _opt_str(case.get("designer"), "", 80, f"{cp}.designer")
+                reviewer = _opt_str(case.get("reviewer"), "", 80, f"{cp}.reviewer")
+                tester = _opt_str(case.get("tester"), "", 80, f"{cp}.tester")
+                case_exec_at = _opt_str(case.get("executedAt"), "", 40, f"{cp}.executedAt")
+
+                gcount[status_val] += 1
+
+                cases.append({
+                    "id": case_id, "name": case_name, "type": case_type,
+                    "description": desc, "funcDesc": func_desc,
+                    "testFunc": test_func, "subjectFunction": subject_function,
+                    "stub": stub, "inserted": inserted,
+                    "inputs": inp, "outputs": out,
+                    "passed": passed_val, "status": status_val,
+                    "notRunReason": not_run_reason,
+                    "issue": issue, "bugId": bug_id,
+                    "designer": designer, "reviewer": reviewer,
+                    "tester": tester, "executedAt": case_exec_at,
+                })
+
+            _check(len(cases) == ftotal,
+                   f"{fp}: cases 数量 ({len(cases)}) ≠ summary.total ({ftotal})")
+
+            functions.append({
+                "functionId": func_id, "name": func_name,
+                "sourceFile": source_file,
+                "summary": {"total": ftotal, "passed": fpassed,
+                            "failed": ffailed, "notRun": fnot,
+                            "unconfirmed": funconf},
+                "unitId": unit_id, "trace": trace, "driver": driver,
+                "coverage": coverage, "cases": cases,
+            })
+
+        phases.append({
+            "phaseId": phase_id, "name": phase_name, "order": phase_order,
+            "functions": functions,
+            "phaseIssues": _opt_str(phase.get("phaseIssues"), "", 4000, f"{pp}.phaseIssues"),
+            "phaseInconsistent": _opt_str(phase.get("phaseInconsistent"), "", 4000,
+                                          f"{pp}.phaseInconsistent"),
+        })
+
+    # ── cross-level balance ──
+    actual_total = sum(len(f["cases"]) for p in phases for f in p["functions"])
+    _check(actual_total == total,
+           f"phases 用例总数 ({actual_total}) ≠ summary.total ({total})")
+
+    for st in ("passed", "failed", "notRun", "unconfirmed"):
+        _check(gcount[st] == sv[st],
+               f"用例中 status={st} 的有 {gcount[st]} 条，但 summary.{st}={sv[st]}")
+
+    # ── coverage ──
+    coverage_raw = data.get("coverage")
+    norm_coverage = None
+    if coverage_raw is not None:
+        _check(isinstance(coverage_raw, dict), "coverage 必须是 JSON 对象")
+        norm_coverage = _validate_coverage(coverage_raw)
+
+    # ── reviews / issues / consistency / regressions (lenient) ──
+    for sec in ("reviews", "issues", "consistency", "regressions"):
+        s = data.get(sec)
+        _check(isinstance(s, (dict, type(None))), f"{sec} 必须是 JSON 对象")
+
+    result: Dict[str, Any] = {
+        "schemaVersion": "2.0", "meta": norm_meta,
+        "provenance": data.get("provenance"),
+        "scope": data.get("scope"),
+        "summary": norm_summary, "phases": phases,
+    }
+    if norm_coverage is not None:
+        result["coverage"] = norm_coverage
+    for sec in ("reviews", "issues", "consistency", "regressions"):
+        v = data.get(sec)
+        if v is not None:
+            result[sec] = v
+    # ── 模型分析字段（report-notes.json 合并而来），原样透传给 builder ──
+    for key in ("overallAssessment", "environmentImpact", "improvements", "staticItems"):
+        value = data.get(key)
+        if value is not None:
+            result[key] = value
+
+    return result

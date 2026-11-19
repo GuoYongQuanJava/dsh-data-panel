@@ -220,6 +220,77 @@ export const PRESETS = Object.freeze({
     targetDeclare: '\\bTEST(?:_F|_P)?\\s*\\(\\s*{target}\\s*\\)',
     targetDotted: true,
   },
+  // 与 gtest 同一套目标规则，只是整批执行并以 JUnit XML 作为逐条证据。
+  // 为什么单独一个 preset：preset 自带的 mode 与 command 是配套的，
+  // 单独覆盖 mode 会让 command 里的 {target} 与 batch 的 {targets} 对不上。
+  'gtest-batch': {
+    id: 'gtest-batch',
+    tools: [],
+    buildTools: ['cmake', ['g++', 'clang++', 'cl']],
+    label: 'GoogleTest (batch)',
+    language: 'cpp',
+    testFile: 'project:tests/generated_test.cpp',
+    mode: 'batch',
+    binary: 'project:build/tests/generated_test',
+    command: ['{binary}', '--gtest_filter={targets}', '--gtest_output=xml:{junit}', '--gtest_color=no'],
+    targetArg: '{target}',
+    // gtest 重复给 --gtest_filter 只有最后一个生效，必须用 : 拼成一条表达式。
+    targetsSeparator: ':',
+    junit: 'junit.xml',
+    notRunPattern: '\\[==========\\] Running 0 tests?',
+    targetExtract: [
+      '\\bTEST(?:_F|_P)?\\s*\\(\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*,\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*\\)',
+    ],
+    targetCompose: '{1}.{2}',
+    targetDeclare: '\\bTEST(?:_F|_P)?\\s*\\(\\s*{target}\\s*\\)',
+    targetDotted: true,
+  },
+  'gtest-batch-cov': {
+    id: 'gtest-batch-cov',
+    // gtest-batch + 旧版 VS 动态覆盖率采集（CodeCoverage.exe collect → analyze）。
+    // 需要安装带“Dynamic Code Coverage Tools”的 VS（Enterprise 2019/2022）。
+    // 选这个 preset 就要求本机真的能找到 CodeCoverage.exe，否则 prepare 会直接报缺工具。
+    tools: ['codecoverage'],
+    buildTools: ['cmake', ['g++', 'clang++', 'cl']],
+    label: 'GoogleTest (batch + VS 覆盖率)',
+    language: 'cpp',
+    testFile: 'project:tests/generated_test.cpp',
+    mode: 'batch',
+    binary: 'project:build/tests/generated_test',
+    command: ['{binary}', '--gtest_filter={targets}', '--gtest_output=xml:{junit}', '--gtest_color=no'],
+    targetArg: '{target}',
+    targetsSeparator: ':',
+    junit: 'junit.xml',
+    notRunPattern: '\\[==========\\] Running 0 tests?',
+    targetExtract: [
+      '\\bTEST(?:_F|_P)?\\s*\\(\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*,\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*\\)',
+    ],
+    targetCompose: '{1}.{2}',
+    targetDeclare: '\\bTEST(?:_F|_P)?\\s*\\(\\s*{target}\\s*\\)',
+    targetDotted: true,
+    coverage: {
+      // 第 1 步：collect 直接跑测试可执行文件（不要先用 vsinstr 插桩）。
+      command: [
+        '{codecoverage}', 'collect',
+        '/session:{runId}',
+        '/verbose',
+        '/config:{coverageConfig}',
+        '/output:{coverageRaw}',
+        '{binary}', '--gtest_filter={targets}',
+      ],
+      // 第 2 步：analyze 把 .coverage 导成旧版 XML。
+      postCommand: [
+        '{codecoverage}', 'analyze',
+        '/output:{coverageFile}',
+        '{coverageRaw}',
+      ],
+      format: 'vs-codecoverage-xml',
+      file: 'coverage/coverage.xml',
+      rawFile: 'coverage/run.coverage',
+      timeoutSec: 1200,
+      hint: '需 Enterprise 版 VS 的 Dynamic Code Coverage Tools；配置必须保留 AllowLowIntegrityProcesses=true（否则只得到 10 字节空报告），并以工具自带 CodeCoverage.config 为基础只改 ModulePaths/Sources 过滤。',
+    },
+  },
   meson: {
     id: 'meson',
     // Meson 构建 + `meson test` 跑。测试名用 TEST(...) 提取（与 gtest 一致）。
@@ -413,7 +484,14 @@ function normalizeCoverage(value) {
     : 900
   // 采不到时告诉用户“装什么”，比只说“没报告”有用。
   const hint = typeof value.hint === 'string' ? value.hint.trim() : ''
-  return { command, format, file, timeoutSec, hint }
+  // ── 两步采集（如旧版 VS：collect 跑测试 + analyze 导 XML）──
+  // postCommand 在主命令之后、读取报告文件之前执行；用同一个 argv 展开规则。
+  const postCommand = stringList(value.postCommand, 'coverage.postCommand')
+  // 原始容器文件（例如 .coverage）；不写就由 {coverageFile} 同名推导。
+  const rawFile = typeof value.rawFile === 'string' ? value.rawFile.trim() : ''
+  // 采集器自带的完整配置；不写则默认用采集器同目录的 CodeCoverage.config。
+  const configFile = typeof value.configFile === 'string' ? value.configFile.trim() : ''
+  return { command, postCommand, format, file, rawFile, configFile, timeoutSec, hint }
 }
 
 function stringList(value, field) {
@@ -471,6 +549,20 @@ export function resolveRunner({ project, root }) {
   }
 
   const base = presetId ? PRESETS[presetId] : null
+  // preset 的 mode 与 command 是配套的一对（per-case 用 {target}，batch 用 {targets}）。
+  // 单独覆盖 mode 会让继承来的 command 对不上占位符，所以只允许通过选 preset 来换模式。
+  if (profile !== null && profile.preset !== undefined && profile.mode !== undefined) {
+    const ownMode = (base && base.mode) || 'per-case'
+    const batchPreset = `${presetId}-batch`
+    const hint = PRESETS[batchPreset]
+      ? `要整批执行请改用 "preset": "${batchPreset}"`
+      : '该框架没有对应的 batch preset，请去掉 preset，自己写 id / mode / command'
+    throw new Error(
+      `runner.json 不能同时写 preset 和 mode：preset "${presetId}" 已经决定模式为 "${ownMode}"。`
+      + `${hint}；要逐条执行请删掉 mode。`
+    )
+  }
+
   const merged = {
     ...(base || {}),
     ...(profile || {}),
@@ -496,10 +588,16 @@ export function resolveRunner({ project, root }) {
     throw new Error('runner.json 缺少 command：需要一个字符串数组（{file} / {target} / {targets} 会被替换）')
   }
   if (mode === 'batch' && !command.some((token) => token.includes('{targets}'))) {
-    throw new Error('batch 模式的 command 必须包含 {targets}：它会展开成本次所有用例的目标')
+    throw new Error(
+      'batch 模式的 command 必须包含 {targets}：它会展开成本次所有用例的目标。'
+      + '若用了 preset，请改选带 -batch 后缀的预设（例如 gtest-batch），不要只手改 command。'
+    )
   }
   if (mode === 'per-case' && !command.some((token) => token.includes('{target}'))) {
-    throw new Error('per-case 模式的 command 必须包含 {target}：它会替换成单条用例的测试函数/测试名')
+    throw new Error(
+      'per-case 模式的 command 必须包含 {target}：它会替换成单条用例的测试函数/测试名。'
+      + '要整批执行请改用带 -batch 后缀的预设（例如 gtest-batch）。'
+    )
   }
 
   const targetArg = String(merged.targetArg || '{file}::{target}')
@@ -623,7 +721,7 @@ export function targetDeclared(testText, target, runner) {
 
 function fillPlaceholders(value, ctx) {
   return String(value).replace(
-    /\{(python|node|npx|gradlew|binary|project|root|runId|runDir|file|junit|coverageFile|coverageDir)\}/g,
+    /\{(python|node|npx|gradlew|binary|project|root|runId|runDir|file|junit|coverageFile|coverageDir|coverageRaw|coverageConfig|codecoverage)\}/g,
     (whole, key) => (typeof ctx[key] === 'string' ? ctx[key] : whole),
   )
 }
@@ -646,6 +744,10 @@ export function renderRunnerSpec(runner, ctx) {
   }
   const binary = typeof ctx.binary === 'string' && ctx.binary !== '' ? ctx.binary : (runner.binary || '')
   const mergedCtx = { ...ctx, binary, file: runner.testFile, junit }
+  // 把探测到的工具路径也放进占位符上下文，使 {codecoverage} / {python} 这类写法能直接展开。
+  for (const [key, value] of Object.entries(ctx.tools || {})) {
+    if (typeof value === 'string' && value !== '' && mergedCtx[key] === undefined) mergedCtx[key] = value
+  }
   const command = fillList(runner.command, mergedCtx)
   const preCommand = fillList(runner.preCommand || [], mergedCtx)
   // 探测到的工具必须真正用于执行；只替换 argv 的可执行文件，不改参数文本。
@@ -671,13 +773,49 @@ export function renderRunnerSpec(runner, ctx) {
       else if (isAbsolute(raw)) coverageFile = resolve(raw)
       else coverageFile = resolve(ctx.runDir, raw)
     }
-    const coverageCtx = { ...mergedCtx, coverageFile, coverageDir: coverageFile === '' ? '' : dirname(coverageFile) }
+    // 原始容器文件：显式 rawFile 优先；否则按报告文件同名推导（.xml -> .coverage）。
+    const rawSpec = String(runner.coverage.rawFile || '').trim()
+    let coverageRaw = ''
+    if (rawSpec !== '') {
+      if (/^project:/i.test(rawSpec)) coverageRaw = resolve(ctx.project, rawSpec.slice('project:'.length))
+      else if (/^root:/i.test(rawSpec)) coverageRaw = resolve(ctx.root, rawSpec.slice('root:'.length))
+      else if (isAbsolute(rawSpec)) coverageRaw = resolve(rawSpec)
+      else coverageRaw = resolve(ctx.runDir, rawSpec)
+    } else if (coverageFile !== '') {
+      coverageRaw = coverageFile.replace(/\.[^.\\/]+$/, '') + '.coverage'
+    }
+    // 采集器自带配置：显式 configFile 优先；否则用采集器同目录的 CodeCoverage.config。
+    const cfgSpec = String(runner.coverage.configFile || '').trim()
+    let coverageConfig = ''
+    if (cfgSpec !== '') {
+      if (/^project:/i.test(cfgSpec)) coverageConfig = resolve(ctx.project, cfgSpec.slice('project:'.length))
+      else if (/^root:/i.test(cfgSpec)) coverageConfig = resolve(ctx.root, cfgSpec.slice('root:'.length))
+      else if (isAbsolute(cfgSpec)) coverageConfig = resolve(cfgSpec)
+      else coverageConfig = resolve(ctx.runDir, cfgSpec)
+    } else {
+      // 约定优先：项目里自己维护的 testReport/coverage.config（已带业务过滤）优先于工具默认配置。
+      const projectCfg = resolve(ctx.project, 'testReport/coverage.config')
+      if (existsSync(projectCfg)) {
+        coverageConfig = projectCfg
+      } else {
+        const exe = ctx.tools && ctx.tools.codecoverage
+        if (typeof exe === 'string' && exe !== '') coverageConfig = join(dirname(exe), '..', 'CodeCoverage.config')
+      }
+    }
+    const coverageCtx = {
+      ...mergedCtx, coverageFile, coverageRaw, coverageConfig,
+      coverageDir: coverageFile === '' ? '' : dirname(coverageFile),
+    }
     const coverageCommand = useResolvedExecutable(fillList(runner.coverage.command || [], coverageCtx))
+    const coveragePost = useResolvedExecutable(fillList(runner.coverage.postCommand || [], coverageCtx))
     // 通配符不展开：由 runner 在报告生成后再去找文件（不同框架落盘时间不同）。
     coverage = {
       command: coverageCommand,
+      postCommand: coveragePost,
       format: String(runner.coverage.format || ''),
       file: coverageFile,
+      rawFile: coverageRaw,
+      configFile: coverageConfig,
       timeoutSec: runner.coverage.timeoutSec,
       hint: runner.coverage.hint || '',
     }

@@ -76,9 +76,21 @@ function makeRecord(overrides) {
 
 function runPrepared(prep) {
   // 直接跑面板给出的整条命令，顺带验证它对 shell 是可直接执行的。
+  // 注意：面板生成的命令面向 DSH 的 PowerShell（带引号的路径必须用 & 调用运算符），
+  // 所以这里用 PowerShell 跑；用 cmd 会报 “& was unexpected at this time.”。
   // 测试进程本身在 node --test 下，子进程要清掉 NODE_TEST_CONTEXT，否则 node --test 会认为自己在递归。
   const env = { ...process.env }
   delete env.NODE_TEST_CONTEXT
+  if (process.platform === 'win32') {
+    // PowerShell 不会自动透传子进程退出码（非零会变成 1），所以显式 exit $LASTEXITCODE，
+    // 否则测退出码的用例会误报。
+    const script = `${prep.command}\nexit $LASTEXITCODE`
+    return spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
+      encoding: 'utf8',
+      timeout: 120000,
+      env,
+    })
+  }
   return spawnSync(prep.command, { shell: true, encoding: 'utf8', timeout: 120000, env })
 }
 
@@ -472,9 +484,7 @@ test('gtest batch 与覆盖率重放共用本次筛选，VS Cobertura 解析不�
   const project = makeDir('panel-vs-coverage-')
   const root = join(project, '.dsh', 'test-sessions', 'vs')
   write(join(root, 'runner.json'), JSON.stringify({
-    preset: 'gtest', mode: 'batch', targetArg: '{target}', targetsSeparator: ':',
-    command: ['{binary}', '--gtest_filter={targets}', '--gtest_output=xml:{junit}'],
-    junit: 'junit.xml',
+    preset: 'gtest-batch',
     coverage: { command: ['C:/VS/Microsoft.CodeCoverage.Console.exe', 'collect', '--output-format', 'cobertura', '--output', '{coverageFile}', '{binary}', '--gtest_filter={targets}'], format: 'cobertura', file: 'coverage/coverage.xml' },
   }))
   const runner = resolveRunner({ project, root })
@@ -732,10 +742,14 @@ test('batch 退出码为 0 但缺少逐条证据时标记未确认', async () =>
   const root = join(project, '.dsh', 'test-sessions', 'batch-unknown')
   write(join(project, 'package.json'), JSON.stringify({ type: 'module' }))
   write(join(root, 'tests', 'test_generated.test.mjs'), "test('alpha', () => {})\n")
+  // 自定义运行器（不写 preset）：mode 与 command 由本文件自己配对。
   write(join(root, 'runner.json'), JSON.stringify({
-    preset: 'node-test', mode: 'batch',
+    id: 'node-test-batch', label: 'Node test (batch)', language: 'javascript',
+    testFile: 'tests/test_generated.test.mjs',
+    mode: 'batch',
     command: [process.execPath, '-e', 'process.exit(0)', '{targets}'],
     targetArg: '{target}', junit: 'junit.xml',
+    targetExtract: ["\\b(?:it|test)\\s*\\(\\s*['\"`]([^'\"`\\n]+)['\"`]"],
   }))
   const store = { records: [makeRecord({ code: "test('alpha', () => {})" })] }
   const prep = await __test.prepareRun({ sessionId: 'batch-unknown', cwd: project, scope: 'all', caseId: '', store })

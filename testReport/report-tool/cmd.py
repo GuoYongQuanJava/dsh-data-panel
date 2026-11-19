@@ -33,6 +33,7 @@ def _force_utf8_output() -> None:
         except Exception:
             pass
 
+from config_file import load_key_values as _load_key_values  # 与 bridge 共用一份解析实现
 
 def main(argv: list = None):
     _force_utf8_output()
@@ -57,6 +58,18 @@ def main(argv: list = None):
         type=Path,
         help="path to the procedure's SKILL.md (or its directory); supplies "
         "designer/reviewer/tester and module metadata",
+    )
+    parser.add_argument(
+        "--config",
+        default=None,
+        type=Path,
+        help="项目配置文件（testReport/skills/<工作区>.md）；补充 meta 中缺失的软件信息与人员",
+    )
+    parser.add_argument(
+        "--notes",
+        default=None,
+        type=Path,
+        help="模型分析 report-notes.json；合并 overallAssessment/environmentImpact/improvements/issues/consistency",
     )
     parser.add_argument(
         "-o",
@@ -89,6 +102,61 @@ def main(argv: list = None):
         print(f"错误：JSON 解析失败 — {exc}", file=sys.stderr)
         sys.exit(1)
 
+
+    # ── 合并项目配置（只补 meta 中缺失的值）──
+    if args.config:
+        if not args.config.is_file():
+            print(f"错误：找不到项目配置文件 {args.config}", file=sys.stderr)
+            sys.exit(1)
+        cfg = _load_key_values(args.config)
+        meta = payload.setdefault("meta", {})
+        mapping = {
+            "projectName": None,  # project 需要拼“单元测试”，单独处理
+            "projectPackage": "projectPackage",
+            "softwareVersion": "softwareVersion",
+            "devUnit": "devUnit",
+            "importance": "importance",
+            "language": "language",
+        }
+        for ckey, mkey in mapping.items():
+            if not mkey:
+                continue
+            val = (cfg.get(ckey) or "").strip()
+            cur = str(meta.get(mkey) or "").strip()
+            if val and (not cur or cur in ("未配置", "未提供")):
+                meta[mkey] = val
+        name = (cfg.get("projectName") or "").strip()
+        if name and (not str(meta.get("project") or "").strip() or meta.get("project", "").endswith("单元测试") and "未记录" in str(meta.get("project"))):
+            meta["project"] = name + " 单元测试"
+        refs = meta.get("references")
+        if not refs:
+            meta["references"] = [
+                {"type": "需求文档", "name": cfg.get("reqDocName") or "", "version": cfg.get("reqDocVersion") or ""},
+                {"type": "设计文档", "name": cfg.get("designDocName") or "", "version": cfg.get("designDocVersion") or ""},
+            ]
+        ppl = meta.get("people") or {}
+        for k in ("designer", "reviewer", "tester"):
+            if (cfg.get(k) or "").strip() and not str(ppl.get(k) or "").strip():
+                ppl[k] = cfg[k].strip()
+        meta["people"] = ppl
+
+    # ── 合并模型分析（report-notes.json）──
+    if args.notes:
+        if not args.notes.is_file():
+            print(f"错误：找不到分析文件 {args.notes}", file=sys.stderr)
+            sys.exit(1)
+        try:
+            notes = json.loads(args.notes.read_text(encoding="utf-8-sig"))
+        except json.JSONDecodeError as exc:
+            print(f"错误：分析文件 JSON 解析失败 — {exc}", file=sys.stderr)
+            sys.exit(1)
+        if isinstance(notes, dict):
+            for key in ("overallAssessment", "environmentImpact", "improvements"):
+                if notes.get(key) and not payload.get(key):
+                    payload[key] = notes[key]
+            for key in ("issues", "consistency"):
+                if notes.get(key) and not payload.get(key):
+                    payload[key] = notes[key]
     # ── build ──
     try:
         out_path = build(

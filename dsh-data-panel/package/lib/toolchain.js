@@ -19,7 +19,7 @@
  * 找不到一律返回空串 —— 调用方必须把「不在 PATH」和「项目不该用这个语言」分开判断，
  * 不能因为一次探测失败就跳过整门语言。
  */
-import { readdirSync, statSync } from 'node:fs'
+import { readdirSync, statSync, readFileSync } from 'node:fs'
 import { join, isAbsolute } from 'node:path'
 import { homedir } from 'node:os'
 
@@ -55,6 +55,8 @@ const TOOL_ALIASES = {
   msbuild: ['msbuild', 'MSBuild'],
   bazel: ['bazel'],
   meson: ['meson'],
+  // 旧版 VS 动态代码覆盖率采集器（Enterprise 版才带），不在 PATH 上。
+  codecoverage: ['CodeCoverage.exe', 'CodeCoverage'],
 }
 
 /** 别名列表：主名在最前，去重。 */
@@ -360,7 +362,136 @@ function commonPatterns() {
       patterns.push(join(value, 'bin'), join(value, 'shims'), join(value, 'versions', '*', 'bin'), value)
     }
   }
+
   return patterns.filter((item) => typeof item === 'string' && item.trim() !== '')
+}
+
+
+/**
+ * Visual Studio「动态代码覆盖率」采集器的落点。
+ *
+ * 它不在 PATH，也不在标准 bin 下，而是 `<VS>\Team Tools\Dynamic Code Coverage Tools\amd64`。
+ * 只装 Professional 的机器没有这个目录（旧版覆盖率是 Enterprise 功能），所以逐实例探测。
+ *
+ * 纯文件读取：VS 安装器把每个实例记在
+ *   %ProgramData%\Microsoft\VisualStudio\Packages\_Instances\<id>\state.json
+ * 的 installationPath 里，不依赖 vswhere 子进程。
+ */
+function vsCoverageDirs() {
+  if (!IS_WIN) return []
+  const found = []
+  const programData = envRoot('ProgramData') || 'C:\\ProgramData'
+  const instances = join(programData, 'Microsoft', 'VisualStudio', 'Packages', '_Instances')
+  for (const entry of safeReaddir(instances)) {
+    const stateFile = join(instances, entry, 'state.json')
+    if (!isFile(stateFile)) continue
+    let installPath = ''
+    try {
+      const parsed = JSON.parse(readFileSync(stateFile, 'utf8'))
+      installPath = typeof parsed?.installationPath === 'string' ? parsed.installationPath.trim() : ''
+    } catch {
+      continue
+    }
+    if (installPath === '') continue
+    const tools = join(installPath, 'Team Tools', 'Dynamic Code Coverage Tools')
+    found.push(join(tools, 'amd64'), tools)
+  }
+  // 标准安装位置兜底（state.json 读不到时）。
+  const programFiles = envRoot('ProgramFiles') || 'C:\\Program Files'
+  const programFilesX86 = envRoot('ProgramFiles(x86)') || 'C:\\Program Files (x86)'
+  for (const root of [programFiles, programFilesX86]) {
+    found.push(join(root, 'Microsoft Visual Studio', '*', '*', 'Team Tools', 'Dynamic Code Coverage Tools', 'amd64'))
+    found.push(join(root, 'Microsoft Visual Studio', '*', '*', 'Team Tools', 'Dynamic Code Coverage Tools'))
+  }
+  // VSINSTALLDIR / VCINSTALLDIR 指到的安装根。
+  for (const key of ['VSINSTALLDIR', 'VCINSTALLDIR']) {
+    const value = envRoot(key)
+    if (value !== '') found.push(join(value, 'Team Tools', 'Dynamic Code Coverage Tools', 'amd64'))
+  }
+  return found.filter((item) => typeof item === 'string' && item.trim() !== '')
+}
+
+
+/** 特殊工具的固定落点（不进 commonPatterns，避免每次请求都扫）。 */
+function specialToolDirs(name) {
+  if (name === 'codecoverage') return vsCoverageDirs()
+  return []
+}
+
+
+/** Windows 固定盘符（不 spawn，逐个 stat 探测）。 */
+function windowsDriveRoots() {
+  const roots = []
+  for (const letter of 'CDEFGHIJKLMNOPQRSTUVWXYZ') {
+    const root = `${letter}:\\`
+    try {
+      if (statSync(root).isDirectory()) roots.push(root)
+    } catch {
+      // 盘不存在或不可读（如空光驱），跳过
+    }
+  }
+  return roots
+}
+
+
+/**
+ * 兜底：在固定盘上做限深扫描，找 `Dynamic Code Coverage Tools` 目录。
+ *
+ * 为什么需要：客户环境不固定 —— 可能是 VS2017 默认装法，也可能是绿色包或
+ * 自定义安装根。state.json 只记 VS 安装器装过的实例，漏网的靠这层扇底。
+ * 只对 codecoverage 用，且带目录预算与进程内缓存，不影响其他工具的探测速度。
+ */
+function scanDrivesForCoverageTools() {
+  if (!IS_WIN) return []
+  const target = 'dynamic code coverage tools'
+  const skipTop = new Set([
+    'windows', '$recycle.bin', 'system volume information', 'recovery', 'perflogs',
+    'users', 'programdata', 'program files', 'program files (x86)', 'temp', 'tmp',
+  ])
+  const found = []
+  let budget = 2500
+  const maxDepth = 4
+  for (const root of windowsDriveRoots()) {
+    const queue = [{ dir: root, depth: 0 }]
+    while (queue.length > 0 && budget > 0) {
+      const item = queue.shift()
+      budget -= 1
+      if (budget <= 0) break
+      let entries = []
+      try {
+        entries = readdirSync(item.dir, { withFileTypes: true })
+      } catch {
+        continue
+      }
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue
+        const lower = entry.name.toLowerCase()
+        if (item.depth === 0 && skipTop.has(lower)) continue
+        const child = join(item.dir, entry.name)
+        if (lower === target) {
+          // 优先 64 位采集器：拿 32 位的去采 64 位进程会失败。
+          const amd64 = join(child, 'amd64')
+          if (isDir(amd64)) found.push(amd64)
+          found.push(child)
+          continue
+        }
+        if (item.depth < maxDepth && lower !== 'node_modules') {
+          queue.push({ dir: child, depth: item.depth + 1 })
+        }
+      }
+    }
+  }
+  return found
+}
+
+
+const deepScanCache = new Map()
+
+/** 需要全盘兜底扫描的工具（目前只有 VS 覆盖率采集器）。 */
+function deepToolDirs(name) {
+  if (name !== 'codecoverage') return []
+  if (!deepScanCache.has(name)) deepScanCache.set(name, scanDrivesForCoverageTools())
+  return deepScanCache.get(name)
 }
 
 /**
@@ -413,6 +544,13 @@ export function resolveTool(tool, options = {}) {
     }
   }
 
+  // 1.6 特殊工具的固定落点（如 VS 覆盖率采集器，不在 PATH / 标准 bin 下）。
+  for (const pattern of specialToolDirs(name)) {
+    for (const dir of pattern.includes('*') ? expandPattern(pattern) : [pattern]) {
+      const hit = pickFrom(dir, name)
+      if (hit !== '') return hit
+    }
+  }
   // 2. 项目内 wrapper / 本地依赖：版本和项目一致时最准。
   for (const candidate of projectCandidates(name, project)) {
     const hit = pickFrom(candidate, name)
@@ -439,6 +577,14 @@ export function resolveTool(tool, options = {}) {
 
   // 6. 常见安装目录 + 版本管理器。
   for (const pattern of commonPatterns()) {
+    for (const dir of pattern.includes('*') ? expandPattern(pattern) : [pattern]) {
+      const hit = pickFrom(dir, name)
+      if (hit !== '') return hit
+    }
+  }
+
+  // 7. 兜底：固定盘限深扫描（仅极少数工具需要，带预算与进程内缓存）。
+  for (const pattern of deepToolDirs(name)) {
     for (const dir of pattern.includes('*') ? expandPattern(pattern) : [pattern]) {
       const hit = pickFrom(dir, name)
       if (hit !== '') return hit
@@ -501,7 +647,7 @@ export function specToolNames(spec) {
 /** 该工具在哪些「层级」里找过（写进接口响应，便于排查“为什么没找到”）。 */
 export function searchLayers() {
   // 顺序与 resolveTool 的搜索阶梯一致：越靠前越可信。
-  return ['env', 'custom-dirs', 'project', 'sdk-home', 'dsh-runtimes', 'path', 'common-install-dirs']
+  return ['env', 'custom-dirs', 'special-dirs', 'project', 'sdk-home', 'dsh-runtimes', 'path', 'common-install-dirs', 'drive-scan']
 }
 
 /** 是否是绝对路径（调用方拿到 runner.json 里的自定义工具路径时用得上）。 */

@@ -1,11 +1,9 @@
-"""Skill-contract checks, exposed as a pytest test.
+"""项目配置文件解析的测试入口（v2）。
 
-The assertions live in ``check_skill.py``: that script runs them at import time
-and ends with ``sys.exit(1)`` when one fails, so importing it from pytest would
-abort collection and hide every other test.  Running it in a subprocess keeps a
-failure a normal test failure.
+断言在 ``check_skill.py``：它以脚本形式逐条打印 PASS/FAIL，失败时 ``sys.exit(1)``。
+直接 import 会终止测试收集，所以在子进程里跑，失败才能当成普通失败。
 
-``python test_skill.py`` still prints the same PASS/FAIL report.
+``python test_skill.py`` 打印同一份 PASS/FAIL 报告。
 """
 
 import subprocess

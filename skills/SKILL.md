@@ -141,14 +141,35 @@ Invoke-RestMethod "$env:DSH_WEB_URL/data-panel/tools?project=$PWD" | ConvertTo-J
 - 阶梯走完仍找不到 → 先交付其他语言的用例，并**在对话里明确报告缺哪个语言的什么工具**，不允许静默少生成。
 - 无论哪种语言（含 Go / Rust / Java / .NET / C++ / Ruby / PHP），判断标准一致：只看阶梯结果，不凭一次命令失败下结论。
 
+
+#### Step 1.6: 读取项目配置文件（v2 报告机制，必做）
+
+查找项目配置文件 `testReport/skills/<工作区名称>.md`（工作区名 = 当前项目根目录名）。
+
+```powershell
+$workspaceName = Split-Path -Leaf (Get-Location)
+$configFile = Join-Path "testReport/skills" "$workspaceName.md"
+if (Test-Path -LiteralPath $configFile) {
+  Write-Host "配置文件：" $configFile
+  Get-Content $configFile -Raw
+} else {
+  Write-Host "配置文件缺失：" $configFile
+}
+```
+
+读取配置中的全部字段，用于后续 caseId 生成与报告：
+- **基本信息**：`projectName`、`projectPackage`、`softwareVersion`、`devUnit`、`importance`、`language`
+- **人员**：`designer`、`reviewer`、`tester`（v2 起从项目配置文件读取，不再从 SKILL.md frontmatter 读取）
+- **引用文档**：`reqDocName`、`reqDocVersion`、`designDocName`、`designDocVersion`
+
+配置文件不存在时，提示用户复制 `testReport/skills/_project-template.md` 为 `<工作区名称>.md` 并填写所有必填字段。字段缺失时逐项列出缺失项，不允许跳过。未补齐配置前不进入 Step 2。
 ### Step 2: 生成测试用例
 **按被测函数组织用例（必须）：** 每条用例填写独立的 `subjectFunction`，表示源码中实际被测的业务函数或方法，例如 `src/order.ts::Order.calculateDiscount`。同一个函数的正常值、边界、分支等用例使用完全相同的值；不同文件或类的同名函数用路径和类名区分。字段最多 240 字符。它与执行入口 `testFunc` 不同，不能填写测试函数名、测试类型、模块分类或中文场景名称。无法确认源码函数时留空，面板显示“未关联函数”，不得猜测。
 
 这是一份插件通用数据约定，适用于本 workflow 和用户自定义 Skill。用例层级由记录中的该字段自动聚合；不要再调用旧分类 API 建立层级。
 
 **一条用例只验证一个具体场景：** 同一形参的候选值 `1/0/-1` 表示三个独立场景时，拆成三条用例，每条都有确定输入和对应预期，不能在一条记录或一个测试函数中循环跑完再只记一个结果。多个形参共同组成一次调用可以放在一条用例中；数组、集合、路径、除法表达式本身是合法的单个输入，不因包含 `/` 或多个元素机械拆分。多步操作共同验证一个状态场景也可保留为一条，不为凑数量做无意义的全排列。参数化框架只有在每个参数实例有独立 `caseId`、准确可筛选的 `testFunc` 和逐条证据时才可使用。
-
-**名称与编号：** `title` 仅使用函数组内的短编号 `T001`、`T002`，每个函数从 T001 开始；详细文字全部放 `description`，说明前置状态、调用动作、具体输入、验证目标及预期行为。相同函数内编号不重复，新增时接着编号，编辑后不重排已有编号。`caseId` 是会话内唯一、稳定的关联 ID（例如 `ORDER-DISCOUNT-T001`）；不同函数可复用名称 T001，但不能复用 caseId，也不要把 `testFunc` 改成显示编号。
+GD:**名称与编号：** title 仅使用函数组内的短编号 T001、T002，每个函数从 T001 开始；详细文字全部放 description，说明前置状态、调用动作、具体输入、验证目标及预期行为。相同函数内编号不重复，新增时接着编号，编辑后不重排已有编号。caseId 是会话内唯一、稳定的关联 ID，格式为 `<类型缩写>-<projectPackage>-<函数分类名>-T<序号>.CTD`：类型缩写取测试类型首字母（功能→GN、接口→JK、边界→BJ、逻辑→LJ、性能→XN），projectPackage 来自项目配置文件，函数分类名来自 Step 1 分析结果（如 RINGBUFFER、push），序号每个函数分类从 T001 起（例如 BJ-ZZKZ-RINGBUFFER-T002.CTD）。不同函数可复用名称 T001，但不能复用 caseId，也不要把 testFunc 改成显示编号。
 
 生成后按 `subjectFunction` 验收：纳入测试的 10 个函数应形成 10 个函数组，每组包含该函数的拆分场景；同名异类、异文件函数不能合并。以查询面板 API 后的实际记录和组内数量为准，不仅核对聊天中的清单。没有可生成用例的函数单独说明，不用假用例凑组。
 
@@ -201,7 +222,7 @@ echo "$DSH_SESSION_ID"                                       # bash
   ```json
   { "preset": "go", "testFile": "project:tests/test_generated_test.go" }
   ```
-  内置 preset：`pytest` / `vitest` / `jest` / `node-test` / `go` / `cargo` / `dotnet` / `maven` / `gradle` / `ctest` / `gtest`。
+  内置 preset：`pytest` / `vitest` / `jest` / `node-test` / `go` / `cargo` / `dotnet` / `maven` / `gradle` / `ctest` / `gtest` / `gtest-batch`。
 - 项目有自己的命令就完全自定义：
   ```json
   {
@@ -218,6 +239,7 @@ echo "$DSH_SESSION_ID"                                       # bash
 - `testFile`：`project:xxx` 相对项目、`root:xxx` 相对会话资产；不写前缀时相对会话资产目录。
 - `command`：字符串数组；单条模式用 `{target}`，整批模式用 `{targets}`。可用占位符还有 `{file}` `{binary}` `{project}` `{root}` `{runId}` `{runDir}` `{junit}`。
 - `mode`：能产出 JUnit XML 的框架用 `batch`（一条命令跑完，逐条结果来自 JUnit）；否则用 `per-case`（一条用例一条命令，退出码即证据，默认）。
+- **写了 `preset` 就不要写 `mode` / `command` / `targetArg` / `targetsSeparator` / `junit`。** 这些字段由 preset 提供且彼此配套（`per-case` 用 `{target}`，`batch` 用 `{targets}`），单独覆盖 `mode` 会让继承来的 `command` 对不上，插件直接报错。要换模式就换 preset：`gtest` 逐条 / `gtest-batch` 整批。确实要自定义命令，就去掉 `preset`，自己写完整 `id` / `mode` / `command`。
 - Java / Go / C# / Rust / C++ 的测试文件通常必须位于项目源码树内，用 `project:` 写实际路径。
 - `targetExtract` 用于从面板用例的 `code` 推断测试名，也用于在真实测试文件中定位同名测试声明；在 `runner.json` 中自定义时会**替换**内置提取规则，可用字符串或字符串数组兼容多种写法。`targetDeclare` 是**单个正则字符串**，准备执行时用它检查测试文件是否声明了目标，定位无法提取时也沿用它；自定义它会替换内置规则。两项不能代替核对实际注册的测试名。
 - C++ 的构建、gtest 目标、runner 配置与 VS 覆盖率按已加载的 [C++ 测试专项 Skill](cpp-test/SKILL.md) 核对。
@@ -284,6 +306,9 @@ echo "$DSH_SESSION_ID"                                       # bash
 | `这次没有可执行的用例` | 本次所有目标都缺少测试名或未通过声明检查；按括号中的逐条原因修复后重新点「执行」。 |
 | `本会话还没有测试代码（...）` | `runner.json` 的 `testFile` 指向的文件不存在；生成测试文件或修正路径。 |
 | `无法识别项目的测试框架` | 自动识别失败；核对项目实际测试方式，并按 Step 2.5 写 `runner.json`。 |
+| `runner.json 不能同时写 preset 和 mode` | 写了 `preset` 又写 `mode`。`mode` 由 preset 决定，删掉 `mode`：整批执行改用 `gtest-batch` 这类带 `-batch` 的 preset，逐条执行删掉 `mode` 即可；要完全自定义就去掉 `preset`。 |
+| `batch 模式的 command 必须包含 {targets}` | 模式是 `batch` 但命令里没有 `{targets}`，通常是只改了 `mode` 没配命令。改用带 `-batch` 后缀的 preset（如 `gtest-batch`），或去掉 `preset` 自己写完整命令。 |
+| `per-case 模式的 command 必须包含 {target}` | 反过来：模式是 `per-case` 但命令只写了 `{targets}`。改用 `gtest` 这类逐条 preset，或补上 `{target}`。 |
 
 准备成功后还要核对返回的 `targetCount`、`missingTestFunc`；需要逐条复查时查看本次 `runs/<runId>/request.json` 的 `targets` 与 `notRun`，不要把“准备成功”当成所有用例都能执行。
 
@@ -294,19 +319,21 @@ echo "$DSH_SESSION_ID"                                       # bash
 将模型分析单独写入该次 `runs/<runId>/analysis.md`（UTF-8），日志窗口会在原始日志下分区展示。每项写明 caseId、testFunc、真实异常摘要、证据位置（run.log 行号、断言文件行号或 result.json 字段）、分析原因、建议与不确定性。无法归属用例的构建/环境异常写“运行级异常”，不要编造关联。区分已确认原因和推测原因；证据不足就写“原因尚未确认”。不覆盖或追加 run.log，不改 result.json/快照，不把模型分析包装成 runner 原始输出。无异常不必生成分析文件；未能生成分析时在最终对话说明，不能阻塞结果和报告交付。分析仅记录，不自动执行建议。
 
 ### Step 6: 生成 Word 报告
-**最终对话中的一致性提醒：** 本次全部测试执行结束并按原流程处理报告后，对照本次 `runs/<runId>/request.json` 指定的 `casesFile`（用例快照）与 `snapshotTestFile`（测试代码快照），按 `caseId`、`testFunc` 核对输入、预期结果、测试场景和实际断言。有明确证据不一致时，仅在最终对话总结中逐条列出用例编号及具体差异，提醒“可能导致测试结果不能准确反映当前用例要求”。无法读取快照或无法判断时说明“未能确认一致性”；未发现明显差异时如实说明，不能凭测试通过证明一致，也不能编造差异。此辅助核对不增加执行前检查，不中途暂停或要求确认，不自动修改用例、测试代码、runner 结果或报告数据，不改变既有测试与报告流程。
+### Step 6: 生成 Word 报告（v2 报告机制）
+
+**最终对话中的一致性提醒：** 本次全部测试执行结束并按原流程处理报告后，对照本次 `runs/<runId>/request.json` 指定的 `casesFile`（用例快照）与 `snapshotTestFile`（测试代码快照），按 `caseId`、`testFunc` 核对输入、预期结果、测试场景和实际断言。有明确证据不一致时，仅在最终对话总结中逐条列出用例编号及具体差异，提醒「可能导致测试结果不能准确反映当前用例要求」。无法读取快照或无法判断时说明「未能确认一致性」；未发现明显差异时如实说明，不能凭测试通过证明一致，也不能编造差异。此辅助核对不增加执行前检查，不中途暂停或要求确认，不自动修改用例、测试代码、runner 结果或报告数据，不改变既有测试与报告流程。
 
 报告只消费**已经真实跑过的那次 run**：
-
 - **每次执行都要生成报告，包括单条用例的「执行」**。单条执行的 snapshot/cases.json 只含该条用例，报告就只写这一条；文件名建议 `<项目>-<caseId>-测试报告.docx`。
 - 报告必须落在 `reports/<runId>/`，否则面板工具栏「报告」和每行的「报告」按钮找不到它。
 
-**先定位报告工具（Windows / PowerShell）**：报告工具独立部署在当前用户目录的 `.dsh\tools\testReport`，不从项目目录或 `DSH_HOME` 查找。把下面的占位值替换为本次执行的会话资产目录和 runId；找不到工具就明确报“报告工具未部署”，不要猜测其他位置。
+**先定位报告工具（Windows / PowerShell）**：报告工具独立部署在当前用户目录的 `.dsh\tools\testReport`。
 
 ```powershell
 $reportRoot = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.dsh\tools\testReport'
 $sessionAssets = '<本次会话资产绝对路径>'
 $runId = '<本次 runId>'
+$configFile = '<项目配置文件绝对路径>'  # testReport/skills/<工作区>.md
 $bridge = Join-Path $reportRoot 'report-tool\bridge.py'
 $builder = Join-Path $reportRoot 'report-tool\cmd.py'
 $dshRoot = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path ([Environment]::GetFolderPath('UserProfile')) '.dsh' }
@@ -322,23 +349,28 @@ if (-not (Test-Path -LiteralPath $reportPython -PathType Leaf)) {
 }
 & $reportPython -c 'import sys; sys.exit(0 if sys.version_info.major == 3 else 1)'
 if ($LASTEXITCODE -ne 0) { throw "报告工具需要 DSH 自带 Python 3：$reportPython" }
+if (-not (Test-Path -LiteralPath $configFile -PathType Leaf)) {
+  throw "项目配置文件缺失：$configFile"
+}
 ```
 
-**6.1 桥接数据**：
+**6.1 桥接数据并生成阶段计划**：
+
 ```powershell
-& $reportPython $bridge --run $runResult
+& $reportPython $bridge --run $runResult --config $configFile
 ```
 
-不传 `--cases` 时 bridge 会自动读 `runs/<runId>/snapshot/cases.json`（本次执行的冻结用例）—— 这很重要：根目录的 `cases.json` 之后可能被改，快照不会。
+bridge.py 按项目配置文件中的函数分类名组织阶段（phases），生成两份文件：
+- `reports/<runId>/report-plan.json` — 阶段计划（phases 按函数分组，每阶段包含所属 caseId 列表）
+- `reports/<runId>/report-data.json` — 结构化报告数据（meta / provenance / scope / summary / phases / coverage / reviews / consistency）
 
-`--run` 必须是**已经跑过的那次** runId 的 result.json。bridge.py：
+不传 `--cases` 时 bridge 会自动读 `runs/<runId>/snapshot/cases.json`（本次执行的冻结用例）。`--run` 必须是已经跑过的那次 runId 的 result.json。bridge.py：
 - **不会**重跑测试；
 - **不会**编造覆盖率（没真实数据就写「未采集」）；
-- 变量表只写用例快照中的 `inputVariables`、`expectedOutputs` 和本次运行记录中的 `ACTUAL_JSON`；缺少结构化证据时保留原始文字并标明“未采集/未提供”，不能猜变量名或把预期当实际。
+- 变量表只写用例快照中的 `inputVariables`、`expectedOutputs` 和本次运行记录中的 `ACTUAL_JSON`；缺少结构化证据时保留原始文字并标明「未采集/未提供」，不能猜变量名或把预期当实际。
 - 覆盖率**只读** result.json 里的 `coverage` 统计（runner 采到的真实数字）；采不到就写「未采集（原因）」，绝不编一个百分比。
 
 **覆盖率怎么才有数字**（不是模型手填，是 runner 采的）：
-
 - 每个 preset 已自带 coverage 配置（pytest / vitest / jest / go / maven / dotnet），runner 会在**用例跑完后额外跑一次采集**，解析报告后写进 result.json；
 - 所以报告里总是「未采集」时，先看 `result.json` 的 `coverage.reason`，常见的两种：
   1. **没装采集插件** —— reason 里会直接给安装命令（如 `python -m pip install coverage pytest-cov`、`npm i -D @vitest/coverage-v8`）；**让用户装好再重跑**，不要自己编数据；
@@ -347,21 +379,59 @@ if ($LASTEXITCODE -ne 0) { throw "报告工具需要 DSH 自带 Python 3：$repo
 - 覆盖率采集失败**不会**把执行判成失败，不要因为它失败就把这次执行说成失败。
 - 逐条结论**只认** result.json 里 `tests` 的逐条结果——`batch` 来自 JUnit，`per-case` 来自每条命令的退出码；找不到证据就标「未确认」，绝不用整体状态推断通过。
 
-**6.2 生成报告**：
-```powershell
-$template = Join-Path $reportRoot 'templates\<适用的报告模板>.docx'
-$reportSkill = Join-Path $reportRoot 'skills\<项目名>'
-if (-not (Test-Path -LiteralPath $template -PathType Leaf)) { throw "报告模板不存在：$template" }
-if (-not (Test-Path -LiteralPath $reportSkill -PathType Container)) { throw "项目报告 Skill 不存在：$reportSkill" }
-& $reportPython $builder --template $template --data (Join-Path $reportDir 'report-data.json') `
-  --skill $reportSkill -o (Join-Path $reportDir '<项目名>-测试报告.docx')
+**6.2 生成模型分析（report-notes.json）**：读取 report-plan.json 和 result.json，综合分析后将以下 JSON 写入 `reports/<runId>/report-notes.json`（UTF-8）：
+
+```json
+{
+  "schemaVersion": "2.0",
+  "generatedAt": "<ISO 时间戳>",
+  "overallAssessment": "总体评估文字（不超过 500 字）",
+  "environmentImpact": "环境因素对结果的影响说明",
+  "improvements": ["改进建议1", "改进建议2"],
+  "issues": [
+    { "category": "doc|static|code|dynamic", "description": "问题描述", "evidence": "证据位置（run.log 行号/result.json 字段）" }
+  ],
+  "consistency": [
+    { "description": "差异描述", "evidence": "证据位置" }
+  ]
+}
 ```
 
-> 报告中间文件按 `reports/<runId>/` 存放，不同次执行不会互相覆盖。生成后面板工具栏「报告」就能看到。
-先确认模板文件与该项目的报告 Skill 目录真实存在；不要把 RingBuffer 示例模板直接用于任意项目。
+每条 issue 写明类别、描述和证据位置。已确认原因和推测原因须明确区分；证据不足写「原因尚未确认」。无异常时 issues 和 consistency 为空数组。分析仅记录，不自动执行建议。
+
+**6.3 生成 Word 报告**：
+
+```powershell
+# 正式报告模板只有一个：单元测试报告模板.docx（固定在模板目录）
+# RingBuffer-test.docx / RingBuffer-test-blank.docx 仅作用例表原型，禁止用作报告模板
+$template = Join-Path $reportRoot 'templates\单元测试报告模板.docx'
+if (-not (Test-Path -LiteralPath $template -PathType Leaf)) {
+  $available = Get-ChildItem (Join-Path $reportRoot 'templates') -Filter *.docx | ForEach-Object { $_.Name }
+  throw "报告模板缺失：$template；现有模板：$($available -join ', ')"
+}
+& $reportPython $builder @(
+    '--template', $template,
+    '--config', $configFile,
+    '--data', (Join-Path $reportDir 'report-data.json'),
+    '--notes', (Join-Path $reportDir 'report-notes.json'),
+    '-o', (Join-Path $reportDir '<项目名>-测试报告.docx')
+)
+```
+
+> builder.py 使用模板 + report-data.json + report-notes.json + 项目配置文件生成 Word 报告。v2 不再需要 `--skill` 参数（不依赖项目专属 SKILL.md）。人员字段（designer / reviewer / tester）从项目配置文件读取，未提供时留空，不套用示例姓名。报告中间文件按 `reports/<runId>/` 存放，不同次执行不会互相覆盖。生成后面板工具栏「报告」就能看到。
 
 报告工具目录固定为当前用户目录下的 `.dsh\tools\testReport\`。
-SKILL.md 的 frontmatter 写 `designer` / `reviewer` / `tester` 三个人员字段。
+
+**模板选择是硬规则，不要自己猜：**
+
+| 模板文件 | 用途 | 能否生成报告 |
+| --- | --- | --- |
+| `单元测试报告模板.docx` | 正式单元测试报告（章节/附录/用例表） | ✅ **唯一可用** |
+| `RingBuffer-test.docx` | 客户历史报告样本，仅作 13×11 用例表格式原型 | ❌ |
+| `RingBuffer-test-blank.docx` | 空白用例表原型 | ❌ |
+
+选错模板会得到「模板缺少阶段标题原型（找不到「项目测试结果」段落）」这类错误；这时**不是模板坏了，而是选错了**，改用 `单元测试报告模板.docx` 重新生成，不要去找新模板、不要改模板结构。
+把 RingBuffer 模板当报告模板用、或修改它去迎合 builder，都是错的。
 
 ---
 
@@ -369,7 +439,7 @@ SKILL.md 的 frontmatter 写 `designer` / `reviewer` / `tester` 三个人员字�
 
 ```json
 {
-  "caseId": "TC-XXX-001",
+  "caseId": "GN-<projectPackage>-<函数分类名>-T001.CTD",
   "title": "T001",
   "testType": "functional|api|boundary|logic|performance",
   "testTypes": ["functional"],

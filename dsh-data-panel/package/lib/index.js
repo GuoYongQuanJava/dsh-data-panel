@@ -1273,7 +1273,10 @@ async function prepareRun({ sessionId, cwd, scope, caseId, caseIds, store }) {
   await rememberAssetRoot(sessionId, root, project)
 
   const python = pythonPath()
-  const command = `"${python}" "${runnerPath}" --project "${project}" --root "${root}" --run-id "${runId}"`
+  // PowerShell 里以引号开头的 token 不会当成命令（会被当成字符串表达式），
+  // 路径含空格必须带引号，而带引号就必须用 & 调用运算符。cmd 下 & 是分隔符，所以只对 Windows 加。
+  const callOperator = process.platform === 'win32' ? '& ' : ''
+  const command = `${callOperator}"${python}" "${runnerPath}" --project "${project}" --root "${root}" --run-id "${runId}"`
 
   return {
     runId,

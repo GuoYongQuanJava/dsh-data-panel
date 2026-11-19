@@ -185,7 +185,32 @@ def set_paragraph_text(paragraph, text: str) -> None:
                 paragraph.add_run(chunk)
 
 
-def _fill_header_block(table: Table, case: Dict[str, Any], module: Optional[Dict[str, Any]]) -> None:
+def _case_count(function: Dict[str, Any]) -> int:
+    """本单元用例数：兼容 caseCount / summary.total / cases 长度三种来源。"""
+    if not isinstance(function, dict):
+        return 0
+    if isinstance(function.get('caseCount'), int):
+        return function['caseCount']
+    summary = function.get('summary') or {}
+    if isinstance(summary.get('total'), int):
+        return summary['total']
+    cases = function.get('cases') or []
+    return len(cases) if isinstance(cases, list) else 0
+
+
+def _func_title(function: Dict[str, Any], case: Dict[str, Any]) -> str:
+    """从 function 名或 subjectFunction 取短名（去掉路径和命名空间）。"""
+    raw = ''
+    if isinstance(function, dict):
+        raw = str(function.get('name') or '')
+    if not raw and isinstance(case, dict):
+        raw = str(case.get('subjectFunction') or '')
+    if not raw:
+        return '未记录'
+    return raw.split('::')[-1] or raw
+
+
+def _fill_header_block(table: Table, case: Dict[str, Any], function: Optional[Dict[str, Any]]) -> None:
     """Fill the merged header block in row 0.
 
     The template block carries seven fields::
@@ -202,15 +227,16 @@ def _fill_header_block(table: Table, case: Dict[str, Any], module: Optional[Dict
     written when the upstream tool actually reported a value — it is never
     inferred (see the project plan's T08 rule).
     """
-    module = module or {}
+    function = function or {}
     lines = [
-        f"单元标识：{module.get('unitId') or case.get('name', '')}",
-        f"设计追溯：{module.get('trace') or '未提供设计追溯'}",
-        f"功能描述：{case.get('funcDesc') or case.get('name', '')}",
-        f"驱动模块：{module.get('driver') or '未记录驱动模块'}",
+        f"单元标识：{function.get('unitId') or case.get('name', '')}",
+        f"设计追溯：{function.get('trace') or '未提供设计追溯'}",
+        f"功能描述：{_func_title(function, case)} 功能测试",
+        f"被测函数：{case.get('subjectFunction') or case.get('functionId') or '未记录'}",
+        f"驱动模块：{function.get('driver') or '未记录驱动模块'}",
         f"打桩模块：{case.get('stub') or '未记录'}",
-        f"覆盖率记录：{module.get('coverage') or '未采集'}",
-        f"备注：本单元共有{module.get('caseCount', 0)}个测试用例",
+        f"覆盖率记录：{(function.get('coverage') or '未采集').replace('-S', '-L')}",
+        f"备注：本单元共有{_case_count(function)}个测试用例",
     ]
     cell = _cell_at(table, 0, 0)
     paragraphs = cell.paragraphs
@@ -228,7 +254,7 @@ def fill_table(
     table: Table,
     case: Dict[str, Any],
     table_index: int = 0,
-    module: Optional[Dict[str, Any]] = None,
+    function: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """Fill *table* with data from *case*.
 
@@ -261,7 +287,7 @@ def fill_table(
     # did not normalise the case through schema.validate()
     status = case.get("status") or ("passed" if case.get("passed", True) else "failed")
 
-    _fill_header_block(table, case, module)
+    _fill_header_block(table, case, function)
     set_cell_text(_cell_at(table, 1, 1), name)
     set_cell_text(_cell_at(table, 1, 7), case_id)
 
@@ -313,6 +339,8 @@ def fill_table(
         # declare an output variable.
         if status == "notRun" and not actual and var_out:
             actual = "未执行"
+        if status == "unconfirmed" and not actual and var_out:
+            actual = "未确认"
 
         for column, value in ((0, var_in), (3, val_in), (4, var_out), (8, expected), (10, actual)):
             cell = _cell_at(table, row_idx, column)

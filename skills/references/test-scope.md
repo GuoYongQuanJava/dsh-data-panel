@@ -33,8 +33,7 @@ node <插件安装目录>/lib/scope.js <项目绝对路径> [业务源码目录 
       "sha256": "<保留扫描器输出的实际哈希>",
       "status": "tested",
       "functions": [
-        { "subjectFunction": "src/order.cpp::Order.total", "caseIds": ["ORDER-TOTAL-T001", "ORDER-TOTAL-T002"] }
-      ]
+        { "subjectFunction": "src/order.cpp::Order.total", "caseIds": ["GN-ZZKZ-ORDER-T001.CTD", "GN-ZZKZ-ORDER-T002.CTD"] }
     },
     {
       "path": "src/vendor_adapter.cpp",

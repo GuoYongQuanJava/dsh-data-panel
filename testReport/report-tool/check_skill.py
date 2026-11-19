@@ -1,19 +1,19 @@
-"""Exercise skill_meta parsing and confirm which fields are inherited.
+"""项目配置文件解析的契约测试（v2）。
 
-The skill file supplies the three **people** fields: designer, reviewer and
-tester — who designs, reviews and runs a procedure is decided once when the
-procedure is set up.  Everything else (unitId / trace / driver / coverage /
-issues) is technical output of a run and must come from the data.
+v2 起，软件名称/版本/研制单位/重要度/人员/引用文档来自**项目配置文件**：
+
+    <项目根>/testReport/skills/<工作区名>.md
+
+本脚本验证 config_file.load_key_values 的解析规则，并保留一小段 skill_meta
+兼容性冒烟（builder 的 skill_path 参数仍接受旧 SKILL.md，但不再驱动人员默认值）。
+
+运行：python check_skill.py
 """
-
-import json
-import shutil
 import sys
 import tempfile
 from pathlib import Path
 
-from schema import validate
-from skill_meta import describe, load_skill, person, tester_of
+from config_file import as_int, load_key_values
 
 failures = []
 
@@ -24,234 +24,116 @@ def check(condition, message):
         failures.append(message)
 
 
-# 示例 skill 不再随包分发：这里临时生成一个固定内容的 SKILL.md 做夹具，
-# 测试不再依赖仓库/本机某个具体 skill 是否存在。
-fixture = Path(tempfile.mkdtemp(prefix="skillfix-"))
-SKILL = fixture / "auth-service-unit-test" / "SKILL.md"
-SKILL.parent.mkdir(parents=True, exist_ok=True)
-SKILL.write_text(
-    "---\nname: auth-service-unit-test\ndescription: 夹具\n"
-    "designer: 张伟\nreviewer: 刘洋\ntester: 王芳\n---\n",
+tmp = Path(tempfile.mkdtemp(prefix="cfgspec-"))
+
+print("== Markdown 列表格式（客户现有写法）==")
+md = tmp / "proj.md"
+md.write_text(
+    "# 某项目配置\n"
+    "\n"
+    "## 基本信息\n"
+    "- projectName: 某软件\n"
+    "- projectPackage: ZZKZ\n"
+    "- softwareVersion: 1.0.1\n"
+    "- devUnit: 质量保障部\n"
+    "- importance: A级\n"
+    "- language: C++\n"
+    "\n"
+    "## 人员\n"
+    "- designer: 张伟\n"
+    "- reviewer: 刘洋\n"
+    "- tester: 王芳\n"
+    "\n"
+    "## 引用文档\n"
+    "- reqDocName: 软件需求规格说明\n"
+    "- reqDocVersion: B\n",
     encoding="utf-8",
 )
+cfg = load_key_values(md)
+check(cfg.get("projectName") == "某软件", f"projectName={cfg.get('projectName')!r}")
+check(cfg.get("projectPackage") == "ZZKZ", f"projectPackage={cfg.get('projectPackage')!r}")
+check(cfg.get("softwareVersion") == "1.0.1", f"softwareVersion={cfg.get('softwareVersion')!r}")
+check(cfg.get("devUnit") == "质量保障部", f"devUnit={cfg.get('devUnit')!r}")
+check(cfg.get("importance") == "A级", f"importance={cfg.get('importance')!r}")
+check(cfg.get("language") == "C++", f"language={cfg.get('language')!r}")
+check(cfg.get("designer") == "张伟", f"designer={cfg.get('designer')!r}")
+check(cfg.get("reviewer") == "刘洋", f"reviewer={cfg.get('reviewer')!r}")
+check(cfg.get("tester") == "王芳", f"tester={cfg.get('tester')!r}")
+check(cfg.get("reqDocName") == "软件需求规格说明", f"reqDocName={cfg.get('reqDocName')!r}")
+check(cfg.get("reqDocVersion") == "B", f"reqDocVersion={cfg.get('reqDocVersion')!r}")
 
-print("== frontmatter：读取三个人员字段 ==")
-meta = load_skill(str(SKILL))
-print("  ", describe(meta), "| 原始:", meta)
-check(person(meta, "designer") == "张伟", f"designer={person(meta, 'designer')!r}")
-check(person(meta, "reviewer") == "刘洋", f"reviewer={person(meta, 'reviewer')!r}")
-check(tester_of(meta) == "王芳", f"tester={tester_of(meta)!r}")
-check(
-    set(meta.keys()) <= {"designer", "reviewer", "tester"},
-    f"只解析人员字段，实际键={sorted(meta)}",
-)
-
-print("\n== 目录形式也支持 ==")
-check(load_skill(str(SKILL.parent)) == meta, "传目录自动找 SKILL.md")
-
-print("\n== 缺失/损坏文件 ==")
-check(load_skill(None) == {}, "None → 空 dict")
-check(load_skill("") == {}, "空字符串 → 空 dict")
-check(load_skill(r"D:\no\such\SKILL.md") == {}, "不存在 → 空 dict")
-
-tmp = Path(tempfile.mkdtemp(prefix="skilltest-"))
-
-print("\n== 非人员键会被忽略 ==")
-noisy = tmp / "noisy.md"
-noisy.write_text(
-    """---
-name: t
-description: d
-designer: 张伟
-reviewer: 刘洋
-tester: 王芳
-coverage: -S 99%
-driver: 某驱动
-unitId: 某单元
-trace: 某追溯
----
-""",
+print("\n== YAML frontmatter 格式（模板写法）==")
+yml = tmp / "yaml.md"
+yml.write_text(
+    "---\n"
+    "projectName: 另一软件\n"
+    "projectPackage: ABC\n"
+    "designer: 李明\n"
+    "---\n"
+    "\n"
+    "正文无关内容，不应影响解析。\n",
     encoding="utf-8",
 )
-meta_noisy = load_skill(str(noisy))
-check(
-    meta_noisy == {"designer": "张伟", "reviewer": "刘洋", "tester": "王芳"},
-    f"只留三个人员字段，其余忽略：{meta_noisy}",
-)
+cfg = load_key_values(yml)
+check(cfg.get("projectName") == "另一软件", f"frontmatter projectName={cfg.get('projectName')!r}")
+check(cfg.get("projectPackage") == "ABC", f"frontmatter projectPackage={cfg.get('projectPackage')!r}")
+check(cfg.get("designer") == "李明", f"frontmatter designer={cfg.get('designer')!r}")
 
-print("\n== 只有正文表格（无 frontmatter）==")
-table_only = tmp / "table.md"
-table_only.write_text(
-    """# 某测试 Skill
-
-| 角色 | 姓名 |
-| --- | --- |
-| 设计者 | 王五 |
-| 校对者 | 赵六 |
-| 测试人员 | 孙七 |
-""",
+print("\n== 解析细节 ==")
+detail = tmp / "detail.md"
+detail.write_text(
+    "# 注释行被忽略\n"
+    "<!-- HTML 注释也忽略 -->\n"
+    "\n"
+    '- quoted: "带双引号的值"\n'
+    "- single: '带单引号的值'\n"
+    "- star: 星号列表\n"
+    "* star2: 星号列表二\n"
+    "- empty: \n"
+    "- projectName: 第一次\n"
+    "- projectName: 第二次\n"
+    "没有冒号的行\n",
     encoding="utf-8",
 )
-meta_table = load_skill(str(table_only))
-check(
-    meta_table == {"designer": "王五", "reviewer": "赵六", "tester": "孙七"},
-    f"正文表格取三个人员：{meta_table}",
-)
+cfg = load_key_values(detail)
+check(cfg.get("quoted") == "带双引号的值", f"双引号被去掉：{cfg.get('quoted')!r}")
+check(cfg.get("single") == "带单引号的值", f"单引号被去掉：{cfg.get('single')!r}")
+check(cfg.get("star") == "星号列表", f"星号列表前缀被去掉：{cfg.get('star')!r}")
+check(cfg.get("star2") == "星号列表二", f"第二种星号列表：{cfg.get('star2')!r}")
+check(cfg.get("empty") == "", f"空值保留为空字符串：{cfg.get('empty')!r}")
+check(cfg.get("projectName") == "第一次", f"同名键取第一次出现：{cfg.get('projectName')!r}")
+check("# 注释行被忽略" not in cfg, "注释行没有被当成键")
+check("没有冒号的行" not in cfg, "无冒号的行没有被当成键")
 
-print("\n== frontmatter 优先于正文表格 ==")
-both = tmp / "both.md"
-both.write_text(
-    """---
-name: t
-description: d
-tester: 前 Matter
----
+print("\n== 缺失与空文件（不许编默认值）==")
+check(load_key_values(None) == {}, "None → 空 dict")
+check(load_key_values("") == {}, "空字符串 → 空 dict")
+check(load_key_values(tmp / "no-such.md") == {}, "不存在 → 空 dict")
+blank = tmp / "blank.md"
+blank.write_text("# 只有注释\n\n", encoding="utf-8")
+check(load_key_values(blank) == {}, "只有注释 → 空 dict")
 
-| 角色 | 姓名 |
-| --- | --- |
-| 测试人员 | 正文表格 |
-""",
-    encoding="utf-8",
-)
-check(tester_of(load_skill(str(both))) == "前 Matter", "frontmatter 优先")
+print("\n== 数字安全转换 ==")
+check(as_int("42") == 42, "as_int('42') == 42")
+check(as_int(" 7 ") == 7, "as_int 容忍空格")
+check(as_int("abc", 3) == 3, "非法值回落默认")
+check(as_int("", 0) == 0, "空值回落默认")
 
-print("\n== 中文键名也认 ==")
-cn = tmp / "cn.md"
-cn.write_text("---\n测试人员: 李明\n---\n", encoding="utf-8")
-check(tester_of(load_skill(str(cn))) == "李明", f"中文键 tester={tester_of(load_skill(str(cn)))!r}")
+print("\n== skill_meta 兼容（旧 SKILL.md 仍可读，但不再驱动人员默认值）==")
+try:
+    from skill_meta import load_skill, tester_of
 
-print("\n== 嵌套 YAML 被忽略（不崩溃）==")
-nested = tmp / "nested.md"
-nested.write_text(
-    """---
-name: t
-metadata:
-  tester: 嵌套值
-tester: 扁平值
----
-""",
-    encoding="utf-8",
-)
-check(tester_of(load_skill(str(nested))) == "扁平值", "取扁平键")
-
-
-def payload(**over):
-    p = {
-        "meta": {"project": "P", "executedAt": "2026-11-13"},
-        "summary": {"total": 1, "passed": 1, "failed": 0},
-        "modules": [
-            {
-                "name": "M",
-                "cases": [
-                    {
-                        "id": "C-1",
-                        "name": "n",
-                        "type": "功能测试",
-                        "description": "d",
-                        "inputs": [],
-                        "outputs": [],
-                        "passed": True,
-                    }
-                ],
-            }
-        ],
-    }
-    p.update(over)
-    return p
-
-
-skill = {"designer": "张伟", "reviewer": "刘洋", "tester": "王芳"}
-
-print("\n== 三个人员字段的注入优先级：用例 > 模块 > skill ==")
-out = validate(payload(), skill)
-case = out["modules"][0]["cases"][0]
-check(case["designer"] == "张伟", f"仅 skill → designer={case['designer']!r}")
-check(case["reviewer"] == "刘洋", f"仅 skill → reviewer={case['reviewer']!r}")
-check(case["tester"] == "王芳", f"仅 skill → tester={case['tester']!r}")
-
-p = payload()
-p["modules"][0].update({"designer": "模块设计", "reviewer": "模块校对", "tester": "模块测试人"})
-out = validate(p, skill)
-case = out["modules"][0]["cases"][0]
-check(case["designer"] == "模块设计", "designer 模块覆盖 skill")
-check(case["reviewer"] == "模块校对", "reviewer 模块覆盖 skill")
-check(case["tester"] == "模块测试人", "tester 模块覆盖 skill")
-
-p = payload()
-p["modules"][0]["cases"][0].update(
-    {"designer": "用例设计", "reviewer": "用例校对", "tester": "用例测试人"}
-)
-out = validate(p, skill)
-case = out["modules"][0]["cases"][0]
-check(case["designer"] == "用例设计", "designer 用例覆盖模块")
-check(case["reviewer"] == "用例校对", "reviewer 用例覆盖模块")
-check(case["tester"] == "用例测试人", "tester 用例覆盖模块")
-
-out = validate(payload(), None)
-case = out["modules"][0]["cases"][0]
-check(
-    case["designer"] == "" and case["reviewer"] == "" and case["tester"] == "",
-    "都缺失 → 三个人员均为空",
-)
-
-print("\n== skill 不得影响技术字段 ==")
-rich_skill = dict(skill)
-rich_skill.update(
-    {"coverage": "-S 99%", "driver": "某驱动", "unitId": "某单元", "trace": "某追溯"}
-)
-out = validate(payload(), rich_skill)
-mod = out["modules"][0]
-check(mod["coverage"] == "未采集", f"coverage 不从 skill 取（{mod['coverage']!r}）")
-check(mod["driver"] == "未记录驱动模块", f"driver 不从 skill 取（{mod['driver']!r}）")
-check(mod["unitId"] == "未记录单元标识", f"unitId 缺失 → 未记录单元标识（{mod['unitId']!r}）")
-check(mod["trace"] == "未提供设计追溯", f"trace 缺失 → 未提供设计追溯（{mod['trace']!r}）")
-
-print("\n== 数据里的值保真 ==")
-p = payload()
-p["modules"][0].update(
-    {
-        "unitId": "单元甲",
-        "trace": "设计 1.1",
-        "driver": "驱动甲",
-        "coverage": "-S 88% -B 77%",
-        "designer": "设计甲",
-        "reviewer": "校对甲",
-    }
-)
-p["modules"][0]["cases"][0]["tester"] = "测试甲"
-out = validate(p, rich_skill)
-mod = out["modules"][0]
-check(mod["unitId"] == "单元甲", "unitId 来自数据")
-check(mod["trace"] == "设计 1.1", "trace 来自数据")
-check(mod["driver"] == "驱动甲", "driver 来自数据")
-check(mod["coverage"] == "-S 88% -B 77%", "coverage 来自数据")
-check(mod["cases"][0]["designer"] == "设计甲", "designer 来自数据")
-check(mod["cases"][0]["reviewer"] == "校对甲", "reviewer 来自数据")
-check(mod["cases"][0]["tester"] == "测试甲", "tester 仍是数据优先")
-
-print("\n== 多模块 unitId 各自独立 ==")
-p = payload()
-p["summary"]["total"] = 2
-p["summary"]["passed"] = 2
-second_case = json.loads(json.dumps(p["modules"][0]["cases"][0]))
-second_case["id"] = "C-2"
-p["modules"][0]["cases"].append(second_case)
-p["modules"][0]["unitId"] = "单元一"
-p["modules"].append({"name": "模块二", "unitId": "单元二", "cases": [dict(second_case, id="C-3")]})
-p["summary"]["total"] = 3
-p["summary"]["passed"] = 3
-out = validate(p, {"unitId": "统一单元"})
-check(out["modules"][0]["unitId"] == "单元一", f"模块一 unitId={out['modules'][0]['unitId']!r}")
-check(
-    out["modules"][1]["unitId"] == "单元二",
-    f"模块二 unitId={out['modules'][1]['unitId']!r}",
-)
-
-shutil.rmtree(tmp, ignore_errors=True)
-shutil.rmtree(fixture, ignore_errors=True)
+    old = tmp / "SKILL.md"
+    old.write_text("---\nname: t\ndesigner: 旧设计\nreviewer: 旧校对\ntester: 旧测试\n---\n", encoding="utf-8")
+    meta = load_skill(str(old))
+    check(tester_of(meta) == "旧测试", f"兼容读取旧 SKILL.md：{tester_of(meta)!r}")
+    check(load_skill(str(tmp / "nope.md")) == {}, "旧 skill 文件不存在时返回空 dict")
+    print("  说明：v2 的 schema.validate 已忽略 skill_meta，人员以配置文件与数据为准。")
+except ImportError:
+    print("  (跳过) 未部署 skill_meta.py")
 
 print()
 if failures:
     print(f"FAILED {len(failures)}: {failures}")
     sys.exit(1)
-print("ALL SKILL TESTS PASSED")
+print("ALL CONFIG TESTS PASSED")

@@ -19,7 +19,9 @@ description: C++ 单元测试专项：结合 ai-test-workflow 完成原生构建
 - CTest 项目通常无需 binary；核对已注册的测试目标及项目筛选命令。只有 Makefile/vcxproj 等入口、无法自动识别时，显式写 runner.json，不擅自引入 CMake。
 - 一条面板用例对应一个可筛选、可取得逐条证据的测试项。本 Skill 不改动“查看测试代码”的既有定位逻辑。
 
-单条 gtest runner 示例（路径与命令按项目核实）：
+gtest 有两种执行模式，**各对应一个完整 preset，选一个就行，不要自己改 mode**（路径与命令按项目核实）：
+
+逐条执行（默认，一条用例一个进程，退出码即证据）——要覆盖的用例少，或期望每个用例独立进程时用：
 
 ```json
 {
@@ -29,6 +31,22 @@ description: C++ 单元测试专项：结合 ai-test-workflow 完成原生构建
   "preCommand": ["cmake", "--build", "{project}/build", "--config", "Debug"]
 }
 ```
+
+整批执行（一次进程跑完，逐条结果来自 JUnit XML）——要跑完整套或需要 JUnit 逐条证据时用：
+
+```json
+{
+  "preset": "gtest-batch",
+  "testFile": "project:tests/generated_test.cpp",
+  "binary": "project:build/tests/generated_test.exe",
+  "preCommand": ["cmake", "--build", "{project}/build", "--config", "Debug"]
+}
+```
+
+**铁律：写 `preset` 时不要同时写 `mode`、`command`、`targetArg`、`targetsSeparator`、`junit`。**
+这些字段由 preset 提供，且彼此配套（`per-case` 用 `{target}`，`batch` 用 `{targets}`）；
+单独覆盖 `mode` 会让继承来的 `command` 占位符对不上，插件会直接报错。
+确实需要自定义命令时，去掉 `preset`，自己写完整的 `id` / `mode` / `command`。
 
 ## 先核实本机能力
 
@@ -79,14 +97,9 @@ $selectedTargets 必须与本次 request 中的目标一致，多条 gtest 目�
 
 ```json
 {
-  "preset": "gtest",
+  "preset": "gtest-batch",
   "testFile": "project:tests/generated_test.cpp",
   "binary": "project:build/tests.exe",
-  "mode": "batch",
-  "targetArg": "{target}",
-  "targetsSeparator": ":",
-  "command": ["{binary}", "--gtest_filter={targets}", "--gtest_output=xml:{junit}"],
-  "junit": "junit.xml",
   "coverage": {
     "command": ["C:/actual/VS/Microsoft.CodeCoverage.Console.exe", "collect", "--settings", "{root}/coverage.config", "--output-format", "cobertura", "--output", "{coverageFile}", "{binary}", "--gtest_filter={targets}"],
     "format": "cobertura",
@@ -96,7 +109,9 @@ $selectedTargets 必须与本次 request 中的目标一致，多条 gtest 目�
 }
 ```
 
-这里 batch 与 `targetsSeparator=:` 让正式执行和覆盖率重放只包含本次目标，单条也只重放该条。不要用默认 per-case 配置配上未展开的 `{targets}`，也不要为单条结果采集整套项目覆盖率。额外重放可能有文件/数据库等副作用，先隔离测试数据，并在总结中说明覆盖率来自额外采集运行。
+`gtest-batch` 已经内置了 `targetsSeparator=:`，所以正式执行和覆盖率重放都只包含本次目标，单条也只重放该条。
+不要用 `per-case` 配置去接未展开的 `{targets}`，也不要为单条结果采集整套项目覆盖率。
+额外重放可能有文件/数据库等副作用，先隔离测试数据，并在总结中说明覆盖率来自额外采集运行。
 
 旧版 CodeCoverage.exe 的使用和解析边界见上节；不要将旧 XML 当作以上示例的 Cobertura。
 
@@ -111,9 +126,139 @@ $selectedTargets 必须与本次 request 中的目标一致，多条 gtest 目�
 - 客户 VS 界面若确实提供块、语句、分支数据，应导出并保留对应原始报告，逐项记录其真实口径，不要求客户更换已能工作的工具。当前自动解析未支持的指标须明确为“保留原始证据，尚未接入面板”，不能说已自动采集；缺少 MC/DC 则单独注明。
 - 采不到时在 analysis.md 记录是工具缺失、插桩/PDB/权限错误、过滤不到业务模块、没执行目标，还是格式无法解析；区分“未采集”和“0%”。覆盖率报告范围必须与本次函数、用例及被测源码一致。
 
+
+## v2 报告覆盖率指标映射
+
+runner 的 coverage 字段现在支持以下五种指标，各按真实工具报告取值：
+
+| 指标 | 标签 | 数据来源 | 说明 |
+|------|------|----------|------|
+| 行覆盖率 | -L | lines_covered / lines_total | 旧版 VS XML 的 lines_covered/lines_partially_covered/lines_not_covered |
+| 块覆盖率 | -BK | blocks_covered / blocks_total | 旧版 VS CodeCoverage.exe analyze XML |
+| 语句覆盖率 | -S | statements_covered / statements_total | 需工具明确提供 statement 字段 |
+| 分支覆盖率 | -B | branches_covered / branches_total | 需工具明确提供 branch 字段 |
+| MC/DC | -MCDC | 条件独立影响判定的覆盖证据 | 需工具明确提供 MC/DC 字段 |
+
+**旧版 VS XML 规则：**
+- blocks_covered / blocks_not_covered → 块覆盖率，标签 -BK
+- lines_covered / lines_partially_covered / lines_not_covered → 行覆盖率，标签 -L
+- 旧版 XML 没有独立的语句或分支字段 → 对应字段写"未提供"，不得推导或改名
+
+**MC/DC 规则：**
+- 当前版本 VS 默认不提供 MC/DC
+- 客户 VS 界面若确实提供 MC/DC 数据，保留原始报告
+- 无实证时写"当前工具/报告未提供 MC/DC"
+
+**result.json.coverage 写入规则：**
+```json
+{
+  "available": true,
+  "line": {"total": 100, "covered": 85, "percent": 85.0},
+  "block": {"total": 50, "covered": 40, "percent": 80.0},
+  "statement": {"total": null, "covered": null, "percent": null, "reason": "未提供"},
+  "branch": {"total": null, "covered": null, "percent": null, "reason": "未提供"},
+  "mcdc": {"total": null, "covered": null, "percent": null, "reason": "当前工具未提供 MC/DC"}
+}
+```
+不可用时 available=false，并填写 reason。
+
+## 旧版 VS CodeCoverage.exe 接入（已验证可用）
+
+**适用条件：** 本机装了 **Enterprise 版** VS（2019/2022），带 `Team Tools/Dynamic Code Coverage Tools`。
+Professional 版没有这个采集器（旧版覆盖率是 Enterprise 功能），只能换工具或换版本。
+
+### 1. 先确认采集器真实存在
+
+```powershell
+$tool = '<VS>\Team Tools\Dynamic Code Coverage Tools\amd64\CodeCoverage.exe'
+if (-not (Test-Path -LiteralPath $tool)) { Write-Host '未安装 Dynamic Code Coverage Tools' }
+```
+
+面板按下面的阶梯找它（工具名 `codecoverage`），**不写死路径**：
+
+| 顺序 | 去哪找 |
+| --- | --- |
+| 1 | `DSH_CODECOVERAGE_PATH` 显式指定 |
+| 2 | `DSH_TOOL_SEARCH_DIRS` 自定义搜索目录 |
+| 3 | 所有 VS 实例：`%ProgramData%\Microsoft\VisualStudio\Packages\_Instances\*\state.json` 的 `installationPath` → `<VS>\Team Tools\Dynamic Code Coverage Tools\amd64` |
+| 4 | `%VSINSTALLDIR%` / `%VCINSTALLDIR%` 指向的安装根 |
+| 5 | `%ProgramFiles%`、`%ProgramFiles(x86)%` 下的 `Microsoft Visual Studio\*\*\Team Tools\...`（VS2017/2019/2022 通用） |
+| 6 | **兜底**：遍历固定盘做限深扫描，找名为 `Dynamic Code Coverage Tools` 的目录（绿色包 / 自定义安装根） |
+
+优先用 `amd64\CodeCoverage.exe`（64 位采集器）；拿 32 位采集器去采 64 位进程会失败。
+
+客户环境常见情况：**只装了一个 VS2017**，默认路径 `C:\Program Files (x86)\Microsoft Visual Studio\2017\<Edition>\Team Tools\Dynamic Code Coverage Tools\`，第 5 层就能命中。
+
+VS **Professional 2022 不带**这个采集器（旧版覆盖率是 Enterprise 功能），本机实测确实没有；遇到这种情况如实报告，不要假装采集成功。
+
+### 2. 生成项目级配置 —— 必须以工具自带配置为基础
+
+```powershell
+$py '<插件>/skills/cpp-test/make_vs_coverage_config.py' `
+    --project <项目根> `
+    --binary-name test_generated.exe `
+    --source-regex '.*[\\/]<项目目录名>[\\/]src[\\/].*\.(cpp|hpp)$' `
+    --tool-config '<VS>\Team Tools\Dynamic Code Coverage Tools\CodeCoverage.config'
+```
+
+**三个硬规则（踩过的坑）：**
+
+1. **不能用几行手写配置**。必须保留
+   `<AllowLowIntegrityProcesses>true</AllowLowIntegrityProcesses>`。
+   实测：同一个程序、同一个收集器，漏了这一项 → `.coverage` 只有 **10 字节**、
+   XML 是 `<results />`；补上 → 正常采集；把它改成 `false` → 又变空。
+   这说明它是硬依赖，不是可选优化。
+2. **源码正则不能只写 `.*\src\.*`**。gtest 自己的
+   `build/_deps/googletest-src/googletest/src/gtest.cc` 也含 `\src\`，
+   会把整个 gtest 算进覆盖率（实测总行数从 24 直接膨到 4285）。
+   把项目目录名写进正则：`.*[\\/]项目名[\\/]src[\\/].*`。
+3. **不要先用 vsinstr 插桩**。旧版动态采集直接跑原始可执行文件即可；
+   被其他分析工具插桩过的程序可能被跳过。
+
+### 3. runner.json 选带覆盖率的 preset
+
+```json
+{
+  "preset": "gtest-batch-cov",
+  "testFile": "project:tests/test_generated.cpp",
+  "binary": "project:build/Debug/test_generated.exe",
+  "preCommand": ["cmake", "--build", "{project}/build", "--config", "Debug"]
+}
+```
+
+`gtest-batch-cov` 会做两步：
+
+```text
+CodeCoverage.exe collect /config:<配置> /output:run.coverage tests.exe --gtest_filter=<目标>
+CodeCoverage.exe analyze /output:coverage.xml run.coverage
+```
+
+报告格式是 `vs-codecoverage-xml`（runner 已支持）。
+配置优先用项目里的 `<项目根>/testReport/coverage.config`，没有才用工具自带配置。
+
+### 4. 前置条件与产物口径
+
+- 测试可执行文件必须是 **同次构建** 且带匹配 **PDB**（Debug、不要 `/DEBUG:NONE`）。
+- 旧版 XML **只有块和行两种口径**，没有独立的语句 / 分支 / MC-DC 字段。
+  报告里这三项写「未提供」，不得推导或改名。
+- 采集会额外跑一次测试可执行文件；有副作用时先隔离测试数据，并在总结中说明覆盖率来自额外采集。
+
+### 5. 已验证的实测数据（cpp-gtest-demo）
+
+| 执行范围 | 块覆盖率 | 行覆盖率 |
+| --- | --- | --- |
+| 2 条用例（AddLine_Normal + Subtotal_EmptyOrder） | 46.4%（13/28） | 50.0%（12/24） |
+| 全量 OrderTest.* | 20.0%（2369/11845） | 29.2%（1251/4285）—— 那时正则未加项目目录名，把 gtest 算进去了 |
+
+第二个数字正是上面第 2 条坑的现场证据，不要当成业务覆盖率。
+
 ## 收尾核对
 
 确认本次 request 的目标筛选、实际收集命令、输出文件新鲜度、非空业务模块、原始指标单位，以及 result.json.coverage.available/reason。已有旧报告不能冒充本次输出。执行有失败时仍检查收集器是否写出报告；不因非零退出码直接丢弃真实覆盖率。
+
+- 覆盖率报告范围必须与本次函数、用例及被测源码一致
+- 确认旧 XML 不被改后缀充当 Cobertura
+- 确认块覆盖率不填入行/分支字段
 
 命令语义参考（客户本机帮助优先）：
 

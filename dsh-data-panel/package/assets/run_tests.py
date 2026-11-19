@@ -427,9 +427,9 @@ def _read_text(path: Path) -> str:
 
 
 def parse_coverage_report(path: Path, fmt: str) -> dict:
-    """解析覆盖率报告，返回 {"line": stat|None, "branch": stat|None}。"""
+    """解析覆盖率报告，返回 {"line": stat|None, "branch": stat|None, "block": stat|None}。"""
     fmt = (fmt or "").strip().lower()
-    line = branch = None
+    line = branch = block = None
 
     if fmt == "coveragepy-json":
         data = json.loads(_read_text(path))
@@ -516,12 +516,43 @@ def parse_coverage_report(path: Path, fmt: str) -> dict:
                 missed = int(branch_counter.get("missed") or 0)
                 branch = _stat(covered, covered + missed)
 
-    else:
-        raise ValueError(f"不认识的覆盖率格式「{fmt}」（可用：coveragepy-json / istanbul-summary / go-cover / lcov / cobertura / jacoco）")
+    elif fmt in ("vs-codecoverage-xml", "vs-xml"):
+        # 旧版 VS 动态采集（CodeCoverage.exe analyze）导出的 XML：
+        #   <module blocks_covered blocks_not_covered lines_covered lines_partially_covered lines_not_covered …>
+        # 只有块与行两种口径，没有独立的语句/分支/MC-DC 字段，不得推导或改名。
+        root = ET.parse(str(path)).getroot()
+        b_cov = b_total = l_cov = l_total = 0
+        modules = 0
+        for module in root.iter("module"):
+            try:
+                bc = int(module.get("blocks_covered") or 0)
+                bm = int(module.get("blocks_not_covered") or 0)
+                lc = int(module.get("lines_covered") or 0)
+                lp = int(module.get("lines_partially_covered") or 0)
+                lm = int(module.get("lines_not_covered") or 0)
+            except (TypeError, ValueError):
+                continue
+            if bc + bm + lc + lp + lm == 0:
+                continue
+            modules += 1
+            b_cov += bc
+            b_total += bc + bm
+            l_cov += lc
+            l_total += lc + lp + lm
+        if modules == 0:
+            raise ValueError(
+                "旧版 VS 覆盖率 XML 里没有块/行数据（通常是空报告："
+                "检查 AllowLowIntegrityProcesses 是否为 true、PDB 是否同次构建、业务模块是否被过滤掉）"
+            )
+        line = _stat(l_cov, l_total)
+        block = _stat(b_cov, b_total)
 
-    if line is None and branch is None:
-        raise ValueError("报告里没有任何可用的行/分支统计")
-    return {"line": line, "branch": branch}
+    else:
+        raise ValueError(f"不认识的覆盖率格式「{fmt}」（可用：coveragepy-json / istanbul-summary / go-cover / lcov / cobertura / jacoco / vs-codecoverage-xml）")
+
+    if line is None and branch is None and block is None:
+        raise ValueError("报告里没有任何可用的行/分支/块统计")
+    return {"line": line, "branch": branch, "block": block}
 
 
 def locate_coverage_file(spec_file: str, project: Path) -> Path | None:
@@ -561,6 +592,19 @@ def collect_coverage(cfg, *, spec: dict, targets: list, run_dir: Path, project: 
     if not isinstance(timeout, int) or timeout <= 0:
         timeout = 900
 
+
+    # 采集器不会自己建目录：报告/原始容器的父目录必须先存在，否则 collect 直接报
+    # 「目录不存在」并退出（-1），看起来像采集失败。
+    for target_path in (report,):
+        if target_path:
+            try:
+                Path(target_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
+            except OSError as error:
+                reason = f"无法创建覆盖率输出目录：{error}"
+                if hint:
+                    reason += f"；{hint}"
+                say(f"[覆盖率未采集] {reason}")
+                return {"available": False, "reason": reason[:300]}
     say("")
     say("── 覆盖率采集 ──")
     say("$ " + " ".join(shlex.quote(part) for part in argv))
@@ -579,6 +623,30 @@ def collect_coverage(cfg, *, spec: dict, targets: list, run_dir: Path, project: 
     if run["code"] != 0:
         # 很多框架在用例失败时仍会写出覆盖率；不能因为退出码不是 0 就放弃读数。
         say(f"[覆盖率命令退出码 {run['code']}，继续尝试读取报告]")
+
+    # ── 两步采集：主命令跑完后，先执行 postCommand（如 analyze 导 XML），再去找报告 ──
+    post_raw = cfg.get("postCommand") or []
+    if post_raw:
+        bad_post = [part for part in post_raw if not isinstance(part, str)]
+        if bad_post:
+            reason = "coverage.postCommand 里有非字符串项（应为一维 argv 字符串数组）"
+            say(f"[覆盖率未采集] {reason}")
+            return {"available": False, "reason": reason}
+        post_argv = prepare_argv({**spec, "command": post_raw}, targets, "")
+        say("$ " + " ".join(shlex.quote(part) for part in post_argv))
+        post = run_command(post_argv, cwd, env, use_shell, started + timeout, log_file, capture=True)
+        if post["error"]:
+            reason = f"覆盖率后处理失败：{post['error']}"
+            if hint:
+                reason += f"；{hint}"
+            say(f"[覆盖率未采集] {reason}")
+            return {"available": False, "reason": reason[:300]}
+        if post["timedOut"]:
+            reason = f"覆盖率后处理超时（{timeout} 秒）"
+            say(f"[覆盖率未采集] {reason}")
+            return {"available": False, "reason": reason}
+        if post["code"] != 0:
+            say(f"[覆盖率后处理退出码 {post['code']}，继续尝试读取报告]")
 
     path = locate_coverage_file(report, project)
     if path is None:
@@ -599,11 +667,14 @@ def collect_coverage(cfg, *, spec: dict, targets: list, run_dir: Path, project: 
 
     line = stats.get("line") or {}
     branch = stats.get("branch") or {}
+    block_stat = stats.get("block") or {}
     summary = []
     if line:
         summary.append(f"行 {line['covered']}/{line['total']} = {line['percent']}%")
     if branch:
         summary.append(f"分支 {branch['covered']}/{branch['total']} = {branch['percent']}%")
+    if block_stat:
+        summary.append(f"块 {block_stat['covered']}/{block_stat['total']} = {block_stat['percent']}%")
     say(f"[覆盖率] {'；'.join(summary)}（{path.name}）")
     say(f"[覆盖率] 采集耗时 {int((time.time() - started) * 1000)}ms")
 
@@ -613,6 +684,7 @@ def collect_coverage(cfg, *, spec: dict, targets: list, run_dir: Path, project: 
         "source": str(path),
         "line": stats.get("line"),
         "branch": stats.get("branch"),
+        "block": stats.get("block"),
         "durationMs": int((time.time() - started) * 1000),
     }
 
