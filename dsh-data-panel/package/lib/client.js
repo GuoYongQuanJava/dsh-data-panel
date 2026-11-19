@@ -5374,9 +5374,31 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 		function IntegrationPanel(props) {
 			var active = props.active === true;
 			var sessionId = typeof props.sessionId === "string" ? props.sessionId : "";
-			var seedState = useState(function () { return buildIntegrationSeed(); });
+			var seedState = useState(function () {
+				// 测试可直接注入种子（同步），生产环境永远是 null → 走 /data-panel/integration。
+				return props.initialSeed || buildIntegrationSeed();
+			});
 			var seed = seedState[0];
 			var setSeed = seedState[1];
+			/*
+			 * 真实数据接入。
+			 *
+			 * 数据来自 <项目>/.dsh/test-sessions/<SID>/integration/ 下三套版本目录，
+			 * 由宿主 /data-panel/integration 读出来。面板不再只靠内存种子：
+			 *   · loadState = "idle" | "loading" | "ready" | "error"
+			 *   · 加载成功后把后端的用例灌进 seed.byVersion，后面的渲染逻辑一行不用改
+			 *   · 后端没有数据（首次使用）就是空列表，不是错误
+			 */
+			var loadStatePair = useState("idle");
+			var loadState = loadStatePair[0];
+			var setLoadState = loadStatePair[1];
+			var loadErrorPair = useState("");
+			var loadError = loadErrorPair[0];
+			var setLoadError = loadErrorPair[1];
+			/* 后端返回的原始三类数据（步骤页/报告页要用），原样存着。 */
+			var remotePair = useState(null);
+			var remote = remotePair[0];
+			var setRemote = remotePair[1];
 			// 当前版本：切版本会换一整套用例数据，互不影响。
 			var versionState = useState(seed.activeVersion);
 			var version = versionState[0];
@@ -5587,6 +5609,95 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 
 			var records = Array.isArray(seed.byVersion[version]) ? seed.byVersion[version] : [];
 
+			/**
+			 * 请求集成测试数据层。
+			 *
+			 * 成功后把后端的用例灌进 seed，并切到后端给的 activeVersion；
+			 * 失败不清空当前界面（避免一次网络抖动把用户的编辑冲掉），只提示。
+			 */
+			function loadIntegration(keepVersion) {
+				if (typeof fetch !== "function") return;
+				var sid = sessionId;
+				if (sid === "") { setLoadState("ready"); return; }
+				setLoadState("loading");
+				var url = "/data-panel/integration?sessionId=" + encodeURIComponent(sid);
+				fetch(url, { method: "GET", headers: { accept: "application/json" } })
+					.then(function (response) {
+						return response.json().catch(function () { return {}; }).then(function (data) {
+							if (!response.ok || data.ok === false) {
+								throw new Error((data && data.error) || ("请求失败（HTTP " + response.status + "）"));
+							}
+							return data;
+						});
+					})
+					.then(function (data) {
+						var kinds = (data && data.kinds) || {};
+						var caseKind = kinds.case || {};
+						var rawList = (caseKind.data && Array.isArray(caseKind.data.cases)) ? caseKind.data.cases : [];
+						var features = (caseKind.data && Array.isArray(caseKind.data.features)) ? caseKind.data.features : [];
+						var versions = Array.isArray(caseKind.index && caseKind.index.versions) ? caseKind.index.versions : [];
+						/*
+						 * 字段映射：面板的「功能项」左栏是按用例的 scenario 聚合的，
+						 * 而 Skill 约定里用例带的是 featureId。这里按 features[] 查表补上
+						 * scenario = 功能项名称，不改动原始 featureId（报告还要用）。
+						 */
+						var featureName = Object.create(null);
+						features.forEach(function (item) {
+							if (item && typeof item.id === "string") featureName[item.id] = item.name || item.id;
+						});
+						var list = rawList.map(function (item) {
+							if (!item || typeof item !== "object") return item;
+							var next = Object.assign({}, item);
+							if (!next.scenario && next.featureId && featureName[next.featureId]) {
+								next.scenario = featureName[next.featureId];
+							}
+							return next;
+						});
+						setRemote({ kinds: kinds, features: features });
+						setSeed(function () {
+							/*
+							 * 后端没有版本时保留一个空 V0.0.1，与 buildIntegrationSeed 的
+							 * 空态一致：面板需要「当前版本」才能渲染。
+							 */
+							var names = versions.length > 0
+								? versions.map(function (item) { return item.name; })
+								: ["V0.0.1"];
+							var byVersion = {};
+							names.forEach(function (name) {
+								byVersion[name] = name === caseKind.activeVersion ? list : [];
+							});
+							if (byVersion[caseKind.activeVersion] === undefined) {
+								byVersion[caseKind.activeVersion || names[0]] = list;
+							}
+							return {
+								versions: versions.length > 0
+									? versions
+									: [{ name: "V0.0.1", at: new Date().toISOString(), status: "current" }],
+								activeVersion: caseKind.activeVersion || names[0],
+								byVersion: byVersion,
+								features: features
+							};
+						});
+						if (!keepVersion) {
+							setVersion(caseKind.activeVersion || "V0.0.1");
+						}
+						setLoadState("ready");
+					})
+					.catch(function (error) {
+						setLoadError(error && error.message ? error.message : String(error));
+						setLoadState("error");
+					});
+			}
+
+			// 挂载时拉一次；切回集成页签时如果还没成功过也再拉一次。
+			// 注入了 initialSeed（测试场景）就不同步 fetch，直接用注入的数据。
+			useEffect(function () {
+				if (!active) return undefined;
+				if (props.initialSeed) { setLoadState("ready"); return undefined; }
+				if (loadState === "idle") loadIntegration(false);
+				return undefined;
+			}, [active]);
+
 			/** 改当前版本的数据；其他版本原样保留。 */
 			function patchRecords(next) {
 				setSeed(function (previous) {
@@ -5705,22 +5816,63 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 				setVersionOpen(false);
 				setResultOpen(false);
 				setExpandedGroups([]);
-				setNotice("演示数据：真实数据接入后这里会重读最新记录。");
+				// 真正重读磁盘：重拉集成测试数据层，而不是只提示「演示数据」。
+				setNotice("");
+				loadIntegration(true);
 			}
 			function notConnected(name) {
 				setNotice("演示数据：" + name + "还没接入后端，等后续规范确认后再实现。");
+			}
+
+			/**
+			 * 把当前版本的用例写回磁盘。
+			 *
+			 * 与单元测试一致：先改界面（乐观更新），再 POST 回去。
+			 * 写失败只提示、不回滚界面 —— 用户能再点一次保存，比悄悄丢掉改动好。
+			 * 没有真实数据源（未加载成功 / 无会话）时跳过，避免报一堆红。
+			 */
+			function persistCases(nextList) {
+				if (typeof fetch !== "function") return;
+				if (sessionId === "") return;
+				if (loadState !== "ready") return;
+				var body = {
+					sessionId: sessionId,
+					kind: "case",
+					op: "saveVersion",
+					version: version,
+					cases: nextList
+				};
+				fetch("/data-panel/integration", {
+					method: "POST",
+					headers: { "content-type": "application/json", accept: "application/json" },
+					body: JSON.stringify(body)
+				})
+					.then(function (response) {
+						return response.json().catch(function () { return {}; }).then(function (data) {
+							if (!response.ok || data.ok === false) {
+								throw new Error((data && data.error) || ("保存失败（HTTP " + response.status + "）"));
+							}
+							return data;
+						});
+					})
+					.then(function () { setNotice(""); })
+					.catch(function (error) {
+						setNotice("保存到磁盘失败：" + (error && error.message ? error.message : String(error)) + "。界面上的改动还在，可以再点一次保存。");
+					});
 			}
 
 			/** 保存用例（新增或编辑）。 */
 			function saveCase(next) {
 				var exists = records.some(function (record) { return record.id === next.id; });
 				if (exists) {
-					patchRecords(records.map(function (record) {
+					var updated = records.map(function (record) {
 						return record.id === next.id ? Object.assign({}, record, next) : record;
-					}));
+					});
+					patchRecords(updated);
+					persistCases(updated);
 				} else {
 					var id = "it-new-" + Date.now();
-					patchRecords(records.concat([Object.assign({}, next, {
+					var created = records.concat([Object.assign({}, next, {
 						id: id,
 						caseId: next.caseId || ("IT-" + String(records.length + 1).padStart(3, "0")),
 						status: next.status || "none",
@@ -5729,13 +5881,17 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 						createdAt: next.createdAt || new Date().toISOString().slice(0, 19),
 						records: next.records || [],
 						steps: Array.isArray(next.steps) ? next.steps : []
-					})]));
+					})]);
+					patchRecords(created);
+					persistCases(created);
 				}
 				setDetail(null);
 				setNotice("");
 			}
 			function removeCase(record) {
-				patchRecords(records.filter(function (item) { return item.id !== record.id; }));
+				var left = records.filter(function (item) { return item.id !== record.id; });
+				patchRecords(left);
+				persistCases(left);
 				confirmSet(null);
 			}
 
@@ -5865,11 +6021,19 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 									rows.length === 0
 									? h("div", { className: "it-empty" },
 										h("div", { className: "it-empty-title" },
-											query.trim() !== "" ? "没有匹配的测试用例" : "当前还没有测试用例"),
+											loadState === "loading"
+												? "正在读取集成测试数据…"
+												: (loadState === "error"
+													? "读取集成测试数据失败"
+													: (query.trim() !== "" ? "没有匹配的测试用例" : "当前还没有测试用例"))),
 										h("div", { className: "it-empty-hint" },
-											query.trim() !== ""
-												? "换个关键词，或清空搜索条件再看看。"
-												: "点右上角「新增用例」手动加一条，或在对话框里让 AI 按需求生成测试用例。")
+											loadState === "loading"
+												? "从本项目的 .dsh/test-sessions/<会话>/integration/ 读取，稍等一下。"
+												: (loadState === "error"
+													? (loadError || "宿主未返回原因。确认项目目录存在、会话已就绪后可点「刷新」重试。")
+													: (query.trim() !== ""
+														? "换个关键词，或清空搜索条件再看看。"
+														: "点右上角「新增用例」手动加一条，或在对话框里让 AI 按需求生成测试用例。")))
 									)
 									: h("table", { className: "it-table" },
 										h("thead", null,

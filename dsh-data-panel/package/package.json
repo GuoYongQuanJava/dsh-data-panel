@@ -16,6 +16,7 @@
     "lib/runners.js",
     "lib/scope.js",
     "lib/toolchain.js",
+    "lib/integration-store.js",
     "assets/run_tests.py",
     "cordis.patch.yml",
     "README.md"

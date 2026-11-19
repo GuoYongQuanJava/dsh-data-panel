@@ -24,6 +24,7 @@ import { fileURLToPath } from 'node:url'
 import { PRESET_TOOLS, PRESETS, detectPreset, renderRunnerSpec, resolveRunner, targetDeclared, targetLine, targetOf } from './runners.js'
 import { resolveSpecs, resolveTool, resolveTools, searchLayers } from './toolchain.js'
 import { assessScope } from './scope.js'
+import { KINDS, createVersion, integrationRoot, readAll, readIndex, readVersion, saveVersion, setActiveVersion, versionValue } from './integration-store.js'
 
 
 export const name = 'dsh-data-panel'
@@ -71,6 +72,8 @@ const RUN_REPORT_PATH = '/data-panel/run/report'
 const RUN_DELETE_PATH = '/data-panel/run/delete'
 const OPEN_PATH = '/data-panel/open'
 const RUN_REPORT_LATEST_PATH = '/data-panel/run/report/latest'
+/** 集成测试数据层：独立的路径，绝不复用单元的 /data-panel/api（那是 5 类硬校验的 store）。 */
+const INTEGRATION_PATH = '/data-panel/integration'
 const MAX_RUN_LOG = 4 * 1024 * 1024
 const RUNNER_ASSET = new URL('../assets/run_tests.py', import.meta.url)
 
@@ -1880,6 +1883,113 @@ function handleTools(req, res) {
   }
 }
 
+/**
+ * 集成测试数据层接口。
+ *
+ * GET  ?sessionId=…&cwd=…&kind=case|step|report[&version=…]
+ *      → { ok, kinds: { kind: { index, activeVersion, data } } }
+ *      不带 kind 时一次返回三类页面的数据，面板打开一次就够。
+ *
+ * POST { sessionId, cwd, kind, op, … }
+ *      op=createVersion  新建一个版本（每次生成动作都新建，不覆盖）
+ *      op=saveVersion    覆盖写某版本内容（面板编辑后保存）
+ *      op=setActive      切换当前查看的版本
+ *
+ * 与单元测试保持一致的两点：
+ *   1. 项目目录由宿主自己解析（resolveSessionCwd），不信任请求里的 cwd；
+ *   2. 没带 sessionId 一律 400，绝不静默写到别处。
+ */
+async function handleIntegration(req, res) {
+  try {
+    let body = {}
+    if (req.method === 'POST') {
+      try {
+        body = await readJson(req)
+      } catch (error) {
+        send(res, error.status || 400, { ok: false, error: error.message })
+        return
+      }
+    }
+
+    const sessionId = extractSessionId(req, body)
+    if (sessionId === '') {
+      throw bad(400, '缺少会话 ID：集成测试数据按会话存储，请带上 sessionId 再请求')
+    }
+
+    const url = new URL(req.url, 'http://localhost')
+    const query = (name) => {
+      const fromQuery = url.searchParams.get(name)
+      if (typeof fromQuery === 'string' && fromQuery !== '') return fromQuery.trim()
+      const fromBody = body?.[name]
+      return typeof fromBody === 'string' ? fromBody.trim() : ''
+    }
+
+    const sessionRoot = sessionAssetRoot(await resolveSessionCwd(sessionId, query('cwd')), sessionId)
+    const root = integrationRoot(sessionRoot)
+
+    if (req.method === 'GET') {
+      const kind = query('kind')
+      const version = query('version')
+      if (kind !== '') {
+        if (!KINDS.includes(kind)) throw bad(400, 'kind 只能是 case / step / report')
+        const index = await readIndex(sessionRoot, kind)
+        const target = version !== '' ? version : index.activeVersion
+        const data = target === '' ? null : await readVersion(sessionRoot, kind, target)
+        send(res, 200, { ok: true, root, kind, index, activeVersion: target, data })
+        return
+      }
+      const all = await readAll(sessionRoot)
+      send(res, 200, { ok: true, root, kinds: all })
+      return
+    }
+
+    if (req.method !== 'POST') {
+      send(res, 405, { ok: false, error: '只支持 GET 和 POST' })
+      return
+    }
+
+    const kind = query('kind')
+    if (!KINDS.includes(kind)) throw bad(400, 'kind 只能是 case / step / report')
+    const op = typeof body.op === 'string' ? body.op : ''
+
+    if (op === 'createVersion') {
+      const created = await createVersion(sessionRoot, kind, {
+        name: query('version') || undefined,
+        sourceCaseVersion: query('sourceCaseVersion') || undefined,
+        sourceStepVersion: query('sourceStepVersion') || undefined,
+        runId: query('runId') || undefined,
+        features: body.features,
+        cases: body.cases,
+        steps: body.steps,
+        snapshot: body.snapshot,
+        report: body.report,
+      })
+      send(res, 200, { ok: true, ...created })
+      return
+    }
+
+    if (op === 'saveVersion') {
+      const version = query('version')
+      if (version === '') throw bad(400, '缺少 version')
+      const saved = await saveVersion(sessionRoot, kind, version, body)
+      send(res, 200, { ok: true, ...saved })
+      return
+    }
+
+    if (op === 'setActive') {
+      const version = query('version')
+      if (version === '') throw bad(400, '缺少 version')
+      const index = await setActiveVersion(sessionRoot, kind, version)
+      send(res, 200, { ok: true, index })
+      return
+    }
+
+    throw bad(400, '不支持的 op：' + (op || '(空)'))
+  } catch (error) {
+    send(res, error.status || 500, { ok: false, error: error instanceof Error ? error.message : '服务内部错误' })
+  }
+}
+
 export function apply(ctx) {
   ctx.effect(
     () =>
@@ -1902,6 +2012,7 @@ export function apply(ctx) {
     [RUN_REPORT_LATEST_PATH, handleRunReportLatest, 'dsh-data-panel: run report latest'],
     [OPEN_PATH, handleOpenFile, 'dsh-data-panel: open file'],
     [TOOLS_PATH, handleTools, 'dsh-data-panel: tools'],
+    [INTEGRATION_PATH, handleIntegration, 'dsh-data-panel: integration store'],
   ]
   for (const [path, handler, label] of runRoutes) {
     ctx.effect(
@@ -1965,4 +2076,12 @@ export const __test = {
   handleRunList,
   handleRunLog,
   handleRunDelete,
+  handleIntegration,
+  readIntegration: readAll,
+  integrationRoot,
+  createIntegrationVersion: createVersion,
+  saveIntegrationVersion: saveVersion,
+  setIntegrationActive: setActiveVersion,
+  readIntegrationIndex: readIndex,
+  integrationVersionValue: versionValue,
 }

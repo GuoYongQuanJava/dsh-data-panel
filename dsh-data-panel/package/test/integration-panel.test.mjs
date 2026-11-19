@@ -6,6 +6,25 @@ import vm from 'node:vm'
 function harness() {
   let descriptor, index = 0
   const states = [], requests = []
+  /*
+   * fetch 桩。
+   *
+   * 历史：集成页曾是纯前端演示，桩直接抛错防止有人偷偷请求后端。
+   * 现在集成页**就是**要从 /data-panel/integration 读数据。
+   *
+   * 但面板的加载是异步的（fetch → setState），而这些测试是同步渲染断言的，
+   * 所以测试统一通过 `initialSeed` 同步注入数据，不依赖异步加载。
+   * 桩保留空响应，用于验证「确实请求了后端」这类断言。
+   */
+  const emptyIntegration = () => ({
+    ok: true,
+    root: '',
+    kinds: {
+      case: { index: { versions: [], activeVersion: '', byVersion: {} }, activeVersion: '', data: null },
+      step: { index: { versions: [], activeVersion: '', byVersion: {} }, activeVersion: '', data: null },
+      report: { index: { versions: [], activeVersion: '', byVersion: {} }, activeVersion: '', data: null },
+    },
+  })
   const React = {
     createElement: (type, props, ...children) => ({ type, props: props || {}, children }),
     useState(initial) {
@@ -17,10 +36,46 @@ function harness() {
   }
   vm.runInNewContext(readFileSync(process.env.DSH_PANEL_CLIENT_PATH || new URL('../lib/client.js', import.meta.url), 'utf8'), {
     window: { __ModuleLoader__: { load: value => { descriptor = value } } },
-    URLSearchParams, console, fetch: (...args) => { requests.push(args); throw new Error('集成演示不得请求后端') },
+    URLSearchParams,
+    console,
+    fetch: (...args) => {
+      requests.push(args)
+      const body = emptyIntegration()
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve(body),
+      })
+    },
   })
   const api = descriptor.factory(name => name === 'react' ? React : {}).__test
-  return { api, requests, render(Component, props = {}) { index = 0; return Component(props) } }
+  /*
+   * 测试用的集成种子：6 条用例 / 2 个功能项 / 两个版本。
+   * 与面板字段对齐（scenario 充当功能项名），用来断言列表行数、搜索过滤、
+   * 切版本、分页这些渲染行为。
+   */
+  const TEST_SEED = {
+    versions: [
+      { name: 'V0.0.1', at: '2026-11-16T09:00:00Z', status: 'current' },
+      { name: 'V0.0.2', at: '2026-11-17T12:00:00Z', status: 'archived' },
+    ],
+    activeVersion: 'V0.0.1',
+    byVersion: {
+      'V0.0.1': [
+        { id: 'it-1', caseId: 'V0_0_1-IT-001', title: '手机号验证码登录', scenario: '用户与登录', type: 'functional', description: '登录链路', steps: [{ no: 1, action: '打开', operation: '进入', expected: '显示' }], records: [{ runId: 'run-1', at: '2026-11-17T10:00:00Z', result: 'pass', durationMs: 1200 }] },
+        { id: 'it-2', caseId: 'V0_0_1-IT-002', title: '账号密码登录失败锁定', scenario: '用户与登录', type: 'functional', description: '锁定 5 次', steps: [{ no: 1, action: '登录', operation: '错 5 次', expected: '锁定' }], records: [] },
+        { id: 'it-3', caseId: 'V0_0_1-IT-003', title: '退出登录清除会话', scenario: '用户与登录', type: 'functional', description: '清除凭证', steps: [], records: [] },
+        { id: 'it-4', caseId: 'V0_0_1-IT-004', title: '商品加入购物车', scenario: '商品与购物车', type: 'functional', description: '加购', steps: [{ no: 1, action: '加购', operation: '点击', expected: '成功' }], records: [{ runId: 'run-2', at: '2026-11-17T10:05:00Z', result: 'fail', durationMs: 800 }] },
+        { id: 'it-5', caseId: 'V0_0_1-IT-005', title: '购物车数量上限校验', scenario: '商品与购物车', type: 'boundary', description: '超库存拦截', steps: [{ no: 1, action: '改量', operation: '输 999', expected: '拦截' }], records: [{ runId: 'run-3', at: '2026-11-17T10:10:00Z', result: 'pass', durationMs: 500 }] },
+        { id: 'it-6', caseId: 'V0_0_1-IT-006', title: '结算优惠券抵扣', scenario: '商品与购物车', type: 'api', description: '满减', steps: [], records: [] },
+      ],
+      'V0.0.2': [
+        { id: 'it2-1', caseId: 'V0_0_2-IT-001', title: '手机号验证码登录', scenario: '用户与登录', type: 'functional', description: '登录链路', steps: [], records: [] },
+        { id: 'it2-2', caseId: 'V0_0_2-IT-002', title: '商品加入购物车', scenario: '商品与购物车', type: 'functional', description: '加购', steps: [], records: [] },
+      ],
+    },
+  }
+  return { api, requests, TEST_SEED, render(Component, props = {}) { index = 0; return Component(props) } }
 }
 function nodes(tree) {
   if (!tree || typeof tree !== 'object') return []
@@ -73,7 +128,7 @@ test('同一壳切换测试页面，保留单元组件及其原始 props，按�
 })
 
 test('集成三个子页、搜索、场景过滤、版本切换不调用单元后端', () => {
-  const h = harness(), render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a' })
+  const h = harness(), render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a', initialSeed: h.TEST_SEED })
   assert.equal(typeof h.api.IntegrationPanel, 'function')
   // 默认页是测试报告，且分组默认折叠；这些断言针对用例表，先切到用例页
   find(render(), 'tab-cases').props.onClick()
@@ -94,7 +149,7 @@ test('集成三个子页、搜索、场景过滤、版本切换不调用单元�
 })
 
 test('新增编辑删除演示用例、步骤修改在三个子页同步，版本独立', () => {
-  const h = harness(), render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a' })
+  const h = harness(), render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a', initialSeed: h.TEST_SEED })
   // 默认页现在是测试报告，这些断言针对用例页，先显式切过去
   find(render(), 'tab-cases').props.onClick()
   find(render(), 'add-case').props.onClick()
@@ -154,7 +209,7 @@ test('总体报告排除和恢复只作用于纳入选择，真实条目保留',
 })
 
 test('步骤页的编辑打开的是步骤弹窗，不是编辑用例', () => {
-  const h = harness(), render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a' })
+  const h = harness(), render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a', initialSeed: h.TEST_SEED })
   find(render(), 'tab-steps').props.onClick()
   const tree = render()
   const id = rowIds(tree)[0]
@@ -212,7 +267,7 @@ test('步骤弹窗保存后步骤写回用例，其他字段不丢', () => {
 })
 
 test('用例表只读与改：名称不可点、无执行入口与行展开，编辑走操作列图标', () => {
-  const h = harness(), render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a' })
+  const h = harness(), render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a', initialSeed: h.TEST_SEED })
   // 默认页现在是测试报告，这些断言针对用例页，先显式切过去
   find(render(), 'tab-cases').props.onClick()
   const id = rowIds(render())[0]
@@ -230,13 +285,15 @@ test('用例表只读与改：名称不可点、无执行入口与行展开，�
   find(render(), 'edit-btn-' + id).props.onClick()
   assert.ok(nodes(render()).some(n => n.type === h.api.IntegrationCaseEditor), '点编辑图标应打开弹窗')
 
+  // 刷新现在真正重读磁盘：应当向集成数据层发请求，而不是只弹一条演示提示。
+  const beforeRefresh = h.requests.length
   find(render(), 'refresh').props.onClick()
-  assert.ok(find(render(), 'notice'), '刷新只给演示提示')
-  assert.equal(h.requests.length, 0)
+  assert.ok(h.requests.length > beforeRefresh, '刷新应向集成数据层发起请求')
+  assert.match(String(h.requests[h.requests.length - 1][0]), /\/data-panel\/integration/)
 })
 
 test('步骤表：序号格箭头展开执行结果子表，操作列是查看和编辑', () => {
-  const h = harness(), render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a' })
+  const h = harness(), render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a', initialSeed: h.TEST_SEED })
   find(render(), 'tab-steps').props.onClick()
   const id = rowIds(render())[0]
 
@@ -262,7 +319,7 @@ test('步骤表：序号格箭头展开执行结果子表，操作列是查看�
 })
 
 test('用例页有「生成测试步骤」，步骤页有「一键执行」，都只给演示提示', () => {
-  const h = harness(), render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a' })
+  const h = harness(), render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a', initialSeed: h.TEST_SEED })
   // 默认页现在是测试报告，这些断言针对用例页，先显式切过去
   find(render(), 'tab-cases').props.onClick()
 
@@ -289,7 +346,7 @@ test('用例页有「生成测试步骤」，步骤页有「一键执行」，�
 })
 
 test('步骤表有「执行结果」列，取该用例最新一次执行的结果', () => {
-  const h = harness(), render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a' })
+  const h = harness(), render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a', initialSeed: h.TEST_SEED })
   find(render(), 'tab-steps').props.onClick()
   const tree = render()
 
@@ -316,7 +373,7 @@ test('步骤表有「执行结果」列，取该用例最新一次执行的结�
 })
 
 test('「筛选」只在步骤页，多选为并集，清空后恢复全部', () => {
-  const h = harness(), render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a' })
+  const h = harness(), render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a', initialSeed: h.TEST_SEED })
 
   // 用例页不该有「筛选」按钮
   assert.equal(find(render(), 'result-menu'), undefined, '测试用例页不应出现筛选按钮')
@@ -356,7 +413,7 @@ test('「筛选」只在步骤页，多选为并集，清空后恢复全部', ()
 })
 
 test('默认进入测试用例页', () => {
-  const h = harness(), render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a' })
+  const h = harness(), render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a', initialSeed: h.TEST_SEED })
   const tree = render()
   // 默认页是测试用例：工具栏上有「新增用例」
   assert.ok(find(tree, 'add-case'), '默认应进入测试用例页，工具栏要有新增用例')
@@ -364,7 +421,7 @@ test('默认进入测试用例页', () => {
 })
 
 test('报告页多选：进入、全选、清空、退出都真实生效', () => {
-  const h = harness(), render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a' })
+  const h = harness(), render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a', initialSeed: h.TEST_SEED })
   // 默认页是测试用例，先切到测试报告页
   find(render(), 'tab-reports').props.onClick()
   let tree = render()
@@ -403,7 +460,7 @@ test('报告页多选：进入、全选、清空、退出都真实生效', () =>
 })
 
 test('报告页每个功能项分组各自分页，选项是 15/30/50/100', () => {
-  const h = harness(), render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a' })
+  const h = harness(), render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a', initialSeed: h.TEST_SEED })
   // 默认页是测试用例，先切到测试报告页；分组默认折叠，再全部展开
   find(render(), 'tab-reports').props.onClick()
   const tree = expandAllGroups(render(), render)
@@ -418,7 +475,7 @@ test('报告页每个功能项分组各自分页，选项是 15/30/50/100', () =
 })
 
 test('步骤页子表分页：选项 15/30/50/100，页码按用例各记一份', () => {
-  const h = harness(), render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a' })
+  const h = harness(), render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a', initialSeed: h.TEST_SEED })
   find(render(), 'tab-steps').props.onClick()
   const id = rowIds(render())[0]
   find(render(), 'expand-' + id).props.onClick()
@@ -438,7 +495,7 @@ test('刷新会收起所有下拉菜单', () => {
    * 点一次刷新，然后确认三个菜单面板都没渲染出来。
    * （各下拉自身的开合行为由「子页下拉承载三个页面并可切换」等测试覆盖。）
    */
-  const h = harness(), render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a' })
+  const h = harness(), render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a', initialSeed: h.TEST_SEED })
   let tree = render()
   assert.equal(find(tree, 'switch-menu-panel'), undefined, '默认子页下拉是关闭的')
   assert.equal(find(tree, 'version-menu-panel'), undefined, '默认版本下拉是关闭的')
@@ -449,13 +506,13 @@ test('刷新会收起所有下拉菜单', () => {
   assert.equal(find(tree, 'switch-menu-panel'), undefined, '刷新后子页下拉仍是关闭的')
   assert.equal(find(tree, 'version-menu-panel'), undefined, '刷新后版本下拉仍是关闭的')
   assert.equal(find(tree, 'result-menu-panel'), undefined, '刷新后筛选下拉仍是关闭的')
-  assert.ok(find(tree, 'notice'), '刷新给出演示提示')
+  assert.equal(find(tree, 'notice'), undefined, '刷新不再弹演示提示（现在真的去读磁盘了）')
 })
 
 
 
 test('报告页分组默认全部收起，点标题才展开，刷新后再次收起', () => {
-  const h = harness(), render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a' })
+  const h = harness(), render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a', initialSeed: h.TEST_SEED })
   // 默认页是测试用例，先切到测试报告页
   find(render(), 'tab-reports').props.onClick()
   let tree = render()
@@ -480,7 +537,7 @@ test('报告页分组默认全部收起，点标题才展开，刷新后再次�
 })
 
 test('版本下拉：按版本号倒序（最新在上），带「当前」标记，最多露出 5 条', () => {
-  const h = harness(), render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a' })
+  const h = harness(), render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a', initialSeed: h.TEST_SEED })
   const itemsOf = tree => nodes(tree)
     .filter(n => n.props && typeof n.props['data-it'] === 'string' &&
       n.props['data-it'].startsWith('version-') &&
@@ -539,7 +596,7 @@ test('步骤编辑器：有列头（测试方法/输入步骤/预期结果/操�
 })
 
 test('四个遗留项：空态文案、点空白关筛选、无 IT 标识、超 5 步滚动', () => {
-  const h = harness(), render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a' })
+  const h = harness(), render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a', initialSeed: h.TEST_SEED })
   const css = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
 
   // ① 三页空态：用搜索词制造无匹配，确认有标题+提示两行文案
@@ -594,7 +651,7 @@ test('背景与卡片结构与单元测试一致：根节点用 --dp-bg，表格
 })
 
 test('用例页与步骤页的表格都包在 .it-card 里', () => {
-  const h = harness(), render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a' })
+  const h = harness(), render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a', initialSeed: h.TEST_SEED })
   const hasCard = tree => nodes(tree).some(n => n.props && n.props.className === 'it-card')
 
   // 用例页（默认页）
