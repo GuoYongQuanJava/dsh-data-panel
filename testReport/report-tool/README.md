@@ -1,4 +1,4 @@
-﻿# 测试报告生成（T08）
+# 测试报告生成（T08）
 
 把**真实测试执行结果**填入客户提供的 Word 模板，输出可直接交付的 `.docx` 报告。
 
@@ -15,7 +15,7 @@ $py = 'C:\Users\PC\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\pyt
 # 生成报告（测试人员来自 skill 文件）
 & $py cmd.py --template "C:\Users\PC\Desktop\RingBuffer-test(1).docx" `
              --data results.json `
-             --skill "D:\1\skills\ringbuffer-unit-test" `
+             --skill "<你的 skill 目录>" `
              -o report.docx
 ```
 
@@ -24,7 +24,7 @@ $py = 'C:\Users\PC\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\pyt
 ```
 modules=3  cases=8  passed=7  failed=1  notRun=0  removed=74  toc_cleared=29
 目录：已重建（OK toc=1 pages=9）
-skill=D:\1\skills\ringbuffer-unit-test  →  设计者=庞江，校对者=陈冠旭，测试人员=庞江
+skill=<你的 skill>  →  设计者=…，校对者=…，测试人员=…
 报告已生成：D:\1\report-tool\report.docx
 ```
 
@@ -48,8 +48,8 @@ frontmatter（推荐）：
 
 ```yaml
 ---
-name: auth-service-unit-test
-description: 用户认证服务单元测试流程
+name: your-project-unit-test
+description: 某模块单元测试流程
 designer: 张伟
 reviewer: 刘洋
 tester: 王芳
@@ -355,7 +355,7 @@ new.append(node)
 & $py test_schema.py        # 18 条校验场景
 & $py test_skill.py         # skill 解析与注入优先级
 & $py test_edges.py         # 变量行、多模块、模板损坏、CLI 退出码
-& $py cmd.py --template RingBuffer-test.docx --data fresh-demo.json --skill ..\skills\ringbuffer-unit-test -o report.docx
+& $py cmd.py --template RingBuffer-test.docx --data fresh-demo.json --skill ..\skills\<你的skill> -o report.docx
 & $py verify_report.py report.docx fresh-demo.json RingBuffer-test.docx
 ```
 

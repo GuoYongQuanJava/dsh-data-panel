@@ -1,4 +1,4 @@
-﻿# 给「生成测试数据」的模型看的任务说明
+# 给「生成测试数据」的模型看的任务说明
 
 > 如果你是被要求「生成一份测试执行结果 JSON，然后跑通报告生成」的模型，按本文档执行。
 > 你是**数据供给侧**，不是报告代码的作者。不要改 `report-tool/` 里的任何 `.py` 文件。
@@ -206,8 +206,7 @@ tester: 王芳
 ---
 ```
 
-**只有这三个人员字段会从 skill 读取**，写别的键会被忽略。完整示例见
-`D:\1\skills\auth-service-unit-test\SKILL.md`。
+**只有这三个人员字段会从 skill 读取**，写别的键会被忽略（完整示例见上面「skill 文件最小形态」）。
 
 ### 4. 校验产物
 
@@ -282,5 +281,10 @@ schema 报错样例（会带精确路径）：
 - 模块级给了 `designer` / `reviewer`，用例级故意不写 `tester`
 - 标识 `AUTH-PWD-0001` 风格，与模板零重叠
 
-配套 skill（只声明 `tester: 王芳`）：
-`D:\1\skills\auth-service-unit-test\SKILL.md`
+配套 skill（只声明 `tester: 王芳`）：自己建一个 `skills/<你的项目>/SKILL.md`，frontmatter 写
+```yaml
+---
+name: your-project-unit-test
+tester: 王芳
+---
+```

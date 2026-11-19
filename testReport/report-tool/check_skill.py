@@ -24,10 +24,16 @@ def check(condition, message):
         failures.append(message)
 
 
-ROOT = Path(__file__).resolve().parent.parent
-SKILL = ROOT / "skills" / "auth-service-unit-test" / "SKILL.md"
-if not SKILL.is_file():
-    SKILL = Path(r"D:\1\skills\auth-service-unit-test\SKILL.md")
+# 示例 skill 不再随包分发：这里临时生成一个固定内容的 SKILL.md 做夹具，
+# 测试不再依赖仓库/本机某个具体 skill 是否存在。
+fixture = Path(tempfile.mkdtemp(prefix="skillfix-"))
+SKILL = fixture / "auth-service-unit-test" / "SKILL.md"
+SKILL.parent.mkdir(parents=True, exist_ok=True)
+SKILL.write_text(
+    "---\nname: auth-service-unit-test\ndescription: 夹具\n"
+    "designer: 张伟\nreviewer: 刘洋\ntester: 王芳\n---\n",
+    encoding="utf-8",
+)
 
 print("== frontmatter：读取三个人员字段 ==")
 meta = load_skill(str(SKILL))
@@ -242,6 +248,7 @@ check(
 )
 
 shutil.rmtree(tmp, ignore_errors=True)
+shutil.rmtree(fixture, ignore_errors=True)
 
 print()
 if failures:

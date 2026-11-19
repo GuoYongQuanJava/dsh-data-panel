@@ -1,4 +1,4 @@
-﻿# 测试报告生成
+# 测试报告生成
 
 把**测试执行结果**填进客户给定的 Word 模板，输出一份可直接交付的测试报告。
 
@@ -39,18 +39,18 @@ pip3 install -r requirements.txt
 python report-tool/cmd.py `
   --template templates/RingBuffer-test-blank.docx `
   --data examples/auth-demo.json `
-  --skill skills/auth-service-unit-test `
   -o 示例报告.docx
 ```
 
 （macOS / Linux 把 `python` 换成 `python3`，反引号换行改成 `\`）
+
+> 包里不预置 skill。要指定自己的 skill 目录（读设计者/校对者/测试人员），加 `--skill skills/<你的项目>`；不加也能出报告，人员取执行数据。
 
 看到这个就成功了：
 
 ```
 modules=3  cases=8  passed=6  failed=1  notRun=1  removed=10  toc_cleared=0
 目录：已重建（OK toc=1 pages=9）
-skill=skills/auth-service-unit-test  →  设计者=张伟，校对者=刘洋，测试人员=王芳
 报告已生成：示例报告.docx
 ```
 
@@ -61,7 +61,6 @@ python report-tool/verify_report.py `
   示例报告.docx `
   examples/auth-demo.json `
   templates/RingBuffer-test-blank.docx `
-  skills/auth-service-unit-test
 ```
 
 最后一行必须是：
@@ -103,9 +102,7 @@ ALL CHECKS PASSED
 ├── templates/
 │   ├── RingBuffer-test.docx         客户原始模板（含样例数据，12 张表）
 │   └── RingBuffer-test-blank.docx   ★ 空白表单模板（推荐用这个）
-├── skills/
-│   ├── auth-service-unit-test/      示例 skill
-│   └── ringbuffer-unit-test/        示例 skill
+├── skills/                          （可选）你自己的 skill 放这里
 └── examples/
     ├── auth-demo.json               3 模块 8 用例（含未执行）
     └── paygate-demo.json            6 模块 16 用例
@@ -130,7 +127,7 @@ ALL CHECKS PASSED
 | 要替换的 | 换成什么 |
 |---|---|
 | `templates/RingBuffer-test-blank.docx` | 客户的模板（先用 `make_blank_template.py` 清空，见 4.3） |
-| `skills/auth-service-unit-test/SKILL.md` | 自己项目的 skill，frontmatter 写设计者/校对者/测试人员 |
+| `skills/<你的项目>/SKILL.md` | 可选：自己项目的 skill，frontmatter 写设计者/校对者/测试人员 |
 | `examples/auth-demo.json` | 自己的执行结果数据 |
 
 ### 4.2 数据怎么写

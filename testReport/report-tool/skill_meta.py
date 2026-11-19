@@ -19,7 +19,7 @@ supported, frontmatter first:
 1. **frontmatter** — flat ``key: value`` lines::
 
        ---
-       name: auth-service-unit-test
+       name: your-project-unit-test
        description: ...
        designer: 张伟
        reviewer: 刘洋

@@ -1,4 +1,4 @@
-﻿"""环境自检：判断当前机器能不能跑通报告生成流程。
+"""环境自检：判断当前机器能不能跑通报告生成流程。
 
 用法::
 
@@ -70,11 +70,14 @@ if missing:
 else:
     add("ok", f"{len(required)} 个必需文件齐全", f"包根目录: {ROOT}")
 
-skill_dir = ROOT / "skills" / "auth-service-unit-test"
+# 示例 skill 不再随包分发：这里只列包里实际放了哪些 skill，一个都没有也不算问题。
+skills_dir = ROOT / "skills"
+found_skills = sorted(p.parent.name for p in skills_dir.glob("*/SKILL.md")) if skills_dir.is_dir() else []
 add(
-    "ok" if (skill_dir / "SKILL.md").is_file() else "warn",
-    "示例 skill",
-    str(skill_dir) if skill_dir.is_dir() else "缺失（不影响出报告，人员会留空）",
+    "ok",
+    "skill（可选）",
+    ("发现: " + ", ".join(found_skills)) if found_skills
+    else "未放置（不影响出报告；人员取执行数据，或用 --skill 指定自己的 skill）",
 )
 
 # ── 4. 数据契约 ────────────────────────────────────────────
@@ -87,14 +90,15 @@ try:
     import json
 
     sample = ROOT / "examples" / "auth-demo.json"
-    meta = load_skill(str(skill_dir))
+    # 有 skill 就读第一个（人员字段），没有就空 dict，人员取执行数据
+    meta = load_skill(str(skills_dir / found_skills[0])) if found_skills else {}
     data = validate(json.loads(sample.read_text(encoding="utf-8")), meta)
     add(
         "ok",
         "示例数据通过校验",
         f"{len(data['modules'])} 模块 / {data['summary']['total']} 用例",
     )
-    add("ok" if meta else "warn", "skill 解析", describe(meta) if meta else "未解析到人员")
+    add("ok", "skill 解析", describe(meta) if meta else "未提供 skill（人员取执行数据）")
 except SchemaError as exc:
     add("bad", "示例数据校验失败", str(exc))
 except Exception as exc:  # noqa: BLE001
@@ -153,7 +157,7 @@ if warn:
     print(f"   （{len(warn)} 项可选能力缺失，不影响出报告）")
 print("\n下一步：")
 print("  python report-tool/cmd.py --template templates/RingBuffer-test-blank.docx \\")
-print("         --data examples/auth-demo.json --skill skills/auth-service-unit-test \\")
+print("         --data examples/auth-demo.json \\")
 print("         -o 示例报告.docx")
 print("\n（Windows 命令换行用反引号 ` 而不是 \\）")
 sys.exit(0)
