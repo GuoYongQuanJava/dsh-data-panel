@@ -19,7 +19,7 @@ supported, frontmatter first:
 1. **frontmatter** — flat ``key: value`` lines::
 
        ---
-       name: your-project-unit-test
+       name: user-report-metadata
        description: ...
        designer: 张伟
        reviewer: 刘洋

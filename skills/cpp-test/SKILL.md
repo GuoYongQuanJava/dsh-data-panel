@@ -252,6 +252,63 @@ CodeCoverage.exe analyze /output:coverage.xml run.coverage
 
 第二个数字正是上面第 2 条坑的现场证据，不要当成业务覆盖率。
 
+## 圈复杂度（报告表 2）
+
+报告表 2 需要每个函数的圈复杂度。它**不需要编译、不需要 VS**，是纯静态分析。
+
+### 工具来源：本机优先，没有就用包里带的
+
+`report-tool/complexity.py` 按这个顺序找 lizard：
+
+| 顺序 | 来源 | 说明 |
+| --- | --- | --- |
+| 1 | 本机已安装的 lizard | `pip install lizard` 过的环境，直接 `import lizard` |
+| 2 | **testReport 自带的副本** | `testReport/vendor/lizard/`（约 730 KB），本机没装时自动降级使用 |
+| 3 | 都没有 | 返回空列表，报告写“未开展静态分析”，**不编数字** |
+
+所以客户机器不需要装 Python 包，也不需要联网。
+
+### 直接跑（也会被 bridge 自动调用）
+
+```powershell
+python report-tool/complexity.py <项目根或源码目录>
+python report-tool/complexity.py <项目根> --json   # 给程序用
+```
+
+它自己会认 `src` / `source` / `lib` / `app` / `include`；直接传源码目录也行。
+开头的 `lizard 来源: system|vendored` 告诉你用的是哪一份。
+
+### 口径
+
+- 圈复杂度 = 判定节点数 + 1，`if` / `for` / `while` / `case` / `&&` / `||` / `? :` 都算；
+- 结果按复杂度降序，报告表 2 直接按这个顺序填；
+- lizard 只做静态估算，**不等于**任何工具的认证结论；报告里不加“已通过静态分析”之类的话。
+
+### vendored 副本的边界
+
+包里那份去掉了两个可选依赖：
+
+| 去掉的 | 影响 |
+| --- | --- |
+| `pathspec` | 只影响 gitignore 过滤，不影响统计 |
+| `pygments` | 只影响 Erlang / F# / OCaml 解析；C/C++/Java/C#/Python/JS 不受影响 |
+
+如果哪天真要分析 Erlang/F#/OCaml，`pip install pygments` 即可，vendor 副本会自动用上。
+
+### 实测（cpp-gtest-demo）
+
+```
+CC   函数                     行数  文件
+ 2   Order::addLine            6   order.cpp
+ 2   Order::setCoupon          6   order.cpp
+ 2   Order::shipping           3   order.cpp
+ 2   Order::subtotal            7   order.cpp
+ 1   Order::payable            3   order.cpp
+ 1   round2                    1   order.cpp
+```
+
+6 个函数，平均 1.67，最高 2。
+
 ## 收尾核对
 
 确认本次 request 的目标筛选、实际收集命令、输出文件新鲜度、非空业务模块、原始指标单位，以及 result.json.coverage.available/reason。已有旧报告不能冒充本次输出。执行有失败时仍检查收集器是否写出报告；不因非零退出码直接丢弃真实覆盖率。

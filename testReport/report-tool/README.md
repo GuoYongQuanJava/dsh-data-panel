@@ -12,10 +12,10 @@
 # 准备一个 python-docx 环境，或用 DSH 自带的
 $py = 'C:\Users\PC\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe'
 
-# 生成报告（测试人员来自 skill 文件）
+# 生成报告（可选传入项目专属 Skill）
 & $py cmd.py --template "C:\Users\PC\Desktop\RingBuffer-test(1).docx" `
              --data results.json `
-             --skill "<你的 skill 目录>" `
+             --skill "C:\项目\report-skill" `
              -o report.docx
 ```
 
@@ -24,11 +24,10 @@ $py = 'C:\Users\PC\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\pyt
 ```
 modules=3  cases=8  passed=7  failed=1  notRun=0  removed=74  toc_cleared=29
 目录：已重建（OK toc=1 pages=9）
-skill=<你的 skill>  →  设计者=…，校对者=…，测试人员=…
 报告已生成：D:\1\report-tool\report.docx
 ```
 
-`--skill` 可省略。省略时测试人员取执行结果 JSON 里的值，JSON 也没写就留空。
+包内不提供写死项目和姓名的示例 Skill，但保留 `--skill` 扩展点。当前脚本从项目 Skill 读取 `designer` / `reviewer` / `tester` 默认值；报告 JSON 中的模块或用例值优先。省略时直接使用 JSON，仍缺失的人员字段留空。
 
 也支持从标准输入读数据（宿主进程管道调用，不落临时文件）：
 
@@ -48,8 +47,8 @@ frontmatter（推荐）：
 
 ```yaml
 ---
-name: your-project-unit-test
-description: 某模块单元测试流程
+name: user-report-metadata
+description: 用户认证服务单元测试流程
 designer: 张伟
 reviewer: 刘洋
 tester: 王芳
@@ -97,9 +96,13 @@ DSH 的 skill 加载器只读 `name` / `description`，其他键会被忽略，�
 | `make_blank_template.py` | 清空模板 | 把客户原始模板清理成空白表单（保留结构标签 + 占位符） |
 | `cmd.py` | CLI 入口 | 参数解析、退出码、stdin 支持、文件占用提示 |
 | `verify_report.py` | 产物校验 | 数据驱动：所有期望值从 JSON 推导，不硬编码任何 fixture |
-| `test_schema.py` | 校验单测 | 25 条用例覆盖缺失/类型/枚举/一致性/空集/notRun |
-| `test_skill.py` | skill 单测 | frontmatter/表格解析、优先级、多模块 unitId 隔离 |
-| `test_edges.py` | 边界与 CLI 单测 | 0~8 组变量、多模块、模板损坏、6 种退出码 |
+| `config_file.py` | 项目配置解析 | 兼容 YAML frontmatter / Markdown 列表；同名键取首值，不编默认值 |
+| `complexity.py` | 圈复杂度 | 本机 lizard 优先，没有就用 `../vendor/lizard`；两者全无时如实返回空 |
+| `test_schema.py` | 校验单测 | v2 契约：schemaVersion、三段平衡、唯一性、空集、notRun、覆盖率口径 |
+| `test_edges.py` | 边界与 CLI 单测 | 0~8 组变量、多阶段多函数、模板缺标记、6 种退出码 |
+| `test_coverage.py` | 覆盖率链路 | 6 种格式 + 旧版 VS XML、两段采集（postCommand）、bridge 标签、失败不篡结论 |
+| `test_complexity.py` | 圈复杂度链路 | system/vendored 两种来源、vendor 缺失降级、CLI 与 bridge 集成 |
+| `test_skill.py` / `check_skill.py` | 配置解析单测 | 两种写法、注释/引号/首值优先、缺失不编值；含 skill_meta 兼容冒烟 |
 | `auth-demo.json` | 全新演示数据 | 认证服务 8 条用例（含 1 条未执行），与模板样例零重叠 |
 | `fresh-demo.json` | 演示数据 | 订单中心 8 条用例 |
 | `demo.json` | 旧演示数据 | RingBuffer 5 条用例（保留做回归） |
@@ -355,7 +358,7 @@ new.append(node)
 & $py test_schema.py        # 18 条校验场景
 & $py test_skill.py         # skill 解析与注入优先级
 & $py test_edges.py         # 变量行、多模块、模板损坏、CLI 退出码
-& $py cmd.py --template RingBuffer-test.docx --data fresh-demo.json --skill ..\skills\<你的skill> -o report.docx
+& $py cmd.py --template RingBuffer-test.docx --data fresh-demo.json -o report.docx
 & $py verify_report.py report.docx fresh-demo.json RingBuffer-test.docx
 ```
 

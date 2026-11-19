@@ -85,7 +85,7 @@ detail.write_text(
     "# 注释行被忽略\n"
     "<!-- HTML 注释也忽略 -->\n"
     "\n"
-    '- quoted: "带双引号的值"\n'
+    "- quoted: \"带双引号的值\"\n"
     "- single: '带单引号的值'\n"
     "- star: 星号列表\n"
     "* star2: 星号列表二\n"
@@ -112,12 +112,23 @@ check(load_key_values(tmp / "no-such.md") == {}, "不存在 → 空 dict")
 blank = tmp / "blank.md"
 blank.write_text("# 只有注释\n\n", encoding="utf-8")
 check(load_key_values(blank) == {}, "只有注释 → 空 dict")
+check(load_key_values(md).get("reqDocVersion") == "B", "无关文件不影响已有解析")
 
 print("\n== 数字安全转换 ==")
 check(as_int("42") == 42, "as_int('42') == 42")
 check(as_int(" 7 ") == 7, "as_int 容忍空格")
 check(as_int("abc", 3) == 3, "非法值回落默认")
 check(as_int("", 0) == 0, "空值回落默认")
+
+print("\n== 真实项目配置能读通 ==")
+real = Path(r"E:\gongzuo\harness\dshCJ\test\cpp-gtest-demo\testReport\skills\cpp-gtest-demo.md")
+if real.is_file():
+    cfg = load_key_values(real)
+    check(cfg.get("projectPackage") == "CPPGTEST", f"真实配置 projectPackage={cfg.get('projectPackage')!r}")
+    check(bool(cfg.get("projectName")), f"真实配置 projectName={cfg.get('projectName')!r}")
+    check(bool(cfg.get("designer")), f"真实配置 designer={cfg.get('designer')!r}")
+else:
+    print("  (跳过) 本机没有该项目配置样例")
 
 print("\n== skill_meta 兼容（旧 SKILL.md 仍可读，但不再驱动人员默认值）==")
 try:

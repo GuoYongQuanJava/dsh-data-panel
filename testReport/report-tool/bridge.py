@@ -128,6 +128,13 @@ def load_cases(path: Path) -> list:
 from config_file import load_key_values as load_config  # noqa: E402
 
 
+# 圈复杂度：优先用本机 lizard，没有就用 testReport 自带的 vendor 副本。
+# 实现集中在 complexity.py（CLI 与 bridge 共用一份）。
+from complexity import analyze as analyze_complexity
+from complexity import load_lizard
+
+
+
 def default_out(run_path: Path) -> Path:
     """默认把报告数据写到 reports/<runId>/report-data.json（runs 的兄弟目录）。"""
     run_id = run_path.parent.name
@@ -602,6 +609,13 @@ def main() -> int:
     out_path = Path(args.out) if args.out else default_out(run_path)
     log_file = Path(args.log) if args.log else (run_path.parent / "run.log")
 
+    # 圈复杂度：纯静态分析，不需要编译。有 lizard 就跑，没有就如实写“未开展”。
+    project_dir = Path(str(result.get("project") or "")) if result.get("project") else run_path.parent.parent.parent.parent
+    static_items = analyze_complexity(project_dir) if project_dir and project_dir.is_dir() else []
+    _lizard_kind = load_lizard()[1] if static_items else ""
+    if _lizard_kind:
+        print(f"   圈复杂度：{len(static_items)} 个函数（lizard={_lizard_kind}）")
+
     report = {
         "schemaVersion": "2.0",
         "meta": {
@@ -664,7 +678,7 @@ def main() -> int:
         "coverage": build_coverage_object(result),
         "reviews": {
             "docReviewDone": False,
-            "staticAnalysisDone": False,
+            "staticAnalysisDone": bool(static_items),
             "codeReviewDone": False,
             "dynamicTestDone": bool(executed_count > 0),
         },
@@ -690,6 +704,7 @@ def main() -> int:
             "previousRunId": "",
             "notes": "未开展回归测试",
         },
+        "staticItems": static_items,
     }
 
     out_path.parent.mkdir(parents=True, exist_ok=True)

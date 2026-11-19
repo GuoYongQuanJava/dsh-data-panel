@@ -39,12 +39,11 @@ pip3 install -r requirements.txt
 python report-tool/cmd.py `
   --template templates/RingBuffer-test-blank.docx `
   --data examples/auth-demo.json `
+  --skill <可选的项目专属Skill目录> `
   -o 示例报告.docx
 ```
 
 （macOS / Linux 把 `python` 换成 `python3`，反引号换行改成 `\`）
-
-> 包里不预置 skill。要指定自己的 skill 目录（读设计者/校对者/测试人员），加 `--skill skills/<你的项目>`；不加也能出报告，人员取执行数据。
 
 看到这个就成功了：
 
@@ -60,7 +59,7 @@ modules=3  cases=8  passed=6  failed=1  notRun=1  removed=10  toc_cleared=0
 python report-tool/verify_report.py `
   示例报告.docx `
   examples/auth-demo.json `
-  templates/RingBuffer-test-blank.docx `
+  templates/RingBuffer-test-blank.docx
 ```
 
 最后一行必须是：
@@ -102,7 +101,6 @@ ALL CHECKS PASSED
 ├── templates/
 │   ├── RingBuffer-test.docx         客户原始模板（含样例数据，12 张表）
 │   └── RingBuffer-test-blank.docx   ★ 空白表单模板（推荐用这个）
-├── skills/                          （可选）你自己的 skill 放这里
 └── examples/
     ├── auth-demo.json               3 模块 8 用例（含未执行）
     └── paygate-demo.json            6 模块 16 用例
@@ -122,12 +120,13 @@ ALL CHECKS PASSED
 
 ## 4. 改成自己的项目
 
-### 4.1 三步替换
+### 4.1 项目资料替换
 
 | 要替换的 | 换成什么 |
 |---|---|
 | `templates/RingBuffer-test-blank.docx` | 客户的模板（先用 `make_blank_template.py` 清空，见 4.3） |
-| `skills/<你的项目>/SKILL.md` | 可选：自己项目的 skill，frontmatter 写设计者/校对者/测试人员 |
+| 可选项目专属 `SKILL.md` | 项目报告规则及默认人员资料；通用包不附带具体项目示例 |
+| 模块或用例的 `designer` / `reviewer` / `tester` | 实际人员信息；优先级高于项目专属 Skill |
 | `examples/auth-demo.json` | 自己的执行结果数据 |
 
 ### 4.2 数据怎么写
@@ -274,12 +273,14 @@ python report-tool/verify_report.py 报告.docx 你的数据.json 模板.docx [s
 
 ```powershell
 cd report-tool
-python test_schema.py     # 输入校验：25 条场景
-python test_skill.py      # skill 解析与人员注入：33 项
-python test_edges.py      # 变量行 0~8 组、多模块、模板损坏、6 种退出码
+python test_schema.py       # 输入校验：v2 契约（schemaVersion/阶段平衡/唯一性/notRun）
+python test_edges.py        # 0~8 组变量、多阶段多函数、模板缺标记、6 种退出码
+python test_coverage.py     # 6 种格式 + 旧版 VS XML、两段采集、bridge 标签
+python test_complexity.py   # 圈复杂度：本机 lizard / vendor 副本 两种来源与降级
+python test_skill.py        # 项目配置文件解析（两种写法/注释/首值优先）
 ```
 
-三个都应以 `ALL ... PASSED` 结束。
+五个都应以 `ALL ... PASSED` 结束。
 ---
 
 ## 📌 想交给 AI 模型来跑？
