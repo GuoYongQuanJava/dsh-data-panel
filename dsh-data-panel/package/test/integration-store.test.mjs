@@ -16,6 +16,7 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
+import { fileURLToPath } from 'node:url'
 
 import {
   nextVersionName,
@@ -376,4 +377,137 @@ test('HTTP：不认识的 op 与非法 kind 都明确报 400', async () => {
   } finally {
     rmSync(base, { recursive: true, force: true })
   }
+})
+
+/**
+ * 回归：集成测试的报告放在 `<会话根>/integration/reports/<runId>/`，
+ * 而不是单元测试那套 `<会话根>/reports/<runId>/`。
+ *
+ * 曾经踩过：报告文件明明在磁盘上（74 份单条 + 1 份总体，266KB），
+ * 面板却提示「这次执行还没有生成 Word 报告」—— 因为 /data-panel/run/report
+ * 只在会话根下找 reports/，从来没看过 integration/ 这一层。
+ */
+test('HTTP：/run/report 能在集成测试的 integration/reports 下找到报告', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'dsh-it-report-'))
+  const sessionId = 'sid-integration-report'
+  const project = join(base, 'proj')
+  const sessionRoot = join(project, '.dsh', 'test-sessions', sessionId)
+  const integrationRoot = join(sessionRoot, 'integration')
+  const runId = 'run_20261120_1020_all'
+
+  try {
+    // 造出集成测试的真实布局：integration/{runs,reports}/<runId>/
+    mkdirSync(join(integrationRoot, 'runs', runId), { recursive: true })
+    writeJsonFile(join(integrationRoot, 'runs', runId, 'result.json'), {
+      runId,
+      stepVersion: 'V0.0.1',
+      caseVersion: 'V0.0.1',
+      steps: [],
+    })
+    const caseDir = join(integrationRoot, 'reports', runId, 'cases')
+    mkdirSync(caseDir, { recursive: true })
+    writeFileSync(join(integrationRoot, 'reports', runId, '集成测试报告-整项目-V0.0.1.docx'), 'overall')
+    writeFileSync(join(caseDir, '集成测试报告-V0_0_1-IT-001-全步骤-V0.0.1.docx'), 'single')
+
+    const res = makeRes()
+    await panel.handleRunReport(
+      makeReq(
+        'GET',
+        '/data-panel/run/report?sessionId=' + sessionId
+          + '&cwd=' + encodeURIComponent(project)
+          + '&runId=' + runId,
+      ),
+      res,
+    )
+    assert.equal(res.statusCode, 200)
+    const body = JSON.parse(res.body)
+    assert.equal(body.ok, true)
+    assert.equal(body.exists, true, '集成测试的报告目录必须能被找到')
+
+    const names = body.files.map((f) => f.name)
+    assert.ok(
+      names.includes('集成测试报告-整项目-V0.0.1.docx'),
+      '总体报告应出现在文件列表里，实际：' + JSON.stringify(names),
+    )
+    assert.ok(
+      names.includes('集成测试报告-V0_0_1-IT-001-全步骤-V0.0.1.docx'),
+      'cases/ 下的单条报告也应被列出，实际：' + JSON.stringify(names),
+    )
+    // kind 要能区分总体报告与单条报告（报告页靠它挑文件）
+    const overall = body.files.find((f) => f.name === '集成测试报告-整项目-V0.0.1.docx')
+    const single = body.files.find((f) => f.name.includes('IT-001'))
+    assert.equal(overall.kind, 'overall')
+    assert.equal(single.kind, 'case')
+  } finally {
+    rmSync(base, { recursive: true, force: true })
+  }
+})
+
+/**
+ * 回归：集成测试面板也要把会话资产根写进映射文件。
+ *
+ * 与单元测试侧 prepareRun() → rememberAssetRoot() 保持一致。
+ * 不写映射的话，读侧 resolveReadRoots() 只能靠客户端传来的 cwd 猜 ——
+ * 一旦 cwd 与真实项目目录有偏差，报告/日志/结果全部找不到。
+ */
+test('集成接口调用后会把资产根记进映射文件（与单元测试一致）', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'dsh-it-assetmap-'))
+  const sessionId = 'sid-assetmap-' + Math.random().toString(36).slice(2, 8)
+  const project = join(base, 'proj')
+  mkdirSync(join(project, 'package.json', '..'), { recursive: true })
+  writeJsonFile(join(project, 'package.json'), { name: 'demo', version: '1.0.0' })
+
+  try {
+    const res = makeRes()
+    await panel.handleIntegration(
+      makeReq('GET', '/data-panel/integration?sessionId=' + sessionId + '&cwd=' + encodeURIComponent(project)),
+      res,
+    )
+    assert.equal(res.statusCode, 200)
+
+    // 映射文件写在插件数据目录下
+    const mapFile = join(panel.dataDir(), `assets-${sessionId}.json`)
+    assert.ok(existsSync(mapFile), '应写入资产根映射：' + mapFile)
+
+    const parsed = JSON.parse(readFileSync(mapFile, 'utf8'))
+    assert.ok(Array.isArray(parsed.roots) && parsed.roots.length > 0)
+    // 存的是**标准会话资产根**（不含 /integration），报告侧再向下找 integration/
+    const expected = join(project, '.dsh', 'test-sessions', sessionId)
+    assert.ok(
+      parsed.roots.some((item) => item && item.root === expected),
+      '映射里应包含 ' + expected + '，实际：' + JSON.stringify(parsed.roots),
+    )
+  } finally {
+    rmSync(base, { recursive: true, force: true })
+    try {
+      rmSync(join(panel.dataDir(), `assets-${sessionId}.json`), { force: true })
+    } catch {
+      // 清理失败不影响断言结果
+    }
+  }
+})
+
+/**
+ * 回归：报告生成器路径必须**按插件包自身位置**解析，不能靠写死的绝对路径。
+ *
+ * 曾经踩过：SKILL.md / 面板话术里硬编码
+ * `F:\插件开发\...\integration_report.py`，别人 clone 到别的盘就失效，
+ * 而 Skill 又要求「缺失必须报错不许降级」，于是换台机器报告根本生成不出来。
+ */
+test('报告生成器路径按包位置解析，不含机器相关的绝对路径', () => {
+  const resolved = panel.integrationReportScriptPath()
+  assert.equal(typeof resolved, 'string')
+  assert.ok(resolved !== '', '在本仓库内应能解析到 integration_report.py')
+  assert.ok(existsSync(resolved), '解析出的路径必须真实存在：' + resolved)
+  assert.match(resolved, /integration_report\.py$/)
+  // 解析结果必须来自包自身的相对定位，而不是某台机器的固定前缀。
+  // 层级：<仓库根>/dsh-data-panel/package/lib/index.js
+  //   ..        → package/
+  //   ../..     → dsh-data-panel/
+  //   ../../..  → 仓库根
+  const libIndex = new URL('../lib/index.js', import.meta.url)
+  const pkgRoot = fileURLToPath(new URL('..', libIndex))
+  const repoRoot = fileURLToPath(new URL('../../..', libIndex))
+  const inside = resolved.startsWith(pkgRoot) || resolved.startsWith(repoRoot)
+  assert.ok(inside, '生成器应位于插件包或仓库内，实际：' + resolved)
 })

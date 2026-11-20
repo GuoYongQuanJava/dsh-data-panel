@@ -1,169 +1,284 @@
 {
   "meta": {
     "softwareName": "电商交易平台",
-    "testStage": "配置项测试",
     "softwareVersion": "V0.0.2",
     "softwareScale": "约 12 万行",
     "language": "Java / TypeScript",
     "devEnv": "Windows 11 / JDK 21 / Node 20",
     "runEnv": "Windows 11 / MySQL 8.0 / Redis 7",
     "importance": "重要",
-    "vendor": "示例科技有限公司"
+    "vendor": "示例科技有限公司",
+    "projectCode": "DEMO",
+    "source": "SRS",
+    "testStartDate": "2026 年 11 月 10 日",
+    "testEndDate": "2026 年 11 月 18 日"
   },
   "people": {
     "designer": "张三",
     "reviewer": "李四",
     "tester": "王五"
   },
-  "features": [
+  "stages": [
     {
-      "code": "F-001",
-      "name": "商品与购物车",
-      "issues": "无。",
+      "name": "第一阶段",
+      "startDate": "2026 年 11 月 10 日",
+      "endDate": "2026 年 11 月 12 日",
       "inconsistent": "无",
-      "cases": [
+      "regression": {},
+      "issues": [],
+      "features": [
         {
-          "caseId": "V0_0_2-IT-001",
-          "title": "商品加入购物车",
-          "type": "functional",
-          "requirement": "SRS-3.2.1 购物车管理",
-          "description": "验证用户在商品详情页选择规格后加入购物车的完整链路",
-          "precondition": "测试环境已部署，已登录用户 test_user，商品 SKU-1001 库存 50",
-          "executedAt": "2026.11.18",
-          "outcome": "passed",
-          "steps": [
+          "code": "F-001",
+          "name": "商品与购物车",
+          "cases": [
             {
-              "no": 1,
-              "action": "打开商品详情页",
-              "operation": "浏览器访问 /product/SKU-1001",
-              "expected": "页面标题显示「无线蓝牙耳机」，价格 ¥299",
-              "observed": "页面加载完成，标题「无线蓝牙耳机」，价格 ¥299，库存充足",
-              "outcome": "passed"
+              "caseId": "V0_0_2-IT-001",
+              "caseCode": "GN-651-DEMO_SRS_CART-1-T001.CTD",
+              "chapter": "CART",
+              "seq": 1,
+              "title": "商品加入购物车",
+              "type": "functional",
+              "requirement": "SRS-3.2.1 购物车管理",
+              "description": "验证用户在商品详情页选择规格后加入购物车的完整链路",
+              "precondition": "测试环境已部署，已登录用户 test_user，商品 SKU-1001 库存 50",
+              "executedAt": "2026.11.10",
+              "outcome": "passed",
+              "steps": [
+                {
+                  "no": 1,
+                  "action": "打开商品详情页",
+                  "operation": "浏览器访问 /product/SKU-1001",
+                  "expected": "页面标题显示「无线蓝牙耳机」，价格 ¥299",
+                  "observed": "页面加载完成，标题「无线蓝牙耳机」，价格 ¥299，库存充足",
+                  "outcome": "passed"
+                },
+                {
+                  "no": 2,
+                  "action": "选择商品规格",
+                  "operation": "点击「颜色：黑色」、点击「数量：2」",
+                  "expected": "规格选中态生效，总价更新为 ¥598",
+                  "observed": "黑色规格高亮，数量显示 2，总价 ¥598",
+                  "outcome": "passed"
+                },
+                {
+                  "no": 3,
+                  "action": "加入购物车",
+                  "operation": "点击「加入购物车」按钮",
+                  "expected": "提示「已加入购物车」，右上角角标由 0 变为 2",
+                  "observed": "弹出「已加入购物车」提示，角标更新为 2，购物车接口返回 200",
+                  "outcome": "passed"
+                },
+                {
+                  "no": 4,
+                  "action": "核对购物车",
+                  "operation": "打开购物车页面",
+                  "expected": "列表中有 SKU-1001 × 2，小计 ¥598",
+                  "observed": "购物车列表显示 SKU-1001 × 2，小计 ¥598，合计 ¥598",
+                  "outcome": "passed"
+                }
+              ]
             },
             {
-              "no": 2,
-              "action": "选择商品规格",
-              "operation": "点击「颜色：黑色」、点击「数量：2」",
-              "expected": "规格选中态生效，总价更新为 ¥598",
-              "observed": "黑色规格高亮，数量显示 2，总价 ¥598",
-              "outcome": "passed"
-            },
-            {
-              "no": 3,
-              "action": "加入购物车",
-              "operation": "点击「加入购物车」按钮",
-              "expected": "提示「已加入购物车」，右上角角标由 0 变为 2",
-              "observed": "弹出「已加入购物车」提示，角标更新为 2，购物车接口返回 200",
-              "outcome": "passed"
-            },
-            {
-              "no": 4,
-              "action": "核对购物车",
-              "operation": "打开购物车页面",
-              "expected": "列表中有 SKU-1001 × 2，小计 ¥598",
-              "observed": "购物车列表显示 SKU-1001 × 2，小计 ¥598，合计 ¥598",
-              "outcome": "passed"
+              "caseId": "V0_0_2-IT-002",
+              "caseCode": "BJ-651-DEMO_SRS_CART-2-T002.CTD",
+              "chapter": "CART",
+              "seq": 2,
+              "title": "购物车数量超库存",
+              "type": "boundary",
+              "polarity": "abnormal",
+              "requirement": "SRS-3.2.4 库存校验",
+              "description": "验证加入购物车数量超过库存时的边界处理",
+              "precondition": "测试环境已部署，商品 SKU-1002 库存仅 3 件",
+              "executedAt": "2026.11.10",
+              "outcome": "failed",
+              "steps": [
+                {
+                  "no": 1,
+                  "action": "打开商品详情页",
+                  "operation": "浏览器访问 /product/SKU-1002",
+                  "expected": "页面正常展示，显示库存 3",
+                  "observed": "页面加载完成，显示库存 3",
+                  "outcome": "passed"
+                },
+                {
+                  "no": 2,
+                  "action": "输入超库存数量",
+                  "operation": "数量输入框填 5，点击「加入购物车」",
+                  "expected": "拦截并提示「库存不足，当前仅剩 3 件」，购物车不变",
+                  "observed": "未拦截，提示「已加入购物车」，购物车数量变为 5，超出实际库存",
+                  "outcome": "failed"
+                }
+              ],
+              "issue": "第 2 步：数量超出库存时未做拦截，购物车可加入 5 件而实际库存仅 3 件",
+              "suggestion": "在加入购物车接口中校验数量与实时库存，超出时返回 400 并给出剩余件数。",
+              "bugId": "BUG-IT-0007"
             }
           ]
-        },
-        {
-          "caseId": "V0_0_2-IT-002",
-          "title": "购物车数量超库存",
-          "type": "boundary",
-          "requirement": "SRS-3.2.4 库存校验",
-          "description": "验证加入购物车数量超过库存时的边界处理",
-          "precondition": "测试环境已部署，商品 SKU-1002 库存仅 3 件",
-          "executedAt": "2026.11.18",
-          "outcome": "failed",
-          "steps": [
-            {
-              "no": 1,
-              "action": "打开商品详情页",
-              "operation": "浏览器访问 /product/SKU-1002",
-              "expected": "页面正常展示，显示库存 3",
-              "observed": "页面加载完成，显示库存 3",
-              "outcome": "passed"
-            },
-            {
-              "no": 2,
-              "action": "输入超库存数量",
-              "operation": "数量输入框填 5，点击「加入购物车」",
-              "expected": "拦截并提示「库存不足，当前仅剩 3 件」，购物车不变",
-              "observed": "未拦截，提示「已加入购物车」，购物车数量变为 5，超出实际库存",
-              "outcome": "failed"
-            }
-          ],
-          "issue": "第 2 步：数量超出库存时未做拦截，购物车可加入 5 件而实际库存仅 3 件",
-          "bugId": "BUG-IT-0007"
         }
       ]
     },
     {
-      "code": "F-002",
-      "name": "订单结算",
-      "issues": "本功能项发现 1 个一般问题，详见附录 A。",
+      "name": "第二阶段",
+      "startDate": "2026 年 11 月 13 日",
+      "endDate": "2026 年 11 月 15 日",
       "inconsistent": "无",
-      "cases": [
+      "regression": {},
+      "issues": [
         {
-          "caseId": "V0_0_2-IT-003",
-          "title": "提交订单并支付",
-          "type": "api",
-          "requirement": "SRS-4.1 订单接口",
-          "description": "验证从购物车提交订单到支付成功的接口链路",
-          "precondition": "测试环境已部署，购物车内有 2 件商品，用户余额充足",
-          "executedAt": "2026.11.18",
-          "outcome": "passed",
-          "steps": [
+          "title": "支付回调超时后订单被置为已支付",
+          "desc": "模拟支付网关回调超时 120 秒后，订单状态仍从「待支付」变为「已支付」，未做超时回滚。",
+          "level": "严重",
+          "caseCode": "AQ-651-DEMO_SRS_ORDER-2-T004.CTD",
+          "suggestion": "订单状态置为已支付必须以支付网关的签名回调为准，回调缺失时保持待支付并触发对账。"
+        }
+      ],
+      "features": [
+        {
+          "code": "F-002",
+          "name": "订单结算",
+          "cases": [
             {
-              "no": 1,
-              "action": "创建订单",
-              "operation": "POST /api/order 携带购物车明细",
-              "expected": "返回 201，orderId 非空，金额 ¥598",
-              "observed": "返回 201，orderId=ORD-20261118-0001，金额 598.00",
-              "outcome": "passed"
+              "caseId": "V0_0_2-IT-003",
+              "caseCode": "JK-651-DEMO_SRS_ORDER-1-T003.CTD",
+              "chapter": "ORDER",
+              "seq": 3,
+              "title": "提交订单并支付",
+              "type": "api",
+              "requirement": "SRS-4.1 订单接口",
+              "description": "验证从购物车提交订单到支付成功的接口链路",
+              "precondition": "测试环境已部署，购物车内有 2 件商品，用户余额充足",
+              "executedAt": "2026.11.13",
+              "outcome": "passed",
+              "steps": [
+                {
+                  "no": 1,
+                  "action": "创建订单",
+                  "operation": "POST /api/order 携带购物车明细",
+                  "expected": "返回 201，orderId 非空，金额 ¥598",
+                  "observed": "返回 201，orderId=ORD-20261118-0001，金额 598.00",
+                  "outcome": "passed"
+                },
+                {
+                  "no": 2,
+                  "action": "发起支付",
+                  "operation": "POST /api/pay 携带 orderId",
+                  "expected": "返回 200，支付状态 success",
+                  "observed": "返回 200，status=success，交易号 TXN-88213",
+                  "outcome": "passed"
+                },
+                {
+                  "no": 3,
+                  "action": "查询订单状态",
+                  "operation": "GET /api/order/ORD-20261118-0001",
+                  "expected": "订单状态为「已支付」",
+                  "observed": "订单状态 paid，支付时间 2026-11-13 14:22:31",
+                  "outcome": "passed"
+                }
+              ]
             },
             {
-              "no": 2,
-              "action": "发起支付",
-              "operation": "POST /api/pay 携带 orderId",
-              "expected": "返回 200，支付状态 success",
-              "observed": "返回 200，status=success，交易号 TXN-88213",
-              "outcome": "passed"
-            },
-            {
-              "no": 3,
-              "action": "查询订单状态",
-              "operation": "GET /api/order/ORD-20261118-0001",
-              "expected": "订单状态为「已支付」",
-              "observed": "订单状态 paid，支付时间 2026-11-18 14:22:31",
-              "outcome": "passed"
+              "caseId": "V0_0_2-IT-004",
+              "caseCode": "AQ-651-DEMO_SRS_ORDER-2-T004.CTD",
+              "chapter": "ORDER",
+              "seq": 4,
+              "title": "支付超时未回调",
+              "type": "security",
+              "polarity": "abnormal",
+              "requirement": "SRS-4.3 支付安全",
+              "description": "验证支付回调超时后订单不会被错误置为已支付",
+              "precondition": "测试环境已部署，使用模拟支付网关",
+              "executedAt": "2026.11.13",
+              "outcome": "failed",
+              "steps": [
+                {
+                  "no": 1,
+                  "action": "创建订单",
+                  "operation": "POST /api/order",
+                  "expected": "返回 201 与 orderId",
+                  "observed": "返回 201，orderId=ORD-20261113-0002",
+                  "outcome": "passed"
+                },
+                {
+                  "no": 2,
+                  "action": "模拟回调超时",
+                  "operation": "等待 120 秒不触发回调",
+                  "expected": "订单保持「待支付」，不出现已支付状态",
+                  "observed": "订单状态变为 paid，且无回调记录，超出预期",
+                  "outcome": "failed"
+                }
+              ],
+              "issue": "第 2 步：回调缺失时订单被置为已支付，无超时回滚逻辑"
             }
           ]
-        },
+        }
+      ]
+    },
+    {
+      "name": "第三阶段",
+      "startDate": "2026 年 11 月 16 日",
+      "endDate": "2026 年 11 月 18 日",
+      "inconsistent": "无",
+      "regression": {},
+      "issues": [],
+      "features": [
         {
-          "caseId": "V0_0_2-IT-004",
-          "title": "支付超时未回调",
-          "type": "security",
-          "requirement": "SRS-4.3 支付安全",
-          "description": "验证支付回调超时后订单不会被错误置为已支付",
-          "precondition": "测试环境已部署，使用模拟支付网关",
-          "executedAt": "2026.11.18",
-          "outcome": "notRun",
-          "notRunReason": "模拟支付网关未部署，本轮环境不具备条件",
-          "steps": [
+          "code": "F-003",
+          "name": "用户与权限",
+          "cases": [
             {
-              "no": 1,
-              "action": "创建订单",
-              "operation": "POST /api/order",
-              "expected": "返回 201 与 orderId",
-              "outcome": "notRun"
+              "caseId": "V0_0_2-IT-005",
+              "caseCode": "GN-651-DEMO_SRS_ACCOUNT-1-T005.CTD",
+              "chapter": "ACCOUNT",
+              "seq": 5,
+              "title": "账号登录与退出",
+              "type": "functional",
+              "requirement": "SRS-2.1 账号管理",
+              "description": "验证已注册用户可用手机号密码登录并正常退出",
+              "precondition": "测试环境已部署，已存在手机号 13900000101 的用户",
+              "executedAt": "2026.11.16",
+              "outcome": "passed",
+              "steps": [
+                {
+                  "no": 1,
+                  "action": "输入账号密码登录",
+                  "operation": "POST /api/auth/login 携带手机号与密码",
+                  "expected": "返回 200 与 token",
+                  "observed": "返回 200，token 已下发",
+                  "outcome": "passed"
+                },
+                {
+                  "no": 2,
+                  "action": "退出登录",
+                  "operation": "点击「退出登录」",
+                  "expected": "本地 token 清空，回到登录页",
+                  "observed": "token 已清空，跳转登录页",
+                  "outcome": "passed"
+                }
+              ]
             },
             {
-              "no": 2,
-              "action": "模拟回调超时",
-              "operation": "等待 120 秒不触发回调",
-              "expected": "订单保持「待支付」，不出现已支付状态",
-              "outcome": "notRun"
+              "caseId": "V0_0_2-IT-006",
+              "caseCode": "YL-651-DEMO_SRS_ACCOUNT-2-T006.CTD",
+              "chapter": "ACCOUNT",
+              "seq": 6,
+              "title": "并发登录余量",
+              "type": "margin",
+              "polarity": "abnormal",
+              "requirement": "SRS-2.4 并发余量",
+              "description": "验证同一账号 20 个并发会话下的登录余量",
+              "precondition": "测试环境已部署，压测工具可用",
+              "executedAt": "2026.11.16",
+              "outcome": "passed",
+              "steps": [
+                {
+                  "no": 1,
+                  "action": "并发登录",
+                  "operation": "20 路并发 POST /api/auth/login",
+                  "expected": "全部返回 200，无 5xx",
+                  "observed": "20 路全部 200，最大耗时 420ms",
+                  "outcome": "passed"
+                }
+              ]
             }
           ]
         }

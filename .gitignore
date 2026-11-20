@@ -4,6 +4,9 @@ __pycache__/
 testReport/calculator-report.docx
 node_modules/
 
-# 集成报告生成器的运行产物与本地凭据（脚本和 sample 进库，产物不进）
+# 集成报告生成器的运行产物（脚本、sample、模板都进库，只有产物不进）
+#
+# 模板为什么进库：与单元测试的 `testReport/templates/单元测试报告模板.docx` 保持一致。
+# 它虽然是二进制（90 KB），但**缺了它就生成不出报告** ——
+# 别人拉取仓库后如果还得单独找人要模板，整条链路就是断的。
 integrationReport/输出/
-integrationReport/配置项测试报告模板.docx

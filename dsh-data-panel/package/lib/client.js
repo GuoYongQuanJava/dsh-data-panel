@@ -5731,6 +5731,33 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			var versionOpenState = useState(false);
 			var versionOpen = versionOpenState[0];
 			var setVersionOpen = versionOpenState[1];
+			/*
+			 * 报告页的版本 = 「某一次一键执行」，与用例/步骤版本是**两套编号**。
+			 *
+			 * 关键坑（用户第 7 点）：原来报告页的版本下拉直接复用了 `version`（用例版本），
+			 * 于是不管一键执行几次，报告页永远只显示 V0.0.1 —— 看起来像"没新建版本"。
+			 * 实际上根本没有读 `report-versions/index.json`。
+			 * 现在三套数据各用各的状态：
+			 *   · version        → 用例页 / 步骤页（case-versions）
+			 *   · reportVersion  → 报告页（report-versions）
+			 */
+			var reportVersionsState = useState([]);
+			var reportVersions = reportVersionsState[0];
+			var setReportVersions = reportVersionsState[1];
+			var reportVersionState = useState("");
+			var reportVersion = reportVersionState[0];
+			var setReportVersion = reportVersionState[1];
+			/*
+			 * 报告生成器的真实路径，由宿主按插件包自身位置解析后回传
+			 * （`GET /data-panel/integration` 的 `reportScript` 字段）。
+			 *
+			 * 为什么不在前端写死：以前话术里硬编码了一个本机仓库的绝对路径，
+			 * 别人把仓库 clone 到别的盘就直接失效，报告生成不出来。
+			 * 现在一律用宿主解析出来的值，拿不到才退化成相对描述。
+			 */
+			var reportScriptState = useState("");
+			var reportScript = reportScriptState[0];
+			var setReportScript = reportScriptState[1];
 			// 子页下拉（测试用例 / 测试步骤 / 测试报告）是否展开。
 			var switchOpenState = useState(false);
 			var switchOpen = switchOpenState[0];
@@ -6029,9 +6056,23 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 						var kinds = (data && data.kinds) || {};
 						var caseKind = kinds.case || {};
 						var stepKind = kinds.step || {};
+						var reportKind = kinds.report || {};
+						/*
+						 * 宿主解析出的报告生成器路径（按插件包自身位置算，不写死）。
+						 * 拿不到时留空，话术里会退化成「用集成测试 Skill 里给的路径」。
+						 */
+						setReportScript(typeof data.reportScript === "string" ? data.reportScript : "");
 						var rawList = (caseKind.data && Array.isArray(caseKind.data.cases)) ? caseKind.data.cases : [];
 						var features = (caseKind.data && Array.isArray(caseKind.data.features)) ? caseKind.data.features : [];
 						var versions = Array.isArray(caseKind.index && caseKind.index.versions) ? caseKind.index.versions : [];
+						/*
+						 * 报告版本单独一套（与用例/步骤版本无关）。
+						 * 只存下来供报告页的版本下拉使用，不参与 records 的选取 ——
+						 * 报告页的行数据仍然来自 exec-records（按 runId 关联 run 目录）。
+						 */
+						var reportVersionList = Array.isArray(reportKind.index && reportKind.index.versions)
+							? reportKind.index.versions
+							: [];
 						/*
 						 * 字段映射：面板的「功能项」左栏是按用例的 scenario 聚合的，
 						 * 而 Skill 约定里用例带的是 featureId。这里按 features[] 查表补上
@@ -6164,6 +6205,15 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 						if (!keepVersion) {
 							setVersion(caseKind.activeVersion || "V0.0.1");
 						}
+						// 报告版本：始终对齐后端（新建版本后刷新就能看到新的）
+						setReportVersions(reportVersionList);
+						setReportVersion(function (previous) {
+							// 后端给了当前版本就用它；否则保持用户已选的那一个
+							if (typeof reportKind.activeVersion === "string" && reportKind.activeVersion !== "") {
+								return reportKind.activeVersion;
+							}
+							return previous !== "" ? previous : (reportVersionList[0] && reportVersionList[0].name ? reportVersionList[0].name : "");
+						});
 						setLoadState("ready");
 					})
 					.catch(function (error) {
@@ -6470,9 +6520,16 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			/**
 			 * 子表里点「查看报告」：按该次执行的 runId 打开 Word 报告。
 			 *
-			 * 复用单元测试那套链路（fetchReportOf → docxOf → openReportFile）：
-			 * 报告按 runId 定位，与「当前数据」无关，所以哪怕用例后来改过，
-			 * 打开的还是那次跑出来的那份。
+			 * ★ 注意：这里**只借用了「按 runId 定位文件」这一条通用约定**，
+			 *   报告的内容、排版、生成脚本全部走集成测试自己那一套
+			 *   （`integration_report.py` 的 `build_single_step` / `build_full`），
+			 *   与单元测试的 `bridge.py` + `report-tool/` **没有任何关系**。
+			 *
+			 *   两套报告在数据形态上就不同，不能互相套用：
+			 *     · 单元测试：result.json 有 `tests[]`、`scope`、覆盖率、复杂度
+			 *     · 集成测试：result.json 有 `steps[]`、`stepVersion`、`caseVersion`，
+			 *       没有 `tests`、没有 `scope`、没有覆盖率
+			 *   所以单元测试的报告填表逻辑套到集成数据上会直接取不到值。
 			 */
 			function viewRunReport(run, caseId) {
 				var runId = run && run.runId ? String(run.runId) : "";
@@ -6595,6 +6652,21 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			}
 
 			/**
+			 * 报告生成器路径的提示文案。
+			 *
+			 * 宿主已经在 `/data-panel/integration` 的响应里回传
+			 * `reportScript`（按插件包自身位置解析，与仓库放在哪个盘无关）。
+			 * 这里只做「有就用、没有就退化」的处理，**绝不写死绝对路径** ——
+			 * 写死就意味着换台机器/换个 clone 目录，报告直接生成不出来。
+			 */
+			function generatorPathNote() {
+				if (typeof reportScript === "string" && reportScript !== "") {
+					return "`" + reportScript + "`";
+				}
+				return "集成测试 Skill 里给出的报告生成器路径（按插件包 assets/ 或仓库 integrationReport/ 定位）";
+			}
+
+			/**
 			 * 单条用例的「执行」按钮：把这一步的完整信息填进对话框。
 			 *
 			 * 与「一键执行」的区别只在范围：这里只跑用户点的那一条用例的步骤，
@@ -6650,7 +6722,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 					"",
 					"## ★ 必须为这次单条执行生成报告",
 					"- 生成时间：执行结束、拿到结果之后**立即生成**，不要等用户再点一次。",
-					"- **必须调生成器生成**：`F:\\插件开发\\dsh-data-panel\\integrationReport\\integration_report.py` 的 `build_single_step()`。",
+					"- **必须调生成器生成**：" + generatorPathNote() + "",
 					"  **不许自己写填表逻辑，不许复制生成器改，生成器缺失要明确报错**（不要降级成简化版）。",
 					"- 存放位置：`integration/reports/<本次 runId>/`（**用这次执行的 runId 建目录**）。",
 					"- **只取「4.1.1 测试结果总结」那一张表**，不要按整本配置项测试模板排版。",
@@ -6711,12 +6783,29 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 					"## ★ 报告要出什么（两类，别混淆）",
 					"",
 					"### 共用铁律：报告一律调生成器，不许自己写填表逻辑",
-					"- 生成器路径：`F:\\插件开发\\dsh-data-panel\\integrationReport\\integration_report.py`",
+					"- 生成器路径：" + generatorPathNote() + "",
 					"- 它对外只有两个函数：`build_single_step(...)` 单条报告、`build_full(...)` 总体报告。",
+					"",
+					"### ★ 首选：直接跑 bridge.py，不要自己写转换脚本",
+					"- 仓库里已有数据转换层 `integrationReport/bridge.py`（与单元测试的 bridge.py 同一分工）：",
+					"  ```",
+					"  cd <仓库根>\\integrationReport",
+					"  python bridge.py --session-root <会话>/integration --run-id <本次 runId> \\",
+					"                   --project-code <项目缩写> --software-name \"<软件名>\" \\",
+					"                   --software-version <版本> --report-version <面板分配的版本号>",
+					"  ```",
+					"- 它会写 `report-plan.json` + `report-data.json`，然后调生成器出总体报告 + 每条用例的单条报告。",
+					"- **不要自己重写一份转换脚本**：",
+					"  · 只有 bridge.py 在仓库里，别人拉取后才有；会话目录里的临时脚本别人没有；",
+					"  · 已踩过：`result.json` 的步骤号字段是 `stepNo` 不是 `no`，写错会让 173 个步骤",
+					"    只匹配到 74 条证据、结论全部变成「未执行」。",
+					"- 只有 bridge.py 真的不满足需求时，才自己写脚本，且职责仍然只有「取数据 + 调生成器」。",
+					"",
+					"### 共用铁律",
 					"- **不许自己实现表格填充**（会漏规范：不要章节号 / 类型映射 / 一页显示 / 人员默认值等）。",
 					"- **不许把生成器复制一份改**（规范会分叉）。要改就改生成器本身。",
 					"- **生成器缺失时明确报错**，不许自己写个简化版冒充。",
-					"- 你的脚本只做「读 json → 组 data → 调生成器」，填表交给生成器。",
+					"- **不许混用单元测试的报告工具**（`bridge.py` / `report-tool/` 是另一套，数据模型不同）。",
 					"",
 					"### A. 每条用例一份「单用列表」报告 —— 只取 4.1.1 那一张表",
 					"- **不要套整本配置项测试模板**，只取模板里 **4.1.1「测试结果总结」那一张表**并填好。",
@@ -6751,7 +6840,28 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 					"- **表3 问题分类**：「合计问题数」没有写 **0**；「测试问题归零解决情况」没有写 **无**。",
 					"- **表4 记录单**：测试阶段不能空；详细需求追踪条目 = 用例标识去掉 `-N-Tnnn.CTD`。",
 					"- 存放位置：`integration/reports/<本次 runId>/`（与 cases/ 平级）",
-					"- 文件名：`集成测试报告-<项目名>-整项目-<版本>.docx`",
+					"- 文件名：`集成测试报告-<项目名>-整项目-<报告版本>.docx`",
+					"",
+					"### ★ 报告版本号：必须向面板要，不许自己写死（用户踩过的坑）",
+					"",
+					"**每次一键执行都要新建一个报告版本**，第二次执行是 V0.0.2、第三次 V0.0.3……",
+					"绝不能在脚本里写死 `V0.0.1`，也绝不能整体覆盖 `report-versions/index.json`。",
+					"**必须**在生成报告之前，先向面板要版本号：",
+					"",
+					"```",
+					"POST /data-panel/integration",
+					'{ "sessionId": "<当前会话>", "kind": "report", "op": "createVersion",',
+					'  "runId": "<本次 runId>", "sourceStepVersion": "<步骤版本>" }',
+					"→ { ok: true, name: \"V0.0.2\", index: {...} }",
+					"```",
+					"",
+					"拿返回的 `name` 去命名 docx 与 `report-versions/<name 换下划线>/report.json`：",
+					"  · `report.json` 里写 `reportVersion: <name>`、`runId`、`stepVersion`、`caseVersion`；",
+					"  · **不要**自己改写 `report-versions/index.json`（面板已经写好了）。",
+					"",
+					"为什么必须这样：runId 精度只到分钟，同一分钟内连点两次「一键执行」会拿到同一个",
+					"runId。旧实现把版本号写死成 V0.0.1 并重写 index.json，于是第二次执行直接盖掉了",
+					"第一次 —— 用户看到的就是「执行了两次，报告页还是只有 V0.0.1」。",
 					"",
 					"### ★ 用例标识规范（每条用例生成时就必须产出 caseCode）",
 					"- 格式：`测试类型缩写-651-项目缩写_需求来源_章节英文名-1或2-T序号.CTD`",
@@ -7687,6 +7797,32 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 						return run && run.source === "all";
 					});
 				});
+				/*
+				 * 按当前**报告版本**再筛一层。
+				 *
+				 * 报告版本 ↔ 某一次一键执行，靠 runId 关联（report-versions/index.json
+				 * 里每个版本都记了 runId）。选中 V0.0.2 时就只显示那一次执行的结果，
+				 * 而不是把历次执行全堆在一起 —— 否则「版本」在报告页没有意义。
+				 *
+				 * 没有 runId 的旧版本（或还没选版本）不做这层过滤，按「全部」显示。
+				 */
+				(function () {
+					if (reportVersion === "") return;
+					var picked = (Array.isArray(reportVersions) ? reportVersions : []).filter(function (item) {
+						return item && item.name === reportVersion;
+					})[0];
+					var pickedRunId = picked && typeof picked.runId === "string" ? picked.runId : "";
+					if (pickedRunId === "") return;
+					rows = rows
+						.map(function (record) {
+							var kept = (Array.isArray(record.records) ? record.records : []).filter(function (run) {
+								return run && run.source === "all" && run.runId === pickedRunId;
+							});
+							if (kept.length === 0) return null;
+							return Object.assign({}, record, { records: kept });
+						})
+						.filter(function (record) { return record !== null; });
+				})();
 				// 按功能项归组，保持侧栏里的顺序（全部 → 各功能项按名称）。
 				var groups = [];
 				scenarios.forEach(function (item) {
@@ -8091,70 +8227,88 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 								"刷新"
 							),
 							// 版本切换：放在操作区，作为「当前查看的数据范围」。
-							h("div", { className: "it-version", "data-dropdown": "version" },
-								h("button", {
-									type: "button",
-									ref: versionBtnRef,
-									className: "it-version-btn",
-									"data-it": "version-menu",
-									title: "切换示例版本",
-									onClick: function () { setVersionOpen(!versionOpen); }
-								},
-									h("span", null, version),
-									h("span", { className: "it-switch-caret" }, h(Icon, { name: "chevron", size: 11 }))
-								),
-								h(ItMenu, {
-									open: versionOpen,
-									anchorRef: versionBtnRef,
-									align: "right",
-									width: 186,
-									/*
-									 * 最多露出 5 条，超过就滚动。
-									 * 每条实测约 30px（6px 上下内边距 + 12px 行高 + 间距），
-									 * 5 条 ≈ 150px，再留 8px 给菜单自身的内边距。
-									 */
-									maxHeight: 158,
-									testId: "version-menu-panel"
-								},
-									/*
-									 * 版本按创建顺序递增（V0.0.1 最早），展示时最新的排最上：
-									 * 当前版本 → 比它旧的依次往下。
-									 *
-									 * 排序依据是版本号里的数字段（major.minor.patch），
-									 * 不是字符串比较 —— 否则 V0.0.10 会排在 V0.0.9 前面。
-									 * 只复制一份再排，不动 seed.versions 本身。
-									 */
-									seed.versions
-										.slice()
-										.sort(function (a, b) {
-											return itVersionValue(b.name) - itVersionValue(a.name);
-										})
-										.map(function (item) {
-										var isCurrent = item.name === version;
-										return h("button", {
-											key: item.name,
-											type: "button",
-											className: cn("it-version-item", isCurrent ? "is-active" : ""),
-											"data-it": "version-" + item.name,
-											onClick: function () {
-												setVersion(item.name);
-												setVersionOpen(false);
-												// 换版本是一整套新数据，页码和分组展开态都重置
-												setCasePage(1);
-												setStepPage(1);
-												setReportPage(1);
-												setExpandedGroups([]);
-											}
-										},
-											h("span", { className: "it-version-name" }, item.name),
-											isCurrent
-												? h("span", { className: "it-version-current" }, "当前")
-												: null,
-											h("span", { className: "it-version-meta" }, itTime(item.at))
-										);
-									})
-								)
-							),
+							/*
+							 * 三个子页的版本**不是同一套编号**：
+							 *   · 测试用例 / 测试步骤 → 用例版本（case-versions）
+							 *   · 测试报告           → 报告版本（report-versions，每次一键执行 +1）
+							 * 所以下拉的数据源与按钮文字都要按当前子页取，不能共用一个 `version`。
+							 * 这正是用户第 7 点「第二次一键执行后报告页还是 V0.0.1」的根因。
+							 */
+							(function () {
+								var isReportTab = tab === "reports";
+								/*
+								 * 报告版本数据存在时，报告页用自己那套编号；
+								 * 不存在时（旧会话 / 还没一键执行过）退回用例版本选择器 ——
+								 * 宁可沿用旧行为，也不要给用户一个空掉的下拉。
+								 */
+								var hasReportVersions = isReportTab
+									&& Array.isArray(reportVersions)
+									&& reportVersions.length > 0;
+								var list = hasReportVersions ? reportVersions : seed.versions;
+								var current = hasReportVersions ? (reportVersion || "") : version;
+								var pick = function (name) {
+									if (hasReportVersions) {
+										setReportVersion(name);
+										// 报告页只做展示，切版本后回到第 1 页、收起分组
+										setReportPage(1);
+										setReportPageMap({});
+										setExpandedGroups([]);
+										return;
+									}
+									setVersion(name);
+									// 换版本是一整套新数据，页码和分组展开态都重置
+									setCasePage(1);
+									setStepPage(1);
+									setReportPage(1);
+									setExpandedGroups([]);
+								};
+								var sorted = (Array.isArray(list) ? list : [])
+									.slice()
+									.sort(function (a, b) {
+										return itVersionValue(b.name) - itVersionValue(a.name);
+									});
+								return h("div", { className: "it-version", "data-dropdown": "version" },
+									h("button", {
+										type: "button",
+										ref: versionBtnRef,
+										className: "it-version-btn",
+										"data-it": "version-menu",
+										title: hasReportVersions ? "切换报告版本" : "切换用例版本",
+										onClick: function () { setVersionOpen(!versionOpen); }
+									},
+										h("span", null, current === "" ? (hasReportVersions ? "暂无报告版本" : "V0.0.1") : current),
+										h("span", { className: "it-switch-caret" }, h(Icon, { name: "chevron", size: 11 }))
+									),
+									h(ItMenu, {
+										open: versionOpen,
+										anchorRef: versionBtnRef,
+										align: "right",
+										width: 186,
+										maxHeight: 158,
+										testId: "version-menu-panel"
+									},
+										sorted.length === 0
+											? h("div", { className: "it-version-empty" }, hasReportVersions ? "还没有报告版本" : "还没有用例版本")
+											: sorted.map(function (item) {
+												var isCurrent = item.name === current;
+												return h("button", {
+													key: item.name,
+													type: "button",
+													className: cn("it-version-item", isCurrent ? "is-active" : ""),
+													"data-it": "version-" + item.name,
+													onClick: function () {
+														pick(item.name);
+														setVersionOpen(false);
+													}
+												},
+													h("span", { className: "it-version-name" }, item.name),
+													isCurrent ? h("span", { className: "it-version-current" }, "当前") : null,
+													h("span", { className: "it-version-meta" }, itTime(item.at))
+												);
+											})
+									)
+								);
+							})(),
 							/*
 							 * 主操作按子页给不同的东西：
 							 *   测试用例 —— 新增用例（primary，唯一的颜色强调）+ 生成测试步骤
