@@ -817,9 +817,6 @@ def _generate_phases(
 
             for case in func.get('cases') or []:
                 case_id = case.get('id', '')
-                label = _make_paragraph(proto_body, case_id)
-                last.addnext(label)
-                last = label
 
                 table_el = deepcopy(rb_tbl)
                 table = Table(table_el, rb_doc)
@@ -1030,9 +1027,6 @@ def _generate_phases_v2(body, insert_point, proto_h1, proto_h2, proto_h3,
 
             for case in func.get('cases') or []:
                 case_id = case.get('id', '')
-                label = _make_paragraph(proto_body, case_id)
-                last.addnext(label)
-                last = label
 
                 table_el = deepcopy(rb_tbl)
                 table = Table(table_el, rb_doc)
