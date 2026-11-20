@@ -18,6 +18,7 @@
     "lib/toolchain.js",
     "lib/integration-store.js",
     "assets/run_tests.py",
+    "assets/report/",
     "cordis.patch.yml",
     "README.md"
   ],

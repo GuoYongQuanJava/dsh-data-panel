@@ -6353,10 +6353,6 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 				setNotice("");
 				loadIntegration(true);
 			}
-			function notConnected(name) {
-				setNotice("演示数据：" + name + "还没接入后端，等后续规范确认后再实现。");
-			}
-
 			/**
 			 * 把一段话术填进对话输入框（用户审阅后自己点发送）。
 			 *
@@ -6438,7 +6434,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			}
 
 			/**
-			 * 总体报告的「导出」：打开**整项目那份**报告。
+			 * 总体报告的「导出」：把**整项目那份** docx 另存到用户选的目录。
 			 *
 			 * 与单条报告的区别：
 			 *   · 单条报告 → reports/<runId>/cases/…docx，只含 4.1.1 那张表
@@ -6447,7 +6443,37 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			 * 所以这里要挑 kind === "overall" 的那份。先找最近一次一键执行的 runId。
 			 */
 			function exportOverallReport(shown) {
-				openOverallReport(shown);
+				var list = Array.isArray(shown) ? shown : [];
+				var latest = null;
+				list.forEach(function (record) {
+					(Array.isArray(record.records) ? record.records : []).forEach(function (run) {
+						if (!run || run.source !== "all") return;
+						if (latest === null || String(run.at || "") > String(latest.at || "")) latest = run;
+					});
+				});
+				if (latest === null) {
+					setNotice("还没有一键执行的记录，没有总体报告可导出。先在步骤页点「一键执行」。");
+					return;
+				}
+				var runId = String(latest.runId || "");
+				if (runId === "") { setNotice("这次执行没有 runId，无法定位总体报告。"); return; }
+				if (sessionId === "") { setNotice("当前会话还没就绪，切到对话再点一次。"); return; }
+				setNotice("正在查找总体报告…");
+				fetchReportOf(sessionId, runId).then(function (detail) {
+					var files = (detail && Array.isArray(detail.files)) ? detail.files.filter(function (file) {
+						return file && typeof file.name === "string" && /\.docx$/i.test(file.name) && file.path;
+					}) : [];
+					var overall = files.filter(function (file) {
+						return file.kind === "overall" || file.name.indexOf("整项目") !== -1;
+					})[0];
+					if (!overall) {
+						setNotice("这次执行还没有生成总体报告（runId " + runId + "）。让模型按配置项测试模板出一份整项目报告。");
+						return;
+					}
+					exportReportsTo([overall.path], 1);
+				}).catch(function (failure) {
+					setNotice("读取总体报告失败：" + (failure && failure.message ? failure.message : String(failure)));
+				});
 			}
 
 			/**
@@ -6550,13 +6576,152 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			}
 
 			/**
-			 * 子表里点「导出报告」：把该次执行的 Word 报告另存到用户选的位置。
+			 * 报告页的「导出报告」图标：把这条用例**最新一次一键执行**的报告另存到用户选的目录。
 			 *
-			 * 与「查看」共用同一份报告文件；这里走 openReportFile 的「保存」语义不可得时
-			 * 直接打开文件所在目录并提示，避免静默失败。
+			 * 与「查看」的区别：查看是开在右侧栏预览；导出是复制一份 docx 出去。
+			 * 报告页只认一键执行的记录（单步报告不进报告页），所以筛 source === "all"。
 			 */
+			function exportLatestReportOfCase(record) {
+				var runs = (Array.isArray(record && record.records) ? record.records : []).filter(function (run) {
+					return run && run.source === "all";
+				});
+				if (runs.length === 0) {
+					setNotice("这条用例还没有一键执行的记录，先在步骤页点「一键执行」。");
+					return;
+				}
+				exportRunReport(runs[0], record.caseId);
+			}
+
 			/**
-			 * 批量导出「已选执行记录」的报告。
+			 * 报告页的「导出已选报告」：多选态下把勾中的用例各导一份。
+			 *
+			 * selected 存的是 record.id（用例），报告页按「用例」概念勾选，
+			 * 与步骤页按「执行记录」勾选不同 —— 两页的语义本来就不同，不能共用一套键。
+			 */
+			function exportPickedCases(ids) {
+				var list = Array.isArray(ids) ? ids : [];
+				if (list.length === 0) { setNotice("还没有勾选任何报告，先勾上再导出。"); return; }
+				if (sessionId === "") { setNotice("当前会话还没就绪，切到对话再点一次。"); return; }
+				var targets = [];
+				list.forEach(function (id) {
+					var record = records.filter(function (r) { return r.id === id; })[0];
+					if (!record) return;
+					var runs = (Array.isArray(record.records) ? record.records : []).filter(function (run) {
+						return run && run.source === "all";
+					});
+					if (runs.length === 0) return;
+					targets.push({ run: runs[0], caseId: record.caseId });
+				});
+				if (targets.length === 0) {
+					setNotice("已选 " + list.length + " 条用例都还没有一键执行的报告，无可导出。");
+					return;
+				}
+				exportRuns(targets, list.length);
+			}
+
+			/**
+			 * 弹原生文件夹选择框，返回用户选的绝对路径（取消时给空串）。
+			 *
+			 * 走宿主不是为了绕远路：浏览器侧拿不到绝对路径，导出必须知道往哪写。
+			 * 这个请求要等用户操作对话框，给 5 分钟预算，不能用默认的 8 秒。
+			 */
+			var PICK_DIR_TIMEOUT_MS = 5 * 60 * 1000;
+
+			function pickExportDir() {
+				return callApi("/data-panel/export/pick-dir", {
+					method: "POST",
+					headers: { "content-type": "application/json", accept: "application/json" },
+					body: JSON.stringify({ sessionId: sessionId, cwd: cwdOf(sessionId) }),
+				}, PICK_DIR_TIMEOUT_MS).then(function (data) {
+					if (data && data.canceled === true) return "";
+					return data && typeof data.dir === "string" ? data.dir : "";
+				});
+			}
+
+			/**
+			 * 把一批报告复制到用户选的目录，成功后汇总提示。
+			 *
+			 * 只支持 docx：本次需求明确如此，PDF 是查看时按需生成的载体，不作为导出格式。
+			 * 「不覆盖已有文件」由宿主保证（同名自动加 ` (1)` 后缀），前端只负责报结果。
+			 *
+			 * ★ 一份 → 复制单份；多份 → 宿主合并成**一份**汇总 Word（一张表一页）。
+			 *   合并是后端做的，前端只看返回的 merged 标记来给对应文案。
+			 */
+			function exportReportsTo(paths, totalWanted) {
+				var list = (Array.isArray(paths) ? paths : []).filter(function (p) {
+					return typeof p === "string" && p !== "";
+				});
+				if (list.length === 0) {
+					setNotice("没有找到可导出的 docx 报告。");
+					return Promise.resolve();
+				}
+				setNotice("请选择导出到的文件夹…");
+				return pickExportDir().then(function (dir) {
+					if (dir === "") {
+						setNotice("已取消导出。");
+						return null;
+					}
+					setNotice(list.length > 1 ? ("正在合并 " + list.length + " 份报告…") : "正在导出报告…");
+					return callApi("/data-panel/export", {
+						method: "POST",
+						headers: { "content-type": "application/json", accept: "application/json" },
+						body: JSON.stringify({ sessionId: sessionId, cwd: cwdOf(sessionId), dir: dir, paths: list }),
+					}, 120000).then(function (data) {
+						var exported = Array.isArray(data && data.exported) ? data.exported : [];
+						var skipped = Array.isArray(data && data.skipped) ? data.skipped : [];
+						if (exported.length === 0) {
+							setNotice("导出失败：" + ((data && data.error) || skipped[0] && skipped[0].reason || "没有成功导出任何报告"));
+							return null;
+						}
+						var text;
+						if (data && data.merged === true) {
+							text = "已合并 " + (data.count || list.length) + " 份报告为一份，存到 " + (data.dir || dir);
+						} else {
+							var wanted = typeof totalWanted === "number" ? totalWanted : list.length;
+							text = "已导出 " + exported.length + " 份到 " + (data.dir || dir);
+							if (wanted > exported.length) text += "（共选 " + wanted + " 份，" + (wanted - exported.length) + " 份没有可用报告，已跳过）";
+						}
+						if (data && typeof data.warning === "string" && data.warning !== "") text += "；" + data.warning;
+						if (skipped.length > 0) text += "；" + skipped.length + " 份失败：" + (skipped[0].reason || "未知原因");
+						setNotice(text);
+						return data;
+					});
+				}).catch(function (failure) {
+					setNotice("导出失败：" + (failure && failure.message ? failure.message : String(failure)));
+					return null;
+				});
+			}
+
+			/**
+			 * 把一批执行记录的报告导出到同一个目录。
+			 *
+			 * 先逐条查出 docx 路径（每份报告的 runId 不同，要分别问宿主），
+			 * 再一次性交给导出接口 —— 只弹一次文件夹框，用户不用为每份报告点一遍。
+			 */
+			function exportRuns(targets, totalWanted) {
+				var list = Array.isArray(targets) ? targets : [];
+				if (list.length === 0) { setNotice("没有可导出的执行记录。"); return; }
+				if (sessionId === "") { setNotice("当前会话还没就绪，切到对话再点一次。"); return; }
+				setNotice("正在查找 " + list.length + " 份报告…");
+				Promise.all(list.map(function (target) {
+					var runId = target && target.run && target.run.runId ? String(target.run.runId) : "";
+					if (runId === "") return Promise.resolve(null);
+					return fetchReportOf(sessionId, runId).then(function (detail) {
+						var doc = docxFor(detail, target.caseId);
+						return doc && doc.path ? doc.path : null;
+					}).catch(function () { return null; });
+				})).then(function (paths) {
+					var found = paths.filter(function (p) { return typeof p === "string" && p !== ""; });
+					if (found.length === 0) {
+						setNotice("已选的执行记录都还没有生成 Word 报告，无法导出。");
+						return null;
+					}
+					return exportReportsTo(found, typeof totalWanted === "number" ? totalWanted : list.length);
+				});
+			}
+
+			/**
+			 * 批量导出「已选执行记录」的报告（步骤页）。
 			 *
 			 * 入参是勾选键数组，每个键 `用例id|runId` 对应一份报告。
 			 * 单独提供 exportRunReport 会误以为按用例导出，这里按记录逐条走。
@@ -6582,26 +6747,23 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 					setNotice("已选 " + list.length + " 条执行记录都找不到对应数据，可能已被删除。");
 					return;
 				}
-				setNotice("正在导出 " + targets.length + " 份报告…");
-				targets.forEach(function (t) { exportRunReport(t.run, t.caseId); });
-				if (targets.length < list.length) {
-					setNotice("已选 " + list.length + " 条，实际导出 " + targets.length + " 份（"
-						+ (list.length - targets.length) + " 条已失效，跳过）。");
-				}
+				// 一次导出全部：只弹一次文件夹框，不是每份报告弹一遍。
+				exportRuns(targets, list.length);
 			}
 
+			/** 单条导出：查一条执行的报告，然后交给统一的导出流程。 */
 			function exportRunReport(run, caseId) {
 				var runId = run && run.runId ? String(run.runId) : "";
 				if (runId === "") { setNotice("这条执行记录没有 runId，无法导出报告。"); return; }
 				if (sessionId === "") { setNotice("当前会话还没就绪，切到对话再点一次。"); return; }
-				setNotice("正在准备导出…");
+				setNotice("正在查找报告…");
 				fetchReportOf(sessionId, runId).then(function (detail) {
 					var doc = docxFor(detail, caseId);
 					if (!doc || !doc.path) {
 						setNotice("这次执行还没有生成 Word 报告，无法导出（runId " + runId + "）。");
 						return;
 					}
-					openReportFile(doc.path, sessionId, function () { setNotice("已打开报告文件，可另存到你想要的位置。"); });
+					exportReportsTo([doc.path], 1);
 				}).catch(function (failure) {
 					setNotice("导出失败：" + (failure && failure.message ? failure.message : String(failure)));
 				});
@@ -7888,7 +8050,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 								className: "it-multi-export",
 								"data-it": "multi-export",
 								disabled: selected.length === 0,
-								onClick: function () { notConnected("导出已选报告"); }
+								onClick: function () { exportPickedCases(selected); }
 							}, h(Icon, { name: "download", size: 13 }), "导出已选报告"),
 							h("button", { type: "button", className: "it-multi-link", "data-it": "multi-select-all", onClick: function () { setSelected(allIds.slice()); } }, "全选"),
 							h("button", { type: "button", className: "it-multi-link", "data-it": "multi-clear", onClick: function () { setSelected([]); } }, "清空")
@@ -8029,7 +8191,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 														h("td", null,
 															h("div", { className: "it-ops" },
 																h(IconButton, { name: "eye", label: "查看报告 " + (record.title || ""), "data-it": "report-" + record.id, onClick: function () { viewLatestReportOfCase(record); } }),
-																h(IconButton, { name: "download", label: "导出报告 " + (record.title || ""), "data-it": "export-" + record.id, onClick: function () { viewLatestReportOfCase(record); } })
+																h(IconButton, { name: "download", label: "导出报告 " + (record.title || ""), "data-it": "export-" + record.id, onClick: function () { exportLatestReportOfCase(record); } })
 															)
 														)
 													);
@@ -8331,6 +8493,27 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 									 */
 									onClick: function () { openOverallReport(records); }
 								}, "总体报告")
+								: null,
+							/*
+							 * 总体报告的「导出」：常驻在「总体报告」右边。
+							 *
+							 * 一开始做成了「点过总体报告才出现」，但那是错的：
+							 * 点「总体报告」会把 PDF 开在**主区域的新 tab**，主面板被切走，
+							 * 用户根本看不到这个按钮（2026-11-20 用户截图反馈）。
+							 * 所以改成常驻 —— 什么时候切回主面板，它都在那儿。
+							 *
+							 * 导出的是**整项目那一份** docx（kind === "overall"），
+							 * 不是某条用例的单条报告。
+							 */
+							tab === "reports"
+								? h(Button, {
+									variant: "ghost",
+									"data-it": "overview-export",
+									onClick: function () { exportOverallReport(records); }
+								},
+									h(Icon, { name: "download", size: 15 }),
+									"导出"
+								)
 								: null,
 							tab === "cases"
 								? h(Button, {
@@ -9044,6 +9227,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 				return Promise.resolve(null);
 			}
 			var service = betterSidebarService(true);
+			// betterSidebar 不可用就没有右侧栏可开，直接回退 docx（不报错）。
 			if (service === null || typeof service.openFile !== "function") return Promise.resolve(null);
 			return callApi("/data-panel/report/pdf", {
 				method: "POST",

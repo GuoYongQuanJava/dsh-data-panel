@@ -16,7 +16,7 @@
  */
 import { createHash, randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
-import { mkdir, readFile, readdir, rename, rm, stat, unlink, writeFile } from 'node:fs/promises'
+import { copyFile, mkdir, readFile, readdir, rename, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import { existsSync, readFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
@@ -77,6 +77,10 @@ const REPORT_PDF_TIMEOUT_MS = 90 * 1000
 /** 同一份 PDF 的并发转换共享一个 promise，避免重复拉起 Word。 */
 const reportPdfJobs = new Map()
 const RUN_REPORT_LATEST_PATH = '/data-panel/run/report/latest'
+/** 选一个导出目录（宿主弹原生文件夹选择框）。 */
+const PICK_DIR_PATH = '/data-panel/export/pick-dir'
+/** 把报告复制到用户选定的目录。 */
+const EXPORT_PATH = '/data-panel/export'
 /** 集成测试数据层：独立的路径，绝不复用单元的 /data-panel/api（那是 5 类硬校验的 store）。 */
 const INTEGRATION_PATH = '/data-panel/integration'
 const MAX_RUN_LOG = 4 * 1024 * 1024
@@ -1714,6 +1718,7 @@ async function handleRunReport(req, res) {
           }
           for (const sub of subEntries.sort()) {
             if (sub.startsWith('~$')) continue   // 同上：跳过 Word 锁文件
+            if (/\.pdf$/i.test(sub)) continue    // 同上：PDF 由查看时按需生成，不当独立报告列
             await pushFile(join(full, sub), sub, 'case')
           }
           continue
@@ -1722,6 +1727,12 @@ async function handleRunReport(req, res) {
         // 必须排除：它只有 162 字节、内容不是 zip，混进列表会让用户点开报
         // 「文件可能已损坏」，而真正的报告明明就在旁边。
         if (name.startsWith('~$')) continue
+        // PDF 是查看报告时由 /data-panel/report/pdf 生成的同目录同名文件，
+        // 与 docx 是「一份报告两种载体」。列表里**不单独列它**：
+        //   · 列出来用户会看到一排重复名（xxx.docx / xxx.pdf），要自己判断点哪个；
+        //   · 归成 'meta' 的话，报告页按 kind 挑文件时可能挑到 PDF 去当总体报告。
+        // 真正要看 PDF 时，前端点「查看报告」会自动转 + 打开（见 requestReportPdf）。
+        if (/\.pdf$/i.test(name)) continue
         await pushFile(full, name, /\.docx$/i.test(name) ? 'overall' : 'meta')
       }
       let data = null
@@ -2108,6 +2119,260 @@ async function handleReportPdf(req, res) {
 }
 
 /**
+ * 弹原生「选择文件夹」对话框，返回用户选的绝对路径。
+ *
+ * 为什么要宿主来做：面板跑在浏览器里，`<input webkitdirectory>` 与
+ * Chromium 的 `showDirectoryPicker()` 都只给文件内容或 handle，**拿不到绝对路径**，
+ * 而导出必须知道要往哪个盘哪个目录写。所以这里起一个 PowerShell 子进程，
+ * 用 System.Windows.Forms.FolderBrowserDialog 弹系统原生目录框。
+ *
+ * 用户点取消时返回 200 + { ok:true, canceled:true }，不是错误 ——
+ * 取消是正常操作，前端静默处理即可。
+ */
+async function pickExportDirectory(timeoutMs = 5 * 60 * 1000) {
+  // 必须是 STA 线程：FolderBrowserDialog 在 MTA 下会直接抛异常。
+  // -File 方式启动的 powershell.exe 默认就是 STA，这里显式再声明一次。
+  const script = `$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms | Out-Null
+$dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+$dialog.Description = '选择报告导出到的文件夹'
+$dialog.ShowNewFolderButton = $true
+try {
+  $result = $dialog.ShowDialog()
+  if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
+    Write-Output ('OK ' + $dialog.SelectedPath)
+  } else {
+    Write-Output 'CANCEL'
+  }
+} catch {
+  Write-Output ('FAIL ' + $_.Exception.Message)
+} finally {
+  if ($dialog -ne $null) { try { $dialog.Dispose() } catch {} }
+}
+`
+  const scriptPath = join(tmpdir(), `dsh-data-panel-pickdir-${process.pid}-${Date.now()}.ps1`)
+  try {
+    // PowerShell 5.1 读无 BOM 的 UTF-8 会按 ANSI 解析；对话框说明是中文，必须写 BOM。
+    await writeFile(scriptPath, '\uFEFF' + script, 'utf8')
+    const result = await runProcess(
+      'powershell.exe',
+      ['-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', scriptPath],
+      timeoutMs,
+    )
+    if (!result.ok) {
+      const detail = result.reason || (result.stderr || '').trim() || `选择目录失败（退出码 ${result.code}）`
+      return { ok: false, reason: detail }
+    }
+    const output = (result.stdout || '').trim()
+    if (output.startsWith('OK ')) {
+      return { ok: true, dir: output.slice(3).trim() }
+    }
+    if (output === 'CANCEL') return { ok: true, canceled: true, dir: '' }
+    return { ok: false, reason: output.replace(/^FAIL\s*/, '') || '选择目录失败' }
+  } catch (error) {
+    return { ok: false, reason: error instanceof Error ? error.message : String(error) }
+  } finally {
+    try { await unlink(scriptPath) } catch { /* 脚本可能没写成功 */ }
+  }
+}
+
+/** 导出目录必须已存在、是目录、且不是某个报告文件本身。 */
+async function resolveExportDirectory(raw) {
+  const value = typeof raw === 'string' ? raw.trim() : ''
+  if (value === '') throw bad(400, '缺少导出目录')
+  if (!isAbsolute(value)) throw bad(400, '导出目录必须是绝对路径')
+  const dir = resolve(value)
+  let info = null
+  try {
+    info = await stat(dir)
+  } catch {
+    throw bad(404, '导出目录不存在：' + dir)
+  }
+  if (!info.isDirectory()) throw bad(400, '导出目录不是文件夹：' + dir)
+  return dir
+}
+
+/**
+ * 目标目录里已经有同名文件时，给一个不冲突的名字：`名 (1).docx`、`名 (2).docx`…
+ *
+ * 用户明确要求「自动加序号后缀，不覆盖已有文件」—— 导出是往外拷，
+ * 静默覆盖掉对方目录里原有的文件是不可接受的副作用。
+ */
+async function freeNameIn(dir, name) {
+  const dot = name.lastIndexOf('.')
+  const stem = dot > 0 ? name.slice(0, dot) : name
+  const ext = dot > 0 ? name.slice(dot) : ''
+  let candidate = name
+  for (let index = 1; index < 1000; index += 1) {
+    try {
+      await stat(join(dir, candidate))
+    } catch {
+      return candidate   // 不存在，可以用
+    }
+    candidate = `${stem} (${index})${ext}`
+  }
+  // 极端情况：同名文件太多，退回带时间戳的名字，绝不覆盖。
+  return `${stem} (${Date.now()})${ext}`
+}
+
+/** 多选合并用的脚本与模板（随插件资产分发，不依赖仓库外的路径）。 */
+function mergeScriptPath() {
+  return fileURLToPath(new URL('../assets/report/merge_reports.py', import.meta.url))
+}
+
+function mergeTemplatePath() {
+  return fileURLToPath(new URL('../assets/report/配置项测试报告模板.docx', import.meta.url))
+}
+
+/**
+ * 把多份单条报告合并成一份 Word（每张用例表一页）。
+ *
+ * 交给 assets/report/merge_reports.py 去做：插件是 Node.js，没有 python-docx，
+ * 而「把已排好版的表格 XML 原样搬过来」正是 python-docx 最稳的用法。
+ * 脚本失败时返回 null，调用方回退到「分别导出」——不能让用户点了导出却什么都没有。
+ */
+async function mergeReportsInto(targetDir, sources, skipped) {
+  const script = mergeScriptPath()
+  const template = mergeTemplatePath()
+  const name = await freeNameIn(targetDir, '集成测试报告-选中用例汇总.docx')
+  const out = join(targetDir, name)
+  const result = await runProcess(
+    pythonPath(),
+    [script, '--template', template, '--out', out, ...sources],
+    120000,
+  )
+  if (!result.ok) {
+    const detail = result.reason || (result.stderr || '').trim() || `合并脚本退出码 ${result.code}`
+    skipped.push({ path: '', reason: '合并失败：' + detail })
+    return null
+  }
+  const output = String(result.stdout || '').trim()
+  if (!output.startsWith('OK')) {
+    skipped.push({ path: '', reason: '合并失败：' + (output || '脚本没有返回成功标记') })
+    return null
+  }
+  // 脚本输出形如 `OK <路径> <表数>`；表数以脚本为准，别用输入数量冒充（可能有文件被跳过）。
+  const count = Number(output.split(/\s+/).pop()) || sources.length
+  return { path: out, name, count }
+}
+
+/**
+ * 把若干份报告复制到用户选定的目录。
+ *
+ * 入参 `paths` 是报告文件路径。每一份都走 resolveReportFile 的校验，
+ * **只允许复制本会话 reports/ 下的文件** —— 否则这个接口就成了
+ * 「传任意路径就能把机器上任何文件拷出来」的漏洞。
+ * 只接受 .docx：本次需求明确只支持 docx，PDF 由查看时按需生成。
+ */
+async function handleExport(req, res) {
+  try {
+    if (req.method !== 'POST') {
+      send(res, 405, { ok: false, error: '仅支持 POST' })
+      return
+    }
+    const body = await readJson(req)
+    const sessionId = extractSessionId(req, body)
+    if (sessionId === '') throw bad(400, '缺少会话 ID')
+    const targetDir = await resolveExportDirectory(body.dir)
+    const list = Array.isArray(body.paths) ? body.paths : (typeof body.path === 'string' ? [body.path] : [])
+    if (list.length === 0) throw bad(400, '没有要导出的报告')
+
+    const exported = []
+    const skipped = []
+    /** 通过校验的源文件（合并时的输入）。只有它们能进合并件。 */
+    const resolvedFiles = []
+    for (const rawPath of list) {
+      let file = ''
+      try {
+        const resolved = await resolveReportFile(sessionId, rawPath, body.cwd)
+        file = resolved.file
+        if (!/\.docx$/i.test(file)) {
+          skipped.push({ path: String(rawPath || ''), reason: '只支持导出 .docx' })
+          continue
+        }
+        const name = await freeNameIn(targetDir, basename(file))
+        await copyFile(file, join(targetDir, name))
+        exported.push({ from: file, to: join(targetDir, name), name })
+        resolvedFiles.push(file)
+      } catch (error) {
+        // 单份失败不影响其余：整批中断会让用户不知道到底导出成功了哪几份。
+        skipped.push({
+          path: String(rawPath || file || ''),
+          reason: error instanceof Error ? error.message : String(error),
+        })
+      }
+    }
+
+    /*
+     * 多选合并：勾了多条时导出的是**一份**拼好的 Word，不是 N 个散文件。
+     *
+     * 用户明确要求「多选导出是合在一起的一个 word 文档，单条报告的表拼接在一起」：
+     *   · 单条 → 仍走上面的复制（点行内导出图标，一次就一份）
+     *   · 多条 → 换成一份汇总件，每个用例一张表、一张表一页
+     *
+     * 上面那轮复制是「逐份校验」用的：合并只接受真正通过 resolveReportFile 的
+     * 文件，否则合并接口就成了「传任意路径就能把机器上的文件读进 Word」。
+     * 复制出去的单份文件随后删掉，目录里只留合并件。
+     */
+    if (resolvedFiles.length > 1) {
+      const merged = await mergeReportsInto(targetDir, resolvedFiles, skipped)
+      if (merged !== null) {
+        for (const item of exported) {
+          try { await unlink(item.to) } catch { /* 已经是合并件的输入，删不掉也不影响结果 */ }
+        }
+        send(res, 200, {
+          ok: true,
+          dir: targetDir,
+          merged: true,
+          count: merged.count,
+          exported: [{ from: '', to: merged.path, name: merged.name }],
+          skipped,
+        })
+        return
+      }
+      // 合并失败时保留上面复制好的单份文件，让用户至少拿到东西，同时说明原因。
+      send(res, 200, {
+        ok: true,
+        dir: targetDir,
+        merged: false,
+        exported,
+        skipped,
+        warning: '合并失败，已改为分别导出 ' + exported.length + ' 份',
+      })
+      return
+    }
+
+    if (exported.length === 0) {
+      send(res, 200, { ok: false, dir: targetDir, exported, skipped, error: '没有成功导出任何报告' })
+      return
+    }
+    send(res, 200, { ok: true, dir: targetDir, merged: false, exported, skipped })
+  } catch (error) {
+    const status = Number.isInteger(error?.status) ? error.status : 500
+    send(res, status, { ok: false, error: error instanceof Error ? error.message : '服务内部错误' })
+  }
+}
+
+/** 选导出目录：宿主弹原生文件夹框，返回绝对路径。 */
+async function handlePickDir(req, res) {
+  try {
+    if (req.method !== 'POST') {
+      send(res, 405, { ok: false, error: '仅支持 POST' })
+      return
+    }
+    const outcome = await pickExportDirectory()
+    if (outcome.ok !== true) {
+      send(res, 200, { ok: false, error: outcome.reason || '选择目录失败' })
+      return
+    }
+    send(res, 200, { ok: true, canceled: outcome.canceled === true, dir: outcome.dir || '' })
+  } catch (error) {
+    const status = Number.isInteger(error?.status) ? error.status : 500
+    send(res, status, { ok: false, error: error instanceof Error ? error.message : '服务内部错误' })
+  }
+}
+
+/**
  * 最近一次执行的报告（一次请求直接给出 docx），供面板「报告」按钮使用：
  * 不用先列全部 run 再查详情，避免多一步请求挂住。
  */
@@ -2426,6 +2691,8 @@ export function apply(ctx) {
     [RUN_REPORT_LATEST_PATH, handleRunReportLatest, 'dsh-data-panel: run report latest'],
     [OPEN_PATH, handleOpenFile, 'dsh-data-panel: open file'],
     [REPORT_PDF_PATH, handleReportPdf, 'dsh-data-panel: report pdf'],
+    [PICK_DIR_PATH, handlePickDir, 'dsh-data-panel: export pick dir'],
+    [EXPORT_PATH, handleExport, 'dsh-data-panel: export reports'],
     [TOOLS_PATH, handleTools, 'dsh-data-panel: tools'],
     [INTEGRATION_PATH, handleIntegration, 'dsh-data-panel: integration store'],
   ]
@@ -2489,6 +2756,11 @@ export const __test = {
   handleRunReportLatest,
   handleOpenFile,
   handleReportPdf,
+  handleExport,
+  handlePickDir,
+  pickExportDirectory,
+  freeNameIn,
+  resolveExportDirectory,
   listRuns,
   handleRunList,
   handleRunLog,

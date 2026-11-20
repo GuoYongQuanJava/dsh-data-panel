@@ -731,3 +731,182 @@ test('docxFor 按 caseId 挑单条报告，pickOverall 挑整项目报告', () =
   // ④ 没有任何 docx 时返回 null
   assert.equal(h.api.docxFor({ files: [files[3]] }, 'x'), null)
 })
+
+/*
+ * 导出功能：三个入口都必须真的去调导出接口，不能是「查看」或空壳。
+ *
+ * 这里的 fetch 桩会记录每次请求，断言按 URL 区分 ——
+ * 历史上报告页的导出图标曾经绑的是 viewLatestReportOfCase（点导出变成查看），
+ * 多选导出也曾经是 notConnected（点了只弹「还没接好」）。
+ */
+function exportHarness() {
+  let descriptor, index = 0
+  const states = [], requests = []
+  const React = {
+    createElement: (type, props, ...children) => ({ type, props: props || {}, children }),
+    useState(initial) {
+      const slot = index++
+      if (!(slot in states)) states[slot] = typeof initial === 'function' ? initial() : initial
+      return [states[slot], value => { states[slot] = typeof value === 'function' ? value(states[slot]) : value }]
+    },
+    useRef: current => ({ current }), useMemo: fn => fn(), useEffect() {},
+  }
+  // 导出目录固定返回一个假路径，导出接口返回成功。
+  const reply = url => {
+    if (String(url).includes('/data-panel/export/pick-dir')) return { ok: true, dir: 'C:\\out', canceled: false }
+    if (String(url).includes('/data-panel/export')) {
+      return { ok: true, dir: 'C:\\out', exported: [{ name: 'r.docx', to: 'C:\\out\\r.docx' }], skipped: [] }
+    }
+    return { ok: true, files: [{ name: 'r.docx', path: 'C:\\r\\r.docx', kind: 'case' }, { name: 'o.docx', path: 'C:\\r\\o.docx', kind: 'overall' }], runs: [] }
+  }
+  vm.runInNewContext(readFileSync(process.env.DSH_PANEL_CLIENT_PATH || new URL('../lib/client.js', import.meta.url), 'utf8'), {
+    window: { __ModuleLoader__: { load: value => { descriptor = value } } },
+    URLSearchParams,
+    console,
+    setTimeout,
+    clearTimeout,
+    AbortController,
+    fetch: (url, init) => {
+      requests.push({ url: String(url), init })
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(reply(url)) })
+    },
+  })
+  return { api: descriptor.factory(name => name === 'react' ? React : {}).__test, requests, render(Component, props = {}) { index = 0; return Component(props) } }
+}
+
+/** 等到所有挂起的 promise 都跑完（导出链路是 fetch → then 多层）。 */
+const settle = () => new Promise(resolve => setTimeout(resolve, 20))
+
+test('报告页的导出图标调导出接口，不是打开查看', async () => {
+  const h = exportHarness()
+  const seed = {
+    versions: [{ name: 'V0.0.1', at: '2026-11-17T09:00:00Z', status: 'current' }],
+    activeVersion: 'V0.0.1',
+    byVersion: {
+      'V0.0.1': [
+        { id: 'it-1', caseId: 'V0_0_1-IT-001', title: '登录', scenario: '登录', type: 'functional',
+          steps: [], records: [{ runId: 'run-1', at: '2026-11-17T10:00:00Z', result: 'pass', source: 'all' }] },
+      ],
+    },
+  }
+  const render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a', initialSeed: seed })
+  find(render(), 'tab-reports').props.onClick()
+  find(render(), 'multi-enter') // 确认渲染成功
+  let tree = render()
+  // 分组默认收起，先展开
+  const toggle = nodes(tree).find(n => n.props && String(n.props['data-it'] || '').startsWith('report-toggle-'))
+  toggle.props.onClick()
+  tree = render()
+  const btn = find(tree, 'export-it-1')
+  assert.ok(btn, '报告页行内要有导出图标')
+  btn.props.onClick()
+  await settle()
+
+  const urls = h.requests.map(r => r.url)
+  assert.ok(urls.some(u => u.includes('/data-panel/export/pick-dir')), '导出必须先弹目录选择：' + JSON.stringify(urls))
+  assert.ok(urls.some(u => u.endsWith('/data-panel/export')), '必须真的调导出接口')
+  // 不能只是打开文件
+  assert.equal(urls.some(u => u.includes('/data-panel/open')), false, '导出不能变成「打开文件」')
+})
+
+test('步骤页子表的导出图标调导出接口', async () => {
+  const h = exportHarness()
+  const seed = {
+    versions: [{ name: 'V0.0.1', at: '2026-11-17T09:00:00Z', status: 'current' }],
+    activeVersion: 'V0.0.1',
+    byVersion: {
+      'V0.0.1': [
+        { id: 'it-1', caseId: 'V0_0_1-IT-001', title: '登录', scenario: '登录', type: 'functional',
+          steps: [], records: [{ runId: 'run-9', at: '2026-11-17T10:00:00Z', result: 'pass', source: 'case' }] },
+      ],
+    },
+  }
+  const render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a', initialSeed: seed })
+  find(render(), 'tab-steps').props.onClick()
+  let tree = render()
+  // 展开该用例的执行记录子表（data-it 是 expand-<record.id>）
+  const rowToggle = nodes(tree).find(n => n.props && String(n.props['data-it'] || '').startsWith('expand-'))
+  assert.ok(rowToggle, '步骤页每行要有展开按钮')
+  rowToggle.props.onClick()
+  tree = render()
+  const btn = find(tree, 'export-sub-run-9')
+  assert.ok(btn, '步骤页子表要有导出图标')
+  btn.props.onClick()
+  await settle()
+
+  const urls = h.requests.map(r => r.url)
+  assert.ok(urls.some(u => u.endsWith('/data-panel/export')), '步骤页导出要调导出接口：' + JSON.stringify(urls))
+  assert.equal(urls.some(u => u.includes('/data-panel/open')), false, '导出不能变成「打开文件」')
+})
+
+test('报告页「导出已选报告」是真实导出，不再是空壳', async () => {
+  const h = exportHarness()
+  const seed = {
+    versions: [{ name: 'V0.0.1', at: '2026-11-17T09:00:00Z', status: 'current' }],
+    activeVersion: 'V0.0.1',
+    byVersion: {
+      'V0.0.1': [
+        { id: 'it-1', caseId: 'V0_0_1-IT-001', title: '登录', scenario: '登录', type: 'functional',
+          steps: [], records: [{ runId: 'run-1', at: '2026-11-17T10:00:00Z', result: 'pass', source: 'all' }] },
+      ],
+    },
+  }
+  const render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a', initialSeed: seed })
+  find(render(), 'tab-reports').props.onClick()
+  find(render(), 'multi-enter').props.onClick()
+  let tree = render()
+  find(tree, 'multi-select-all').props.onClick()
+  tree = render()
+  const btn = find(tree, 'multi-export')
+  assert.equal(btn.props.disabled, false, '全选后导出可用')
+  btn.props.onClick()
+  await settle()
+
+  const urls = h.requests.map(r => r.url)
+  assert.ok(urls.some(u => u.endsWith('/data-panel/export')), '多选导出要调导出接口：' + JSON.stringify(urls))
+})
+
+test('总体报告的导出按钮常驻，不需要先点总体报告', async () => {
+  const h = exportHarness()
+  const seed = {
+    versions: [{ name: 'V0.0.1', at: '2026-11-17T09:00:00Z', status: 'current' }],
+    activeVersion: 'V0.0.1',
+    byVersion: {
+      'V0.0.1': [
+        { id: 'it-1', caseId: 'V0_0_1-IT-001', title: '登录', scenario: '登录', type: 'functional',
+          steps: [], records: [{ runId: 'run-1', at: '2026-11-17T10:00:00Z', result: 'pass', source: 'all' }] },
+      ],
+    },
+  }
+  const render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a', initialSeed: seed })
+  find(render(), 'tab-reports').props.onClick()
+  let tree = render()
+  /*
+   * 常驻：不需要先点「总体报告」就该看到导出按钮。
+   *
+   * 曾经做成「点过总体报告才出现」，但点它会把这个 PDF 开在主区域的新 tab，
+   * 主面板被切走，按钮根本看不到（用户 2026-11-20 截图反馈）。
+   */
+  assert.ok(find(tree, 'overview'), '总体报告按钮要在')
+  const persistent = find(tree, 'overview-export')
+  assert.ok(persistent, '导出按钮应常驻，不必先点总体报告')
+
+  persistent.props.onClick()
+  await settle()
+  const urls = h.requests.map(r => r.url)
+  assert.ok(urls.some(u => u.endsWith('/data-panel/export')), '总体报告导出要调导出接口：' + JSON.stringify(urls))
+})
+
+test('切换到别的子页时总体报告导出按钮不出现', () => {
+  const h = exportHarness()
+  const seed = {
+    versions: [{ name: 'V0.0.1', at: '2026-11-17T09:00:00Z', status: 'current' }],
+    activeVersion: 'V0.0.1',
+    byVersion: { 'V0.0.1': [] },
+  }
+  const render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a', initialSeed: seed })
+  // 默认在测试用例页：这两个按钮只属于报告页
+  const tree = render()
+  assert.equal(find(tree, 'overview'), undefined, '用例页不该有总体报告按钮')
+  assert.equal(find(tree, 'overview-export'), undefined, '用例页不该有导出按钮')
+})

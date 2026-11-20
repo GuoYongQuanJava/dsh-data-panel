@@ -30,7 +30,14 @@ export function PdfView(props: { scope: SessionScope; path: string; title: strin
         // proxy cached application/octet-stream. The Blob URL owns an explicit
         // PDF MIME and therefore consistently opens the browser PDF viewer.
         objectUrl = URL.createObjectURL(new Blob([bytes], { type: 'application/pdf' }))
-        setLoad({ status: 'ready', url: objectUrl })
+        // 让 PDF 按**页面宽度**适配，而不是按高度：集成测试的总体报告是 A4 竖版
+        // 长文档（实测一份 108 页），默认缩放只显示页面左侧约 57%，右侧内容被
+        // 截断、必须横向拖才能看全。page-width 让整页宽度铺满容器，一屏能完整
+        // 看到一行内容，纵向也少滚几屏。
+        //
+        // 注意：这是 PDF 的 Open Parameters，必须拼在 blob URL 的 `#` 之后，
+        // 不能写进 Blob 内容里。放错位置浏览器会把它当成文件名的一部分忽略掉。
+        setLoad({ status: 'ready', url: objectUrl + '#zoom=page-width' })
       } catch (error) {
         if (controller.signal.aborted) return
         setLoad({ status: 'error', message: error instanceof Error ? error.message : String(error) })
