@@ -1,0 +1,3169 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createStore } from "../src/store.js";
+import { createService } from "../src/service.js";
+import { createApi } from "../src/api.js";
+import { createInjector } from "../src/inject.js";
+import { createSettings } from "../src/settings.js";
+import { createVectorIndex } from "../src/vector-index.js";
+import { Config, applyLightModePreset } from "../src/config.js";
+import { parseHumanEdits } from "../src/mirror.js";
+import { FAKE_API_TOKEN, fakeOpenAiKey, fakeMaskedOpenAiKey } from "./helpers/fake-auth-values.js";
+import { testConfig } from "./helpers/test-config.js";
+
+// 解析后的 schema 默认值，作为 /features effective 的 bundle 配置侧样本。
+const FLAGS_CFG = Config({});
+
+class FakeRes extends EventEmitter {
+  constructor() { super(); this.statusCode = 200; this.body = ""; }
+  writeHead(code, headers) { this.statusCode = code; this.headers = headers; return this; }
+  end(text) { this.body = text ?? ""; this.emit("end"); return this; }
+}
+
+function req(path, method = "GET", body = null) {
+  const r = new EventEmitter();
+  r.url = path;
+  r.method = method;
+  r.headers = {};
+  if (body !== null) {
+    process.nextTick(() => {
+      r.emit("data", Buffer.from(JSON.stringify(body)));
+      r.emit("end");
+    });
+  }
+  return r;
+}
+
+function setup(embedder, apiToken = "", config = null, semantic = undefined) {
+  const store = createStore(":memory:");
+  const service = createService({ store, mirror: null, config: testConfig({}) });
+  const settings = createSettings(store.db);
+  const commands = {
+    add: (def) => settings.addCommand(def),
+    remove: (id) => settings.removeCommand(id),
+    list: () => settings.listCommands()
+  };
+  const routes = [];
+  const ctx = {
+    webServer: {
+      register(route) {
+        routes.push(route);
+        return () => {};
+      }
+    }
+  };
+  const api = createApi(ctx, service, settings, commands, embedder, semantic, apiToken, config);
+  return { store, service, routes, api, settings, apiToken };
+}
+
+function findHandler(routes, path) {
+  // 先找精确登记，再退回 prefix 兜底。不能只写一个 find：`/api/dsh-mneme` 那条
+  // prefix 404 兜底登记得很早，路径以它开头的任何一条都会先命中它，于是不管
+  // 断言什么都是 404。
+  const exact = routes.find((r) => r.kind === "exact" && r.path === path);
+  if (exact) return exact;
+  return routes.find((r) => r.kind === "prefix" && path.startsWith(r.path));
+}
+
+test("registers list, search, and get prefix routes", () => {
+  const { routes } = setup();
+  const paths = routes.map((r) => r.path);
+  assert.ok(paths.includes("/api/dsh-mneme/list"));
+  assert.ok(paths.includes("/api/dsh-mneme/search"));
+  assert.ok(paths.includes("/api/dsh-mneme"));
+});
+
+test("GET /api/dsh-mneme/list returns memories as JSON", async () => {
+  const { routes, service } = setup();
+  service.saveWithDedupe({ type: "preference", title: "语言", content: "中文" });
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/list");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/list?type=preference"), res);
+  assert.equal(res.statusCode, 200);
+  const data = JSON.parse(res.body);
+  assert.equal(data.items.length, 1);
+  assert.equal(data.items[0].title, "语言");
+});
+
+test("GET /api/dsh-mneme/search?q= returns matches", async () => {
+  const { routes, service } = setup();
+  service.saveWithDedupe({ type: "project", title: "记忆插件", content: "SQLite 中文搜索" });
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/search");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/search?q=%E4%B8%AD%E6%96%87"), res);
+  assert.equal(res.statusCode, 200);
+  const data = JSON.parse(res.body);
+  assert.equal(data.items.length, 1);
+});
+
+test("unknown route under prefix returns 404 json", async () => {
+  const { routes } = setup();
+  const route = findHandler(routes, "/api/dsh-mneme");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/nope"), res);
+  assert.equal(res.statusCode, 404);
+});
+
+test("list total excludes forgotten entries", async () => {
+  const { routes, service } = setup();
+  service.saveWithDedupe({ type: "preference", title: "正常", content: "可见" });
+  const forgotten = service.saveWithDedupe({ type: "preference", title: "遗忘", content: "隐藏" });
+  service.saveWithDedupe({ type: "project", title: "项目", content: "其他类型" });
+  service.setForget(forgotten.memory.id, true);
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/list");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/list?type=preference"), res);
+  assert.equal(res.statusCode, 200);
+  const data = JSON.parse(res.body);
+  assert.equal(data.items.length, 1);
+  assert.equal(data.total, 1, "total matches visible items, forgotten excluded");
+});
+
+test("list carries typeCounts: the full distribution without the type filter (#597)", async () => {
+  const { routes, service } = setup();
+  service.saveWithDedupe({ type: "preference", title: "p", content: "c" });
+  service.saveWithDedupe({ type: "project", title: "j1", content: "c" });
+  service.saveWithDedupe({ type: "project", title: "j2", content: "c" });
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/list");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/list?type=project"), res);
+  assert.equal(res.statusCode, 200);
+  const data = JSON.parse(res.body);
+  assert.equal(data.total, 2, "total honors the type filter");
+  assert.deepEqual(data.typeCounts, { preference: 1, project: 2 }, "distribution ignores the type filter — other classes survive a selection");
+
+  const resAll = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/list"), resAll);
+  const all = JSON.parse(resAll.body);
+  assert.equal(
+    Object.keys(all.typeCounts).reduce((n, k) => n + all.typeCounts[k], 0),
+    all.total,
+    "distribution sums to the unfiltered total"
+  );
+});
+
+test("list?id= also excludes forgotten entries", async () => {
+  // getById 是裸 SELECT，不套 list 的 forgotten 谓词；这条路由是 open 的，
+  // 漏掉过滤等于让本机任意进程按 id 读到遗忘记忆的全文（评审 #1）。
+  const { routes, service } = setup();
+  const forgotten = service.saveWithDedupe({ type: "preference", title: "遗忘", content: "隐藏" });
+  service.setForget(forgotten.memory.id, true);
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/list");
+  const res = new FakeRes();
+  await route.handler(req(`/api/dsh-mneme/list?id=${forgotten.memory.id}`), res);
+  assert.equal(res.statusCode, 200);
+  const data = JSON.parse(res.body);
+  assert.deepEqual(data.items, []);
+  assert.equal(data.total, 0);
+});
+
+test("list?id= still returns archived rows (archive is not forget)", async () => {
+  const { routes, service } = setup();
+  const archived = service.saveWithDedupe({ type: "preference", title: "归档", content: "仍可比对" });
+  service.setArchived(archived.memory.id, true);
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/list");
+  const res = new FakeRes();
+  await route.handler(req(`/api/dsh-mneme/list?id=${archived.memory.id}`), res);
+  const data = JSON.parse(res.body);
+  assert.equal(data.items.length, 1);
+  assert.equal(data.items[0].title, "归档");
+});
+
+test("list honors limit/offset", async () => {
+  const { routes, service } = setup();
+  service.saveWithDedupe({ type: "preference", title: "a", content: "1" });
+  service.saveWithDedupe({ type: "preference", title: "b", content: "2" });
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/list");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/list?limit=1&offset=0"), res);
+  const data = JSON.parse(res.body);
+  assert.equal(data.items.length, 1);
+  assert.equal(data.total, 2);
+});
+
+test("responses carry application/json content-type", async () => {
+  const { routes } = setup();
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/list");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/list"), res);
+  assert.match(res.headers["Content-Type"], /application\/json/);
+});
+
+test("handler errors return 500 json instead of leaking to host", async () => {
+  const routes = [];
+  const ctx = {
+    webServer: {
+      register(route) {
+        routes.push(route);
+        return () => {};
+      }
+    }
+  };
+  const service = {
+    list() { throw new Error("boom"); },
+    count() { throw new Error("boom"); },
+    search() { throw new Error("boom"); },
+    toApiList() { return []; }
+  };
+  createApi(ctx, service, {}, { add: () => { throw new Error("x"); }, remove: () => false, list: () => [] });
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/list");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/list"), res);
+  assert.equal(res.statusCode, 500);
+  assert.deepEqual(JSON.parse(res.body), { error: "internal" });
+});
+
+test("GET /api/dsh-mneme/profile returns stored profile", async () => {
+  const { routes, settings } = setup();
+  settings.setProfile("我是前端");
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/profile");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/profile"), res);
+  assert.equal(res.statusCode, 200);
+  assert.equal(JSON.parse(res.body).profile, "我是前端");
+});
+
+test("PUT /api/dsh-mneme/profile saves profile", async () => {
+  const { routes, settings } = setup();
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/profile");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/profile", "PUT", { profile: "新画像" }), res);
+  assert.equal(res.statusCode, 200);
+  assert.equal(JSON.parse(res.body).profile, "新画像");
+  assert.equal(settings.getProfile(), "新画像");
+});
+
+test("GET /api/dsh-mneme/rules returns stored rules", async () => {
+  const { routes, settings } = setup();
+  settings.setRules(["规则1", "规则2"]);
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/rules");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/rules"), res);
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(JSON.parse(res.body).rules, ["规则1", "规则2"]);
+});
+
+test("PUT /api/dsh-mneme/rules saves rules", async () => {
+  const { routes, settings } = setup();
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/rules");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/rules", "PUT", { rules: ["a", "b"] }), res);
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(settings.getRules(), ["a", "b"]);
+});
+
+// --- panel mode (light/standard) ---
+
+test("GET /api/dsh-mneme/mode defaults to standard", async () => {
+  const { routes } = setup();
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/mode");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/mode"), res);
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(JSON.parse(res.body), { mode: "standard" });
+});
+
+test("PUT /api/dsh-mneme/mode validates the enum and persists", async () => {
+  const { routes, settings } = setup();
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/mode");
+
+  const put = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/mode", "PUT", { mode: "light" }), put);
+  assert.equal(put.statusCode, 200);
+  assert.deepEqual(JSON.parse(put.body), { mode: "light" });
+  assert.equal(settings.getPanelMode(), "light");
+
+  const back = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/mode", "PUT", { mode: "standard" }), back);
+  assert.deepEqual(JSON.parse(back.body), { mode: "standard" });
+
+  const bad = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/mode", "PUT", { mode: "turbo" }), bad);
+  assert.equal(bad.statusCode, 400);
+  assert.equal(settings.getPanelMode(), "standard", "invalid value not persisted");
+});
+
+test("PUT /api/dsh-mneme/mode is token-gated like other settings writes", async () => {
+  const { routes } = setup(undefined, FAKE_API_TOKEN);
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/mode");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/mode", "PUT", { mode: "light" }), res);
+  assert.equal(res.statusCode, 401);
+  const ok = new FakeRes();
+  const authed = req("/api/dsh-mneme/mode", "PUT", { mode: "light" });
+  authed.headers = { authorization: `Bearer ${FAKE_API_TOKEN}` };
+  await route.handler(authed, ok);
+  assert.equal(ok.statusCode, 200);
+});
+
+test("GET /api/dsh-mneme/commands lists commands", async () => {
+  const { routes, settings } = setup();
+  settings.addCommand({ name: "agenda", instruction: "x" });
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/commands");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/commands"), res);
+  assert.equal(res.statusCode, 200);
+  assert.equal(JSON.parse(res.body).commands.length, 1);
+});
+
+test("POST /api/dsh-mneme/commands adds a command; DELETE removes", async () => {
+  const { routes } = setup();
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/commands");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/commands", "POST", { name: "fmt", description: "d", instruction: "格式化" }), res);
+  assert.equal(res.statusCode, 200);
+  const { command } = JSON.parse(res.body);
+  assert.equal(command.name, "fmt");
+  const del = new FakeRes();
+  await route.handler(req(`/api/dsh-mneme/commands?id=${command.id}`, "DELETE"), del);
+  assert.equal(JSON.parse(del.body).removed, true);
+});
+
+test("POST /api/dsh-mneme/commands rejects invalid name with 400", async () => {
+  const { routes } = setup();
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/commands");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/commands", "POST", { name: "Bad Name", instruction: "x" }), res);
+  assert.equal(res.statusCode, 400);
+});
+
+// --- vector search routes ---
+
+function setupWithEmbedder(embedder) {
+  const base = setup(embedder);
+  base.settings.setVectorConfig({
+    enabled: true,
+    baseUrl: "https://api.example.com/v1",
+    apiKey: "sk-test",
+    model: "text-embedding-v3"
+  });
+  return base;
+}
+
+test("vector-config defaults and round-trips through PUT/GET", async () => {
+  const { routes, settings } = setup();
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/vector-config");
+
+  const get1 = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/vector-config"), get1);
+  assert.equal(JSON.parse(get1.body).config.enabled, false);
+
+  const put = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/vector-config", "PUT", { enabled: true, baseUrl: "https://api.openai.com/v1", apiKey: "sk-x", model: "text-embedding-3-small" }), put);
+  assert.equal(JSON.parse(put.body).config.model, "text-embedding-3-small");
+  assert.equal(settings.getVectorConfig().enabled, true);
+});
+
+test("search mode=vector merges vector results when embedder returns a vector", async () => {
+  const embedder = {
+    embed: async () => [1, 0, 0],
+    reindexMissing: async () => ({ indexed: 0, skipped: 0 })
+  };
+  const { routes, store, service } = setupWithEmbedder(embedder);
+  const v = service.saveWithDedupe({ type: "preference", title: "猫", content: "喜欢猫" });
+  store.setEmbedding(v.memory.id, [1, 0, 0]);
+  service.saveWithDedupe({ type: "preference", title: "狗", content: "喜欢狗" });
+
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/search");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/search?q=%E7%8C%AB&mode=vector"), res);
+  const data = JSON.parse(res.body);
+  assert.equal(data.mode, "vector");
+  assert.equal(data.items.length, 1, "keyword hit + vector fill merged");
+  assert.equal(data.items[0].title, "猫");
+});
+
+test("search falls back to keyword when embedder disabled or unavailable", async () => {
+  // embedder that resolves null (disabled provider)
+  const embedder = { embed: async () => null, reindexMissing: async () => ({ indexed: 0, skipped: 0 }) };
+  const { routes, service } = setupWithEmbedder(embedder);
+  service.saveWithDedupe({ type: "preference", title: "语言", content: "中文交流" });
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/search");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/search?q=%E4%B8%AD%E6%96%87"), res);
+  const data = JSON.parse(res.body);
+  assert.equal(data.mode, "keyword");
+  assert.equal(data.items.length, 1);
+});
+
+test("vector-reindex calls embedder and returns counts", async () => {
+  const embedder = { reindexMissing: async () => ({ indexed: 2, skipped: 1 }) };
+  const { routes } = setupWithEmbedder(embedder);
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/vector-reindex");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/vector-reindex"), res);
+  const data = JSON.parse(res.body);
+  assert.equal(data.indexed, 2);
+  assert.equal(data.skipped, 1);
+});
+
+test("vector-config masks apiKey; empty/masked key on PUT keeps existing", async () => {
+  const { routes, settings } = setup();
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/vector-config");
+
+  // PUT stores the real key but responds masked
+  const put = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/vector-config", "PUT", {
+    enabled: true, baseUrl: "https://api.openai.com/v1", apiKey: fakeOpenAiKey(), model: "m1"
+  }), put);
+  const putBody = JSON.parse(put.body);
+  assert.equal(putBody.config.apiKey, "sk-***mnop", "PUT response masked");
+  assert.equal(settings.getVectorConfig().apiKey, "sk-abcdefghijklmnop", "storage keeps the real key");
+
+  // GET returns masked key, other fields intact
+  const get = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/vector-config"), get);
+  const getBody = JSON.parse(get.body);
+  assert.equal(getBody.config.apiKey, "sk-***mnop");
+  assert.equal(getBody.config.baseUrl, "https://api.openai.com/v1");
+  assert.equal(getBody.config.enabled, true);
+
+  // PUT with empty apiKey keeps the previous key
+  const put2 = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/vector-config", "PUT", {
+    enabled: true, baseUrl: "https://api.openai.com/v1", apiKey: "", model: "m2"
+  }), put2);
+  assert.equal(settings.getVectorConfig().apiKey, "sk-abcdefghijklmnop", "empty key keeps existing");
+  assert.equal(JSON.parse(put2.body).config.model, "m2");
+
+  // PUT with a masked apiKey (client round-trip) also keeps the previous key
+  const put3 = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/vector-config", "PUT", {
+    enabled: true, baseUrl: "https://api.openai.com/v1", apiKey: fakeMaskedOpenAiKey(), model: "m3"
+  }), put3);
+  assert.equal(settings.getVectorConfig().apiKey, "sk-abcdefghijklmnop", "masked key keeps existing");
+});
+
+test("apiToken protects write/secret endpoints while read endpoints stay open", async () => {
+  const { routes } = setup(undefined, FAKE_API_TOKEN);
+  const list = routes.find((r) => r.path === "/api/dsh-mneme/list");
+  const profile = routes.find((r) => r.path === "/api/dsh-mneme/profile");
+  const vec = routes.find((r) => r.path === "/api/dsh-mneme/vector-config");
+  const reindex = routes.find((r) => r.path === "/api/dsh-mneme/vector-reindex");
+
+  // read-only endpoint stays open without a token
+  const resList = new FakeRes();
+  await list.handler(req("/api/dsh-mneme/list"), resList);
+  assert.equal(resList.statusCode, 200, "list stays open");
+
+  // secret endpoint without token → 401
+  const resVec = new FakeRes();
+  await vec.handler(req("/api/dsh-mneme/vector-config"), resVec);
+  assert.equal(resVec.statusCode, 401, "vector-config GET requires token");
+
+  // write endpoint without token → 401
+  const resProfile = new FakeRes();
+  await profile.handler(req("/api/dsh-mneme/profile", "PUT", { profile: "x" }), resProfile);
+  assert.equal(resProfile.statusCode, 401, "profile PUT requires token");
+
+  // reindex without token → 401
+  const resReindex = new FakeRes();
+  await reindex.handler(req("/api/dsh-mneme/vector-reindex"), resReindex);
+  assert.equal(resReindex.statusCode, 401, "vector-reindex requires token");
+
+  // with a Bearer token everything is allowed
+  const authReq = (path, method = "GET", body = null) => {
+    const r = req(path, method, body);
+    r.headers = { authorization: `Bearer ${FAKE_API_TOKEN}` };
+    return r;
+  };
+  const resVecOk = new FakeRes();
+  await vec.handler(authReq("/api/dsh-mneme/vector-config"), resVecOk);
+  assert.equal(resVecOk.statusCode, 200, "vector-config GET with token");
+  const resProfileOk = new FakeRes();
+  await profile.handler(authReq("/api/dsh-mneme/profile", "PUT", { profile: "hi" }), resProfileOk);
+  assert.equal(resProfileOk.statusCode, 200, "profile PUT with token");
+
+  // wrong token → 401
+  const bad = req("/api/dsh-mneme/vector-config");
+  bad.headers = { authorization: "Bearer wrong" };
+  const resBad = new FakeRes();
+  await vec.handler(bad, resBad);
+  assert.equal(resBad.statusCode, 401, "wrong token rejected");
+});
+
+test("no apiToken configured keeps all endpoints open", async () => {
+  const { routes } = setup();
+  const vec = routes.find((r) => r.path === "/api/dsh-mneme/vector-config");
+  const res = new FakeRes();
+  await vec.handler(req("/api/dsh-mneme/vector-config"), res);
+  assert.equal(res.statusCode, 200, "open when apiToken is unset");
+});
+
+// --- #118: /semantic exposes embedder readiness for the status card ----------
+
+test("GET /api/dsh-mneme/semantic reports ready state per embedder", async () => {
+  const fetchSem = async (embedder) => {
+    const { routes } = setup(embedder);
+    const sem = routes.find((r) => r.path === "/api/dsh-mneme/semantic");
+    const res = new FakeRes();
+    await sem.handler(req("/api/dsh-mneme/semantic"), res);
+    assert.equal(res.statusCode, 200);
+    return JSON.parse(res.body);
+  };
+  // no embedder → everything null
+  assert.equal((await fetchSem(undefined)).embedProvider, null);
+  assert.equal((await fetchSem(undefined)).ready, null, "no embedder → ready null");
+
+  // Ollama-style embedder mid-init (ready:false) → ready false
+  class OllamaEmbedder { constructor() { this.ready = false; } }
+  const mid = await fetchSem(new OllamaEmbedder());
+  assert.equal(mid.embedProvider, "OllamaEmbedder");
+  assert.equal(mid.ready, false, "not-yet-ready embedder → ready false");
+
+  // ready after init
+  const ready = new OllamaEmbedder(); ready.ready = true;
+  assert.equal((await fetchSem(ready)).ready, true);
+
+  // legacy OpenAI embedder has no `ready` prop → treated as ready
+  assert.equal((await fetchSem({ embed() {} })).ready, true, "no ready prop → assumed ready");
+
+  // legacy embedder carries an explicit display name (constructor.name of a
+  // literal is "Object", which the status card must not render verbatim)
+  const named = await fetchSem({ name: "OpenAI", embed() {} });
+  assert.equal(named.embedProvider, "OpenAI", "explicit name beats constructor.name");
+  assert.equal(named.ready, true);
+});
+
+// --- #135: /semantic must tell "not configured" apart from "degraded" ---------
+
+test("GET /api/dsh-mneme/semantic reports configured/coverage/degraded", async () => {
+  const fetchSem = async (embedder, semantic) => {
+    const { routes } = setup(embedder, "", null, semantic);
+    const sem = routes.find((r) => r.path === "/api/dsh-mneme/semantic");
+    const res = new FakeRes();
+    await sem.handler(req("/api/dsh-mneme/semantic"), res);
+    assert.equal(res.statusCode, 200);
+    return JSON.parse(res.body);
+  };
+  // Stats double: `total` is the memory count, `embedded` the indexed count.
+  const index = (embeddedCount, totalCount) => ({
+    vectorIndex: { getStats: () => ({ embeddedCount, totalCount }) }
+  });
+  const openai = (ready, configured) => ({
+    name: "OpenAI",
+    get ready() { return ready; },
+    get configured() { return configured; },
+    embed() {}
+  });
+
+  // No embedder at all → everything reports absence, not a false green.
+  const none = await fetchSem(undefined, index(0, 0));
+  assert.equal(none.configured, null);
+  assert.equal(none.reason, "no-embedder");
+  assert.equal(none.degraded, false);
+  assert.deepEqual(none.coverage, { embedded: 0, total: 0, ratio: null },
+    "empty store → ratio null (0 would read as 'nothing embedded')");
+
+  // Configured embedder still initializing: unreachable ≠ unconfigured.
+  assert.equal((await fetchSem(openai(false, true), index(0, 346))).reason, "initializing");
+
+  // Never configured: reported as such even though the index has memories.
+  const unconfigured = await fetchSem(openai(false, false), index(0, 346));
+  assert.equal(unconfigured.ready, false);
+  assert.equal(unconfigured.configured, false);
+  assert.equal(unconfigured.reason, "not-configured");
+  assert.equal(unconfigured.degraded, false, "unconfigured was never meant to index");
+  assert.equal(unconfigured.coverage.ratio, 0);
+
+  // Configured, memories present, zero vectors — the state this machine sat in
+  // for weeks while the card showed a healthy provider.
+  const degraded = await fetchSem(openai(true, true), index(0, 346));
+  assert.equal(degraded.reason, null, "a complete config has no abnormal reason");
+  assert.equal(degraded.degraded, true);
+  assert.equal(degraded.coverage.ratio, 0);
+
+  // Healthy index.
+  const ok = await fetchSem(openai(true, true), index(173, 346));
+  assert.equal(ok.degraded, false);
+  assert.equal(ok.coverage.ratio, 0.5);
+
+  // Adapters without a `configured` field (third-party/test doubles) keep the
+  // old contract: assumed configured, `ready` decides.
+  const legacy = await fetchSem({ embed() {} }, index(5, 10));
+  assert.equal(legacy.configured, true);
+  assert.equal(legacy.reason, null);
+  assert.equal(legacy.ready, true);
+
+  // No stats provider (no vector index) must not throw — coverage falls back
+  // to zeros and an empty store is never "degraded".
+  const noIndex = await fetchSem(openai(true, true), null);
+  assert.deepEqual(noIndex.coverage, { embedded: 0, total: 0, ratio: null });
+  assert.equal(noIndex.degraded, false);
+});
+
+// --- distill-tx-embed-gap 后续：/semantic 区分「有向量」与「可检索」 -----------
+
+test("GET /api/dsh-mneme/semantic reports per-dimension/per-model vector breakdown", async () => {
+  const { routes, store, service } = setup(undefined);
+  // 三种状态混进一个库：3 维 2 条、旧 4 维 1 条、不可解析 1 条；
+  // 模型出身 m1#aaa 一行、m2#bbb 一行、无出身两行。
+  const a = service.saveWithDedupe({ type: "preference", title: "同维A", content: "x" }).memory;
+  const b = service.saveWithDedupe({ type: "preference", title: "同维B", content: "x" }).memory;
+  const c = service.saveWithDedupe({ type: "preference", title: "旧维C", content: "x" }).memory;
+  const d = service.saveWithDedupe({ type: "preference", title: "坏D", content: "x" }).memory;
+  store.db.prepare("UPDATE memories SET embedding = ? WHERE id = ?").run(JSON.stringify([1, 2, 3]), a.id);
+  store.db.prepare("UPDATE memories SET embedding = ?, embedding_model = ? WHERE id = ?").run(JSON.stringify([1, 2, 3]), "m1#aaa", b.id);
+  store.db.prepare("UPDATE memories SET embedding = ?, embedding_model = ? WHERE id = ?").run(JSON.stringify([1, 2, 3, 4]), "m2#bbb", c.id);
+  store.db.prepare("UPDATE memories SET embedding = ? WHERE id = ?").run("not-json", d.id);
+
+  const sem = routes.find((r) => r.path === "/api/dsh-mneme/semantic");
+  const res = new FakeRes();
+  await sem.handler(req("/api/dsh-mneme/semantic"), res);
+  assert.equal(res.statusCode, 200);
+  const data = JSON.parse(res.body);
+
+  // 无 embedder → 无当前维度可比对：unsearchable 报 0、retrievable 报 null。
+  assert.equal(data.vectors.unsearchable, 0);
+  assert.equal(data.vectors.retrievable, null);
+  const dims = Object.fromEntries(data.vectors.byDimension.map((e) => [e.dimension, e.count]));
+  assert.equal(dims["3"], 2);
+  assert.equal(dims["4"], 1);
+  assert.equal(dims[null], 1, "unparseable vector counted under null");
+  const models = Object.fromEntries(data.vectors.byModel.map((e) => [e.model, e.count]));
+  assert.equal(models["m1#aaa"], 1);
+  assert.equal(models["m2#bbb"], 1);
+  assert.equal(models[null], 2, "rows without provenance counted under null");
+});
+
+test("GET /api/dsh-mneme/semantic counts stale-dimension rows as unsearchable with a matching embedder", async () => {
+  // 核心回归锁：库里掺一条错维向量，端点必须报出 unsearchable ≥ 1。
+  // 旧实现无论怎么混都只给 coverage，状态卡说不出「有向量但检索不到」。
+  const { routes, store, service } = setup({ name: "OpenAI", embed() {}, dimension: 3 });
+  const a = service.saveWithDedupe({ type: "preference", title: "同维", content: "x" }).memory;
+  const b = service.saveWithDedupe({ type: "preference", title: "错维", content: "x" }).memory;
+  store.db.prepare("UPDATE memories SET embedding = ? WHERE id = ?").run(JSON.stringify([1, 2, 3]), a.id);
+  store.db.prepare("UPDATE memories SET embedding = ? WHERE id = ?").run(JSON.stringify([1, 2, 3, 4, 5, 6, 7, 8]), b.id);
+  const sem = routes.find((r) => r.path === "/api/dsh-mneme/semantic");
+  const res = new FakeRes();
+  await sem.handler(req("/api/dsh-mneme/semantic"), res);
+  assert.equal(res.statusCode, 200);
+  const data = JSON.parse(res.body);
+  assert.equal(data.vectors.unsearchable, 1, "the 8-dim row is not searchable against a 3-dim embedder");
+  assert.equal(data.vectors.retrievable, 1, "the 3-dim row is searchable");
+  // coverage 走 semantic.vectorIndex.getStats（本测试未挂 → 0），所以「有向量的行」
+  // 用 byDimension 总和对照：两条都在「有向量」里，但只有一条可检索 —— 这正是
+  // unsearchable 必须存在的原因。
+  const embeddedRows = data.vectors.byDimension.reduce((s, e) => s + e.count, 0);
+  assert.equal(embeddedRows, 2, "both rows have vectors");
+  assert.equal(data.vectors.unsearchable, 1, "yet only one is retrievable");
+});
+
+test("GET /api/dsh-mneme/semantic surfaces the #604 backfill/receipt diagnostics", async () => {
+  // #604 的诊断面在 api.js 里一直有出口，但全仓没有一条用例断言过
+  // `data.embeddings`，所以「传参形状不对 → 真机恒为 null」这件事测试看不见。
+  // 这里从 handler 一侧锁住出口本身：semantic 面有 embeddingDiagnostics 就必须透出。
+  const diag = {
+    backfill: { indexed: 12, failed: 1, finishReason: "capped", stillStale: true },
+    receipts: { recent: [{ reason: "http-503" }], totals: { ok: 12, failed: 1 } }
+  };
+  const { routes } = setup(undefined, "", null, {
+    vectorIndex: { getStats: () => ({ embeddedCount: 12, totalCount: 13 }) },
+    embeddingDiagnostics: () => diag
+  });
+  const sem = routes.find((r) => r.path === "/api/dsh-mneme/semantic");
+  const res = new FakeRes();
+  await sem.handler(req("/api/dsh-mneme/semantic"), res);
+  assert.equal(res.statusCode, 200);
+  const data = JSON.parse(res.body);
+  assert.deepEqual(data.embeddings, diag, "the diagnostics must reach the panel verbatim");
+
+  // 老 semantic 面（没有这个方法）仍报 null，不伪造空对象。
+  const { routes: plain } = setup(undefined, "", null, { vectorIndex: { getStats: () => ({ embeddedCount: 0, totalCount: 0 }) } });
+  const plainSem = plain.find((r) => r.path === "/api/dsh-mneme/semantic");
+  const plainRes = new FakeRes();
+  await plainSem.handler(req("/api/dsh-mneme/semantic"), plainRes);
+  assert.equal(JSON.parse(plainRes.body).embeddings, null);
+});
+
+// --- Bug8: llm-audit API (pagination + stats) --------------------------------
+
+test("GET /api/dsh-mneme/semantic/llm-audit returns paginated rows", async () => {
+  const { routes, service } = setup();
+  for (let i = 0; i < 5; i++) {
+    service.saveLlmAudit({ trigger_source: "autoDream", operation_type: "dream_consolidate", model_id: "m1", input_tokens: 10, output_tokens: 5, status: "success", related_memory_ids: [] });
+  }
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/semantic/llm-audit");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/semantic/llm-audit?page=2&pageSize=2"), res);
+  assert.equal(res.statusCode, 200);
+  const data = JSON.parse(res.body);
+  assert.equal(data.total, 5);
+  assert.equal(data.page, 2);
+  assert.equal(data.pageSize, 2);
+  assert.equal(data.items.length, 2, "second page of 2");
+});
+
+test("GET /api/dsh-mneme/semantic/llm-audit filters by source", async () => {
+  const { routes, service } = setup();
+  service.saveLlmAudit({ trigger_source: "autoDream", operation_type: "dream_consolidate", model_id: "m1", status: "success" });
+  service.saveLlmAudit({ trigger_source: "autoSummarize", operation_type: "summarize_compress", model_id: "m2", status: "success" });
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/semantic/llm-audit");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/semantic/llm-audit?source=autoSummarize"), res);
+  const data = JSON.parse(res.body);
+  assert.equal(data.total, 1);
+  assert.equal(data.items[0].operation_type, "summarize_compress");
+});
+
+test("GET /api/dsh-mneme/semantic/llm-audit/stats aggregates tokens by source and status", async () => {
+  const { routes, service } = setup();
+  service.saveLlmAudit({
+    trigger_source: "autoDream", operation_type: "dream_consolidate", model_id: "m1",
+    input_tokens: 100, output_tokens: 50, total_tokens: 150, duration_ms: 12, status: "success", related_memory_ids: []
+  });
+  service.saveLlmAudit({
+    trigger_source: "autoSummarize", operation_type: "summarize_compress", model_id: "m2",
+    input_tokens: 20, output_tokens: 10, total_tokens: 30, duration_ms: 5, status: "error", error_message: "boom", related_memory_ids: []
+  });
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/semantic/llm-audit/stats");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/semantic/llm-audit/stats?days=7"), res);
+  assert.equal(res.statusCode, 200);
+  const data = JSON.parse(res.body);
+  assert.equal(data.total_calls, 2);
+  assert.equal(data.input_tokens, 120);
+  assert.equal(data.output_tokens, 60);
+  assert.equal(data.total_tokens, 180);
+  assert.equal(data.total_duration_ms, 17);
+  assert.ok(data.by_source.some((s) => s.source === "autoDream" && s.total_tokens === 150), "autoDream aggregate present");
+  assert.ok(data.by_status.some((s) => s.status === "error" && s.c === 1), "error status counted");
+});
+
+// --- issue #10: vector-reindex with an embed-only OpenAI-compatible embedder --
+
+test("Bug10: vector-reindex with an embed-only OpenAI-compatible embedder returns the real count and records the model fingerprint", async () => {
+  const store = createStore(":memory:");
+  const service = createService({ store, mirror: null, config: testConfig({}) });
+  const settings = createSettings(store.db);
+  const vectorIndex = createVectorIndex({ store });
+  const embedder = {
+    embed: async (text) => [0.1, 0.2, 0.3], // OpenAI-compatible single-text embed
+    modelHash: "text-embedding-3#abc",
+    dimension: 3
+  };
+  // A pre-index row written before the embedder is attached (so it still has no vector).
+  service.saveWithDedupe({ type: "project", title: "待回填", content: "缺少向量的存量记忆" });
+  const routes = [];
+  const ctx = { webServer: { register(route) { routes.push(route); return () => {}; } } };
+  createApi(ctx, service, settings, { add() {}, remove() {}, list() { return []; } }, embedder, { vectorIndex }, "");
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/vector-reindex");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/vector-reindex"), res);
+  assert.equal(res.statusCode, 200);
+  const data = JSON.parse(res.body);
+  assert.equal(data.indexed, 1, "actual indexed count, not 0");
+  assert.equal(data.skipped, 0);
+  assert.equal(vectorIndex.modelHash(), "text-embedding-3#abc", "model_hash written to vector_meta");
+  assert.equal(vectorIndex.dimension(), 3, "dimension written to vector_meta");
+  assert.equal(vectorIndex.getEmbedding(service.all()[0].id).length, 3, "embedding persisted");
+});
+
+// --- /info（反馈预填的插件版本）-----------------------------------------------
+
+test("GET /api/dsh-mneme/info returns the package version for feedback prefills", async () => {
+  const { routes } = setup(undefined);
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/info");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/info"), res);
+  assert.equal(res.statusCode, 200);
+  const data = JSON.parse(res.body);
+  // 与插件根 package.json 的版本一致（反馈 issue/邮件的预填环境信息依赖它）。
+  const expected = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
+  assert.equal(data.version, expected);
+});
+
+// --- feature flags（/features：overrides + effective）------------------------
+
+test("GET /api/dsh-mneme/features returns empty overrides and effective config defaults", async () => {
+  const { routes } = setup(undefined, "", FLAGS_CFG);
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/features");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/features"), res);
+  assert.equal(res.statusCode, 200);
+  const data = JSON.parse(res.body);
+  assert.deepEqual(data.overrides, {});
+  // effective 覆盖全部 52 个白名单键（含 v0.7.20 heatEnabled、Issue #89 新增
+  // dreamSkipInvalid/allowCrossTypeMerge/dreamMinIntervalMinutes、面板可调的
+  // dreamMaxTokens、睡眠路由 sleepProvider/sleepModel、PR1 新增的
+  // recallFusion/signalTransparency、issue #109 新增的实体抽取路由
+  // entityExtractionProvider/entityExtractionModel/entityExtractionReasoning、
+  // issue #127 新增的 summarize 五键、issue #126 新增的 sleepActionSet，
+  // 以及 issue #125 新增的候选集三键、issue #17（v0.8.0 A1/A3）新增的
+  // scopeEnabled/strictScope、issue #194 新增的 resilientModelDownload），
+  // 未覆盖时取 bundle 配置的解析默认值；
+  // dreamProvider/dreamModel 无 schema 默认值（Config({}) 解析为 undefined），
+  // 不编造给前端 → 62 - 2 = 60（issue #164① 新增 injectContentMaxChars，
+  // issue #164 叙述条批次新增 dreamNarrativeEnabled/dreamNarrativeMinCluster，
+  // issue #239 新增 summarizeMinWindowChars/summarizeMaxRunsPerSession、
+  // 第 4 项的 summarizePeakHours/summarizePeakMaxDeferMinutes 与
+  // 第 5 项的 injectUncertaintyAdaptive、
+  // issue #257 新增 sleepMaxTokens、issue #258 新增总览路由两键与
+  // dreamSummaryMaxInputs、issue #230 新增 documentMemoryEnabled/
+  // documentInjectBudget、issue #249 第一批新增 injectGuidanceEnabled/
+  // pinnedInjectBudget、issue #249 N3 新增 continuityRescueEnabled，
+  // v0.8.5 新增 disableMemorySearch/disableMemoryArchive，
+  // 本地嵌入池化新增 localEmbedPooling，issue #315 新增 summarizeReasoningEffort，
+  // issue #239 第 4 项镜像到巩固新增 dreamPeakHours/dreamPeakMaxDeferMinutes，
+  // issue #292 新增 autoDreamFailureBackoff、
+  // issue #254 新增 writeAdmission.enabled/writeAdmission.enforce，
+  // issue #34 恢复（#333）新增 injectTimePrefix、
+  // issue #24 块1 新增 graphAnchoringEnabled/graphSeedCap/graphCascadeDepth、
+  // 块2 新增 graphWeightEnabled/graphWeightDelta、块3 新增 graphInjectHint/graphInjectBudget、
+  // 块4 新增 graphPassiveConfirm、
+  // issue #339 新增 dreamMergeGuard、
+  // issue #218/E5 新增 injectHeatEnabled、
+  // issue #164 A2 新增 sensitiveScanEnabled（顶层扁平键，走 configFlagValue 默认分支）、
+  // issue #380 新增 preInjectGate.enabled/preInjectGate.enforce（注入前判定两级开关）、
+  // #135 成本审计派生新增 dreamMaxMergePerRun（单轮 merge 决策上限））
+  // issue #399 新增 distillRecords.enabled/distillRecords.retentionDays（蒸馏原文留存 +
+  // 溯源：开关与保留期都在嵌套对象里，两个都进 NESTED_FLAG_PATHS））
+  // v0.9.0 新增 actionPipelineEnabled（M.O. beta 门控；顶层扁平键，
+  // 走 configFlagValue 默认分支，不需要 NESTED_FLAG_PATHS 条目）。
+  // v0.9.0 第二批新增 actionRunEnabled（M.O. 执行记账；同样顶层扁平键）。
+  // persona 页新增 personaEnabled（人格注入顶层总闸；顶层扁平键，同上）。
+  // 计数锁钉的是「白名单键 ↔ config schema 成对」：schema 加了键而漏了白名单
+  // （或反过来）时，effective 会静默少键/多键，面板读不到也报不出来。
+  // issue #471 新增 scopeState.enabled/scopeState.enforce（政策轴作用域级可逆闸门；
+  // 两个都是嵌套对象子字段，都进 NESTED_FLAG_PATHS）。
+  // 合并 #451（人格页）后的真实计数：98（本批前）+ actionRunEnabled + personaEnabled = 99
+  // #471 再 + 2 = 101。
+  // v0.9.3 新增 actionNudgeEnabled（M.O. 自动沉淀；顶层扁平键）= 102。
+  // issue #493 新增 summarizeParseFailureMaxRetries（连续解析失败后放弃窗口的
+  // 护栏，int 键走 INT_RANGES 表）= 103。
+  // issue #231 第二批新增 organizeEnabled（memory_organize 的暴露闸；顶层扁平键，
+  // 不需要 NESTED_FLAG_PATHS 条目）= 104。
+  // 人格寻址口径新增 personaStrictAddressing（顶层扁平键，同上）= 105。
+  // issue #497 新增 profileExtractEnabled（画像提取草稿；顶层扁平键，同上）= 106。
+  // issue #539 新增 sessionGateEnabled / sessionGateSubagents（逐会话无痕闸门，总开关
+  // 与子代理选择器；manual id 名单是数组配置，不进 feature_flags）= 108。
+  // issue #529 新增 sleepConflictMaxPairs / sleepConflictMaxPairsPerRun（冲突阶段的
+  // 输入侧预算，两个 int 键都走 INT_RANGES 表）= 110。
+  // issue #529 再新增 sleepFailureBackoff（sleep 连续失败退避；顶层布尔键，
+  // 不需要 NESTED_FLAG_PATHS 条目）= 111。
+  // chorography M1 新增 chorographyEnabled（仓库地志只读工具 + 面板页的暴露闸；
+  // 顶层扁平键，不需要 NESTED_FLAG_PATHS 条目）= 112。
+  // chorography M3 新增 chorographyInject（开局注入档位；枚举键走 ENUMS 表，
+  // 顶层扁平原值 "light"，不需要 NESTED_FLAG_PATHS 条目）= 113。
+  // 「Agent 眼中的你」自动事实新增 profileFactsEnabled（dream 后逐卡维护 + 手动轮
+  // + 注入段的顶层总闸；顶层扁平键，不需要 NESTED_FLAG_PATHS 条目）= 114。
+  // 2026-11-08 kb-qoder parity（契约 §3.1）新增 chorographyAutoRefresh /
+  // chorographyT1FromPanel / kbEnabled（面板闭环的两个授权闸 + kb 子系统总闸；
+  // 三个都是顶层扁平键，不需要 NESTED_FLAG_PATHS 条目）= 117。
+  // issue #603 第 4 层再新增 conflictAutoResolveEnabled（自动裁决档开关；顶层布尔键）
+  // 与 conflictAutoResolveMinSimilarity（阈值，走 NUMBER_RANGES 表）= 119。
+  // v0.13 再新增 diaryEnabled（QQ 日记本：跨天判定 + 手写入口 + 面板页的总闸；
+  // 顶层扁平键，不需要 NESTED_FLAG_PATHS 条目）= 120。
+  // v0.13 diaryWriteEveryMinutes（日记定时写间隔，走 INT_RANGES 表）= 121。
+  // issue #557 新增 dreamInputSummaryEnabled（顶层布尔键，不需要 NESTED_FLAG_PATHS 条目）
+  // = +1；issue #275 新增 capacityWarning 三个嵌套点号键 = +3。两个 PR 各自把锁从
+  // 121 往上加，合并时只能做加法（选边会写回旧值，锁当场红）。
+  // issue #619 情感归因相位再新增 sleepAffectiveEnabled（顶层布尔键）、
+  // sleepAffectiveTraitMinSessions 与 sleepAffectiveMaxRelationsPerRun
+  // （两个都走 INT_RANGES 表）= +3，故 121 + 1 + 3 + 3 = 128。
+  // issue #641（beta 第一阶段）新增 conflictLedgerMode（分诊账本档位枚举，走 ENUMS
+  // 表）与 conflictLedgerDupMinSimilarity（T1 dup 阈值，走 NUMBER_RANGES 表）= +2；
+  // issue #637 新增 injectRotationTurns（注入跨轮轮换窗口；键本身 #205 就在 config
+  // schema，只是补白名单——走 INT_RANGES 表）= +1。两条各自加法落地，128 + 2 + 1 = 131。
+  // 图像描述档（docs/DISTILL.md:346）新增三个键：imageDescribeEnabled（顶层布尔键，
+  // 走 BOOLEANS 表）+ imageDescribeProvider / imageDescribeModel（两条路由串，走
+  // STRINGS 表）= +3，故 131 + 3 = 134。
+  // #619 补链（注入侧）新增 affectiveInjectEnabled（顶层布尔键，走 BOOLEANS 表）
+  // = +1，故 134 + 1 = 135。
+  // 图像溯源（v2）新增 imageMemoryEnabled（顶层布尔键、imageDescribeEnabled 的子
+  // 开关，走 BOOLEANS 表）= +1，故 135 + 1 = 136。
+  // #687 批内跨类型去重新增两个键：summarizeBatchCrossTypeDedupe（顶层布尔键，
+  // 走 BOOLEANS 表）与 summarizeBatchCrossTypeMinSim（相似度阈，走
+  // NUMBER_RANGES 表）= +2，故 136 + 2 = 138。
+  // #718 注入前判定判官专用路由新增两个键：preInjectGateProvider /
+  // preInjectGateModel（顶层字符串键，走 FEATURE_FLAG_STRINGS 表，成对生效）
+  // = +2，故 138 + 2 = 140。
+  assert.equal(Object.keys(data.effective).length, 140);
+  // #718 判官路由默认值单独钉：默认空串 = 回落 agentDefaultModel（entity
+  // 同款成对语义，计数锁钉不住空串缺省被翻转）。
+  assert.equal(data.effective.preInjectGateProvider, "");
+  assert.equal(data.effective.preInjectGateModel, "");
+  // 描述档三条的默认值单独钉：开关默认关（不配路由就一个调用都不发），
+  // 路由默认空串——空串在这里的语义是「整档不跑」，不是「跟随当前模型」，
+  // 所以它不能像 summarizeProvider 那样被回填成会话模型。
+  assert.equal(data.effective.imageDescribeEnabled, false);
+  assert.equal(data.effective.imageDescribeProvider, "");
+  assert.equal(data.effective.imageDescribeModel, "");
+  // #619 补链：情绪注释默认关——未获用户同意前不进注入块、不占预算。
+  assert.equal(data.effective.affectiveInjectEnabled, false);
+  // 图像溯源（v2）默认关：父 imageDescribeEnabled 关着时它本就不生效，这里再把
+  // 默认值单独钉一次——计数锁钉不住值，缺省翻转会让每窗蒸馏多写一张表的行。
+  assert.equal(data.effective.imageMemoryEnabled, false);
+  // issue #641：分诊账本档位默认 off（默认路径零行为变化）、T1 阈值默认 0.9。
+  // 值单独钉：计数锁钉不住枚举默认被翻转（shadow 意外变默认会让每轮巩固多写账本）。
+  assert.equal(data.effective.conflictLedgerMode, "off");
+  assert.equal(data.effective.conflictLedgerDupMinSimilarity, 0.9);
+  // #637：轮换窗口的默认值（0 = 关）与 schema 对齐，防止白名单值域改动时静默漂移
+  assert.equal(data.effective.injectRotationTurns, 0);
+  // 三个 kb 新键的默认值单独钉一遍：计数锁只钉数量，钉不住值（缺省值翻转时
+  // 面板会静默换上一套授权语义），这里补上值这一层。
+  assert.equal(data.effective.chorographyAutoRefresh, false);
+  assert.equal(data.effective.chorographyT1FromPanel, true);
+  assert.equal(data.effective.kbEnabled, false);
+  assert.equal(data.effective.chorographyEnabled, false);
+  assert.equal(data.effective.chorographyInject, "light");
+  assert.equal(data.effective.dreamSkipInvalid, true);
+  assert.equal(data.effective.allowCrossTypeMerge, false);
+  assert.equal(data.effective.dreamMergeGuard, true);
+  assert.equal(data.effective.injectHeatEnabled, false);
+  // issue #557：审计行快照瘦身默认关（默认审计行逐字节一致）
+  assert.equal(data.effective.dreamInputSummaryEnabled, false);
+  // issue #380：注入前判定两级开关，默认全关（默认路径零行为变化）
+  assert.equal(data.effective["preInjectGate.enabled"], false);
+  assert.equal(data.effective["preInjectGate.enforce"], false);
+  // issue #471：政策轴作用域级可逆闸门，两级开关默认全关（默认路径零行为变化）
+  assert.equal(data.effective["scopeState.enabled"], false);
+  assert.equal(data.effective["scopeState.enforce"], false);
+  assert.equal(data.effective.dreamMinIntervalMinutes, 0);
+  assert.equal(data.effective.autoDreamFailureBackoff, false);
+  assert.equal(data.effective.dreamMaxTokens, 131072);
+  assert.equal(data.effective.dreamMaxMergePerRun, 40);
+  assert.equal(data.effective.sleepProvider, "");
+  assert.equal(data.effective.sleepModel, "");
+  assert.equal(data.effective.autoInject, true);
+  assert.equal(data.effective.codingRetrospect, false);
+  assert.equal(data.effective.distillMaxChars, 24000);
+  assert.equal(data.effective.codingBoostFactor, 2);
+  // 新增布尔键（含嵌套点号键）从 bundle 配置的对象子字段/顶层取默认值
+  assert.equal(data.effective.bm25SearchEnabled, true);
+  assert.equal(data.effective.conflictFreezeEnabled, false);
+  assert.equal(data.effective.trustEpistemicWeighting, false);
+  assert.equal(data.effective.reflectionFailureTracking, true);
+  assert.equal(data.effective["memoryQualityFilter.enabled"], true);
+  assert.equal(data.effective["llmAudit.enabled"], true);
+  // #254：写入准入两个键都默认关（默认路径零行为变化），面板可逐项启停。
+  assert.equal(data.effective["writeAdmission.enabled"], false);
+  assert.equal(data.effective["writeAdmission.enforce"], false);
+  // #164 A2：密钥/PII 判据自己的闸，同样默认关（#332 的行为逐字节保留）。
+  assert.equal(data.effective.sensitiveScanEnabled, false);
+  // #399：蒸馏原文留存默认关（这是一份对话原文副本，不该由升级默认打开），
+  // 保留期默认 90 天（与 llmAudit.retentionDays 同款）。
+  assert.equal(data.effective["distillRecords.enabled"], false);
+  assert.equal(data.effective["distillRecords.retentionDays"], 90);
+  // v0.9.0：M.O. beta 门控默认关——客户端 GET /features 必须能读到这个键
+  // （读不到就静默不注册任何座位），且默认值必须是 false（beta opt-in）。
+  assert.equal(data.effective.actionPipelineEnabled, false);
+  // v0.9.0 第二批：M.O. 执行记账同样默认关，且**是独立的一个键**——看图与写账
+  // 分开，避免「只想看图」的人不知不觉获得热路径上的写入能力。
+  assert.equal(data.effective.actionRunEnabled, false);
+  // 人格页（beta）：注入总闸默认关，effective 必须能读到（同 #254 坑形防线）。
+  assert.equal(data.effective.personaEnabled, false);
+  // 人格寻址口径：默认关 = 历史兜底行为不变（升级后不许有人格静默消失或新增）。
+  assert.equal(data.effective.personaStrictAddressing, false);
+  // 画像提取默认关：面板按钮在用户没开启前不该偷偷花一次 LLM 调用。
+  assert.equal(data.effective.profileExtractEnabled, false);
+  assert.equal(data.effective.sessionGateEnabled, false);
+  assert.equal(data.effective.sessionGateSubagents, true);
+  // v0.9.3：M.O. 自动沉淀的第三个键。与 actionPipelineEnabled（看图）、
+  // actionRunEnabled（记账）都不是一件事——它挂 session/event 并解压会话日志，
+  // 是三者里最重的一条，所以独立开关、默认关、且进 LIGHT_MODE_OFF。
+  assert.equal(data.effective.actionNudgeEnabled, false);
+  // issue #231 第二批：整理接口的暴露闸默认关（关 = memory_organize 根本不注册）。
+  // 面板要能读到这一格，否则用户开了也不见效、还以为是 bug。
+  assert.equal(data.effective.organizeEnabled, false);
+  // 新增字符串 / URL / 枚举键
+  assert.equal(data.effective.localEmbedModel, "Xenova/bge-small-zh-v1.5");
+  assert.equal(data.effective.ollamaBaseUrl, "http://localhost:11434");
+  assert.equal(data.effective.ollamaModel, "nomic-embed-text");
+  assert.equal(data.effective.embedProvider, "openai");
+  // PR1：融合配方枚举 + 信号透明布尔（均有默认值，故计入 effective 计数）
+  assert.equal(data.effective.recallFusion, "blend");
+  assert.equal(data.effective.signalTransparency, false);
+  // issue #109：实体抽取路由三键（均有默认值，故计入 effective 计数）
+  assert.equal(data.effective.entityExtractionProvider, "");
+  assert.equal(data.effective.entityExtractionModel, "");
+  assert.equal(data.effective.entityExtractionReasoning, "none");
+  // issue #315：蒸馏思考强度（默认 none = 不发送字段，行为不变）
+  assert.equal(data.effective.summarizeReasoningEffort, "none");
+  // issue #127：summarize 节流五键（均有默认值，故计入 effective 计数）
+  assert.equal(data.effective.summarizeMinIntervalMinutes, 0);
+  assert.equal(data.effective.summarizeMaxEntriesPerRun, 0);
+  assert.equal(data.effective.summarizeDedupeMode, "off");
+  assert.equal(data.effective.summarizeDedupeMinSim, 0.92);
+  assert.equal(data.effective.summarizeDedupeWindowHours, 24);
+  // issue #126：sleep 动作集（默认 conflict = 现状；面板可切 full）
+  assert.equal(data.effective.sleepActionSet, "conflict");
+  // issue #125：候选集三键（默认 window / 0 / 0.85）
+  assert.equal(data.effective.dreamCandidateMode, "window");
+  assert.equal(data.effective.dreamCandidateMax, 0);
+  assert.equal(data.effective.dreamCandidateMinSim, 0.85);
+  // #481：没有 overrides 时不存在「改了还没生效」的键，必须是空数组而不是缺字段
+  // ——面板按数组长度渲染提示条，字段缺失会让它渲染出 undefined.length 这类东西。
+  assert.ok(Array.isArray(data.pendingRestart), "pendingRestart must always be an array");
+  assert.deepEqual(data.pendingRestart, []);
+});
+
+test("GET /api/dsh-mneme/features reports only the overrides the frozen config has not picked up", async () => {
+  const { routes, settings } = setup(undefined, "", FLAGS_CFG);
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/features");
+  // #481 实测现场：面板显示人格总闸「已开启」，人格段却不注入——因为开关在宿主
+  // 启动时合并进 cfg 并冻结，运行中改 kv 只是持久化。pendingRestart 就是把
+  // 「显式覆盖 ≠ 冻结值」这个落差报出来，否则用户只能靠反复试错发现。
+  settings.setFeatureFlags({
+    personaEnabled: true,                 // 冻结值 false → 待重启
+    autoDream: false,                     // 冻结值 true  → 待重启
+    "memoryQualityFilter.enabled": false, // 冻结值 true  → 待重启
+    distillMaxChars: 24000                // 与冻结值相同 → 不该报
+  });
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/features"), res);
+  assert.equal(res.statusCode, 200);
+  const data = JSON.parse(res.body);
+  // 比的是集合而非顺序（顺序跟白名单分组走，不是契约的一部分）。
+  assert.deepEqual([...data.pendingRestart].sort(), ["autoDream", "memoryQualityFilter.enabled", "personaEnabled"]);
+  assert.ok(!data.pendingRestart.includes("distillMaxChars"),
+    "a key whose override equals the frozen value is not pending");
+  // effective 仍然是「运行时取什么值」= overrides 优先，不受本字段影响。
+  assert.equal(data.effective.personaEnabled, true);
+});
+
+test("GET /api/dsh-mneme/features cannot report pendingRestart without a frozen config", async () => {
+  // config 缺席（旧调用方直连、未传 cfg）时无从比较冻结值——返回空数组，不编造。
+  const { routes, settings } = setup(undefined);
+  settings.setFeatureFlags({ personaEnabled: true });
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/features");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/features"), res);
+  assert.equal(res.statusCode, 200);
+  const data = JSON.parse(res.body);
+  assert.deepEqual(data.pendingRestart, []);
+  assert.equal(data.effective.personaEnabled, true, "effective still reports the override");
+});
+
+test("PUT /api/dsh-mneme/features round-trips, overrides effective and persists", async () => {
+  const { routes, settings } = setup(undefined, "", FLAGS_CFG);
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/features");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/features", "PUT", {
+    autoDream: false,
+    distillMaxChars: 48000,
+    actionPipelineEnabled: true,
+    sessionGateEnabled: true,
+    sessionGateSubagents: false
+  }), res);
+  assert.equal(res.statusCode, 200);
+  const data = JSON.parse(res.body);
+  assert.deepEqual(data.overrides, {
+    autoDream: false,
+    distillMaxChars: 48000,
+    actionPipelineEnabled: true,
+    sessionGateEnabled: true,
+    sessionGateSubagents: false
+  });
+  assert.equal(data.effective.autoDream, false, "override wins over config default");
+  assert.equal(data.effective.distillMaxChars, 48000);
+  // v0.9.0：默认关的键也能被 PUT 打开并读回（beta 功能的启用路径）。
+  assert.equal(data.effective.actionPipelineEnabled, true, "override flips the beta gate on");
+  assert.equal(data.effective.sessionGateEnabled, true);
+  assert.equal(data.effective.sessionGateSubagents, false);
+  assert.equal(data.effective.autoInject, true, "keys not in the patch still report config");
+  assert.deepEqual(settings.getFeatureFlags(), {
+    autoDream: false,
+    distillMaxChars: 48000,
+    actionPipelineEnabled: true,
+    sessionGateEnabled: true,
+    sessionGateSubagents: false
+  });
+});
+
+test("PUT /api/dsh-mneme/features round-trips nested, string, url and enum keys", async () => {
+  const { routes, settings } = setup(undefined, "", FLAGS_CFG);
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/features");
+  const patch = {
+    "memoryQualityFilter.enabled": false,
+    "llmAudit.enabled": false,
+    // #254：新点号键必须同时进 settings 白名单**和** api.js 的 NESTED_FLAG_PATHS。
+    // 只加白名单时 configFlagValue("writeAdmission.enabled") 取的是 cfg 顶层的
+    // 同名字符串（不存在）→ effective 静默少键、PUT 存了也读不回来，且面板无感。
+    // 这里往返一次就是钉这件事的（计数锁只钉数量，钉不住值）。
+    "writeAdmission.enabled": true,
+    "writeAdmission.enforce": true,
+    // #380：同款点号键往返——白名单与 NESTED_FLAG_PATHS 成对缺一即静默缺键。
+    "preInjectGate.enabled": true,
+    "preInjectGate.enforce": true,
+    // #399：布尔与整数范围两类点号键都往返一次（retentionDays 是 int，同样必须进
+    // NESTED_FLAG_PATHS——否则 configFlagValue 落到顶层同名键上，effective 静默缺键）。
+    "distillRecords.enabled": true,
+    "distillRecords.retentionDays": 30,
+    // #471：政策轴的两个点号键往返——白名单与 NESTED_FLAG_PATHS 成对缺一即静默缺键。
+    "scopeState.enabled": true,
+    "scopeState.enforce": true,
+    // #275：三个容量阈值点号键往返——两个 int 走 INT_RANGES、一个浮点走
+    // NUMBER_RANGES，都必须同时进 settings 白名单与 api.js 的 NESTED_FLAG_PATHS
+    //（成对缺一即静默缺键）。
+    "capacityWarning.dbSizeWarnMb": 128,
+    "capacityWarning.archivedRowsWarn": 6000,
+    "capacityWarning.archivedRatioWarn": 0.9,
+    // #164 A2：顶层扁平键（不是对象子字段），与上面两个点号键走同一条往返；
+    // 它的默认值断言在计数锁那一条里，这里钉的是「PUT 存进去、effective 读得回」。
+    sensitiveScanEnabled: true,
+    embedProvider: "local",
+    ollamaBaseUrl: "http://127.0.0.1:11434",
+    dreamProvider: "  siliconflow  ",
+    dreamModel: ""
+  };
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/features", "PUT", patch), res);
+  assert.equal(res.statusCode, 200);
+  const data = JSON.parse(res.body);
+  assert.deepEqual(data.overrides, {
+    "memoryQualityFilter.enabled": false,
+    "llmAudit.enabled": false,
+    "writeAdmission.enabled": true,
+    "writeAdmission.enforce": true,
+    "preInjectGate.enabled": true,
+    "preInjectGate.enforce": true,
+    "distillRecords.enabled": true,
+    "distillRecords.retentionDays": 30,
+    "scopeState.enabled": true,
+    "scopeState.enforce": true,
+    "capacityWarning.dbSizeWarnMb": 128,
+    "capacityWarning.archivedRowsWarn": 6000,
+    "capacityWarning.archivedRatioWarn": 0.9,
+    sensitiveScanEnabled: true,
+    embedProvider: "local",
+    ollamaBaseUrl: "http://127.0.0.1:11434",
+    dreamProvider: "siliconflow",
+    dreamModel: ""
+  }, "nested keys persist flat, free strings are trimmed");
+  // 嵌套键的覆盖值压过 bundle 配置的对象子字段
+  assert.equal(data.effective["memoryQualityFilter.enabled"], false);
+  assert.equal(data.effective["llmAudit.enabled"], false);
+  assert.equal(data.effective["writeAdmission.enabled"], true);
+  assert.equal(data.effective["writeAdmission.enforce"], true);
+  // #380：往返回来的覆盖值压过 bundle 配置默认
+  assert.equal(data.effective["preInjectGate.enabled"], true);
+  assert.equal(data.effective["preInjectGate.enforce"], true);
+  assert.equal(data.effective["distillRecords.enabled"], true);
+  assert.equal(data.effective["distillRecords.retentionDays"], 30, "整数点号键也要读得回来");
+  // #471：政策轴两个点号键同款往返
+  assert.equal(data.effective["scopeState.enabled"], true);
+  assert.equal(data.effective["scopeState.enforce"], true);
+  // #275：容量阈值 int 与浮点两类点号键都读得回来
+  assert.equal(data.effective["capacityWarning.dbSizeWarnMb"], 128, "整数点号键也要读得回来");
+  assert.equal(data.effective["capacityWarning.archivedRowsWarn"], 6000);
+  assert.equal(data.effective["capacityWarning.archivedRatioWarn"], 0.9, "浮点点号键同款往返");
+  assert.equal(data.effective.sensitiveScanEnabled, true);
+  assert.equal(data.effective.embedProvider, "local");
+  assert.equal(data.effective.ollamaBaseUrl, "http://127.0.0.1:11434");
+  assert.equal(data.effective.dreamProvider, "siliconflow");
+  assert.equal(data.effective.dreamModel, "", "empty string is a legal override");
+  assert.deepEqual(settings.getFeatureFlags(), data.overrides, "overrides persisted");
+
+  // 非法枚举 / 非 http 协议的 URL → 400 且不落库
+  const badEnum = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/features", "PUT", { embedProvider: "bogus" }), badEnum);
+  assert.equal(badEnum.statusCode, 400);
+  assert.match(JSON.parse(badEnum.body).error, /embedProvider/);
+
+  const badUrl = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/features", "PUT", { ollamaBaseUrl: "ftp://localhost:11434" }), badUrl);
+  assert.equal(badUrl.statusCode, 400);
+  assert.match(JSON.parse(badUrl.body).error, /ollamaBaseUrl/);
+
+  assert.deepEqual(settings.getFeatureFlags(), data.overrides, "rejected writes persist nothing");
+});
+
+test("GET/PUT /api/dsh-mneme/features 带 invalidPeakHours（#622：时段串解析失败在面板可见）", async () => {
+  const { routes } = setup(undefined, "", FLAGS_CFG);
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/features");
+  // 默认配置（空串）与合法串：不报——不骚扰没配错峰的用户（验收第 2 条）
+  const get0 = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/features"), get0);
+  assert.deepEqual(JSON.parse(get0.body).invalidPeakHours, []);
+  await route.handler(req("/api/dsh-mneme/features", "PUT", { summarizePeakHours: "09:00-18:00" }), new FakeRes());
+  await route.handler(req("/api/dsh-mneme/features", "PUT", { summarizePeakHours: "" }), new FakeRes());
+  const get1 = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/features"), get1);
+  assert.deepEqual(JSON.parse(get1.body).invalidPeakHours, []);
+  // 非法串（越界 / 点号当冒号——#621 归一救不了的那类）经 PUT 存进去后要被点名
+  await route.handler(req("/api/dsh-mneme/features", "PUT", { summarizePeakHours: "24:00-08:00" }), new FakeRes());
+  const get2 = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/features"), get2);
+  assert.deepEqual(JSON.parse(get2.body).invalidPeakHours, ["summarizePeakHours"]);
+  await route.handler(req("/api/dsh-mneme/features", "PUT", { dreamPeakHours: "09.00-18.00" }), new FakeRes());
+  const get3 = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/features"), get3);
+  assert.deepEqual([...JSON.parse(get3.body).invalidPeakHours].sort(), ["dreamPeakHours", "summarizePeakHours"]);
+  // PUT 答复同走 featureSnapshot：保存后提示立即跟着换（改回合法值即消失）
+  const put = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/features", "PUT", { dreamPeakHours: "23:00-06:00" }), put);
+  assert.deepEqual(JSON.parse(put.body).invalidPeakHours, ["summarizePeakHours"]);
+  // 校验只读 effective：不因提示改任何行为面（空 patch 依旧 400，语义零变化）
+  const empty = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/features", "PUT", {}), empty);
+  assert.equal(empty.statusCode, 400);
+});
+
+test("PUT /api/dsh-mneme/features rejects unknown keys, bad types and bad ranges with 400", async () => {
+  const { routes, settings } = setup(undefined, "", FLAGS_CFG);
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/features");
+
+  const unknown = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/features", "PUT", { noSuchFlag: true }), unknown);
+  assert.equal(unknown.statusCode, 400);
+  assert.match(JSON.parse(unknown.body).error, /noSuchFlag/);
+
+  const badType = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/features", "PUT", { autoInject: "yes" }), badType);
+  assert.equal(badType.statusCode, 400);
+  assert.match(JSON.parse(badType.body).error, /autoInject/);
+
+  const badRange = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/features", "PUT", { codingBoostFactor: 9 }), badRange);
+  assert.equal(badRange.statusCode, 400);
+  assert.match(JSON.parse(badRange.body).error, /codingBoostFactor/);
+
+  // 空 patch 不携带任何意图，直接 400
+  const empty = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/features", "PUT", {}), empty);
+  assert.equal(empty.statusCode, 400);
+
+  assert.deepEqual(settings.getFeatureFlags(), {}, "failed writes persist nothing");
+});
+
+test("PUT /api/dsh-mneme/features is token-gated; GET stays open", async () => {
+  const { routes } = setup(undefined, FAKE_API_TOKEN, FLAGS_CFG);
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/features");
+
+  const get = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/features"), get);
+  assert.equal(get.statusCode, 200, "read stays open without token");
+
+  const put = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/features", "PUT", { autoDream: false }), put);
+  assert.equal(put.statusCode, 401);
+
+  const ok = req("/api/dsh-mneme/features", "PUT", { autoDream: false });
+  ok.headers = { authorization: `Bearer ${FAKE_API_TOKEN}` };
+  const okRes = new FakeRes();
+  await route.handler(ok, okRes);
+  assert.equal(okRes.statusCode, 200);
+});
+
+// --- 交互式记忆库面板：日期过滤 / update / memories/entities / export / import / dream-status ---
+
+test("GET /api/dsh-mneme/list supports updatedFrom/updatedTo and count matches", async () => {
+  const { routes, service, store } = setup();
+  service.saveWithDedupe({ type: "preference", title: "旧", content: "1" });
+  service.saveWithDedupe({ type: "preference", title: "中", content: "2" });
+  service.saveWithDedupe({ type: "preference", title: "新", content: "3" });
+  const setAt = (title, at) => store.db.prepare("UPDATE memories SET updated_at = ? WHERE title = ?").run(at, title);
+  setAt("旧", "2026-08-01T00:00:00.000Z");
+  setAt("中", "2026-09-01T12:00:00.000Z");
+  setAt("新", "2026-09-15T23:00:00.000Z");
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/list");
+
+  const from = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/list?updatedFrom=2026-09-01"), from);
+  const fromData = JSON.parse(from.body);
+  assert.equal(fromData.items.length, 2);
+  assert.equal(fromData.total, 2, "count filter matches list filter");
+  assert.deepEqual(fromData.items.map((m) => m.title).sort(), ["中", "新"]);
+
+  // date-only updatedTo 闭区间含当天全天（中 09-01T12:00 命中）
+  const range = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/list?updatedFrom=2026-08-01&updatedTo=2026-09-01"), range);
+  const rangeData = JSON.parse(range.body);
+  assert.equal(rangeData.items.length, 2);
+  assert.equal(rangeData.total, 2);
+
+  const to = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/list?updatedTo=2026-08-31"), to);
+  const toData = JSON.parse(to.body);
+  assert.equal(toData.items.length, 1);
+  assert.equal(toData.items[0].title, "旧");
+
+  // 非法日期值 → 忽略（不报错、不过滤）
+  const bad = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/list?updatedFrom=not-a-date&updatedTo=%E4%B9%B1"), bad);
+  const badData = JSON.parse(bad.body);
+  assert.equal(badData.items.length, 3);
+  assert.equal(badData.total, 3);
+
+  // 完整时间戳同样生效
+  const ts = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/list?updatedFrom=2026-09-02T00:00:00.000Z"), ts);
+  const tsData = JSON.parse(ts.body);
+  assert.equal(tsData.items.length, 1);
+  assert.equal(tsData.items[0].title, "新");
+});
+
+test("POST /api/dsh-mneme/update edits title/importance and archives", async () => {
+  const { routes, service } = setup();
+  const created = service.saveWithDedupe({ type: "preference", title: "原始", content: "原始内容" });
+  const id = created.memory.id;
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/update");
+
+  const edit = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/update", "POST", { id, title: "改名", importance: 5 }), edit);
+  assert.equal(edit.statusCode, 200);
+  const row = JSON.parse(edit.body).memory;
+  assert.equal(row.title, "改名");
+  assert.equal(row.importance, 5);
+  assert.equal(row.archived, false, "archived booleanized in the response row");
+  assert.notEqual(row.updated_at, created.memory.updated_at, "updated_at advances");
+
+  const archive = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/update", "POST", { id, archived: true }), archive);
+  assert.equal(archive.statusCode, 200);
+  assert.equal(JSON.parse(archive.body).memory.archived, true);
+  assert.equal(service.getById(id).archived, true);
+});
+
+test("POST /api/dsh-mneme/update archives replaced content into content_history", async () => {
+  const { routes, service } = setup();
+  const created = service.saveWithDedupe({ type: "preference", title: "历史", content: "第一版" });
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/update");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/update", "POST", { id: created.memory.id, content: "第二版" }), res);
+  assert.equal(res.statusCode, 200);
+  const row = service.getById(created.memory.id);
+  assert.equal(row.content, "第二版");
+  assert.equal(row.content_history[0].content, "第一版");
+  assert.equal(row.content_history[0].source, "human_override");
+});
+
+test("POST /api/dsh-mneme/update returns 400/404 for bad requests", async () => {
+  const { routes, service } = setup();
+  const created = service.saveWithDedupe({ type: "preference", title: "存在", content: "x" });
+  const id = created.memory.id;
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/update");
+
+  const missing = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/update", "POST", { title: "无 id" }), missing);
+  assert.equal(missing.statusCode, 400);
+
+  const noFields = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/update", "POST", { id }), noFields);
+  assert.equal(noFields.statusCode, 400);
+
+  const emptyTitle = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/update", "POST", { id, title: "   " }), emptyTitle);
+  assert.equal(emptyTitle.statusCode, 400);
+
+  const emptyContent = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/update", "POST", { id, content: "" }), emptyContent);
+  assert.equal(emptyContent.statusCode, 400);
+
+  const badImportance = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/update", "POST", { id, importance: 9 }), badImportance);
+  assert.equal(badImportance.statusCode, 400);
+
+  const badTags = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/update", "POST", { id, tags: "x" }), badTags);
+  assert.equal(badTags.statusCode, 400);
+
+  const badArchived = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/update", "POST", { id, archived: "yes" }), badArchived);
+  assert.equal(badArchived.statusCode, 400);
+
+  const gone = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/update", "POST", { id: "no-such-id", title: "x" }), gone);
+  assert.equal(gone.statusCode, 404);
+  assert.deepEqual(JSON.parse(gone.body), { error: "not-found" });
+
+  assert.equal(service.getById(id).title, "存在", "failed writes persist nothing");
+});
+
+test("POST /api/dsh-mneme/update is token-gated", async () => {
+  const { routes } = setup(undefined, FAKE_API_TOKEN);
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/update");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/update", "POST", { id: "x", title: "y" }), res);
+  assert.equal(res.statusCode, 401);
+});
+
+test("GET /api/dsh-mneme/memories/entities returns entities linked to a memory", async () => {
+  const { routes, service } = setup();
+  const a = service.saveWithDedupe({ type: "project", title: "A", content: "提到甲" });
+  const b = service.saveWithDedupe({ type: "project", title: "B", content: "无关" });
+  const entity = service.createEntity({ name: "甲", type: "person" });
+  // 同一记忆两次提及同一实体（两条 attr）→ 去重后只出现一次
+  service.saveAttr({ entity_id: entity.id, attr_key: "角色", attr_value: "负责人", memory_id: a.memory.id });
+  service.saveAttr({ entity_id: entity.id, attr_key: "团队", attr_value: "前端", memory_id: a.memory.id });
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/memories/entities");
+
+  const res = new FakeRes();
+  await route.handler(req(`/api/dsh-mneme/memories/entities?memoryId=${a.memory.id}`), res);
+  assert.equal(res.statusCode, 200);
+  const data = JSON.parse(res.body);
+  assert.equal(data.entities.length, 1, "deduped by mention");
+  assert.equal(data.entities[0].name, "甲");
+  assert.equal(data.entities[0].type, "person");
+
+  const none = new FakeRes();
+  await route.handler(req(`/api/dsh-mneme/memories/entities?memoryId=${b.memory.id}`), none);
+  assert.deepEqual(JSON.parse(none.body), { entities: [] });
+
+  const missing = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/memories/entities"), missing);
+  assert.equal(missing.statusCode, 400);
+});
+
+test("GET /api/dsh-mneme/export json carries full rows and version", async () => {
+  const { routes, service } = setup();
+  service.saveWithDedupe({ type: "preference", title: "甲", content: "内容甲" });
+  const hidden = service.saveWithDedupe({ type: "preference", title: "乙", content: "内容乙" });
+  service.setForget(hidden.memory.id, true);
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/export");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/export"), res);
+  assert.equal(res.statusCode, 200);
+  const data = JSON.parse(res.body);
+  assert.equal(data.count, 2, "export includes forgotten rows");
+  assert.equal(data.memories.length, 2);
+  assert.equal(typeof data.version, "string", "version comes from package.json");
+  assert.ok(data.exported_at);
+  assert.equal(data.memories.every((m) => typeof m.archived === "boolean" && typeof m.forgotten === "boolean"), true);
+  const times = data.memories.map((m) => m.updated_at);
+  assert.deepEqual(times, [...times].sort().reverse(), "updated_at DESC");
+  assert.match(res.headers["Content-Disposition"], /attachment; filename="dsh-mneme-export-\d{8}\.json"/);
+});
+
+test("GET /api/dsh-mneme/export markdown feeds straight back through import", async () => {
+  const { routes, service } = setup();
+  const a = service.saveWithDedupe({ type: "preference", title: "语言", content: "中文优先" });
+  const b = service.saveWithDedupe({ type: "preference", title: "风格", content: "简洁" });
+  const exportRoute = routes.find((r) => r.path === "/api/dsh-mneme/export");
+  const importRoute = routes.find((r) => r.path === "/api/dsh-mneme/import");
+
+  const res = new FakeRes();
+  await exportRoute.handler(req("/api/dsh-mneme/export?format=markdown"), res);
+  assert.equal(res.statusCode, 200);
+  assert.match(res.headers["Content-Type"], /text\/markdown/);
+  assert.match(res.headers["Content-Disposition"], /attachment; filename="dsh-mneme-export-\d{8}\.md"/);
+  const md = res.body;
+  assert.ok(md.includes("- **ID**: `" + a.memory.id + "`"), "anchor line present (readHumanEdits-compatible)");
+
+  // 导出是一个文档（#278 审查 F1/F3）：frontmatter 只能有一份并在最前，分节不带
+  // 各自的文件头；而且它的覆盖声明必须与正文条目数一致——「说一套写一套」比没有
+  // 这个字段更糟，外部工具会照着它聚合。
+  assert.equal([...md.matchAll(/^type: /gm)].length, 1, "只有一个 frontmatter 的 type 键");
+  assert.match(md, /^type: memory-export$/m);
+  assert.match(md, /^coverage: all$/m, "导出含归档/已遗忘行，声明要说实话");
+  assert.equal(
+    Number(md.match(/^covered: (\d+)$/m)[1]),
+    (md.match(/^- \*\*ID\*\*: /gm) ?? []).length,
+    "covered 必须等于实际导出的条目数"
+  );
+
+  // 黄金用例：导出文本原样导入 → 解析出全部条目，且字段无漂移
+  const back = new FakeRes();
+  await importRoute.handler(req("/api/dsh-mneme/import", "POST", { type: "preference", markdown: md }), back);
+  assert.equal(back.statusCode, 200);
+  const data = JSON.parse(back.body);
+  assert.equal(data.type, "preference");
+  assert.ok(data.merged >= 2, "both memories parsed back");
+  assert.equal(service.getById(a.memory.id).title, "语言");
+  assert.equal(service.getById(a.memory.id).content, "中文优先");
+  assert.equal(service.getById(b.memory.id).title, "风格");
+  assert.equal(service.getById(b.memory.id).content, "简洁");
+});
+
+test("POST /api/dsh-mneme/import validates type/markdown and tolerates zero edits", async () => {
+  const { routes } = setup();
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/import");
+
+  const badType = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/import", "POST", { type: "preferences", markdown: "x" }), badType);
+  assert.equal(badType.statusCode, 400, "TYPE_FILE keys are singular, plural is rejected");
+
+  const badMd = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/import", "POST", { type: "preference", markdown: "" }), badMd);
+  assert.equal(badMd.statusCode, 400);
+
+  const zero = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/import", "POST", { type: "preference", markdown: "# 空镜像" }), zero);
+  assert.equal(zero.statusCode, 200);
+  assert.deepEqual(JSON.parse(zero.body), { merged: 0, type: "preference" });
+});
+
+test("POST /api/dsh-mneme/import is token-gated", async () => {
+  const { routes } = setup(undefined, FAKE_API_TOKEN);
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/import");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/import", "POST", { type: "preference", markdown: "x" }), res);
+  assert.equal(res.statusCode, 401);
+});
+
+// #521：面板要能一眼看出「一整类动作 100% 被拦」。此前 skipped 只存在库里，
+// 响应里没有聚合，status: degraded + applied: 3 从外面看完全是健康轮的样子。
+test("GET /api/dsh-mneme/dream-status aggregates skipped reasons by kind (issue #521)", async () => {
+  const { routes, service } = setup();
+  // 三条同因（序号前缀不同）+ 一条不同因，模拟 #521 现场：merge 被 mergeGuard
+  // 全拦，前缀 decision[N]: 让朴素 GROUP BY 拆成三组。
+  service.saveDreamRun({
+    created_at: "2026-01-03T00:00:00.000Z",
+    status: "degraded",
+    snapshot_hash: "h3",
+    input_count: 200,
+    receipt: "r3",
+    skipped: [
+      { index: 0, action: "merge", ids: ["p1", "p2"], error: 'decision[0]: merge of long-retention type(s) preference is blocked by dreamMergeGuard' },
+      { index: 1, action: "merge", ids: ["p3", "p4"], error: 'decision[1]: merge of long-retention type(s) preference is blocked by dreamMergeGuard' },
+      { index: 2, action: "merge", ids: ["p5", "p6"], error: 'decision[2]: merge of long-retention type(s) preference is blocked by dreamMergeGuard' },
+      { index: 3, action: "archive", ids: ["x"], error: 'decision[3]: archive of long-retention type(s) constraint needs a duplicate/outdated rationale' }
+    ]
+  });
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/dream-status");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/dream-status"), res);
+  const data = JSON.parse(res.body);
+  assert.equal(data.lastRun.skippedCount, 4, "raw skipped count is preserved");
+  assert.equal(data.lastRun.skippedReasons.length, 2, "three same-cause skips collapse into one bucket");
+  assert.equal(data.lastRun.skippedReasons[0].count, 3, "largest bucket first");
+  assert.equal(data.lastRun.skippedReasons[0].action, "merge");
+  assert.match(data.lastRun.skippedReasons[0].reason, /dreamMergeGuard/);
+  assert.doesNotMatch(data.lastRun.skippedReasons[0].reason, /decision\[/, "index prefix is stripped");
+  assert.equal(data.lastRun.skippedReasons[1].action, "archive", "same wording on a different action stays separate");
+});
+
+// #522 评审：一条决策可能攒下多条错误（skipped[].error 用 "; " 拼），原先的剥
+// 前缀正则 ^ 锚定、只剥得掉第一个，后面的 decision[1]: 留在字符串中间，聚合时
+// 同类原因又被拆成多组。另外校验器回给模型的自由文本尾巴（got: "…"）可能夹带
+// 记忆正文、也可能被截断成没有右引号，靠引号配对剥不掉——这条路由是 open 的，
+// 审计文本不该这样出网关。两件事一起锁在下面这条用例里。
+test("GET /api/dsh-mneme/dream-status strips every decision index and the free-text tail (issue #522)", async () => {
+  const { routes, service } = setup();
+  service.saveDreamRun({
+    created_at: "2026-01-04T00:00:00.000Z",
+    status: "degraded",
+    snapshot_hash: "h4",
+    input_count: 200,
+    receipt: "r4",
+    skipped: [
+      {
+        index: 0,
+        action: "merge",
+        ids: ["p1", "p2"],
+        // 两条错误拼成一句：第二个前缀必须也剥掉，否则同一类原因会被拆成两组。
+        error: 'decision[0]: merge of long-retention type(s) preference is blocked by dreamMergeGuard (needs a duplicate/outdated rationale, 重复/过时); decision[0]: unknown id "p9"'
+      },
+      {
+        index: 1,
+        action: "archive",
+        ids: ["x"],
+        // got: 后面是模型写的理由原文（这里故意放一段像记忆正文的话），整段该被丢掉。
+        error: 'decision[1]: archive of long-retention type(s) constraint needs a duplicate/outdated rationale, got: "用户说过预算是 12400 元"'
+      },
+      {
+        // #522 第二轮评审：模型写的理由里可能正好含 "; decision[0]: "，先切分就会把
+        // 这段自由文本变成新的一段，而新段没有 got: 前缀，剥尾正则够不着它——原文
+        // 于是随 open 路由出网关。切分必须排在剥 got: 之后。
+        index: 2,
+        action: "archive",
+        ids: ["z"],
+        error: 'decision[2]: archive of long-retention type(s) preference needs a duplicate/outdated rationale (重复/过时), got: "并不过时; decision[0]: email@example.com 说的"'
+      },
+      {
+        index: 3,
+        // action 不在 ACTIONS 枚举里：聚合结果会随 open 路由出网关，来路不明的动作名
+        // 不该由上游脏数据自己决定响应形状，一律归成空串。
+        action: "drop-everything",
+        ids: ["y"],
+        error: "decision[3]: unknown action"
+      },
+      {
+        // #522 三轮评审：分隔符本身可能出现在 id 里。旧实现按 ", got: " 猜自由文本
+        // 起点，会把这里的引号截断成未闭合状态，后面的引号配对替换随之失效，邮箱
+        // 原样留下。判据必须只看引号，不看分隔符。
+        index: 4,
+        action: "merge",
+        ids: ["q"],
+        error: 'decision[4]: unknown id "alice@example.com, got: x"'
+      },
+      {
+        // 旧版把理由先截到 60 字再 stringify，落库的历史行可能带着一个未闭合引号
+        // （字符串从中间断开）。抹不干净就得砍到结尾——宁可少一句尾巴。
+        index: 5,
+        action: "archive",
+        ids: ["w"],
+        error: 'decision[5]: archive of long-retention type(s) constraint needs a duplicate/outdated rationale, got: "用户说过预算是 12400'
+      }
+    ]
+  });
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/dream-status");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/dream-status"), res);
+  const data = JSON.parse(res.body);
+  assert.equal(data.lastRun.skippedCount, 6, "raw skipped count is preserved");
+  const unknownAction = data.lastRun.skippedReasons.find((b) => b.reason === "unknown action");
+  assert.equal(unknownAction.action, "", "an action outside the enum is not echoed back to the open route");
+  for (const bucket of data.lastRun.skippedReasons) {
+    assert.doesNotMatch(bucket.reason, /decision\[/, "every index prefix is stripped, not just the first");
+    assert.doesNotMatch(bucket.reason, /got:/, "the free-text tail never leaves the gateway");
+    assert.doesNotMatch(bucket.reason, /12400/, "model-authored text must not ride along with the audit reason");
+    assert.doesNotMatch(bucket.reason, /email@example\.com/, "free text split on a fake decision boundary must not leak either");
+    assert.doesNotMatch(bucket.reason, /并不过时/, "the whole free-text tail is dropped, not just its first half");
+    assert.doesNotMatch(bucket.reason, /alice@example\.com/, "an id carrying the tail separator is masked by quote pairing, not by the separator");
+    assert.doesNotMatch(bucket.reason, /用户说过预算是/, "a historical row whose reason was cut mid-string still gets masked");
+    assert.doesNotMatch(bucket.reason, /\b12400\b/, "nor does the truncated number survive");
+  }
+});
+test("GET /api/dsh-mneme/dream-status returns runs and pending conflict ids", async () => {
+  const { routes, service } = setup();
+  service.saveDreamRun({ created_at: "2026-01-01T00:00:00.000Z", status: "ok", provider: "ollama", model: "qwen", snapshot_hash: "h1", input_count: 2, receipt: "r1" });
+  service.saveDreamRun({ created_at: "2026-01-02T00:00:00.000Z", status: "failed", error: "boom", snapshot_hash: "h2", input_count: 0, receipt: "r2" });
+  const pending = service.saveConflictPending({ memory_a: "aaaa", memory_b: "bbbb", reason: "矛盾" });
+
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/dream-status");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/dream-status"), res);
+  assert.equal(res.statusCode, 200);
+  const data = JSON.parse(res.body);
+  assert.equal(data.runs.length, 2);
+  assert.equal(data.runs[0].created_at, "2026-01-02T00:00:00.000Z", "created_at DESC");
+  assert.deepEqual(data.lastRun, data.runs[0]);
+  assert.deepEqual(data.lastConsolidation, data.runs[0], "no organize row => same as lastRun");
+  // #521：skippedCount / skippedReasons 是本轮新增的两个字段（面板按归一化原因
+  // 显示跳过明细）。这行锁的是 dream-status 的响应形状，加字段必须同步改这里。
+  assert.deepEqual(Object.keys(data.lastRun).sort(), ["created_at", "demotion", "error", "model", "provider", "run_type", "skippedCount", "skippedReasons", "status"]);
+  assert.equal(data.lastRun.run_type, "auto", "default run_type is auto");
+  assert.equal(data.lastRun.demotion, null, "no demotion info for non-sleep runs");
+  assert.equal(data.runs[0].error, "boom");
+  assert.equal(data.runs[1].provider, "ollama");
+  assert.equal(data.pendingConflicts, 1);
+  assert.deepEqual(data.pendingMemoryIds.sort(), ["aaaa", "bbbb"]);
+
+  // 解决后队列清空
+  service.resolveConflictPending(pending.id, { winner: "aaaa" });
+  const after = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/dream-status"), after);
+  const afterData = JSON.parse(after.body);
+  assert.equal(afterData.pendingConflicts, 0);
+  assert.deepEqual(afterData.pendingMemoryIds, []);
+});
+
+// Issue #495：organize 与巩固共用 dream_runs，一次 agent 主动整理写两行（dryRun
+// 报告 + apply 回执）。面板那张卡的标题是「最近巩固」，若继续取 runs[0]，一次整理
+// 就会把它顶成整理回执——测的是「卡面数字取的是巩固轮」，不是「runs 里没有 organize」。
+test("GET /api/dsh-mneme/dream-status keeps organize rows out of lastConsolidation (issue #495)", async () => {
+  const { routes, service } = setup();
+  service.saveDreamRun({ created_at: "2026-01-01T00:00:00.000Z", status: "ok", snapshot_hash: "h1", input_count: 2, receipt: "r1" });
+  // 一次整理的两行：报告在前、回执在后，都晚于那次巩固。
+  service.saveDreamRun({
+    created_at: "2026-01-02T00:00:00.000Z", status: "ok", run_type: "organize",
+    snapshot_hash: "h2", input_count: 0, receipt: "r2",
+    outcome: { dryRun: true, byId: {} }
+  });
+  service.saveDreamRun({
+    created_at: "2026-01-02T00:00:01.000Z", status: "ok", run_type: "organize",
+    snapshot_hash: "h3", input_count: 0, receipt: "r3",
+    outcome: { dry_run_id: "dry-1", byId: {} }
+  });
+
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/dream-status");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/dream-status"), res);
+  const data = JSON.parse(res.body);
+
+  // 审计面不缩：runs 仍是全类型 5 条，organize 照旧排在最前。
+  assert.equal(data.runs.length, 3, "runs keeps every run type — the audit surface is not filtered");
+  assert.equal(data.runs[0].run_type, "organize");
+  assert.equal(data.lastRun.run_type, "organize", "lastRun still means the newest row of any type");
+  // 卡面取数：跳过 organize，回到那次真巩固。
+  assert.ok(data.lastConsolidation, "lastConsolidation must not be empty when a consolidation exists");
+  assert.equal(data.lastConsolidation.run_type, "auto");
+  assert.equal(data.lastConsolidation.created_at, "2026-01-01T00:00:00.000Z");
+  // 两条路径共用同一份投影，字段形状必须一致（否则面板得写两套渲染）。
+  assert.deepEqual(Object.keys(data.lastConsolidation).sort(), Object.keys(data.lastRun).sort());
+});
+
+// 只有 organize 跑过时：宁可留空让面板说「尚未运行」并加脚注，也不能拿整理回执
+// 冒充巩固——那是这条 issue 要治的那个错。
+test("dream-status: organize-only history leaves lastConsolidation null, never the organize row (issue #495)", async () => {
+  const { routes, service } = setup();
+  service.saveDreamRun({
+    created_at: "2026-01-02T00:00:00.000Z", status: "ok", run_type: "organize",
+    snapshot_hash: "h1", input_count: 0, receipt: "r1",
+    outcome: { dry_run_id: "dry-1", byId: {} }
+  });
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/dream-status");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/dream-status"), res);
+  const data = JSON.parse(res.body);
+  assert.equal(data.lastRun.run_type, "organize");
+  assert.equal(data.lastConsolidation, null, "an organize receipt must never be reported as the last consolidation");
+  assert.equal(data.runs.length, 1);
+});
+
+// v0.8.0 冲突集中处理：GET /conflicts 队列联表 + POST /conflicts/resolve 人工确认。
+test("GET /api/dsh-mneme/conflicts joins both sides of unresolved conflicts", async () => {
+  const { routes, service } = setup();
+  const a = service.saveWithDedupe({ type: "history", title: "界面暗色偏好", content: "用户当前使用暗色界面主题", importance: 3 }).memory;
+  const b = service.saveWithDedupe({ type: "history", title: "界面亮色切换", content: "用户界面亮色切换计划", importance: 3 }).memory;
+  service.saveConflictPending({ memory_a: a.id, memory_b: b.id, reason: "主题偏好前后矛盾" });
+
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/conflicts");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/conflicts"), res);
+  assert.equal(res.statusCode, 200);
+  const data = JSON.parse(res.body);
+  assert.equal(data.items.length, 1);
+  assert.equal(data.total, 1);
+  assert.equal(data.items[0].reason, "主题偏好前后矛盾");
+  // saveConflictPending 会按 id 字典序归一 A/B 侧位——断言集合而非位置。
+  assert.deepEqual(
+    [data.items[0].memory_a.title, data.items[0].memory_b.title].sort(),
+    ["界面亮色切换", "界面暗色偏好"]
+  );
+  assert.equal(data.items[0].memory_a.archived, false);
+  assert.equal(data.items[0].memory_b.archived, false);
+  // 裁决依据（冲突窗可读性报障）：两侧必须带新旧时间戳，否则面板只能显示
+  // A 方/B 方两个标签，用户没有客观依据判断该留哪条。
+  for (const key of ["memory_a", "memory_b"]) {
+    assert.equal(typeof data.items[0][key].created_at, "string", `${key} must carry created_at`);
+    assert.equal(typeof data.items[0][key].updated_at, "string", `${key} must carry updated_at`);
+    assert.ok(!Number.isNaN(Date.parse(data.items[0][key].updated_at)), `${key}.updated_at must parse`);
+  }
+  // 幽灵侧容忍缺失
+  service.saveConflictPending({ memory_a: a.id, memory_b: "ghost-id", reason: "对方已删" });
+  const res2 = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/conflicts"), res2);
+  const data2 = JSON.parse(res2.body);
+  assert.equal(data2.items.length, 2);
+  assert.equal(data2.items.find((x) => x.reason === "对方已删").memory_b.missing, true);
+});
+
+test("POST /api/dsh-mneme/conflicts/resolve stamps and applies the disposition", async () => {
+  const { store, routes, service } = setup();
+  const a = service.saveWithDedupe({ type: "history", title: "界面暗色偏好", content: "用户当前使用暗色界面主题", importance: 3 }).memory;
+  const b = service.saveWithDedupe({ type: "history", title: "界面亮色切换", content: "用户界面亮色切换计划", importance: 3 }).memory;
+  const pending = service.saveConflictPending({ memory_a: a.id, memory_b: b.id, reason: "主题偏好前后矛盾" });
+
+  // store 会把 pair 按 id 字典序归一——从队列行反查「界面亮色切换」所在侧再选。
+  const queueRoute = routes.find((r) => r.path === "/api/dsh-mneme/conflicts");
+  const queueRes = new FakeRes();
+  await queueRoute.handler(req("/api/dsh-mneme/conflicts"), queueRes);
+  const queued = JSON.parse(queueRes.body).items.find((x) => x.id === pending.id);
+  const keepSide = queued.memory_a.id === b.id ? "a" : "b";
+  // loser 恒为 a（keeper 恒为「界面亮色切换」= b），与 A/B 侧位字母无关
+  const loserId = a.id;
+
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/conflicts/resolve");
+  // 保留「界面亮色切换」所在侧（apply 默认 true）→ 该侧保留，另一侧归档
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/conflicts/resolve", "POST", { id: pending.id, winner: keepSide }), res);
+  assert.equal(res.statusCode, 200);
+  const data = JSON.parse(res.body);
+  assert.equal(data.ok, true);
+  assert.equal(data.conflict.resolved_winner, b.id);
+  assert.equal(data.conflict.disposition.ok, true);
+  assert.equal(store.getById(b.id).archived, false, "winner kept");
+  assert.equal(store.getById(loserId).archived, true, "loser archived by apply");
+
+  // 处理过的 id 再 resolve → 幂等重盖（仍是 200；队列视图只列未解决行，
+  // 正常 UI 不会再发这个请求，但接口层保持幂等）
+  const res2 = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/conflicts/resolve", "POST", { id: pending.id, winner: "a" }), res2);
+  assert.equal(res2.statusCode, 200);
+  assert.equal(JSON.parse(res2.body).ok, true);
+
+  // 未知 id → 404；缺 id → 400
+  const res3 = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/conflicts/resolve", "POST", { id: "nope", winner: "a" }), res3);
+  assert.equal(res3.statusCode, 404);
+  const res4 = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/conflicts/resolve", "POST", {}), res4);
+  assert.equal(res4.statusCode, 400);
+
+  // apply:false 只盖章不处置
+  const c = service.saveWithDedupe({ type: "decision", title: "丙", content: "内容丙" }).memory;
+  const d = service.saveWithDedupe({ type: "decision", title: "丁", content: "内容丁" }).memory;
+  const p2 = service.saveConflictPending({ memory_a: c.id, memory_b: d.id, reason: "r2" });
+  const res5 = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/conflicts/resolve", "POST", { id: p2.id, apply: false }), res5);
+  assert.equal(res5.statusCode, 200);
+  assert.equal(JSON.parse(res5.body).conflict.disposition, null);
+  assert.equal(store.getById(c.id).archived, false);
+  assert.equal(store.getById(d.id).archived, false);
+});
+
+test("parseHumanEdits is the pure core of readHumanEdits (CRLF tolerant)", () => {
+  const digest = "0".repeat(64);
+  const text = [
+    "# x\r\n",
+    "\r\n",
+    "## 标题\r\n",
+    "\r\n",
+    "- **ID**: `m1`\n",
+    "- **类型**: preference\n",
+    "- **重要性**: 3\n",
+    "- **标签**: \n",
+    "- **更新时间**: 2026-01-01T00:00:00.000Z\n",
+    "\n",
+    `<!-- mirror-digest: ${digest} -->\n`,
+    "正文一段\n",
+    "\n",
+    "---\n",
+    "\n",
+    "## 另一条\n",
+    "\r\n",
+    "- **ID**: `m2`\n",
+    "- **类型**: preference\n",
+    "- **重要性**: 4\n",
+    "- **标签**: \n",
+    "- **更新时间**: 2026-01-02T00:00:00.000Z\n",
+    "\n",
+    "内容二\n",
+    "\n",
+    "---\n"
+  ].join("");
+  const edits = parseHumanEdits(text);
+  assert.equal(edits.length, 2);
+  assert.equal(edits[0].id, "m1");
+  assert.equal(edits[0].title, "标题");
+  assert.equal(edits[0].content, "正文一段");
+  assert.equal(edits[1].id, "m2");
+  assert.equal(edits[1].content, "内容二");
+});
+
+test("GET /api/dsh-mneme/list?archived=only lists just archived rows; default list hides them", async () => {
+  const { routes, service } = setup();
+  service.saveWithDedupe({ type: "preference", title: "在用", content: "keep" });
+  service.saveWithDedupe({ type: "project", title: "已归档", content: "gone" });
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/list");
+  const upd = routes.find((r) => r.path === "/api/dsh-mneme/update");
+
+  const def0 = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/list"), def0);
+  const target = JSON.parse(def0.body).items.find((m) => m.title === "已归档");
+
+  const arch = new FakeRes();
+  await upd.handler(req("/api/dsh-mneme/update", "POST", { id: target.id, archived: true }), arch);
+  assert.equal(arch.statusCode, 200);
+
+  const def = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/list"), def);
+  assert.equal(JSON.parse(def.body).total, 1, "default list hides archived rows");
+
+  const only = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/list?archived=only"), only);
+  const onlyData = JSON.parse(only.body);
+  assert.equal(onlyData.total, 1, "archived-only count matches rows");
+  assert.deepEqual(onlyData.items.map((m) => m.title), ["已归档"]);
+  assert.equal(onlyData.items[0].archived, true);
+
+  // 恢复（unarchive）后归档视图清空、默认列表重新可见
+  const restore = new FakeRes();
+  await upd.handler(req("/api/dsh-mneme/update", "POST", { id: target.id, archived: false }), restore);
+  assert.equal(restore.statusCode, 200);
+  const empty = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/list?archived=only"), empty);
+  assert.equal(JSON.parse(empty.body).total, 0);
+  const back = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/list"), back);
+  assert.equal(JSON.parse(back.body).total, 2);
+});
+
+test("GET /api/dsh-mneme/list?deposited=only lists dream-touched memories (receipts ∪ source=dream)", async () => {
+  const { routes, service } = setup();
+  const plain = service.saveWithDedupe({ type: "preference", title: "无关", content: "plain" });
+  const merged = service.saveWithDedupe({ type: "project", title: "被巩固", content: "merged" });
+  const updated = service.saveWithDedupe({ type: "decision", title: "被更新", content: "updated" });
+  service.saveWithDedupe({ type: "summary", title: "总览", content: "overview", source: "dream" });
+  const ids = [plain, merged, updated].map((r) => r.memory.id);
+
+  // 巩固账本：merge 落在 keepSource、update 落在目标；conflict 只仲裁不落
+  // 内容，不算沉淀。verdict='live' 才有效。
+  service.saveReceipt({
+    receipt_id: "r-merge", run_id: "run-1", record_id: merged.memory.id, kind: "merge",
+    input_digest: "d1", keep_source: merged.memory.id, sources: [merged.memory.id, ids[0]],
+    verdict: "live", count_before: 2, count_after: 1, policy_epoch: 0,
+    created_at: new Date().toISOString()
+  });
+  service.saveReceipt({
+    receipt_id: "r-update", run_id: "run-1", record_id: updated.memory.id, kind: "update",
+    input_digest: "d2", verdict: "live", count_before: 1, count_after: 1,
+    policy_epoch: 0, created_at: new Date().toISOString()
+  });
+  service.saveReceipt({
+    receipt_id: "r-conflict", run_id: "run-1", record_id: "winner-x", kind: "conflict",
+    input_digest: "d3", winner_id: "winner-x", loser_id: "loser-y", verdict: "live",
+    count_before: 2, count_after: 2, policy_epoch: 0, created_at: new Date().toISOString()
+  });
+
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/list");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/list?deposited=only"), res);
+  const data = JSON.parse(res.body);
+  assert.deepEqual(
+    data.items.map((m) => m.title).sort(),
+    ["总览", "被巩固", "被更新"],
+    "deposited view = receipt merge/update records ∪ source=dream writes"
+  );
+  assert.equal(data.total, 3, "total honors the deposited filter");
+
+  // 默认列表不受 deposited 过滤影响
+  const def = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/list"), def);
+  assert.equal(JSON.parse(def.body).total, 4);
+
+  // 与 archived=only 可叠加：归档的沉淀记忆才出现在交集视图里
+  const upd = routes.find((r) => r.path === "/api/dsh-mneme/update");
+  const arch = new FakeRes();
+  await upd.handler(req("/api/dsh-mneme/update", "POST", { id: merged.memory.id, archived: true }), arch);
+  assert.equal(arch.statusCode, 200);
+  const both = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/list?deposited=only&archived=only"), both);
+  const bothData = JSON.parse(both.body);
+  assert.deepEqual(bothData.items.map((m) => m.title), ["被巩固"]);
+  assert.equal(bothData.total, 1);
+});
+
+test("GET /api/dsh-mneme/list projects per-memory heat only when heatEnabled=true", async () => {
+  // 默认（heatEnabled=false）：heat 字段整体缺省——前端徽章据此自动隐藏
+  const off = setup();
+  off.service.saveWithDedupe({ type: "preference", title: "免疫型", content: "immune" });
+  const r0 = new FakeRes();
+  await off.routes.find((r) => r.path === "/api/dsh-mneme/list").handler(req("/api/dsh-mneme/list"), r0);
+  const d0 = JSON.parse(r0.body);
+  assert.equal(d0.total, 1);
+  assert.equal("heat" in d0.items[0], false, "heat must be absent from the wire DTO when the flag is off");
+
+  // heatEnabled=true：逐条投影。λ=0 免疫类型（preference）恒 1.0；其余落在
+  // [0,1] 区间（新建记忆 Δt≈0 接近满格，衰减数学由 heat.test.js 看门）。
+  const on = setup(null, "", { heatEnabled: true });
+  on.service.saveWithDedupe({ type: "preference", title: "免疫型", content: "immune" });
+  on.service.saveWithDedupe({ type: "history", title: "会话历史", content: "recent" });
+  const r1 = new FakeRes();
+  await on.routes.find((r) => r.path === "/api/dsh-mneme/list").handler(req("/api/dsh-mneme/list"), r1);
+  const d1 = JSON.parse(r1.body);
+  assert.equal(d1.total, 2);
+  const byTitle = Object.fromEntries(d1.items.map((m) => [m.title, m.heat]));
+  assert.equal(byTitle["免疫型"], 1, "λ=0 immune types stay at full heat");
+  for (const v of Object.values(byTitle)) {
+    assert.ok(typeof v === "number" && v >= 0 && v <= 1, "heat values stay within [0,1]");
+  }
+});
+
+// ---------------------------------------------------------------- llm-providers / test-model
+// Settings-panel support: enumerate host-registered providers/models so the
+// panel can offer a dropdown over real models, and probe connectivity with a
+// minimal LLM call (same harness path the consolidation uses).
+
+function setupLlm(llm, apiToken = "", extraCtx = {}, config = null) {
+  const store = createStore(":memory:");
+  const service = createService({ store, mirror: null, config: testConfig({}) });
+  const settings = createSettings(store.db);
+  const commands = { add: () => {}, remove: () => {}, list: () => [] };
+  const routes = [];
+  const ctx = {
+    webServer: { register(route) { routes.push(route); return () => {}; } },
+    llm,
+    ...extraCtx
+  };
+  const api = createApi(ctx, service, settings, commands, undefined, undefined, apiToken, config);
+  return { routes };
+}
+
+const MOCK_LLM = {
+  listProviders: () => [
+    { id: "deepseek", name: "DeepSeek" },
+    { id: "broken", name: "Broken Adapter" }
+  ],
+  listModels: async (provider) => {
+    if (provider === "broken") throw new Error("provider not reachable");
+    return [{ id: "deepseek-chat", name: "DeepSeek Chat" }, { id: "deepseek-reasoner", name: "DeepSeek Reasoner" }];
+  },
+  // 每次 stream 的 options 留档：既给「字段省略 / 透传」的断言用，也让「档位被拒
+  // 后重试一次」能数出调用次数（降级必须恰好两次，多一次就是盲重试）。
+  streamCalls: [],
+  async *stream(options) {
+    MOCK_LLM.lastOptions = options;
+    MOCK_LLM.streamCalls.push(options);
+    if (options.model === "bad-model") {
+      yield {
+        type: "finish",
+        reason: { kind: "error", failure: { code: "AUTH_FAILED", message: "invalid api key" } }
+      };
+      return;
+    }
+    // 流级档位拒收：rc.1 起的适配器把 provider 的拒收折叠成终止 error finish
+    // chunk（不抛错），这条路径曾让 withEffortFallback 的重试形同死代码。
+    if (options.model === "stream-reject" && options.reasoningEffort) {
+      yield {
+        type: "finish",
+        reason: {
+          kind: "error",
+          failure: {
+            code: "UNSUPPORTED_REASONING_EFFORT",
+            message: `provider "mock" model "mock-model" does not support reasoning effort "${options.reasoningEffort}"`
+          }
+        }
+      };
+      return;
+    }
+    // 抛错型真失败（网络中断 / provider 崩溃）：错误以异常形式冒到 catch 路径，
+    // 必须原样上报——「档位被拒才重试」不能退化成「见到错误就重试」。
+    if (options.model === "crash-model") {
+      throw new Error("socket hang up");
+    }
+    if (options.reasoningEffort === "reject") {
+      throw new Error('UNSUPPORTED_REASONING_EFFORT: provider "mock" model "mock-model" does not support reasoning effort "reject"');
+    }
+    yield { type: "text-delta", index: 0, text: " ok " };
+    yield { type: "finish", reason: { kind: "stop" } };
+  }
+};
+
+test("GET /api/dsh-mneme/llm-providers lists host providers with models, per-provider best effort", async () => {
+  const { routes } = setupLlm(MOCK_LLM);
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/llm-providers");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/llm-providers"), res);
+  assert.equal(res.statusCode, 200);
+  const data = JSON.parse(res.body);
+  assert.equal(data.providers.length, 2);
+  const deepseek = data.providers.find((p) => p.provider === "deepseek");
+  assert.deepEqual(deepseek.models.map((m) => m.id), ["deepseek-chat", "deepseek-reasoner"]);
+  const broken = data.providers.find((p) => p.provider === "broken");
+  assert.deepEqual(broken.models, [], "a provider whose model list throws degrades to empty, not a hard fail");
+});
+
+test("GET /api/dsh-mneme/llm-providers without ctx.llm returns 501", async () => {
+  const { routes } = setup();
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/llm-providers");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/llm-providers"), res);
+  assert.equal(res.statusCode, 501);
+  assert.equal(JSON.parse(res.body).error, "llm-unavailable");
+});
+
+test("POST /api/dsh-mneme/test-model succeeds and reports reply + latency", async () => {
+  const { routes } = setupLlm(MOCK_LLM);
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/test-model");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/test-model", "POST", { provider: "deepseek", model: "deepseek-chat" }), res);
+  assert.equal(res.statusCode, 200);
+  const data = JSON.parse(res.body);
+  assert.equal(data.ok, true);
+  assert.equal(data.reply, "ok", "reply trimmed");
+  assert.ok(data.durationMs >= 0);
+  assert.equal(data.modelId, "deepseek:deepseek-chat", "modelId reports the probed route");
+  assert.equal(MOCK_LLM.lastOptions.provider, "deepseek");
+  assert.equal(MOCK_LLM.lastOptions.purpose, "dsh-mneme-connectivity-test");
+  // 回归：探测必须是一条 user 消息（带 source）。system-only 对话自
+  // 0.1.6-alpha.1 起被官方 API 整单拒绝（「messages: at least one message
+  // is required」），探测按钮会 502。
+  assert.equal(MOCK_LLM.lastOptions.messages[0].role, "user");
+  // issue #326：kind 必须是生产者自有值，裸 "plugin" 被 DSH 0.1.7 的 V4 写入准入拒绝。
+  assert.equal(MOCK_LLM.lastOptions.messages[0].source?.kind, "plugin:dsh-mneme");
+  assert.equal("reasoningEffort" in MOCK_LLM.lastOptions, false, "no effort configured -> field omitted");
+});
+
+test("POST /api/dsh-mneme/test-model forwards reasoningEffort verbatim", async () => {
+  const { routes } = setupLlm(MOCK_LLM);
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/test-model");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/test-model", "POST", { provider: "deepseek", model: "deepseek-chat", reasoningEffort: "low" }), res);
+  assert.equal(res.statusCode, 200);
+  assert.equal(MOCK_LLM.lastOptions.reasoningEffort, "low", "effort forwarded to the probe call");
+});
+
+test("POST /api/dsh-mneme/test-model reports stream-level failure with 502", async () => {
+  const { routes } = setupLlm(MOCK_LLM);
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/test-model");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/test-model", "POST", { provider: "deepseek", model: "bad-model" }), res);
+  assert.equal(res.statusCode, 502);
+  const data = JSON.parse(res.body);
+  assert.equal(data.ok, false);
+  assert.match(data.error, /AUTH_FAILED/, "stream failure reason surfaced like audit rows");
+});
+
+// issue #215 的后续：探针是仓里唯一「接受并转发调用方档位、却此前没有兜底」的
+// LLM 调用面（直调 llm.stream 的其余各面要么在 withEffortFallback 之内，要么
+// 是 src/index.js 的手写版兜底，要么像 pre-inject-gate 的判定池那样不转发档位），
+// 档位被拒则丢掉字段重试一次，于是同一份配置「后台跑得通、点测试报红」，用户被
+// 引向「换哪家 Provider 都失败」。探针必须与真实 run 同语义：降级跑通 → 200 +
+// effortDropped:true（不是 502）。
+test("POST /api/dsh-mneme/test-model degrades on a rejected effort instead of failing (issue #215 follow-up)", async () => {
+  const { routes } = setupLlm(MOCK_LLM);
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/test-model");
+  const before = MOCK_LLM.streamCalls.length;
+  const res = new FakeRes();
+  await route.handler(
+    req("/api/dsh-mneme/test-model", "POST", { provider: "mock", model: "mock-model", reasoningEffort: "reject" }),
+    res
+  );
+  assert.equal(res.statusCode, 200, "a rejected effort is a downgrade, not a connectivity failure");
+  const data = JSON.parse(res.body);
+  assert.equal(data.ok, true);
+  assert.equal(data.reply, "ok", "the no-effort retry actually answered");
+  assert.equal(data.effortDropped, true, "the caller must be able to tell 'connected, effort dropped' from 'connected as configured'");
+  const calls = MOCK_LLM.streamCalls.slice(before);
+  assert.equal(calls.length, 2, "exactly one retry: attempt with the effort, then once without");
+  assert.equal(calls[0].reasoningEffort, "reject", "first attempt carries the configured effort");
+  assert.equal("reasoningEffort" in calls[1], false, "the retry omits the field entirely");
+});
+
+test("POST /api/dsh-mneme/test-model degrades on a STREAM-level effort rejection too", async () => {
+  // rc.1 起适配器不抛错，把 provider 的拒收折叠成终止 error finish chunk——只在
+  // catch 里做兜底的话这条路径就是死的，探针会照旧 502。
+  const { routes } = setupLlm(MOCK_LLM);
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/test-model");
+  const before = MOCK_LLM.streamCalls.length;
+  const res = new FakeRes();
+  await route.handler(
+    req("/api/dsh-mneme/test-model", "POST", { provider: "mock", model: "stream-reject", reasoningEffort: "high" }),
+    res
+  );
+  assert.equal(res.statusCode, 200, "stream-level rejection also downgrades");
+  const data = JSON.parse(res.body);
+  assert.equal(data.ok, true);
+  assert.equal(data.effortDropped, true);
+  const calls = MOCK_LLM.streamCalls.slice(before);
+  assert.equal(calls.length, 2, "stream rejection retries once without the effort");
+  assert.equal("reasoningEffort" in calls[1], false);
+});
+
+test("POST /api/dsh-mneme/test-model keeps real failures red and never reports a phantom downgrade", async () => {
+  // 非档位原因的失败绝不能被兜底吞掉：真连不上还得是 502、还得带原始原因。
+  const { routes } = setupLlm(MOCK_LLM);
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/test-model");
+  const before = MOCK_LLM.streamCalls.length;
+  const res = new FakeRes();
+  await route.handler(
+    req("/api/dsh-mneme/test-model", "POST", { provider: "deepseek", model: "bad-model", reasoningEffort: "low" }),
+    res
+  );
+  assert.equal(res.statusCode, 502);
+  const data = JSON.parse(res.body);
+  assert.equal(data.ok, false);
+  assert.match(data.error, /AUTH_FAILED/);
+  assert.equal(data.effortDropped, undefined, "a genuine failure is not a downgrade");
+  assert.equal(MOCK_LLM.streamCalls.length - before, 1, "non-effort failures are not retried blindly");
+});
+
+test("POST /api/dsh-mneme/test-model reports a thrown transport failure as-is (catch path)", async () => {
+  // 错误以异常形式到达时（socket 断开 / provider 崩溃）走 catch 路径：谎报成功不行，
+  // 拿 without-effort 的裸奔重试去掩盖真故障更不行——「档位被拒才重试」不能退化成
+  // 「见到错误就重试」，否则真故障会被一次盲重试糊住（还多烧一次配额）。
+  const { routes } = setupLlm(MOCK_LLM);
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/test-model");
+  const before = MOCK_LLM.streamCalls.length;
+  const res = new FakeRes();
+  await route.handler(
+    req("/api/dsh-mneme/test-model", "POST", { provider: "deepseek", model: "crash-model", reasoningEffort: "low" }),
+    res
+  );
+  assert.equal(res.statusCode, 502);
+  const data = JSON.parse(res.body);
+  assert.equal(data.ok, false);
+  assert.match(data.error, /socket hang up/, "the thrown cause reaches the panel verbatim");
+  assert.equal(data.effortDropped, undefined, "a thrown failure is not a downgrade");
+  assert.equal(MOCK_LLM.streamCalls.length - before, 1, "a thrown failure is not retried blindly either");
+});
+
+test("POST /api/dsh-mneme/test-model omits effortDropped when no effort was configured", async () => {
+  const { routes } = setupLlm(MOCK_LLM);
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/test-model");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/test-model", "POST", { provider: "deepseek", model: "deepseek-chat" }), res);
+  assert.equal(res.statusCode, 200);
+  const data = JSON.parse(res.body);
+  assert.equal(data.effortDropped, undefined, "no effort configured -> nothing was dropped");
+});
+
+// 防分叉静态锁（与 #405 的归一逻辑同款）：档位拒收的判据与降级语义全仓只有一份
+// ——dream.js 的 EFFORT_REJECT_RE + withEffortFallback。api.js 手写正则或自己做
+// 重试，两条路必然漂移（漂移方向就是「探针与服务端行为不一致」，本次修的就是这个）。
+test("api.js reuses the single effort-rejection source instead of forking it", () => {
+  const src = readFileSync(new URL("../src/api.js", import.meta.url), "utf8");
+  assert.match(
+    src,
+    /import \{[^}]*withEffortFallback[^}]*\} from "\.\/dream\.js"/,
+    "the probe must reuse dream.js's withEffortFallback instead of hand-rolling a retry"
+  );
+  assert.match(
+    src,
+    /import \{[^}]*EFFORT_REJECT_RE[^}]*\} from "\.\/dream\.js"/,
+    "the rejection predicate must come from dream.js (single source), not a local regex"
+  );
+  assert.ok(
+    !/\/reasoning\[/.test(src),
+    "api.js must not carry its own copy of the effort-rejection pattern"
+  );
+  // 降级语义只能有一处：探针内不得再出现第二个「无档位重试」判据。
+  const attempts = src.split("withEffortFallback(").length - 1;
+  assert.equal(attempts, 1, `the probe must route through withEffortFallback exactly once (got ${attempts})`);
+});
+
+test("POST /api/dsh-mneme/test-model resolves empty body against the consolidation route", async () => {
+  // Empty provider/model = "test whatever consolidation uses now": the route
+  // falls back to agentDefaultModel (config dreamProvider/dreamModel absent),
+  // the probe runs against that model, and modelId reports what was tested.
+  const { routes } = setupLlm(MOCK_LLM, "", {
+    agentDefaultModel: { currentSelection: () => ({ provider: "sel-provider", model: "sel-model" }) }
+  });
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/test-model");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/test-model", "POST", {}), res);
+  assert.equal(res.statusCode, 200);
+  const data = JSON.parse(res.body);
+  assert.equal(data.ok, true);
+  assert.equal(data.modelId, "sel-provider:sel-model", "probe ran against the resolved consolidation route");
+  assert.equal(MOCK_LLM.lastOptions.provider, "sel-provider");
+  assert.equal(MOCK_LLM.lastOptions.model, "sel-model");
+});
+
+test("POST /api/dsh-mneme/test-model validates input and llm availability", async () => {
+  const { routes } = setupLlm(MOCK_LLM);
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/test-model");
+  let res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/test-model", "POST", { provider: "deepseek" }), res);
+  assert.equal(res.statusCode, 400, "partial input (provider without model) rejected");
+  assert.equal(JSON.parse(res.body).error, "missing-provider-or-model");
+
+  // empty body with no route (no agentDefaultModel, no config route) -> no-route
+  res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/test-model", "POST", {}), res);
+  assert.equal(res.statusCode, 400, "empty body with no resolvable route rejected");
+  assert.equal(JSON.parse(res.body).error, "no-route");
+
+  const { routes: routesNoLlm } = setup();
+  const routeNoLlm = routesNoLlm.find((r) => r.path === "/api/dsh-mneme/test-model");
+  res = new FakeRes();
+  await routeNoLlm.handler(req("/api/dsh-mneme/test-model", "POST", { provider: "deepseek", model: "deepseek-chat" }), res);
+  assert.equal(res.statusCode, 501, "no ctx.llm -> llm-unavailable");
+});
+
+test("POST /api/dsh-mneme/test-model is auth-gated like other expensive endpoints", async () => {
+  const { routes } = setupLlm(MOCK_LLM, FAKE_API_TOKEN);
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/test-model");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/test-model", "POST", { provider: "deepseek", model: "deepseek-chat" }), res);
+  assert.equal(res.statusCode, 401, "probe spends the user's API quota, so it must require auth");
+});
+
+test("GET /api/dsh-mneme/inject-status: suppressed only when minimal preset observed (issue #182)", async () => {
+  const store = createStore(":memory:");
+  const service = createService({ store, mirror: null, config: testConfig({}) });
+  const settings = createSettings(store.db);
+  const routes = [];
+  let onEvent = null;
+  const ctx = {
+    webServer: {
+      register(route) {
+        routes.push(route);
+        return () => {};
+      }
+    },
+    on(type, fn) {
+      onEvent = fn;
+      return () => {};
+    }
+  };
+  const api = createApi(
+    ctx,
+    service,
+    settings,
+    { add() {}, remove() {}, list() { return []; } },
+    undefined,
+    undefined,
+    "",
+    Config({}) // autoInject default true
+  );
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/inject-status");
+
+  // 未观测到任何会话：agentPreset=null，不猜、不压制。
+  let res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/inject-status"), res);
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(JSON.parse(res.body), { autoInject: true, agentPreset: null, suppressed: false });
+
+  // minimal 会话事件到达（session/event 的第一参为 session）→ suppressed。
+  onEvent({ header: { agentPreset: "minimal" } });
+  res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/inject-status"), res);
+  assert.deepEqual(JSON.parse(res.body), { autoInject: true, agentPreset: "minimal", suppressed: true });
+
+  // standard 会话 → 无提示。
+  onEvent({ header: { agentPreset: "standard" } });
+  res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/inject-status"), res);
+  assert.deepEqual(JSON.parse(res.body), { autoInject: true, agentPreset: "standard", suppressed: false });
+
+  // 头里没有 agentPreset（降级形状）→ 回落 null，静默不猜。
+  onEvent({ header: {} });
+  res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/inject-status"), res);
+  assert.deepEqual(JSON.parse(res.body), { autoInject: true, agentPreset: null, suppressed: false });
+
+  // 非 GET → 404（与其他只读端点同款）。
+  res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/inject-status", "POST"), res);
+  assert.equal(res.statusCode, 404);
+});
+
+test("inject-status: autoInject off is never suppressed (user's own choice, not a black box)", async () => {
+  const store = createStore(":memory:");
+  const service = createService({ store, mirror: null, config: testConfig({}) });
+  const settings = createSettings(store.db);
+  const routes = [];
+  let onEvent = null;
+  const ctx = {
+    webServer: {
+      register(route) {
+        routes.push(route);
+        return () => {};
+      }
+    },
+    on(type, fn) {
+      onEvent = fn;
+      return () => {};
+    }
+  };
+  const api = createApi(
+    ctx,
+    service,
+    settings,
+    { add() {}, remove() {}, list() { return []; } },
+    undefined,
+    undefined,
+    "",
+    Config({ autoInject: false })
+  );
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/inject-status");
+  onEvent({ header: { agentPreset: "minimal" } });
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/inject-status"), res);
+  assert.deepEqual(JSON.parse(res.body), { autoInject: false, agentPreset: "minimal", suppressed: false });
+});
+
+test("GET /api/dsh-mneme/inject-preview: returns last assembly snapshot (issue #179)", async () => {
+  const store = createStore(":memory:");
+  const service = createService({ store, mirror: null, config: testConfig({}) });
+  const settings = createSettings(store.db);
+  const routes = [];
+  const ctx = {
+    webServer: {
+      register(route) {
+        routes.push(route);
+        return () => {};
+      }
+    }
+  };
+  const api = createApi(
+    ctx,
+    service,
+    settings,
+    { add() {}, remove() {}, list() { return []; } },
+    undefined,
+    undefined,
+    "",
+    Config({})
+  );
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/inject-preview");
+  assert.ok(route, "preview endpoint must be registered");
+
+  // 无渲染发生：snapshot=null（新宿主/新会话/autoInject 关闭同形）。
+  let res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/inject-preview"), res);
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(JSON.parse(res.body), { snapshot: null });
+
+  // 真实渲染一帧后：快照透传（api 层不做任何加工）。
+  service.saveWithDedupe({ type: "preference", title: "语言", content: "用户用中文交流", importance: 5 });
+  const contexts = [];
+  const promptCtx = {
+    systemPrompt: { context(def) { contexts.push(def); return () => {}; } }
+  };
+  const injector = createInjector(promptCtx, service, settings, Config({ maxInjectedItems: 3, importanceThreshold: 3 }));
+  contexts[0].text({});
+  res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/inject-preview"), res);
+  const body = JSON.parse(res.body);
+  assert.ok(body.snapshot, "snapshot present after a real render");
+  assert.equal(body.snapshot.entries[0].title, "语言");
+  assert.ok(body.snapshot.totalChars > 0);
+
+  // 非 GET → 404（与 inject-status 同款）。
+  res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/inject-preview", "POST"), res);
+  assert.equal(res.statusCode, 404);
+  injector(); // 快照是模块全局：用完即清，不污染后续用例
+});
+
+// --- /pipeline：观察旁挂能真的挂进投影（CodeRabbit #458 F1 的锁）--------------
+
+test("GET /api/dsh-mneme/pipeline 带观察旁挂：observationsById 真的进了投影而不是被 catch 吞掉", async () => {
+  // 锁 F1：ids 原本声明在账本分支的块级作用域里，旁挂块一引用就 ReferenceError，
+  // 被 catch 静默吞成「没有观察」——面板上一切正常，fix-step-tool 提议却永远少一类。
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { saveObservations } = await import("../src/pipeline-observations.js");
+
+  const root = mkdtempSync(join(tmpdir(), "mo-api-f1-"));
+  try {
+    const project = join(root, "proj");
+    const pipeline = {
+      id: "demo-f1",
+      name: "演示F1",
+      project: "someone/repo",
+      version: 0,
+      status: "active",
+      done: "做完",
+      trigger: [{ kind: "phrase", value: "跑一下" }],
+      steps: [{
+        id: "S1",
+        phase: "做",
+        title: "跑测试",
+        when: "有人要跑",
+        do: "npm test",
+        who: "main",
+        tool: "npm test",
+        done: "测试全绿",
+        risk: "R0",
+        needs: [],
+        why: "没有它后面没得跑",
+        evidence: ["跑过"]
+      }]
+    };
+    // 项目层工作流（<project>/.mneme/pipelines/*.json）
+    mkdirSync(join(project, ".mneme", "pipelines"), { recursive: true });
+    writeFileSync(join(project, ".mneme", "pipelines", "demo-f1.json"), JSON.stringify(pipeline));
+    // 运行账：<project>/.mneme/pipelines/<id>.runs.jsonl（有账才走到旁挂分支）。
+    // 行形状走 normalizeRun 契约：run.at/by + step.at 全必填（时间不补默认）。
+    writeFileSync(
+      join(project, ".mneme", "pipelines", "demo-f1.runs.jsonl"),
+      JSON.stringify({ at: "2026-10-17T01:00:00.000Z", by: "main", steps: [{ id: "S1", at: "2026-10-17T01:00:00.000Z", skipped: false, detoured: false, refuted: false }] }) + "\n"
+    );
+    // 观察旁挂：<memoryDir>/observations/<项目键>/demo-f1.jsonl。项目键走 candidates.js
+    // 的 projectKey(projectRoot)（sha256 前 8 位 + 清洗名），与 api.js 同源——不能用
+    // 裸 observations/ 目录，那不是 api 侧会查的桶。
+    const { projectKey } = await import("../src/candidates.js");
+    const memoryDir = join(root, "memory");
+    const odir = join(memoryDir, "observations", projectKey(project));
+    const saved = saveObservations({
+      dir: odir,
+      pipelineId: "demo-f1",
+      confirmAt: "2026-10-17T02:00:00.000Z",
+      activities: [{ key: "git push", count: 2 }]
+    });
+    assert.equal(saved.ok, true);
+
+    const { routes } = setup(undefined, "", { memoryDir });
+    const route = routes.find((r) => r.path === "/api/dsh-mneme/pipeline");
+    const res = new FakeRes();
+    await route.handler(req(`/api/dsh-mneme/pipeline?id=demo-f1&project=${encodeURIComponent(project)}`), res);
+    assert.equal(res.statusCode, 200);
+    const data = JSON.parse(res.body);
+    const row = (data.available || []).find((r) => r.id === "demo-f1");
+    assert.ok(row, "工作流要出现在清单里");
+    assert.ok(data.pipeline, "选中投影要存在");
+    // F1 的直接断言：观察旁挂真的喂进了 suggestions 的判据（修复前 observationsById
+    // 恒为 {}——ReferenceError 被 catch 吞掉，观察永远空）。
+    // 观察里只写了 git push，而 S1 声明 tool=npm test 且账本确认走过 1 次 → 矛盾
+    // 成立，fix-step-tool 必须冒头（下方正向锁）；观察为空时它不该冒，那是
+    // pipeline.test.js 的判据锁。
+    // runsState 是账本健康度（RUNS_STATES: absent/empty/ok/partial/broken），
+    // 不是节点状态——账本一行合法 run 即为 ok。节点级 trusted 由 deriveState 管，
+    // 在 summarizePipeline 的 perNode 里，这里不重复锁。
+    assert.equal(row.runsState, "ok", "账本一行合法 run，健康度应是 ok");
+    // suggestions 在投影顶层（不在 pipeline 对象下）。
+    assert.ok(Array.isArray(data.suggestions), "投影必须带 suggestions 数组");
+    // 正向锁：观察里只有 git push、S1 声明 npm test 且确认走过 → fix-step-tool 必须冒头。
+    // F1 未修时 observationsById 恒为空，这条断言必挂——正是要抓的回归。
+    const fix = data.suggestions.find((s) => s.kind === "fix-step-tool");
+    assert.ok(fix, "观察进了判据（npm test 未见于观察）→ 必须有 fix-step-tool 提议");
+    assert.equal(fix.stepId, "S1");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// --- 记忆级溯源读出口（#399 写、#421 读）---------------------------------------
+// distill_records 与 memory_provenance 自 #399 起就只有写入路径：库里有答案、
+// service.provenanceFor 能查，但外部（面板 / standalone API / 脚本）拿不到——
+// 「这条记忆是从哪几句蒸出来的」只能开 sqlite 手写 JOIN。
+//
+// #509 评审整改：读出口吃 distillRecords.enabled（与写侧同一个开关、同一个判据）。
+// 关着时 409 {error:"distill-records-disabled"}。所以这一族的用例必须显式把开关
+// 打开——setup 的 config 缺省 null，而 null 在这道门上的含义就是「关」（fail-closed）。
+const RECORDS_ON = { distillRecords: { enabled: true } };
+
+test("GET /api/dsh-mneme/memory/provenance 返回窗口区间与原文行", async () => {
+  const { routes, service, store } = setup(null, FAKE_API_TOKEN, RECORDS_ON);
+  // 直接落溯源链接与原文：读取面不关心是谁写的，只关心库里的形状。
+  service.saveWithDedupe({ type: "decision", title: "核心决策", content: "选定 SQLite 单文件库", importance: 5 });
+  const memory = service.all()[0];
+  store.saveMemoryProvenance({
+    memoryId: memory.id, sessionId: "s1", seqStart: 10, seqEnd: 12, createdAt: "2026-10-23T00:00:00Z"
+  });
+  store.saveDistillRecords([
+    { sessionId: "s1", seq: 10, role: "user", text: "第一句原文", windowId: "w1", distilledAt: "2026-10-23T00:00:00Z" },
+    { sessionId: "s1", seq: 11, role: "assistant", text: "第二句原文", windowId: "w1", distilledAt: "2026-10-23T00:00:00Z" },
+    { sessionId: "s1", seq: 12, role: "user", text: "第三句原文", windowId: "w1", distilledAt: "2026-10-23T00:00:00Z" },
+    // 区间外的一句：不该被带出来
+    { sessionId: "s1", seq: 99, role: "user", text: "区间外", windowId: "w1", distilledAt: "2026-10-23T00:00:00Z" }
+  ]);
+
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/memory/provenance");
+  assert.equal(route.policy, "token", "records 带会话原文，与开放的 /list 串起来即可枚举 id 后捞回原文——必须受门控");
+
+  const res = new FakeRes();
+  const r = req("/api/dsh-mneme/memory/provenance?id=" + memory.id);
+  r.headers = { authorization: `Bearer ${FAKE_API_TOKEN}` };
+  await route.handler(r, res);
+  assert.equal(res.statusCode, 200);
+  const data = JSON.parse(res.body);
+  assert.equal(data.memoryId, memory.id);
+  assert.equal(data.windows.length, 1, "一个链接一个窗口");
+  const w = data.windows[0];
+  assert.equal(w.session_id, "s1");
+  assert.equal(w.seq_start, 10);
+  assert.equal(w.seq_end, 12);
+  assert.equal(w.created_at, "2026-10-23T00:00:00Z");
+  assert.deepEqual(w.records.map((r) => r.text), ["第一句原文", "第二句原文", "第三句原文"],
+    "原文按 seq 升序，且不越出区间");
+  assert.deepEqual(w.records.map((r) => r.seq), [10, 11, 12]);
+});
+
+test("GET /api/dsh-mneme/memory/provenance：无 token 401，装配没接线 503", async () => {
+  const { routes, service } = setup(null, FAKE_API_TOKEN, RECORDS_ON);
+  service.saveWithDedupe({ type: "preference", title: "语言", content: "中文" });
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/memory/provenance");
+
+  // 没 token → 401（policy=token 的机械结果）
+  const noAuth = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/memory/provenance?id=x"), noAuth);
+  assert.equal(noAuth.statusCode, 401);
+
+  // 装配没接线（headless / 旧装配：service 上没有这两个方法）→ 503。
+  // 这与「这条记忆没有来源」是两件事，必须分开读数——后者是事实，前者是接线坏了。
+  const store = createStore(":memory:");
+  const settings = createSettings(store.db);
+  const bare = createService({ store, mirror: null, config: testConfig({}) });
+  delete bare.provenanceFor;
+  delete bare.distillRecordsFor;
+  const bareRoutes = [];
+  createApi(
+    { webServer: { register(r) { bareRoutes.push(r); return () => {}; } } },
+    bare, settings, { add() {}, remove() {}, list: () => [] }, null, undefined, FAKE_API_TOKEN,
+    RECORDS_ON
+  );
+  const bareRoute = bareRoutes.find((r) => r.path === "/api/dsh-mneme/memory/provenance");
+  const res503 = new FakeRes();
+  const authed = req("/api/dsh-mneme/memory/provenance?id=x");
+  authed.headers = { authorization: `Bearer ${FAKE_API_TOKEN}` };
+  await bareRoute.handler(authed, res503);
+  assert.equal(res503.statusCode, 503, "装配缺方法 → provenance-unavailable，不是空 windows");
+  assert.equal(JSON.parse(res503.body).error, "provenance-unavailable");
+  store.close();
+});
+
+test("GET /api/dsh-mneme/memory/provenance：非蒸馏来源的记忆返回空窗口而非报错", async () => {
+  // memory_save 写进来的记忆没有溯源链接——「这条不是蒸馏来的」本身是有效答案，
+  // 不能 404/500。契约：空 windows，不是错误。
+  const { routes, service } = setup(null, FAKE_API_TOKEN, RECORDS_ON);
+  service.saveWithDedupe({ type: "preference", title: "语言", content: "中文" });
+  const memory = service.all()[0];
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/memory/provenance");
+  const res = new FakeRes();
+  const r = req("/api/dsh-mneme/memory/provenance?id=" + memory.id);
+  r.headers = { authorization: `Bearer ${FAKE_API_TOKEN}` };
+  await route.handler(r, res);
+  assert.equal(res.statusCode, 200);
+  const data = JSON.parse(res.body);
+  assert.deepEqual(data.windows, [], "没有链接 → 空窗口，不是错误");
+});
+
+test("GET /api/dsh-mneme/memory/provenance 缺 id 报 400，未知 id 返回空窗口", async () => {
+  const { routes } = setup(null, FAKE_API_TOKEN, RECORDS_ON);
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/memory/provenance");
+  // 400 要赢过 401：调用方发坏了，报「没鉴权」是误导（reclaimReply 同款顺序）。
+  const bad = new FakeRes();
+  const badReq = req("/api/dsh-mneme/memory/provenance");
+  badReq.headers = { authorization: `Bearer ${FAKE_API_TOKEN}` };
+  await route.handler(badReq, bad);
+  assert.equal(bad.statusCode, 400);
+
+  // 库里有 distill 数据但这条 id 不存在：读端点不替调用方判断记忆是否存在，
+  // 「没有链接」对未知 id 与对非蒸馏记忆是同一个答案。
+  const unknown = new FakeRes();
+  const unknownReq = req("/api/dsh-mneme/memory/provenance?id=nope");
+  unknownReq.headers = { authorization: `Bearer ${FAKE_API_TOKEN}` };
+  await route.handler(unknownReq, unknown);
+  assert.equal(unknown.statusCode, 200);
+  assert.deepEqual(JSON.parse(unknown.body).windows, []);
+});
+
+test("GET /api/dsh-mneme/memory/provenance：读失败要留痕，500 不能把 warn 一起吞掉", async () => {
+  // 共用模块的测试已经锁了「抛错 → 调 warn」（provenance-http.test.js），但锁不住
+  // **壳把哪个 logger 递进去**。#509 第二次迭代在这里栽过：壳里写的是裸 `logger`，
+  // 而 createApi 的作用域只有 ctx.logger——warn 回调自己抛 ReferenceError，被外层
+  // catch 吞掉，响应还是 500，但「为什么失败」一个字都不留。下面这条把接线本身锁住。
+  const store = createStore(":memory:");
+  const settings = createSettings(store.db);
+  const service = createService({ store, mirror: null, config: testConfig({}) });
+  const realFor = service.provenanceFor;
+  service.provenanceFor = (id) => { realFor(id); throw new Error("db locked"); };
+
+  const routes = [];
+  const warnings = [];
+  createApi(
+    {
+      webServer: { register(r) { routes.push(r); return () => {}; } },
+      logger: { warn: (m) => warnings.push(m) }
+    },
+    service, settings, { add() {}, remove() {}, list: () => [] }, null, undefined, FAKE_API_TOKEN,
+    RECORDS_ON
+  );
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/memory/provenance");
+  const res = new FakeRes();
+  const r = req("/api/dsh-mneme/memory/provenance?id=m1");
+  r.headers = { authorization: `Bearer ${FAKE_API_TOKEN}` };
+  await route.handler(r, res);
+
+  assert.equal(res.statusCode, 500, "读失败回 500");
+  assert.equal(JSON.parse(res.body).error, "internal");
+  assert.equal(warnings.length, 1, "500 必须伴随一条 warn——否则失败原因只存在于调用方的猜测里");
+  assert.match(warnings[0], /memory provenance read failed/, "留痕要带原始异常");
+  assert.match(warnings[0], /db locked/);
+  store.close();
+});
+
+// --- distillRecords.enabled 门（#509 评审整改）--------------------------------
+// 维护者在 #509 里指出的缺口：读出口此前一处都不读这个开关，于是「把 distill_records
+// 关掉」的语义是不再写、也不再删，却还多一个能读出去的口。门落在共用模块，两个壳
+// 都吃它；这里锁宿主面的外壳与顺序。
+
+test("GET /api/dsh-mneme/memory/provenance：distillRecords.enabled 关着 → 409，不是 404 也不是空 windows", async () => {
+  const { routes, service } = setup(null, FAKE_API_TOKEN, { distillRecords: { enabled: false } });
+  service.saveWithDedupe({ type: "preference", title: "语言", content: "中文" });
+  const memory = service.all()[0];
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/memory/provenance");
+  const res = new FakeRes();
+  const r = req("/api/dsh-mneme/memory/provenance?id=" + memory.id);
+  r.headers = { authorization: `Bearer ${FAKE_API_TOKEN}` };
+  await route.handler(r, res);
+
+  assert.equal(res.statusCode, 409, "用户关了功能 = 409（src/api.js:525 的 profileExtract 同型先例）");
+  assert.deepEqual(JSON.parse(res.body), { error: "distill-records-disabled" });
+});
+
+test("GET /api/dsh-mneme/memory/provenance：config 整个缺席也按关处理（fail-closed）", async () => {
+  // 旧调用方直连 createApi 不传第 8 参、或宿主没装配 cfg：这个端点返回逐字原文，
+  // 判不出来时必须往「不读」那一侧倒。
+  const { routes } = setup(null, FAKE_API_TOKEN);
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/memory/provenance");
+  const res = new FakeRes();
+  const r = req("/api/dsh-mneme/memory/provenance?id=whatever");
+  r.headers = { authorization: `Bearer ${FAKE_API_TOKEN}` };
+  await route.handler(r, res);
+  assert.equal(res.statusCode, 409);
+  assert.deepEqual(JSON.parse(res.body), { error: "distill-records-disabled" });
+});
+
+test("GET /api/dsh-mneme/memory/provenance：400 赢 409——缺 id 是语法畸形，与服务端状态无关", async () => {
+  const { routes } = setup(null, FAKE_API_TOKEN, { distillRecords: { enabled: false } });
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/memory/provenance");
+  const res = new FakeRes();
+  const r = req("/api/dsh-mneme/memory/provenance");
+  r.headers = { authorization: `Bearer ${FAKE_API_TOKEN}` };
+  await route.handler(r, res);
+  assert.equal(res.statusCode, 400, "请求本身不成立时报「功能关了」是误导");
+  assert.equal(JSON.parse(res.body).error, "missing-id");
+});
+
+test("GET /api/dsh-mneme/memory/provenance：409 赢 503——功能关比装配坏更具体", async () => {
+  // 关着 + service 上连方法都没有：503 会让人去查一个没坏的部署。
+  const store = createStore(":memory:");
+  const settings = createSettings(store.db);
+  const bare = createService({ store, mirror: null, config: testConfig({}) });
+  delete bare.provenanceFor;
+  delete bare.distillRecordsFor;
+  const bareRoutes = [];
+  createApi(
+    { webServer: { register(r) { bareRoutes.push(r); return () => {}; } } },
+    bare, settings, { add() {}, remove() {}, list: () => [] }, null, undefined, FAKE_API_TOKEN,
+    { distillRecords: { enabled: false } }
+  );
+  const route = bareRoutes.find((r) => r.path === "/api/dsh-mneme/memory/provenance");
+  const res = new FakeRes();
+  const r = req("/api/dsh-mneme/memory/provenance?id=x");
+  r.headers = { authorization: `Bearer ${FAKE_API_TOKEN}` };
+  await route.handler(r, res);
+  assert.equal(res.statusCode, 409);
+  assert.equal(JSON.parse(res.body).error, "distill-records-disabled");
+  store.close();
+});
+
+test("GET /api/dsh-mneme/memory/provenance：关着时对已知 id 与未知 id 同一个答案——不当存在性预言机", async () => {
+  // 如果关着只对「有原文的 id」回 409、对别的 id 回空 windows，调用方就能拿这个
+  // 端点枚举「哪些记忆有蒸馏原文」。功能关是端点的属性，每个 id 答案必须一样。
+  const { routes, service } = setup(null, FAKE_API_TOKEN, { distillRecords: { enabled: false } });
+  service.saveWithDedupe({ type: "preference", title: "语言", content: "中文" });
+  const memory = service.all()[0];
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/memory/provenance");
+  for (const id of [memory.id, "nope", ""]) {
+    const res = new FakeRes();
+    const r = req("/api/dsh-mneme/memory/provenance?id=" + id);
+    r.headers = { authorization: `Bearer ${FAKE_API_TOKEN}` };
+    await route.handler(r, res);
+    if (id === "") {
+      assert.equal(res.statusCode, 400, "空 id 仍是语法问题，409 不该吃掉它");
+      continue;
+    }
+    assert.equal(res.statusCode, 409, `${id} → 409`);
+    assert.deepEqual(JSON.parse(res.body), { error: "distill-records-disabled" });
+  }
+});
+
+test("GET /api/dsh-mneme/memory/provenance：lightMode 预设把关掉 → 409（与写侧同源）", async () => {
+  // applyLightModePreset 把 distillRecords.enabled 置 false（pre-inject-gate.test.js
+  // 锁的是写入侧那个方向）；读侧必须跟着变，否则轻量模式下用户以为自己关了、原文
+  // 却还能从 HTTP 读出去。
+  const { routes } = setup(null, FAKE_API_TOKEN, applyLightModePreset({ lightMode: true, distillRecords: { enabled: true } }));
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/memory/provenance");
+  const res = new FakeRes();
+  const r = req("/api/dsh-mneme/memory/provenance?id=m1");
+  r.headers = { authorization: `Bearer ${FAKE_API_TOKEN}` };
+  await route.handler(r, res);
+  assert.equal(res.statusCode, 409);
+  assert.equal(JSON.parse(res.body).error, "distill-records-disabled");
+});
+
+// #524 方向 2：按会话列窗口（store 侧 GROUP BY 成一行一窗口）。这条用例盯三件事：
+// 同一窗口派生的多条记忆不许变成多行、区间按 seq_start 排、答复用 sessionId 认领。
+test("GET /api/dsh-mneme/memory/provenance?sessionId= 列出该会话的蒸馏窗口（#524）", async () => {
+  const { routes, service, store } = setup(null, FAKE_API_TOKEN, RECORDS_ON);
+  service.saveWithDedupe({ type: "decision", title: "核心决策", content: "选定 SQLite 单文件库", importance: 5 });
+  service.saveWithDedupe({ type: "decision", title: "备选", content: "先用 JSON 文件顶着", importance: 3 });
+  const [m1, m2] = service.all();
+  // 两个窗口：后一个 seq 更小，用来验证答复按 seq_start 排而不是按写入序。
+  store.saveMemoryProvenance({ memoryId: m1.id, sessionId: "s1", seqStart: 10, seqEnd: 12, createdAt: "t2" });
+  store.saveMemoryProvenance({ memoryId: m2.id, sessionId: "s1", seqStart: 10, seqEnd: 12, createdAt: "t2" });
+  store.saveMemoryProvenance({ memoryId: m1.id, sessionId: "s1", seqStart: 1, seqEnd: 3, createdAt: "t1" });
+  // 另一个会话的窗口不该出现。
+  store.saveMemoryProvenance({ memoryId: m1.id, sessionId: "s2", seqStart: 50, seqEnd: 51, createdAt: "t3" });
+
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/memory/provenance");
+  const res = new FakeRes();
+  const r = req("/api/dsh-mneme/memory/provenance?sessionId=s1");
+  r.headers = { authorization: `Bearer ${FAKE_API_TOKEN}` };
+  await route.handler(r, res);
+  assert.equal(res.statusCode, 200);
+  const data = JSON.parse(res.body);
+  assert.equal(data.sessionId, "s1", "方向 2 的答复用 sessionId 认领，不冒充 memoryId");
+  assert.equal(data.memoryId, undefined, "两个方向的认领键不许同时出现");
+  assert.equal(data.truncated, false);
+  assert.deepEqual(data.windows.map((w) => [w.seq_start, w.seq_end]), [[1, 3], [10, 12]],
+    "同一 (seq_start, seq_end) 的两条记忆必须并成一行，且按 seq_start 升序");
+  assert.deepEqual(data.windows.map((w) => w.link_count), [1, 2],
+    "link_count 说明该窗口派生出几条记忆——这是一行一窗口之后唯一还剩的「多」的信息");
+});
+
+test("GET /api/dsh-mneme/memory/provenance：两个主键都给 → 400，不静默择一（#524）", async () => {
+  const { routes } = setup(null, FAKE_API_TOKEN, RECORDS_ON);
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/memory/provenance");
+  const res = new FakeRes();
+  const r = req("/api/dsh-mneme/memory/provenance?id=m1&sessionId=s1");
+  r.headers = { authorization: `Bearer ${FAKE_API_TOKEN}` };
+  await route.handler(r, res);
+  assert.equal(res.statusCode, 400);
+  assert.equal(JSON.parse(res.body).error, "ambiguous-id");
+});
+
+test("GET /api/dsh-mneme/memory/provenance?sessionId=：limit 越界 → 400；撞上限时 truncated=true（#524）", async () => {
+  const { routes, service, store } = setup(null, FAKE_API_TOKEN, RECORDS_ON);
+  service.saveWithDedupe({ type: "decision", title: "核心决策", content: "x", importance: 5 });
+  const memory = service.all()[0];
+  for (const n of [1, 2, 3]) {
+    store.saveMemoryProvenance({ memoryId: memory.id, sessionId: "s1", seqStart: n, seqEnd: n, createdAt: "t" });
+  }
+  const route = routes.find((r) => r.path === "/api/dsh-mneme/memory/provenance");
+
+  const bad = new FakeRes();
+  const badReq = req("/api/dsh-mneme/memory/provenance?sessionId=s1&limit=0");
+  badReq.headers = { authorization: `Bearer ${FAKE_API_TOKEN}` };
+  await route.handler(badReq, bad);
+  assert.equal(bad.statusCode, 400);
+  assert.equal(JSON.parse(bad.body).error, "invalid-limit");
+
+  const ok = new FakeRes();
+  const okReq = req("/api/dsh-mneme/memory/provenance?sessionId=s1&limit=2");
+  okReq.headers = { authorization: `Bearer ${FAKE_API_TOKEN}` };
+  await route.handler(okReq, ok);
+  assert.equal(ok.statusCode, 200);
+  const data = JSON.parse(ok.body);
+  assert.equal(data.windows.length, 2);
+  assert.equal(data.truncated, true, "还有第三个窗口没回——必须说出来，否则半份转录会被当成全部");
+});
+
+// --- 日记库两条路由（左侧「ta 的日记」面板的数据源）-----------------------
+// 这两条与上面按 project 定位的五条日记路由不是一回事：面板拿不到当前会话，
+// 只能整体扫 diaries 根目录。所以这里也必须不传 project 就能读。
+
+/** 造一个带 diaries 目录的临时 memoryDir，并按 bucket/date 铺文件。 */
+function diaryFixture(buckets) {
+  const memoryDir = mkdtempSync(join(tmpdir(), "mneme-api-diary-"));
+  const root = join(memoryDir, "diaries");
+  mkdirSync(root, { recursive: true });
+  for (const [bucket, files] of Object.entries(buckets)) {
+    mkdirSync(join(root, bucket), { recursive: true });
+    for (const [date, text] of Object.entries(files)) {
+      writeFileSync(join(root, bucket, `${date}.md`), text, "utf8");
+    }
+  }
+  return { memoryDir, root };
+}
+
+function diaryPage(agent, body = "正文") {
+  return `---\ndate: 2026-11-08\nproject: p\npersona: settings (${agent})\n---\n\n${body}\n`;
+}
+
+/** 只装配日记要的那一个位置参数（第 14 个），其余留空。 */
+function setupDiary(config, diary = { compose: async () => ({ ok: true }) }) {
+  const store = createStore(":memory:");
+  const service = createService({ store, mirror: null, config: testConfig({}) });
+  const settings = createSettings(store.db);
+  const routes = [];
+  const handlers = {};
+  const ctx = {
+    webServer: { register(route) { routes.push(route); return () => {}; } },
+    // 用真的 session/event 通道：agentBySession 账本正是从这里喂料的，
+    // 换成假函数就只测了「我自己的桩」，测不到真实接线。
+    on(name, fn) { handlers[name] = fn; return () => { delete handlers[name]; }; }
+  };
+  createApi(ctx, service, settings, { add() {}, remove() {}, list: () => [] }, undefined,
+    undefined, "", config, null, null, null, null, null, diary);
+  const emitSession = (session) => {
+    const fn = handlers["session/event"];
+    if (fn) fn(session);
+  };
+  return { routes, emitSession }; 
+}
+
+/**
+ * 一个在本平台一定是绝对路径的项目根。
+ *
+ * 这里原先写死 `D:/proj`：Windows 上 isAbsolute() 为真、Linux/macOS 上为假，
+ * 于是 src/api.js 的 diaryProject() 直接回 400 project-not-absolute，ubuntu 22/24
+ * 与 test-host-legacy 两腿全红，而本机 Windows 全绿——产品代码没错，是断言不可移植。
+ * tmpdir() 在两种平台上都返回绝对路径，用例才真正等价。
+ */
+function portableProjectRoot() {
+  return join(tmpdir(), "mneme-diary-compose");
+}
+
+/** 抓一个 compose 调用参数的 spy：既要知道调没调、也要知道传了什么。 */
+function composeSpy() {
+  const calls = [];
+  const diary = {
+    compose: async (args) => {
+      calls.push(args);
+      return { ok: true, status: "written", date: "2026-11-08", path: "x.md" };
+    }
+  };
+  return { calls, diary };
+}
+
+test("GET /api/dsh-mneme/diary/library：不传 project 也能列清单（面板拿不到会话）", async (t) => {
+  const { memoryDir } = diaryFixture({
+    "amarre-c836db6a": { "2026-11-08": diaryPage("amarre") },
+    "attune-dd7a5103": { "2026-11-07": diaryPage("attune") }
+  });
+  t.after(() => rmSync(memoryDir, { recursive: true, force: true }));
+
+  const { routes } = setupDiary({ memoryDir, diaryEnabled: true });
+  const route = findHandler(routes, "/api/dsh-mneme/diary/library");
+  assert.ok(route, "路由必须注册在 /api/dsh-mneme/diary/library");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/diary/library"), res);
+  assert.equal(res.statusCode, 200);
+  const data = JSON.parse(res.body);
+  assert.equal(data.contract, "mneme.diary/v1");
+  assert.equal(data.buckets.length, 2);
+});
+
+test("GET /api/dsh-mneme/diary/library/entry：正常读到正文", async (t) => {
+  const { memoryDir } = diaryFixture({ "amarre-c836db6a": { "2026-11-08": diaryPage("amarre", "今天很好") } });
+  t.after(() => rmSync(memoryDir, { recursive: true, force: true }));
+
+  const { routes } = setupDiary({ memoryDir, diaryEnabled: true });
+  const route = findHandler(routes, "/api/dsh-mneme/diary/library/entry");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/diary/library/entry?bucket=amarre-c836db6a&date=2026-11-08"), res);
+  assert.equal(res.statusCode, 200);
+  const data = JSON.parse(res.body);
+  assert.equal(data.bucket, "amarre-c836db6a");
+  assert.equal(data.date, "2026-11-08");
+  assert.match(data.text, /今天很好/);
+});
+
+test("GET /api/dsh-mneme/diary/library/entry：越界桶名与坏日期都回 400，不伪装成 404", async (t) => {
+  const { memoryDir } = diaryFixture({ ok: { "2026-11-08": diaryPage("x") } });
+  t.after(() => rmSync(memoryDir, { recursive: true, force: true }));
+
+  const { routes } = setupDiary({ memoryDir, diaryEnabled: true });
+  const route = findHandler(routes, "/api/dsh-mneme/diary/library/entry");
+
+  // 越界是一种**坏请求**，不是「这本不存在」——回 404 会让调用方以为换个名字再试就行。
+  for (const bad of ["..", "../x", "ok/../ok", ""]) {
+    const res = new FakeRes();
+    await route.handler(req(`/api/dsh-mneme/diary/library/entry?bucket=${encodeURIComponent(bad)}&date=2026-11-08`), res);
+    assert.equal(res.statusCode, 400, `桶名 ${JSON.stringify(bad)} 该回 400`);
+    assert.equal(JSON.parse(res.body).error, "bucket-required");
+  }
+  for (const bad of ["2026-1-1", "../../etc/passwd", ""]) {
+    const res = new FakeRes();
+    await route.handler(req(`/api/dsh-mneme/diary/library/entry?bucket=ok&date=${encodeURIComponent(bad)}`), res);
+    assert.equal(res.statusCode, 400, `日期 ${JSON.stringify(bad)} 该回 400`);
+    assert.equal(JSON.parse(res.body).error, "date-required");
+  }
+});
+
+test("GET /api/dsh-mneme/diary/library/entry：合法但不存在 → 404 diary-not-found", async (t) => {
+  const { memoryDir } = diaryFixture({ ok: { "2026-11-08": diaryPage("x") } });
+  t.after(() => rmSync(memoryDir, { recursive: true, force: true }));
+
+  const { routes } = setupDiary({ memoryDir, diaryEnabled: true });
+  const route = findHandler(routes, "/api/dsh-mneme/diary/library/entry");
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/diary/library/entry?bucket=ok&date=2026-01-01"), res);
+  assert.equal(res.statusCode, 404);
+  assert.equal(JSON.parse(res.body).error, "diary-not-found");
+});
+
+test("日记库两条路由与右栏同源：装配缺件 503、开关关着 409", async (t) => {
+  const { memoryDir } = diaryFixture({ ok: { "2026-11-08": diaryPage("x") } });
+  t.after(() => rmSync(memoryDir, { recursive: true, force: true }));
+  for (const path of ["/api/dsh-mneme/diary/library", "/api/dsh-mneme/diary/library/entry?bucket=ok&date=2026-11-08"]) {
+    // 503：diary 位置参数没装配。
+    const off = setupDiary({ memoryDir, diaryEnabled: true }, null);
+    const r1 = new FakeRes();
+    await findHandler(off.routes, "/api/dsh-mneme/diary/library").handler(req(path), r1);
+    assert.equal(r1.statusCode, 503, `${path} 装配缺件该回 503`);
+    assert.equal(JSON.parse(r1.body).reason, "diary-unavailable");
+
+    // 409：装配了但用户没开。
+    const disabled = setupDiary({ memoryDir, diaryEnabled: false });
+    const r2 = new FakeRes();
+    await findHandler(disabled.routes, "/api/dsh-mneme/diary/library").handler(req(path), r2);
+    assert.equal(r2.statusCode, 409, `${path} 开关关着该回 409`);
+    assert.equal(JSON.parse(r2.body).reason, "diary-not-enabled");
+  }
+});
+
+test("中文桶名：清单里列得出来就必须读得到（否则就是点了没反应）", async (t) => {
+  // 现场真有一个保留中文的历史桶。上一版这里两层用了不同判据——清单按路径语义、
+  // 路由按 ASCII 白名单——结果是列得出来、点进去 400。这条用例锁住两者同源。
+  const { memoryDir } = diaryFixture({ "QQ对话-4f061790": { "2026-11-07": diaryPage("amarre", "旧的那篇") } });
+  t.after(() => rmSync(memoryDir, { recursive: true, force: true }));
+
+  const { routes } = setupDiary({ memoryDir, diaryEnabled: true });
+  const list = new FakeRes();
+  await findHandler(routes, "/api/dsh-mneme/diary/library").handler(req("/api/dsh-mneme/diary/library"), list);
+  const buckets = JSON.parse(list.body).buckets.map((b) => b.key);
+  assert.ok(buckets.includes("QQ对话-4f061790"), "中文桶必须出现在清单里");
+
+  const res = new FakeRes();
+  await findHandler(routes, "/api/dsh-mneme/diary/library/entry")
+    .handler(req(`/api/dsh-mneme/diary/library/entry?bucket=${encodeURIComponent("QQ对话-4f061790")}&date=2026-11-07`), res);
+  assert.equal(res.statusCode, 200, "清单里列得出来的桶，点进去必须读得到");
+  assert.match(JSON.parse(res.body).text, /旧的那篇/);
+});
+
+// --- 手动写日记必须带身份（「设定好人格的 agent 只以这个人格的口吻写日记」）-----
+// 自动轮（src/diary/auto.js:47）一直传 agentId，手动轮的 /diary/compose 却不传，
+// 于是永远落 default 人格卡：同一天从两个入口写，是两张卡的两种声音。
+// 这三条锁住「带 ?agent= / ?session= 就传、都不带就不猜」。
+
+test("POST /diary/compose 带 ?agent= 时把它作为 agentId 传下去", async () => {
+  const { calls, diary } = composeSpy();
+  const { routes } = setupDiary({ diaryEnabled: true }, diary);
+  const route = findHandler(routes, "/api/dsh-mneme/diary/compose");
+  const project = portableProjectRoot();
+  const res = new FakeRes();
+  await route.handler(
+    req("/api/dsh-mneme/diary/compose?project=" + encodeURIComponent(project) + "&agent=amarre", "POST", {}),
+    res
+  );
+  assert.equal(res.statusCode, 200);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].agentId, "amarre");
+  assert.equal(calls[0].trigger, "manual");
+  assert.equal(calls[0].projectRoot, project);
+});
+
+test("POST /diary/compose 只带 ?session= 时按会话账本反查身份", async () => {
+  const { calls, diary } = composeSpy();
+  const { routes, emitSession } = setupDiary({ diaryEnabled: true }, diary);
+  // 账本由真实的 session/event 通道喂料，不手搓内部结构。
+  emitSession({ id: "sess-1", header: { agentPreset: "attune" } });
+  const route = findHandler(routes, "/api/dsh-mneme/diary/compose");
+  const project = portableProjectRoot();
+  const res = new FakeRes();
+  await route.handler(
+    req("/api/dsh-mneme/diary/compose?project=" + encodeURIComponent(project) + "&session=sess-1", "POST", {}),
+    res
+  );
+  assert.equal(res.statusCode, 200);
+  assert.equal(calls[0].agentId, "attune", "会话身份必须从账本里查出来，不能落 default");
+});
+
+test("POST /diary/compose 两个身份参数都没有时传 null，不假装自己是 default", async () => {
+  const { calls, diary } = composeSpy();
+  const { routes } = setupDiary({ diaryEnabled: true }, diary);
+  const route = findHandler(routes, "/api/dsh-mneme/diary/compose");
+  const project = portableProjectRoot();
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/diary/compose?project=" + encodeURIComponent(project), "POST", {}), res);
+  assert.equal(res.statusCode, 200);
+  assert.equal(calls[0].agentId, null, "不知道是谁 ≠ 以为是 default");
+});
+
+// ── DSH 访问检查（fkysly 在 awesome 条目里点出的那条：只有 apiToken 挡不住
+// 浏览器里任意网页对 127.0.0.1 的请求）。宿主给了 connection 就必须先过
+// requestRejection；没给（headless / 旧宿主 / 测试 mock）则行为退回加这层之前。
+
+function setupWithConnection(connection, apiToken = FAKE_API_TOKEN) {
+  const store = createStore(":memory:");
+  const service = createService({ store, mirror: null, config: testConfig({}) });
+  const settings = createSettings(store.db);
+  const commands = {
+    add: (def) => settings.addCommand(def),
+    remove: (id) => settings.removeCommand(id),
+    list: () => settings.listCommands()
+  };
+  const routes = [];
+  const ctx = {
+    webServer: {
+      register(route) {
+        routes.push(route);
+        return () => {};
+      }
+    },
+    connection
+  };
+  createApi(ctx, service, settings, commands, null, undefined, apiToken, null);
+  return { routes, service, store };
+}
+
+const ALLOW_ALL = { requestRejection: () => undefined };
+
+test("connection 说 403 时，连 policy=open 的路由也不放行（跨站网页调不动）", async () => {
+  const seen = [];
+  const { routes } = setupWithConnection({
+    requestRejection(request) {
+      seen.push(request.url);
+      return 403;
+    }
+  });
+  // /api/dsh-mneme/info 是 policy=open：加这层之前它对谁都不设防。
+  const route = findHandler(routes, "/api/dsh-mneme/info");
+  assert.equal(route.policy, "open", "这条测试的前提就是它 policy=open");
+
+  const res = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/info"), res);
+  assert.equal(res.statusCode, 403);
+  assert.equal(res.body, "", "被拒时不该回插件数据，也不该回 JSON 错误体");
+  assert.equal(seen.length, 1, "requestRejection 恰好被问一次");
+});
+
+test("connection 说 401 时同样挡下，且不改写状态码以外的响应", async () => {
+  const { routes } = setupWithConnection({ requestRejection: () => 401 });
+  const res = new FakeRes();
+  await findHandler(routes, "/api/dsh-mneme/info").handler(req("/api/dsh-mneme/info"), res);
+  assert.equal(res.statusCode, 401);
+  assert.equal(res.body, "");
+});
+
+test("connection 放行后策略照旧：open 直接过，token 仍要 token", async () => {
+  const { routes } = setupWithConnection(ALLOW_ALL);
+
+  const openRes = new FakeRes();
+  await findHandler(routes, "/api/dsh-mneme/info").handler(req("/api/dsh-mneme/info"), openRes);
+  assert.equal(openRes.statusCode, 200, "放行后 open 路由行为不变");
+
+  const noAuth = new FakeRes();
+  await findHandler(routes, "/api/dsh-mneme/memory/provenance")
+    .handler(req("/api/dsh-mneme/memory/provenance?id=x"), noAuth);
+  assert.equal(noAuth.statusCode, 401, "访问检查不等于鉴权：token 策略还要 token");
+
+  // 放行 token 的那一半必须在**要 token 的路由**上验：拿 policy=open 的 /info
+  // 带 token 是自证——就算受门控路由错误地拒掉所有 token，那条断言照样绿。
+  const authed = new FakeRes();
+  const r = req("/api/dsh-mneme/vector-config");
+  r.headers = { authorization: `Bearer ${FAKE_API_TOKEN}` };
+  await findHandler(routes, "/api/dsh-mneme/vector-config").handler(r, authed);
+  assert.equal(authed.statusCode, 200, "带正确 token 时受门控路由要放行");
+});
+
+test("宿主没提供 connection 时不加检查，行为与加这层之前逐字一致", async () => {
+  const { routes } = setupWithConnection(undefined);
+  const res = new FakeRes();
+  await findHandler(routes, "/api/dsh-mneme/info").handler(req("/api/dsh-mneme/info"), res);
+  assert.equal(res.statusCode, 200, "headless / 旧宿主不能因为拿不到 connection 就整体 401");
+});
+
+test("connection 对象在手、但没有 requestRejection 方法时按「没提供」处理", async () => {
+  const { routes } = setupWithConnection({});
+  const res = new FakeRes();
+  await findHandler(routes, "/api/dsh-mneme/info").handler(req("/api/dsh-mneme/info"), res);
+  assert.equal(res.statusCode, 200);
+});
+
+test("connection 在 createApi 之后才挂上时，随后的请求仍然过检查（惰性读取）", async () => {
+  // cordis 里宿主服务的存续会变（重载、后到），createApi 那一刻的快照不能
+  // 被冻死：否则先起的面板就永久裸奔。
+  const store = { connection: undefined };
+  const routes = [];
+  const ctx = {
+    reflect: { get: (name) => (name === "webServer"
+      ? { register(r) { routes.push(r); return () => {}; } }
+      : store[name]) },
+    webServer: { register(r) { routes.push(r); return () => {}; } }
+  };
+  const storeDb = createStore(":memory:");
+  const service = createService({ store: storeDb, mirror: null, config: testConfig({}) });
+  const settings = createSettings(storeDb.db);
+  createApi(ctx, service, settings, { add() {}, remove() {}, list: () => [] }, null, undefined, "", null);
+
+  const route = findHandler(routes, "/api/dsh-mneme/info");
+
+  // 先没有 connection：放行。
+  const before = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/info"), before);
+  assert.equal(before.statusCode, 200);
+
+  // 之后宿主挂上 connection 并开始拒绝：同一个 handler 必须跟着变。
+  store.connection = { requestRejection: () => 403 };
+  const after = new FakeRes();
+  await route.handler(req("/api/dsh-mneme/info"), after);
+  assert.equal(after.statusCode, 403, "后来挂上的 connection 必须被看到");
+});
+
+test("读 connection 抛错时按未提供处理，不让面板 500", async () => {
+  const routes = [];
+  const ctx = {
+    reflect: {
+      get(name) {
+        if (name === "webServer") return { register(r) { routes.push(r); return () => {}; } };
+        throw new Error("cannot get required service \"connection\" in inactive context");
+      }
+    }
+  };
+  const storeDb = createStore(":memory:");
+  const service = createService({ store: storeDb, mirror: null, config: testConfig({}) });
+  const settings = createSettings(storeDb.db);
+  createApi(ctx, service, settings, { add() {}, remove() {}, list: () => [] }, null, undefined, "", null);
+
+  const res = new FakeRes();
+  await findHandler(routes, "/api/dsh-mneme/info").handler(req("/api/dsh-mneme/info"), res);
+  assert.equal(res.statusCode, 200, "宿主卸载中的抛错不能变成面板 500");
+});

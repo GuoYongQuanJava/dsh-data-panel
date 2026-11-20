@@ -1,0 +1,4996 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { readFileSync, existsSync, readdirSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+import { spawnSync } from "node:child_process";
+
+const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+const clientSource = readFileSync(join(root, "lib/client.js"), "utf8");
+const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+
+// The Web client bundle registers itself via __ModuleLoader__.load. DSH
+// resolves the bundle by plugin package name, so the registered id must match
+// package.json `name` exactly (a mismatch surfaces as "loaded without
+// registering '@modusensus/dsh-mneme'" in the DSH client).
+test("client bundle registers under the package name", () => {
+  const match = clientSource.match(/__ModuleLoader__\.load\(\{\s*id:\s*"([^"]+)"/);
+  assert.ok(match, "client bundle must call __ModuleLoader__.load with an id");
+  assert.equal(match[1], pkg.name, "registered id must equal package.json name");
+});
+
+// client.js is hand-authored under lib/ only (no src/ counterpart), so the
+// src->lib sync must never prune it.
+test("client bundle is lib-only with no src counterpart", () => {
+  assert.equal(existsSync(join(root, "src/client.js")), false, "src/ must not contain client.js");
+  assert.equal(existsSync(join(root, "lib/client.js")), true, "lib/client.js must exist");
+});
+
+// 归档侧第五指标（#275）自己按「归档区为空就整段省略」门控，但整卡还有一道 hasData 门：
+// 那道门只认召回回执与活跃僵尸行时，「全归档 + 窗口内无回执」的库会直接 return null，
+// 指标永远不显示（自动评审 #312 指出的回归）。这里锁死 hasData 必须把 archive.total 计进来。
+test("status card: hasData counts the archive metric", () => {
+  const m = clientSource.match(/const hasData =[^;]+;/);
+  assert.ok(m, "the status card must declare hasData");
+  assert.match(m[0], /d\.archive\?\.total/, "hasData must count archive.total, not just runs/active rows");
+});
+
+// The memory entry is a first-class host panel now: `sidebar.panellist` puts a
+// glyph into the host's own panel list (the host row owns the button, the click
+// and aria-current) and `main` puts the library into the center column, side by
+// side with the conversation — the centered sheet is no longer the primary
+// surface (#559 follow-up; baleen does the same).
+//
+// Both seats are gated on the host declaring them, so the old footer entry has
+// to survive as the fallback for hosts without the seat pair. This test locks
+// the pair AND the fallback: dropping either one strands a whole host family
+// (new hosts get a sheet on top of the conversation again, old hosts lose the
+// entry entirely).
+test("memory entry registers the host panel seats and keeps the footer fallback", () => {
+  assert.ok(
+    clientSource.includes('ctx.slots.inject("sidebar.panellist"'),
+    "client must inject into sidebar.panellist (the host panel list)"
+  );
+  assert.ok(
+    clientSource.includes('name: "sidebar.panellist"'),
+    "the sidebar seat must be registered under its real slot name"
+  );
+  // main 的 key 必须与侧栏 id 逐字相同：宿主 PanelRow 点一下就是
+  // layout.selectPanel(id)，它在 main 槽里按 options.key 找 entry，对不上直接抛。
+  // 两处改成同一个常量以外的任何写法（比如 main 用 "mneme"、侧栏用 "dsh-mneme"）
+  // 面板点了没反应且控制台报 "main panel ... is not registered"。
+  assert.ok(
+    clientSource.includes('key: "dsh-mneme"'),
+    "the main seat key must match the sidebar seat id verbatim"
+  );
+  assert.ok(
+    clientSource.includes('ctx.slots.spec("sidebar.panellist")'),
+    "the footer fallback must be gated on the host actually declaring the panel seat"
+  );
+  assert.ok(
+    clientSource.includes("dropFooterSeat()"),
+    "once the panel seat exists the footer entry must be torn down, or the sidebar shows two memory entries"
+  );
+  assert.ok(
+    clientSource.includes('ctx.slots.inject("sidebar.footer.action"'),
+    "client must keep injecting into sidebar.footer.action as the old-host fallback"
+  );
+  assert.equal(
+    clientSource.includes('"settings.section"'),
+    false,
+    "the old settings.section registration must be gone"
+  );
+});
+
+// chorography（仓库地志）第二个座位（M1）。#598 起成对规则拆成两半：
+// main 的 key 仍逐字同为 "dsh-mneme-wiki" 且无条件注册——#562 的墙（布局存着
+// activePanelId 时少注册，宿主 selectPanel 直接抛）；侧栏 glyph 改读 features
+// 按 chorographyEnabled 决定，与 M.O.（v0.9.0）/日记（v0.13）的座位闸同一形态，
+// fail-closed。默认关的功能不该常驻一个点进去只有「未启用」的入口。
+test("chorography wiki main stays unconditional; the sidebar glyph is feature-gated (#598)", () => {
+  assert.ok(
+    clientSource.includes('key: "dsh-mneme-wiki"'),
+    "the wiki main seat key must stay verbatim and unconditional (#562)"
+  );
+  assert.ok(
+    clientSource.includes("h(WikiMainPanel, { t })"),
+    "the wiki main seat must render WikiMainPanel"
+  );
+  assert.ok(
+    clientSource.includes('id: "dsh-mneme-wiki"'),
+    "the wiki sidebar seat keeps its own id (now registered by the gate)"
+  );
+  assert.ok(
+    clientSource.includes('"dsh-mneme: chorography seat gate"'),
+    "the glyph registration must live behind the features gate"
+  );
+  assert.ok(
+    /if \(!\(\(j && j\.effective\) \|\| \{\}\)\.chorographyEnabled\) return;/.test(clientSource),
+    "the gate must fail-closed on the chorographyEnabled flag"
+  );
+  assert.ok(
+    clientSource.includes("chorography seat stays off"),
+    "a failed features fetch must leave the seat off, not guess"
+  );
+  assert.ok(
+    clientSource.includes('phase: "disabled"'),
+    "the disabled empty state must survive for layouts that still point at the wiki panel (#562 keeps main alive for exactly this)"
+  );
+  // wiki / kb 的 glyph 清理都随各自登记进了座位闸（cordis 上下文销毁时一并
+  // 回收）；panellist 回调的扫帚只剩记忆对 + 两个 main。
+  assert.ok(
+    /return \(\) => \{\s*disposeGlyph\(\);\s*disposeMain\(\);[\s\S]*?disposeWikiMain\(\);/.test(clientSource),
+    "the panellist cleanup must dispose the memory pair and wiki main, in order"
+  );
+});
+
+// 收尾档（P34）留下的边界：面板的「重建」触发点只接 T0（秒级同步回执）。
+// T1 后来按契约 §3.5 单开了自己的路由（/choro/t1 + 轮询），所以这里的
+// 「不上 HTTP」只对重建按钮成立，不再是整个面板的规矩——重建仍然是同步回执，
+// 锁三件事：按钮打到 /choro/run、rebuilding 态防连点、t1Loss/指引文案存在
+// （spec §3「现在生成」的落点 + M2 补洞的警告透出）。
+test("chorography wiki page exposes the rebuild action against /choro/run", () => {
+  assert.ok(
+    clientSource.includes('"/api/dsh-mneme/choro/run"'),
+    "the rebuild action must POST /choro/run (token-write route)"
+  );
+  assert.ok(
+    clientSource.includes("rebuilding: true"),
+    "the rebuild action must guard against double-fire while in flight"
+  );
+  assert.ok(
+    clientSource.includes("wiki.rebuild.hint"),
+    "the rebuild control must carry the hint that T1 stays on the CLI and enriched pages fall back"
+  );
+  assert.ok(
+    clientSource.includes("wiki.rebuild.done"),
+    "the receipt note must surface the rebuilt module/page counts"
+  );
+});
+
+// issue #607 正面修复：空态（phase === "no-repo"）以前只有一句「去跑 CLI」的
+// 纯文字，一个可点的东西都没有，而那句命令在 PATH 里根本不存在。回归表现：
+//  · 空态退回纯文字 → 用户第一次进这块只能自己去翻文档；
+//  · 命令示例写回裸 CLI 名 → 抄进终端就是 "command not found"；
+//  · 文案出现「cd 进目录」→ 命令收的是路径参数，cd 进去反而找不着仓库。
+test("#607: the no-repo empty state offers a clickable path-to-generate entry", () => {
+  assert.ok(
+    clientSource.includes("mneme-wikirunrow"),
+    "the no-repo empty state must render an input+button row, not a bare paragraph"
+  );
+  assert.ok(
+    clientSource.includes('t("wiki.empty.generate")'),
+    "the empty state must carry its own generate button label"
+  );
+  assert.ok(
+    clientSource.includes('t("wiki.empty.pathPlaceholder")'),
+    "the empty state must ask for the repository's absolute path (the CLI takes a path argument)"
+  );
+  // 命令要给绝对路径：dsh-mneme-choro 不在 PATH 里，裸名抄进终端必然找不到。
+  // 值里含转义引号（路径要用引号包住），所以逐字取到未转义的那个收尾引号。
+  const cmds = [...clientSource.matchAll(/"wiki\.empty\.cliCmd":\s*"((?:[^"\\]|\\.)+)"/g)].map((m) => m[1]);
+  assert.equal(cmds.length, 2, "wiki.empty.cliCmd must exist in both dictionaries");
+  for (const cmd of cmds) {
+    assert.ok(
+      cmd.includes("node ") && cmd.includes("dsh-mneme-choro.mjs"),
+      "the CLI example must be a node call on the bin script, got: " + cmd
+    );
+    assert.ok(cmd.includes("--apply"), "the example must carry --apply, otherwise it only previews");
+  }
+  // 收的是路径参数，不能教用户 cd 进目录：cd 进去再传 "." 又会因为命令不在
+  // PATH 里失败，这是 #607 报告里最常被踩的一步。判据落在两处：旧的「在仓库
+  // 目录里跑」这句必须消失；剩下的提及只允许是「不必先 cd」这种反例澄清。
+  const noRepos = [...clientSource.matchAll(/"wiki\.empty\.noRepo":\s*"((?:[^"\\]|\\.)+)"/g)].map((m) => m[1]);
+  assert.equal(noRepos.length, 2, "wiki.empty.noRepo must exist in both dictionaries");
+  for (const copy of noRepos) {
+    assert.equal(
+      /在仓库目录里跑|inside the repository|run this inside/i.test(copy),
+      false,
+      "the copy must not tell the user to run the command from inside the repository, got: " + copy
+    );
+    // #607 的三件事缺一不可：是什么、在哪里开、命令要给绝对路径。
+    assert.ok(copy.includes("mneme"), "the copy must say which plugin this belongs to");
+  }
+  const hints = [...clientSource.matchAll(/"wiki\.empty\.cliHint":\s*"((?:[^"\\]|\\.)+)"/g)].map((m) => m[1]);
+  assert.equal(hints.length, 2, "wiki.empty.cliHint must exist in both dictionaries");
+  for (const hint of hints) {
+    assert.ok(
+      /不必先 cd|no need to cd/i.test(hint),
+      "a mention of cd must be the explicit disclaimer, got: " + hint
+    );
+  }
+  assert.ok(
+    clientSource.includes('t("wiki.run.notGit")'),
+    "a not-git rejection must be translated into an explanation, not echoed as a bare code"
+  );
+});
+
+// 空态那条 POST 要带 path 字段（契约 §3.2）：老实现只认 repo，新实现认 path，
+// 两个都带上才能同时跑在两版后端上。回归表现：只发 repo → 第一次进来自报家门
+// 的目录永远登记不上。
+test("#607: generating from the empty state posts the absolute path to /choro/run", () => {
+  const fn = sliceComponent("WikiMainPanel");
+  assert.ok(/body = \{ path: p \}/.test(fn), "the run body must carry the path field");
+  assert.ok(fn.includes("body.repo = "), "the run body must still carry repo when one is already loaded");
+  assert.ok(fn.includes('"/api/dsh-mneme/choro/run"'), "both entry points share the token-write route");
+});
+
+// 失败也要能读懂（#607 的另一半：原文案把错误码直接糊在屏幕上）。
+// 后端把 wiki 层的 err.code "not-git" 翻成了对外契约的 "not-a-git-repo"，两个码
+// 都要认——只认一个就会出现「同一个失败，换个后端版本就只剩错误码」的半修状态。
+test("#607: run failures explain themselves instead of echoing a bare error code", () => {
+  const fn = sliceComponent("WikiMainPanel");
+  assert.ok(fn.includes('data.error === "not-git"'), "the wiki-layer code must still be understood");
+  assert.ok(fn.includes('data.error === "not-a-git-repo"'), "the public API code is the one the server actually sends");
+  assert.ok(fn.includes('t("wiki.run.notGit")'), "not-git must resolve to an explanation, not a code");
+  assert.ok(fn.includes('t("wiki.run.notAbsolute")'), "a relative path must say it has to be absolute");
+  assert.ok(fn.includes('t("wiki.run.notFound")'), "a missing directory must say so");
+
+  // 解释本身要讲清「为什么」：非 git 没有可比基线，且不含「cd 进目录」这类误导。
+  const notGit = clientSource.match(/"wiki\.run\.notGit":\s*"((?:[^"\\]|\\.)+)"/g) || [];
+  assert.equal(notGit.length, 2, "wiki.run.notGit must exist in zh and en");
+  for (const line of notGit) {
+    assert.ok(/git/.test(line), "the not-git copy must mention git");
+    assert.ok(/基线|baseline/.test(line), "the not-git copy must explain the missing baseline, i.e. why it is refused");
+  }
+});
+
+// 契约 §3.5-2：面板顶栏两枚子开关 + T1 长任务。
+//  · T1 是 30–240s 起步的长任务，POST 只负责起跑，进度必须靠轮询；
+//  · 轮询依赖取 jobId 而不是整个 t1 对象，否则每拍 setState 都把定时器拆了重建；
+//  · stale 的仓库要在行内标出来，否则用户以为页面和代码同步。
+test("choro page wires the two feature toggles, the T1 job and the stale marker", () => {
+  const fn = sliceComponent("WikiMainPanel");
+  assert.ok(fn.includes('toggleFlag("chorographyAutoRefresh")'), "the auto-refresh toggle must ride on chorographyAutoRefresh");
+  // 两枚都是「面板就地能改」的开关，不是只读回显：点一下要把同一个键 PUT 回 /features。
+  assert.ok(fn.includes('toggleFlag("chorographyT1FromPanel")'), "the T1 permission is its own toggle, not a read-only echo");
+  assert.ok(fn.includes('"/api/dsh-mneme/features"'), "toggling must write back through /features, not a local-only flag");
+  assert.ok(fn.includes('"/api/dsh-mneme/choro/t1"'), "the T1 button must POST /choro/t1");
+  assert.ok(fn.includes("/api/dsh-mneme/choro/t1/status?jobId="), "T1 progress must be polled from /choro/t1/status");
+  assert.ok(fn.includes("setInterval(tick, 2000)"), "the poll interval is 2s per contract §3.5");
+  assert.ok(fn.includes("clearInterval"), "the poller must be torn down when the job ends or the panel unmounts");
+  assert.ok(
+    fn.includes("mneme-badge--pending") && fn.includes('t("wiki.stale")'),
+    'stale repos need an inline "code changed" badge'
+  );
+});
+
+// 证据复核（Grounded Claims）：用 git diff 判「哪条结论被改动碰到了」。
+// 这条锁的是三件在屏幕上看不见但一错就骗人的事：
+//  · 三种结局（干净 / 基线找不到 / 比对失败）必须走三条分支，不能并成一句；
+//  · 四种命中原因各自有文案，尤其 touched 与 shifted 不许混成一个「失效」；
+//  · 「没算」不许长得像「没事」——#607 的病根就是把没做成说成做成了。
+test("claim evidence check reports three distinct outcomes instead of one reassuring blob", () => {
+  const fn = sliceComponent("WikiMainPanel");
+  assert.ok(fn.includes("/api/dsh-mneme/choro/claims?repo="), "the check must read the /choro/claims route");
+  // 手动触发，不进 useEffect：每次切页都跑 git diff 会把浏览拖慢，而且这个面板
+  // 第一次就自动跑的话，「没点过」和「点过没事」在屏幕上就长一个样了。
+  assert.ok(
+    !/useEffect\(\(\) => \{[^}]*checkDrift/.test(fn),
+    "the check must not run automatically on mount — an unasked check cannot be told apart from an unrun one"
+  );
+  for (const key of ["wiki.drift.clean", "wiki.drift.anchorStale", "wiki.drift.blocked", "wiki.drift.summary"]) {
+    assert.ok(fn.includes(`t("${key}")`), `each outcome needs its own sentence, missing ${key}`);
+  }
+  for (const key of ["wiki.drift.touched", "wiki.drift.shifted", "wiki.drift.deleted", "wiki.drift.unverifiable"]) {
+    assert.ok(fn.includes(`t("${key}")`), `each hit reason needs its own sentence, missing ${key}`);
+  }
+  // touched 与 shifted 分家：混成「失效」会让只是行号挪了的结论也被喊去重写。
+  assert.ok(
+    fn.includes('c.reason === "touched"') && fn.includes('c.reason === "shifted"'),
+    "touched and shifted must stay two verdicts"
+  );
+  // 正文有语义段、库里零条结论（T1 落盘非原子留下的残局）要单独说出来，
+  // 否则这页会永远显示成干净。
+  assert.ok(fn.includes('t("wiki.drift.inconsistent")'), "a page with prose but no claims must say so");
+  // 每页的条数挂在树里，用户不用先点开才知道哪页被改动碰到。
+  assert.ok(fn.includes("mneme-wikidriftn"), "the tree must carry a per-page count badge");
+
+  // 文案本身也要能区分「没算」与「没事」：干净那句必须提到 HEAD/基线，
+  // 失败那句必须提到失败——两者措辞相同就等于没区分。
+  const clean = [...clientSource.matchAll(/"wiki\.drift\.clean":\s*"((?:[^"\\]|\\.)+)"/g)].map((m) => m[1]);
+  const blocked = [...clientSource.matchAll(/"wiki\.drift\.blocked":\s*"((?:[^"\\]|\\.)+)"/g)].map((m) => m[1]);
+  assert.equal(clean.length, 2, "wiki.drift.clean must exist in both dictionaries");
+  assert.equal(blocked.length, 2, "wiki.drift.blocked must exist in both dictionaries");
+  for (const line of clean) {
+    assert.ok(/HEAD|基线|baseline/.test(line), "the clean copy must say what it compared against");
+  }
+  for (const line of blocked) {
+    assert.ok(/失败|failed/i.test(line), "the blocked copy must admit the comparison did not happen");
+  }
+  assert.notEqual(clean[0], blocked[0], "the two outcomes must not share copy");
+});
+
+// 自动刷新被主动跳过（仓库里有富化页）。这条锁的是「拒绝不许长得像失败」：
+// 服务端已经把 autoRefreshSkipped 与 autoRefreshError 分成两个字段，面板必须
+// 跟着分——合成一句「刷新失败」就是在报一个没发生过的故障，而真正的后果
+// （语义段还在、快照还是旧的）反而没人说。
+test("auto-refresh skip is shown as a standing reason, not as a failure toast", () => {
+  const fn = sliceComponent("WikiMainPanel");
+  assert.ok(fn.includes("autoRefreshSkipped"), "the panel must read the skip signal");
+  assert.ok(fn.includes("autoRefreshNote"), "the skip reason needs a visible home");
+  assert.ok(
+    !/autoRefreshError[^\n]*autoRefreshSkipped|autoRefreshSkipped[^\n]*autoRefreshError/.test(fn),
+    "skipped and error must not be merged into one branch"
+  );
+  // 提示条不能只在 toast 里：toast 2.5 秒就没了，而「为什么没刷」是一个
+  // 仍然成立的状态（库里还有富化页），用户回头还要能看到。
+  assert.ok(fn.includes("mneme-wikidriftbar") && fn.includes("state.autoRefreshNote"),
+    "the skip note must render as a bar, not a self-clearing toast");
+  const zh = [...clientSource.matchAll(/"wiki\.autoRefresh\.skipped":\s*"((?:[^"\\]|\\.)+)"/g)].map((m) => m[1]);
+  const en = zh.length;
+  assert.equal(en, 2, "wiki.autoRefresh.skipped must exist in both dictionaries");
+  assert.ok(/没.*做|没有做/.test(zh[0]), "the Chinese copy must say it did not happen");
+  assert.ok(!/失败/.test(zh[0]), "the skip copy must not claim a failure");
+  assert.ok(/skipped/i.test(zh[1]), "the English copy must say skipped");
+});
+
+// 知识库页（契约 §3.6）。这条锁的是「路由与就近文案都在」，不是布局：
+//  · 409/503 各有自己的空态，不把裸状态码丢屏幕上；
+//  · disabled 那句必须说清去哪儿开（#607 的教训：只说「未启用」等于没说）；
+//  · 地志页导入要拼绝对路径，根路径只从 /choro/repos 取，拿不到就停手。
+test("knowledge base page exposes the §3.6 routes and explains every empty state", () => {
+  const fn = sliceComponent("KbMainPanel");
+  for (const route of [
+    '"/api/dsh-mneme/kb/collections',
+    '"/api/dsh-mneme/kb/docs?collection=',
+    '"/api/dsh-mneme/kb/ingest"',
+    '"/api/dsh-mneme/kb/search"'
+  ]) {
+    assert.ok(fn.includes(route), "the knowledge base page must call " + route);
+  }
+  assert.ok(fn.includes('t("kb.empty.disabled")'), "409 must render the disabled explanation");
+  assert.ok(fn.includes('t("kb.empty.unavailable")'), "503 must render the unavailable explanation");
+  assert.ok(fn.includes('t("kb.empty.collections")'), "an empty collection list must explain what to do next");
+  assert.ok(fn.includes('t("kb.repo.noPath")'), "a missing rootPath must stop before composing a guaranteed 404");
+  // 后端 /choro/modules 曾只回 snake_case 的 page_rel_path，面板读 mod.relPath 恒 undefined，
+  // 于是「选完模块点导入」永远弹「请先选模块」——把后端缺陷说成用户没点（#607 同型）。
+  // 现在后端补了 relPath，缺字段时也必须落到独立的解释上，不许复用 pickFirst。
+  assert.ok(fn.includes('t("kb.repo.noRelPath")'), "a module without relPath needs its own explanation");
+  assert.ok(
+    !/if \(!relPath\) \{ patch\(\{ toast: t\("kb\.repo\.pickFirst"\) \}\); return; \}/.test(fn),
+    "a missing relPath must not be reported as 'pick a module first'"
+  );
+  assert.ok(fn.includes("kb/collections?key="), "deleting a collection addresses it by key");
+
+  // 文案本身锁一次：说清这是 mneme 的功能、开关在哪儿。
+  assert.ok(
+    clientSource.includes("设置 → 记忆(mneme) → 功能 → 扩展功能"),
+    "the Chinese disabled copy must name the exact toggle path"
+  );
+  assert.ok(
+    clientSource.includes("Settings → Memory (mneme) → Features → Extensions, turn on the knowledge base switch"),
+    "the English disabled copy must name the same path (group label is Extensions since v0.13)"
+  );
+});
+
+// 仓库卡片 + 一键整理（#607 反馈：希望「在这里选择整理知识」，照 Qoder Repo Wiki 那样）。
+// 这条锁四件事，都是「假成功」的高发点：
+//  · /choro/repos 的 409/503 不能并进「还没有仓库」，否则地志没开被说成用户没生成；
+//  · 批量整理的失败必须逐条留名（toast 2.5 秒就没了，名字一多读不完）；
+//  · 只有 relPath 存在的模块才去灌（没骨架页硬灌 = 一串 file-not-found）；
+//  · 手动入库降级为可折叠的高级入口，卡片才是首屏路径。
+test("knowledge base organises a whole repo from cards and never fakes a clean result", () => {
+  const fn = sliceComponent("KbMainPanel");
+  assert.ok(fn.includes('"/api/dsh-mneme/choro/repos"'), "the cards read the repo list (the only route with rootPath)");
+  assert.ok(fn.includes('"/api/dsh-mneme/choro/modules?repo="'), "organising needs each repo's page relative paths");
+  // 409/503 必须各走各的 reposPhase，不许落进空列表。
+  assert.ok(/status === 409[^}]*reposPhase: "disabled"/.test(fn), "409 must set reposPhase=disabled, not an empty list");
+  assert.ok(/status === 503[^}]*reposPhase: "unavailable"/.test(fn), "503 must set reposPhase=unavailable, not an empty list");
+  assert.ok(fn.includes('t("kb.repos.empty")'), "a genuinely empty repo list gets its own copy");
+  // 三档回执：新增 / 未变 / 失败，合并成一句「整理完成」就是假回声。
+  assert.ok(fn.includes('t("kb.repos.new")') && fn.includes('t("kb.repos.same")') && fn.includes('t("kb.repos.failedN")'),
+    "the batch receipt must report added, unchanged and failed separately");
+  assert.ok(fn.includes("organizeErrors"), "failed pages must stay on the page, not only in a 2.5s toast");
+  // 只灌有 relPath 的页。
+  assert.ok(/\.filter\(\(m\) => m\.relPath\)/.test(fn), "only modules with a relPath may be ingested");
+  // 高级入口：手动表单常驻，但折叠在按钮后面。
+  assert.ok(fn.includes("mneme-kbadvtoggle") && fn.includes('t("kb.advanced")'),
+    "manual ingest stays available behind one explicit toggle");
+  // 卡片上的「已整理 N/M」按当前集合的 relKey 前缀数，不额外打请求。
+  assert.ok(fn.includes("organizedCount") && fn.includes("state.docs"), "the organised count reads the loaded docs, not a new request");
+});
+
+// 知识库是第三个座位：id 与 main 的 key 必须逐字同名，否则宿主 selectPanel
+// 直接抛 "main panel ... is not registered"（#562 在记忆座位上踩过）。
+// #685（反转 #598 评论区 §四的另一半）：kb 的侧栏位置改成跟 kbEnabled 走，
+// 与 choro 同一形态；main 仍无条件——#562 那堵墙（布局里存着
+// activePanelId="dsh-mneme-kb" 时少注册 main，宿主 selectPanel 直接抛）。
+test("knowledge base sidebar entry follows kbEnabled; its main seat stays unconditional (#685)", () => {
+  assert.ok(clientSource.includes('id: "dsh-mneme-kb"'), "the kb sidebar seat must keep its own id");
+  assert.ok(clientSource.includes('key: "dsh-mneme-kb"'), "the kb main seat key must match the sidebar id verbatim");
+  assert.ok(clientSource.includes("h(KbMainPanel, { t })"), "the kb main seat must render KbMainPanel");
+  assert.ok(
+    clientSource.includes("h(KbGlyph, { size: props && props.size })"),
+    "the kb glyph takes its size from the host"
+  );
+  assert.ok(
+    clientSource.includes('"dsh-mneme: kb seat gate"'),
+    "the kb glyph registration must live behind its own features gate"
+  );
+  assert.ok(
+    /if \(!\(\(j && j\.effective\) \|\| \{\}\)\.kbEnabled\) return;/.test(clientSource),
+    "the gate must fail-closed on the kbEnabled flag"
+  );
+  assert.ok(
+    clientSource.includes("kb seat stays off"),
+    "a failed features fetch must leave the kb seat off, not guess"
+  );
+  // 侧栏图标不能留在 panellist 回调的无条件注册里——那正是 #685 报的形态。
+  const gateStart = clientSource.indexOf('ctx.slots.inject("sidebar.panellist"');
+  const gateEnd = clientSource.indexOf("mountFooterSeat();", gateStart);
+  const panellistBlock = gateStart === -1 || gateEnd === -1 ? "" : clientSource.slice(gateStart, gateEnd);
+  assert.ok(panellistBlock.length > 0, "the panellist injection block must still exist");
+  assert.ok(
+    panellistBlock.includes('key: "dsh-mneme-kb"'),
+    "the kb main seat must stay in the unconditional panellist block (#562)"
+  );
+  assert.ok(
+    !/id:\s*"dsh-mneme-kb"/.test(panellistBlock),
+    "the kb sidebar glyph must not be registered unconditionally anymore (#685)"
+  );
+  // kb glyph 的清理随登记进了座位闸；panellist 的扫帚只剩记忆对 + 两个 main。
+  assert.ok(
+    /return \(\) => \{\s*disposeGlyph\(\);\s*disposeMain\(\);[\s\S]*?disposeWikiMain\(\);\s*disposeKbMain\(\);/.test(clientSource),
+    "the panellist cleanup must dispose the memory pair and both main seats (the glyphs live in their gates)"
+  );
+  assert.ok(!clientSource.includes("disposeKbGlyph"), "the unconditional kb glyph dispose must be gone with the seat itself");
+});
+
+// v0.11.1 美化：文件清单的竖线等宽行换成真 table（用户实测反馈「文件名排列
+// 太难看」）。锁渲染器三件事：真 <table>、分隔行（--- | ---:）按对齐元数据消费
+// 而不是画成可见行、数字列右对齐。回归表现：改回竖线等宽行画法 → 红在缺 table。
+test("chorography wiki page renders markdown tables as real aligned tables", () => {
+  assert.ok(
+    clientSource.includes("mneme-wikitable"),
+    "the markdown renderer must emit real table elements"
+  );
+  assert.ok(
+    clientSource.includes("isSepRow"),
+    "the separator row (--- | ---:) must be consumed as alignment metadata, not rendered"
+  );
+  assert.ok(
+    clientSource.includes("mneme-wikinum"),
+    "numeric columns (行数) must be right-aligned via the alignment marker"
+  );
+});
+
+// 上一条锁的是「代码里有没有这两套座位」，这条锁「装/卸真的按条件跑」。
+// 回归表现（都靠字符串锁抓不到）：
+//  · 新宿主上两套都装 → 侧栏两颗记忆入口；
+//  · 宿主先声明 panellist、后来撤掉/换形态 → 回落不装回来，入口整个消失；
+//  · 回落被重复装入 → footer 里叠两个按钮；
+//  · 卸载 panellist 座位时忘了连带卸 main → 侧栏没图标但 activePanelId 仍指向
+//    一个已死面板（宿主 retainMainPanels 会把它复位成会话，界面上看不出来，
+//    但用户的「回到记忆库」状态被悄悄清掉）。
+test("panel seats: the fallback mounts and unmounts with the host's declaration", () => {
+  // 匹配范围必须一直吃到最后一条 inject 的收尾：非贪婪到第一个 \n      });
+  // 会停在 panellist 那段的中途，footer 回落根本进不了沙箱，测出来的永远不会红。
+  const src = clientSource.match(/const hostHasPanelSeat = \(\) =>[\s\S]*?ctx\.slots\.inject\("sidebar\.footer\.action"[\s\S]*?\n      \}\);/);
+  assert.ok(src, "the seat block must be extractable verbatim");
+  const boot = new Function("ctx", "t", "h", `${src[0]}\n return { hostHasPanelSeat };`);
+  const makeCtx = (specFor) => {
+    const regs = [];
+    const ctx = {
+      slots: {
+        spec: (key) => specFor(key),
+        inject: (key, cb) => { ctx.injected.push({ key, cb }); return () => {}; },
+        register: (opts, comp) => {
+          const rec = { opts, comp, alive: true };
+          regs.push(rec);
+          return () => { rec.alive = false; };
+        }
+      },
+      injected: []
+    };
+    return { ctx, regs };
+  };
+  const alive = (regs, name) => regs.filter((r) => r.alive && r.opts.name === name).length;
+
+  // 宿主只在「那个槽已被声明」时才跑 inject 的回调，所以这里也只在对应的
+  // spec 存在时点火：一把全点会把新座位的注册塞进老宿主，测出来的就不是真行为。
+  const fire = (ctx, key) => ctx.injected.filter((i) => i.key === key).map((i) => i.cb());
+
+  // 新宿主：panellist 已声明。panellist 里只剩记忆一份图标（wiki 自 #598、
+  // 知识库自 #685 都改成各自 features 闸里的按需注册），main 三份（记忆 +
+  // chorography + 知识库）无条件——#562 的墙；footer 回落不装。
+  // 日记本原有第四对座位，2026-11-09 按桉桉要求撤掉——它现在是记忆面板内的
+  // 一个标签页，与人格页并列，不再占侧边栏；人格页同理（面板内标签页，不是座位）。
+  {
+    const { ctx, regs } = makeCtx((key) => (key === "sidebar.panellist" ? { kind: "list" } : undefined));
+    const api = boot(ctx, (k) => k, () => null);
+    assert.equal(api.hostHasPanelSeat(), true);
+    const disposes = fire(ctx, "sidebar.panellist");
+    fire(ctx, "sidebar.footer.action");
+    assert.equal(disposes.length, 1);
+    const ids = (name) => regs.filter((r) => r.alive && r.opts.name === name).map((r) => r.opts.id ?? r.opts.key).sort();
+    assert.equal(alive(regs, "sidebar.panellist"), 1, "memory glyph only — the wiki and kb glyphs are feature-gated (#598, #685)");
+    assert.deepEqual(ids("sidebar.panellist"), ["dsh-mneme"], "the only unconditional sidebar glyph is the memory entry");
+    assert.equal(alive(regs, "main"), 3, "memory + wiki + kb pages — wiki main stays unconditional (#562)");
+    assert.deepEqual(ids("main"), ["dsh-mneme", "dsh-mneme-kb", "dsh-mneme-wiki"], "main key 与侧栏 id 逐字同名（wiki 的 main 无条件保留，#562）");
+    assert.equal(alive(regs, "sidebar.footer.action"), 0, "the footer fallback must not mount on a host that has the seat");
+  }
+
+  // 老宿主：没有 panellist。回落必须装上，且只装一份。
+  {
+    const { ctx, regs } = makeCtx(() => undefined);
+    const api = boot(ctx, (k) => k, () => null);
+    assert.equal(api.hostHasPanelSeat(), false);
+    fire(ctx, "sidebar.footer.action");
+    assert.equal(alive(regs, "sidebar.panellist"), 0);
+    assert.equal(alive(regs, "main"), 0);
+    assert.equal(alive(regs, "sidebar.footer.action"), 1, "old hosts keep exactly one footer entry");
+  }
+
+  // 座位消失：卸载 panellist 之后回落必须自己装回来，否则那台宿主上没有入口。
+  // 真实顺序是「声明先没了（spec 变 undefined），再把 entry 的 disposer 跑掉」，
+  // 所以这里要让 spec 跟着一起变——判据读的是当下这次 spec()，不是启动时那次。
+  {
+    let declared = true;
+    const { ctx, regs } = makeCtx(() => (declared ? { kind: "list" } : undefined));
+    boot(ctx, (k) => k, () => null);
+    const disposes = fire(ctx, "sidebar.panellist");
+    assert.equal(alive(regs, "sidebar.footer.action"), 0);
+    declared = false;
+    disposes.forEach((d) => d());
+    assert.equal(alive(regs, "sidebar.panellist"), 0);
+    assert.equal(alive(regs, "main"), 0, "unmounting the seat must tear down the main panel too");
+    assert.equal(alive(regs, "sidebar.footer.action"), 1, "the fallback must come back when the seat disappears");
+  }
+});
+
+// 侧栏那颗 glyph 是「宿主面板行里的图标」，不是按钮：宿主 PanelRow 已经渲染
+// button + aria-label + Tooltip + aria-current，插件再套一层按钮就会出现两颗
+// 可聚焦元素（Tab 停两次，读屏报两次），而且我们这层的 onClick 还得自己去调
+// layout.selectPanel —— 那是宿主自己的活。
+// 主面板同理不自带「回到会话」：宿主 openSession / 新建会话都走 selectPanel(null)，
+// 用户点侧栏任何会话行就回去了（baleen 也不做这颗按钮）。
+function sliceComponent(name) {
+  const start = clientSource.indexOf("    function " + name + "(");
+  assert.notEqual(start, -1, name + " must exist as a component");
+  // 组件体到下一个「四空格缩进的 }」为止：与本文件 :3060 那条静态扫描同一套缩进约定。
+  const end = clientSource.indexOf("\n    }", start);
+  assert.notEqual(end, -1, name + " must be a plain function component");
+  return clientSource.slice(start, end + 7);
+}
+
+test("panel seats hand the host a glyph and a page, not a second button or a close affordance", () => {
+  const glyph = sliceComponent("SidebarPanelGlyph");
+  assert.equal(/h\("button"/.test(glyph), false,
+    "the sidebar glyph must not render its own button (the host panel row owns it)");
+  assert.ok(glyph.includes("mneme-paneliglyph"),
+    "the glyph needs its own root class to carry the conflict badge and the semantic color layer");
+  assert.ok(glyph.includes("h(ConflictBadge, { pending })"),
+    "the panel-list entry must keep the pending-conflict badge");
+
+  const main = sliceComponent("MnemeMainPanel");
+  assert.ok(main.includes("h(MemoryExplorer, { t })"),
+    "the center-column page must reuse the same MemoryExplorer");
+  assert.ok(main.includes('className: "mneme-panel"'),
+    "the page needs the fill container (the host main slot only gives min-width:0 + overflow:hidden)");
+  // 面板切换归宿主：PanelRow 点一下就是 layout.selectPanel(id)，openSession /
+  // 新建会话又都是 selectPanel(null)。插件自己再调一次会把用户的导航意图打断
+  // （宿主那边 selectPanel 还会 abort 当前 navigation）。
+  assert.equal(clientSource.includes("ctx.layout.selectPanel"), false,
+    "the plugin must never call layout.selectPanel — the host row and openSession already do");
+});
+
+// The tab era is over: the in-conversation memory tab fought the floating
+// composer and squeezed the session layout, so the library no longer
+// registers as a conversation view. The sidebar entry opens the centered
+// sheet directly — from any state, including the new-chat hero screen. A
+// dialog role stays banned either way.
+test("sidebar entry opens the sheet; conversation-view tab stays retired", () => {
+  assert.equal(
+    clientSource.includes("role: \"dialog\""),
+    false,
+    "no dialog surface should remain"
+  );
+  assert.ok(
+    /function openLibrary\(\) \{\s*setOverlayOpen\(true\);/.test(clientSource),
+    "the entry must open the overlay directly (no tab activation)"
+  );
+  assert.ok(
+    clientSource.includes("conflictBadgeCount.refresh();"),
+    "opening the library must re-read the conflict count (badge must not show a stale number)"
+  );
+  assert.equal(
+    clientSource.includes('ctx.slots.inject("conversation.view"'),
+    false,
+    "the conversation.view tab must stay retired"
+  );
+  assert.equal(
+    clientSource.includes("activateExplorerTab"),
+    false,
+    "the tab-click activation machinery must be gone"
+  );
+});
+
+// The sheet is deliberately NOT fullscreen: a dimmed backdrop plus a rounded
+// panel capped at 1180×880 keeps the conversation visible behind it. It
+// reuses the full MemoryExplorer and closes on Esc, the close button, or a
+// backdrop click.
+test("memory library opens as a centered sheet with backdrop", () => {
+  assert.ok(
+    clientSource.includes(".mneme-backdrop{position:fixed;inset:0"),
+    "a dimmed backdrop must sit behind the sheet"
+  );
+  assert.ok(
+    /\.mneme-overlay\{position:fixed;z-index:1000;left:50%;top:50%;transform:translate\(-50%,-50%\)/.test(clientSource),
+    "the sheet must be centered, not viewport-filling"
+  );
+  assert.ok(
+    clientSource.includes("width:min(1240px,calc(100vw - 88px))"),
+    "the sheet must not occupy the full width and keeps friendly margins"
+  );
+  assert.ok(
+    clientSource.includes('h(MemoryExplorer, { t })'),
+    "the sheet renders the same MemoryExplorer component"
+  );
+  assert.ok(
+    clientSource.includes('e.key === "Escape"'),
+    "Esc must close the sheet"
+  );
+  assert.ok(
+    clientSource.includes('className: "mneme-backdrop"'),
+    "the backdrop is a clickable close surface"
+  );
+  assert.ok(
+    clientSource.includes('"memory.overlay.close"'),
+    "the close affordance keeps its localized label"
+  );
+});
+
+// #597：分类栏与页头的数字源必须来自服务端（typeCounts / total）——浏览页被
+// type 筛过又分了页，页内现数两头都数不出真分布：选中一类后其它类计数为 0 被
+// filter 整条滤掉（分类栏塌剩两枚），页头停在已加载行数（滚动一次后恒 200）。
+// 降级路径必须同时在：老服务端没有 typeCounts 时退回页内现数，功能不炸。
+test("explorer counts read the server distribution with an in-page fallback (#597)", () => {
+  assert.ok(
+    clientSource.includes("setTypeCounts(d.typeCounts || null)"),
+    "the browse fetch must capture the server distribution"
+  );
+  assert.ok(
+    clientSource.includes("for (const k of EXPLORER_TYPES) counts[k] = typeCounts[k] || 0"),
+    "the type rail must read the server distribution (missing types are 0, never collapse)"
+  );
+  assert.ok(
+    clientSource.includes("for (const m of items) counts[m.type] = (counts[m.type] || 0) + 1"),
+    "the in-page fallback must stay for servers without typeCounts"
+  );
+  assert.ok(
+    clientSource.includes("String(allCount)"),
+    "the all chip must use the distribution sum, not the loaded page length"
+  );
+  assert.ok(
+    /String\(remoteItems \? visible\.length : total\)/.test(clientSource),
+    "the header count must use the server total in browse mode (not visible.length)"
+  );
+});
+
+// The sidebar hands each entry only its column state: a wide row (icon +
+// label) when expanded, a bare rail icon when collapsed — for both the
+// portalled top button and the footer fallback.
+test("trigger renders a wide row or a rail icon from the wide flag", () => {
+  assert.ok(
+    /wide \? "mneme-trigger" : "mneme-trigger mneme-rail"/.test(clientSource),
+    "trigger must branch on the wide flag"
+  );
+  assert.ok(
+    /wide && h\("span", \{ className: "mneme-trigger-label" \}/.test(clientSource),
+    "the label span must render only when wide"
+  );
+  assert.ok(
+    /size: wide \? 16 : 18/.test(clientSource),
+    "the portalled icon must follow the host panel-row size (16) and the rail size (18)"
+  );
+});
+
+// 入口的两态形状（宿主内核 0.2 侧边栏改版后重写，见 lib/client.js 的
+// SidebarTopEntry 头注释）：
+//  · 展开：混进宿主 nav.panelList 里「插件 / 自动化任务」那一组，套用宿主
+//    panelRow 的实时类名 → 一颗低调面板行，不再是第二个高亮「新会话」按钮；
+//  · 收起：宿主把面板列表整组 display:none，只有 fixed 到标题栏的开关与
+//    「新会话」还可见，所以入口必须搬回那个位置（见下一条用例）。
+// 本用例锁「展开态借的是宿主面板行」，回归表现是入口退回成大按钮或落回
+// 新会话行后面变成孤立项。
+test("sidebar entry portals into the host panel list with footer fallback", () => {
+  assert.ok(
+    clientSource.includes('ctx.slots.inject("sidebar.footer.action"'),
+    "the footer slot registration must stay as anchor + fallback"
+  );
+  assert.ok(
+    clientSource.includes("SidebarTopEntry"),
+    "the portalled top entry must exist"
+  );
+  assert.ok(
+    clientSource.includes(`'[class*="regionArea"]'`),
+    "the portal must anchor at the host's regionArea container"
+  );
+  assert.ok(
+    clientSource.includes(`'[class*="panelList"]'`),
+    "the wide shape must target the host panel list (the 插件 / 自动化任务 group)"
+  );
+  assert.ok(
+    clientSource.includes(`'[class*="panelRow"]:not(.mneme-topentry-native)'`),
+    "the panel-row class must come from a host row, never from our own portalled button"
+  );
+  assert.ok(
+    clientSource.includes("list.appendChild(created)"),
+    "the wide entry must be appended into that group, below the host's own entries"
+  );
+  assert.ok(
+    clientSource.includes("insertBefore(created, target)"),
+    "the entry must keep the idempotent place() helper for hosts without a panel list"
+  );
+  assert.ok(
+    clientSource.includes("if (!host) return fallback;"),
+    "the portal entry persists across collapse (no footer jump); footer fallback only covers portal failure"
+  );
+  assert.ok(
+    clientSource.includes('"memory.view.label"'),
+    "the sheet aria-label must come from the memory.view.label dictionary key"
+  );
+});
+
+// Issue #573：宿主 0.2.2 起把面板列表的「更多」行（PanelMoreMenu）也追加进同一个
+// nav.panelList，于是组尾不再是面板行。仍按「追加到组尾」落位时，入口会排到
+// 「更多」下面，菜单一展开就把入口盖住——用户看到的是「记忆入口不见了」。
+// 回归表现：入口掉到「更多」之后、或展开菜单后入口被遮。
+// 落位改成「插在『更多』之前」，判据与其余几处一致走 [class*=] 前缀，不写死
+// 宿主哈希类名；老宿主没有该行时必须原样退回追加组尾，不能整块不落位。
+test("sidebar entry lands above the host's More row, not below it", () => {
+  assert.ok(
+    clientSource.includes(`list.querySelector('[class*="moreAnchor"]')`),
+    "the More row must be located by class prefix like every other host class"
+  );
+  assert.ok(
+    clientSource.includes("list.insertBefore(created, more)"),
+    "the wide entry must insert before the More row so the expanded menu cannot cover it"
+  );
+  assert.ok(
+    clientSource.includes("created.nextElementSibling === more"),
+    "placement must stay idempotent against the More anchor so the observer never writes on steady state"
+  );
+  // 老宿主没有「更多」行：追加组尾的分支必须还在，否则那些宿主上入口根本不落位。
+  assert.ok(
+    clientSource.includes("created === list.lastElementChild"),
+    "hosts without a More row must keep the append-to-tail fallback"
+  );
+});
+
+// Issue #130: ecosystem plugins (task board, skill explorer, …) inject their
+// own entries right after the New-Session row, and late inserters land above
+// earlier ones — a fixed "before regionArea" slot degrades into the tail of
+// that group, detaching the memory button from its familiar top spot. The
+// entry therefore (a) resolves the same anchor as the ecosystem's shared
+// sidebar-entry-core (logoRow row, legacy direct-child button), (b) re-asserts
+// its slot from the existing observer, and (c) stays idempotent — the anchor
+// check short-circuits before any DOM write, so observers never ping-pong.
+test("entry re-asserts its slot against ecosystem entries", () => {
+  assert.ok(
+    clientSource.includes(`btn.closest('[class*="logoRow"]')`),
+    "the anchor must resolve the New-Session logo row like the ecosystem core"
+  );
+  assert.ok(
+    clientSource.includes("const target = anchor ? anchor.nextSibling : region;"),
+    "the entry must sit right after the New-Session row, falling back before regionArea"
+  );
+  assert.ok(
+    clientSource.includes("if (created.parentElement === parent && created.nextSibling === target) return;"),
+    "placement must be idempotent so the observer never writes on steady state"
+  );
+  assert.ok(
+    /place\(cur\);\s*\n\s*sync\(cur\);/.test(clientSource),
+    "the observer must re-place the entry and re-read its classes on childList churn"
+  );
+});
+
+// 用户实测确认的遮挡 bug（v0.8.10）：收起侧边栏时入口沿用宿主给「新会话」的
+// left:48px，正好压在「新会话」图标上把它盖掉，左上角只剩两颗图标。
+// 修法：不再共用那个 left，用一条更具体的规则推到 84px（「新会话」右侧 =
+// 宿主 48px + 钮宽 28px + 间距 8px），并把宿主的面板菜单变量
+// --dsh-windows-menu-start（宿主收起态自己设 84px）顺延到 120px。
+// 回归表现：左上角少一颗图标，或「应用 / 编辑」与记忆图标叠在一起。
+test("collapsed entry vacates the New-Session slot instead of covering it", () => {
+  assert.ok(
+    clientSource.includes("html[data-windows-titlebar] .mneme-topentry .mneme-topentry-rail{left:84px}"),
+    "the collapsed entry must sit right of the host's 48px New-Session slot"
+  );
+  assert.ok(
+    // 源码里这段 CSS 含转义引号（注入 <style> 后才还原成普通引号），断言按源码字面量写。
+    clientSource.includes(':has([data-plugin-entry=\\"@modusensus/dsh-mneme\\"]){--dsh-windows-menu-start:120px}'),
+    "the caption menu must shift right so the memory icon never overlaps 应用 / 编辑"
+  );
+  assert.ok(
+    clientSource.includes(":has([data-sidebar-collapsed=true]):has("),
+    "the menu shift must apply only while the sidebar is collapsed"
+  );
+  assert.ok(
+    clientSource.includes("`${cls.row} mneme-topentry-rail`.trim()"),
+    "the collapsed button carries the host New-Session class plus our rail offset rule"
+  );
+});
+
+// 宿主面板行的类名带着激活态修饰类（.xxx_panelActive），而我们的入口不是
+// panel 插槽的成员、永远不该常亮；照抄整串类名会让记忆入口跟着宿主当前选中
+// 的面板一起高亮。这里锁「读类名时必须剔掉激活态」。
+test("panel-row highlight never leaks onto the memory entry", () => {
+  assert.ok(
+    clientSource.includes('!name.includes("panelActive")'),
+    "panelActive must be filtered out of the copied host row classes"
+  );
+});
+
+// Three alignment/softness guarantees born from field feedback: (a) the
+// portalled entry re-reads the live host classes on every mutation — the host
+// and skins rewrite hashed class names asynchronously, so a mount-time snapshot
+// goes stale (收起态尤其依赖这条：搬迁后类名必须重新对齐宿主「新会话」按钮),
+// (b) it never hardcodes a width, so whichever host class it carries decides the
+// box model, (c) the toolbar dropdown escapes the transform stacking trap — the
+// container needs the z-index because transform creates the context.
+test("entry re-reads the live host classes and lifts the toolbar dropdown", () => {
+  assert.ok(
+    clientSource.includes("new MutationObserver"),
+    "the entry must re-sync the copied class via MutationObserver"
+  );
+  assert.ok(
+    clientSource.includes('attributeFilter: ["class"]'),
+    "the observer must watch class attribute changes"
+  );
+  assert.doesNotMatch(
+    clientSource,
+    /\.mneme-topentry-native\{(?:[^}]*;)?width:/,
+    "the entry must use the native button width, which reserves its horizontal margins"
+  );
+  assert.ok(
+    clientSource.includes(".mneme-topentry{display:flex;flex-direction:column;position:relative}"),
+    "the entry wrapper must stretch the native button within a column flex layout (position:relative hosts the #177 badge)"
+  );
+  assert.equal(
+    clientSource.includes(".mneme-topentry-native .mneme-topentry-label{flex:1;min-width:0;text-align:left;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}"),
+    false,
+    "the old left-aligned label override must go; native centering applies"
+  );
+  assert.ok(
+    /\.mneme-xtools\{[^}]*z-index:3\}/.test(clientSource),
+    "the toolbar container must carry z-index:3 (sticky month header is 2, drawer 6)"
+  );
+});
+
+// Importance renders as Lucide star glyphs (the morphicons-paired data set;
+// the runtime cannot require the ESM-only morphicons engine, so the path
+// ships inline like the other stroke icons). Raw text stars are fully
+// retired: the drawer's edit-mode <option> select used to keep "★".repeat
+// labels (SVG cannot render inside <option>) — it is now the SVG star
+// button row, and the inline indicators (importance chips / entity meta /
+// inject preview) share the same StarGlyph, so every star in the panel has
+// one shape. (用户反馈：文本 ★ 过尖、与卡片 SVG 星不统一。)
+test("importance renders as star glyphs, not raw text stars", () => {
+  assert.ok(
+    clientSource.includes("STAR_PATH_D"),
+    "the Lucide star path data must be inlined"
+  );
+  assert.ok(
+    clientSource.includes("const ImportanceStars"),
+    "the star-row component must exist"
+  );
+  assert.equal(
+    (clientSource.match(/★/g) || []).length,
+    0,
+    "no raw text star may remain anywhere — every star renders through the shared SVG path"
+  );
+  assert.ok(
+    /h\(ImportanceStars, \{ className: "mneme-dmetaval"/.test(clientSource),
+    "the drawer detail must render the star row"
+  );
+  assert.ok(
+    /h\(ImportanceStars, \{ value: m\.importance/.test(clientSource),
+    "the card foot must render the star row"
+  );
+  assert.ok(
+    /className: "mneme-staredit"/.test(clientSource),
+    "the drawer edit importance must be the SVG star button row, not a text-star <select>"
+  );
+  assert.ok(
+    /h\(StarGlyph, \{ size: 11 \}\)/.test(clientSource),
+    "inline star indicators must go through the shared StarGlyph"
+  );
+});
+
+// better-sidebar ecosystem integration is an optional capability (official
+// external-plugin-guide §2.2): 'betterSidebar' IS declared in inject (DSH's
+// runtime gates ctx property access on the inject declaration — probing
+// without declaring fails the whole loader entry, verified in the field) and
+// better-sidebar 软集成（issue #88 修正）：模块级 inject 声明 betterSidebar
+// 是硬等待——未安装 bs 的环境整个 entry pending（"1 entry did not activate"，
+// Failed to load plugins）。正确模式（dsh-server-deck 同款）：外层入口零
+// inject 立即激活（独立模式保底），tab 注册挂在内层动态子插件
+// ctx.plugin({ inject: ['betterSidebar'] }) 由 cordis 原生等待服务——bs 未装
+// 时该内层 fiber 永远 INACTIVE，静默无害。
+test("better-sidebar tab mounts via an inner sub-plugin, standalone mode intact", () => {
+  assert.ok(
+    /const reg = bsCtx\.betterSidebar;[\s\S]{0,60}typeof reg\.registerTab !== "function"/.test(clientSource),
+    "the inner apply must still guard the service shape before registering"
+  );
+  assert.ok(
+    /(?:const TAB_ID = |id: )"dsh-mneme:memory"/.test(clientSource),
+    "the registered tab id must be package-prefixed"
+  );
+  assert.ok(
+    /title: \(\) => t\("memory\.view\.label"\)/.test(clientSource),
+    "the tab title must reuse the localized 记忆库 label"
+  );
+  assert.ok(
+    /component: \(\) => h\(MemoryExplorer, \{ t \}\)/.test(clientSource),
+    "the tab must reuse the MemoryExplorer views"
+  );
+  assert.ok(
+    clientSource.includes('"dsh-mneme: better-sidebar tab"'),
+    "the registration effect must carry a named label for scope cleanup"
+  );
+  // issue #88：模块级 inject 声明 betterSidebar 是硬等待——未安装 bs 的环境
+  // 整个 entry pending（"1 entry did not activate"）。tab 注册必须挂在内层
+  // 动态子插件（dsh-server-deck 同款模式），外层入口零 inject 立即激活。
+  assert.ok(
+    /const inject = \["slots", "locale"\]/.test(clientSource),
+    "the module inject must not declare betterSidebar (hard-wait regression)"
+  );
+  assert.ok(
+    /ctx\.plugin\?\.\(\{[\s\S]*?inject: \["betterSidebar"\][\s\S]*?apply: \(bsCtx\) =>/.test(clientSource),
+    "the tab registration must live in an inner dynamic sub-plugin waiting on cordis"
+  );
+  assert.ok(
+    /if \(\+\+tries <= 10\) timer = setTimeout\(attempt, 1000\);/.test(clientSource) === false,
+    "the old 10×1s probe must go — cordis waits for the inner inject natively"
+  );
+});
+
+// The graph toggle must not read as "share": the primitives share icon is
+// banned and a custom node-graph glyph takes its place.
+test("graph toggle uses a node-graph glyph, not the share icon", () => {
+  assert.equal(
+    clientSource.includes("IconShareOutline16"),
+    false,
+    "IconShareOutline16 reads as share and must not appear"
+  );
+  assert.ok(
+    clientSource.includes("GraphNodesIcon"),
+    "the custom node-graph icon must back the graph toggle"
+  );
+});
+
+// #287 的成因已经不存在了，但那条教训要留着：当年的崩法是「宿主图标名换代 →
+// 取到 undefined → h(undefined) 即 React #130，整个 slot entry 崩掉」。现在的解法
+// 不是继续探测多代名字，而是**不再依赖宿主图标库**——插件自己画 mneme mark。
+// 这条用例锁三件事：(a) 客户端里不再有对宿主 IconArchive* 名字的探测（回到探测
+// 就等于把 #287 那类耦合请回来）；(b) mark 走一个内联 SVG 组件、自带路径常量；
+// (c) 四个入口共用同一个 helper，避免某处漏改又出现"归档盒"。
+test("mneme mark is self-drawn: no host icon-name probing left (#287 root cause)", () => {
+  assert.equal(
+    /primitives\.IconArchiveOutline(20|Regular|Medium)/.test(clientSource),
+    false,
+    "the client must not probe host archive glyph names any more"
+  );
+  assert.ok(
+    /const MNEME_MARK_D = "M[^"]+"/.test(clientSource),
+    "the mark must carry its own path constant"
+  );
+  assert.ok(
+    clientSource.includes('viewBox: "0 0 16 16"') && clientSource.includes('stroke: "currentColor"'),
+    "the mark must follow the host icon spec (16 grid, currentColor) so it reads as first-party"
+  );
+  assert.ok(
+    /const renderMnemeMark = \(props\) => h\(MnemeMark, props\)/.test(clientSource),
+    "the mark must render through one shared helper"
+  );
+  for (const site of [
+    "renderMnemeMark({ size: 15 })",              // 浮层标题栏
+    "renderMnemeMark({ size: wide ? 16 : 18 })",  // 侧栏 trigger + portal 入口（面板行档 16 / 标题栏档 18）
+    "renderMnemeMark({ size })"                   // better-sidebar tab 图标
+  ]) {
+    assert.ok(clientSource.includes(site), `every render site must go through the helper: ${site}`);
+  }
+  assert.equal(
+    /renderArchiveIcon/.test(clientSource),
+    false,
+    "the retired archive-glyph helper must be gone, not left as a second path"
+  );
+});
+
+// 插件列表那颗图标由宿主从 package.json 的 `icon` 读：必须是**包内相对路径**、
+// 落在 files 白名单里、且宿主只接受 SVG/PNG/JPEG/WebP ≤256KiB。
+// 宿主 `iconOf()` 的硬规则：绝对路径或带 scheme 直接报错、realpath 后不许跑出
+// manifest 目录、超 256KiB 报错；缺文件/坏文件时静默回落成通用插画（等于用户
+// 看到的不是自家图标）。这里把可静态检的部分全锁住。
+test("plugin-list icon: declared, in-package, and shipped in files", () => {
+  const icon = pkg.icon;
+  assert.equal(typeof icon, "string", "package.json must declare an icon");
+  assert.equal(icon, "assets/icon.png", "the icon must be the shipped brand avatar");
+  assert.ok(!/^([A-Za-z]:|[A-Za-z][A-Za-z\d+.-]*:)/.test(icon), "the icon must be a relative path (host rejects absolute/URL)");
+  assert.ok(pkg.files.includes("assets"), "the assets dir must ship, or the published package has no icon");
+  const file = join(root, icon);
+  assert.ok(existsSync(file), `the declared icon must exist: ${icon}`);
+  const bytes = readFileSync(file);
+  assert.ok(bytes.length > 0 && bytes.length <= 256 * 1024, "the icon must be a non-empty file under the host's 256 KiB cap");
+  // 位图取代了手绘 SVG mark：宿主只按扩展名收位图，坏文件会静默回落成通用插画，
+  // 所以直接把 PNG 结构验到底——魔数、IHDR 边长、位深与 RGBA 通道。
+  assert.equal(bytes.subarray(0, 8).toString("hex"), "89504e470d0a1a0a", "the icon must be a real PNG");
+  assert.equal(bytes.readUInt32BE(16), 256, "the icon must be 256 px wide");
+  assert.equal(bytes.readUInt32BE(20), 256, "the icon must be 256 px tall");
+  assert.equal(bytes[24], 8, "the icon must be 8-bit");
+  // 圆角必须是真的透明而不是涂白，否则浅底/深底主题下都会露出方角。
+  assert.equal(bytes[25], 6, "the icon must be RGBA so the rounded corners stay transparent");
+});
+
+// 插件列表的标题/描述读包内的 `locale/<语言码>.json`：宿主 readPluginMeta 先解析
+// `<specifier>/locale/en.json`，再遍历同目录的每个 *.json（文件名必须过语言码正则），
+// 取 meta.title / meta.description；一个都读不到就回落到 package.json 的 name——
+// 也就是裸包名 "@modusensus/dsh-mneme"（用户看到的现状）。
+// ⚠️ 真正的门槛是**能否被 Node 解析**：宿主用 ESM resolver 取这个文件，而 exports
+// 字段会把没列出的子路径**全部挡掉**，且 optionalResourcePath 对"读不到"是静默的
+// （返回 undefined 继续走回落），不报错。所以少了 "./locale/*" 这一行，文件乖乖躺在
+// 包里也永远不生效——这条回归极难靠肉眼发现，必须锁死。
+test("plugin-list title/description are localized through locale/*.json", () => {
+  assert.ok(
+    Object.keys(pkg.exports).includes("./locale/*"),
+    "exports must expose ./locale/* or the host resolver silently never reads the dictionaries"
+  );
+  assert.ok(pkg.files.includes("locale"), "the locale dir must ship in files, or the published package loses it");
+  const dir = join(root, "locale");
+  assert.ok(existsSync(dir), "locale/ must exist");
+  const files = readdirSync(dir).filter((name) => name.endsWith(".json"));
+  assert.ok(files.length >= 2, "at least an English and a Chinese dictionary must ship");
+  for (const name of files) {
+    const language = name.slice(0, -5);
+    assert.match(language, /^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$/, `locale/${name} must be named after a language id`);
+    const parsed = JSON.parse(readFileSync(join(dir, name), "utf8"));
+    assert.equal(typeof parsed.meta, "object", `locale/${name} must carry a meta block`);
+    assert.ok(typeof parsed.meta.title === "string" && parsed.meta.title.trim() !== "", `locale/${name}: meta.title must be a non-empty string`);
+    assert.ok(
+      typeof parsed.meta.description === "string" && parsed.meta.description.trim() !== "",
+      `locale/${name}: meta.description must be a non-empty string`
+    );
+  }
+  const en = JSON.parse(readFileSync(join(dir, "en.json"), "utf8"));
+  assert.ok(en.meta.title !== pkg.name, "the English title must not be the bare package name (that is the bug this fixes)");
+});
+
+// 方案 A：查询收敛。状态页只做仪表盘（小页预览 + 服务端 total + 查看全部），
+// 沉淀/归档的完整浏览走记忆库的 deposited/archived 筛选视图（chip 预置 +
+// 状态页入口跳转），详情抽屉给归档记忆一个反向的「恢复」。
+test("status dashboard links into deposited/archived library views", () => {
+  assert.ok(
+    clientSource.includes('"/api/dsh-mneme/list?deposited=only&limit=8&order=chrono"'),
+    "the workbench deposited preview must read the server-side deposited view"
+  );
+  assert.ok(
+    clientSource.includes('"/api/dsh-mneme/list?archived=only&limit=3&order=chrono"'),
+    "the workbench archived preview must cap at 3 rows backed by a server total"
+  );
+  assert.ok(
+    clientSource.includes("browseWithFilter"),
+    "the status page must jump into the library with preset filters"
+  );
+  assert.ok(
+    /view === "status" && h\(StatusPanel, \{ t, onBrowse: browseWithFilter \}\)/.test(clientSource),
+    "the status panel must receive the browse-jump callback"
+  );
+  assert.ok(
+    clientSource.includes('(depositedOnly ? "&deposited=only" : "")'),
+    "the library filterQS must carry the deposited chip"
+  );
+  assert.ok(
+    clientSource.includes('(archivedOnly ? "&archived=only" : "")'),
+    "the library filterQS must carry the archived chip"
+  );
+  assert.ok(
+    clientSource.includes('postUpdate({ archived: false }, { restored: true })'),
+    "the drawer must offer restore for archived memories"
+  );
+  assert.ok(
+    clientSource.includes('"memory.status.viewAll"'),
+    "the view-all entries must come from the dictionary"
+  );
+});
+
+// Every memory feature lives in the main-area library now: the explorer
+// hosts three sub-views (browse / entities / settings) switched by tabs whose
+// labels come from dedicated dictionary keys.
+test("explorer hosts browse, entities and settings sub-views", () => {
+  for (const key of ["tabMemory", "tabEntities", "tabSettings"]) {
+    assert.ok(
+      clientSource.includes(`"memory.explorer.${key}"`),
+      `sub-view labels must come from memory.explorer.${key}`
+    );
+  }
+  assert.ok(
+    clientSource.includes("h(EntityPanel, { t, focusEntity: graphFocus, onJumpMemory: jumpToMemory })"),
+    "the entity panel must be embedded as a sub-view"
+  );
+  assert.ok(
+    clientSource.includes('h(SettingsContent, { t })'),
+    "the settings forms must be embedded as a sub-view"
+  );
+});
+
+// The graph panel jumps back into the browser: related-memory rows and the
+// edge source button must land on the browse tab with the target selected.
+test("graph jump lands on the selected memory in the browser", () => {
+  assert.ok(
+    /onClick: \(\) => onJumpMemory && onJumpMemory\(m\)/.test(clientSource),
+    "related-memory rows must jump via onJumpMemory(m)"
+  );
+  assert.ok(
+    clientSource.includes("onJumpMemory({ id: selected.edge.memory_id })"),
+    "the edge source button must jump to the origin memory by id"
+  );
+  assert.ok(
+    /const jumpToMemory = \(target\) => \{/.test(clientSource),
+    "jumpToMemory must reset filters and select the target"
+  );
+});
+
+// "entity:" in the browser search is the graph entry grammar: it must offer
+// a jump chip instead of filtering the list.
+test("entity: search grammar offers a graph jump", () => {
+  assert.ok(
+    clientSource.includes('query.trim().startsWith("entity:")'),
+    "the entity: prefix must be recognized"
+  );
+  assert.ok(
+    /onClick: \(\) => openGraphFor\(entityQuery\)/.test(clientSource),
+    "the jump chip must switch to the graph sub-view"
+  );
+});
+
+// The explorer is a card-grid / timeline browse with a right-hand detail
+// drawer: types with counts, a month→day time tree (timeline mode), and the
+// drawer rendering the untruncated content.
+test("explorer lays out types, timeline, and full-text detail", () => {
+  assert.ok(
+    clientSource.includes('className: "mneme-xmain"'),
+    "the three-column grid must be present"
+  );
+  assert.ok(
+    clientSource.includes('className: "mneme-dcontent"'),
+    "the detail drawer must render the full content"
+  );
+  assert.ok(
+    clientSource.includes('className: "mneme-cards"'),
+    "the card-grid view must exist alongside the timeline"
+  );
+  assert.ok(
+    /toLocaleDateString\(undefined, \{ year: "numeric", month: "long" \}\)/.test(clientSource),
+    "month groups must format via the host locale, not hardcoded strings"
+  );
+});
+
+// The library page must read as a first-party view: the chrome resolves to
+// the host's design tokens (layer-1 canvas, brand-blue active states) and
+// the boxed-panel / pill-chip patterns of the drawer era must stay gone.
+test("explorer chrome aligns with the host design system", () => {
+  assert.ok(
+    clientSource.includes("background:var(--dsw-alias-bg-layer-1)"),
+    "the page canvas must sit on the host bg-layer-1 token"
+  );
+  assert.ok(
+    /\.mneme-vtab\.mneme-active::after/.test(clientSource),
+    "active sub-tabs use the host underline treatment"
+  );
+  // #178：这里原本直接断言宿主品牌蓝。宿主蓝在浅色画布上只有 4.23:1，对 13px
+  // 正文不足 AA，所以面板改用自己的语义色层 --mneme-accent（同一条宿主 token
+  // 往 label-primary 方向混 15%），换肤仍跟随宿主。意图不变：激活态是品牌蓝。
+  assert.ok(
+    clientSource.includes(".mneme-vtab.mneme-active{color:var(--mneme-accent)}"),
+    "active sub-tab text must turn the host brand blue (via the panel accent layer)"
+  );
+  assert.equal(
+    /\.mneme-xmain\{[^}]*border:1px/.test(clientSource),
+    false,
+    "the three-column layout must not wrap itself in a boxed panel"
+  );
+  assert.equal(
+    clientSource.includes("border-radius:999px"),
+    false,
+    "pill chips belong to the drawer era and must stay gone"
+  );
+});
+
+// heat 阶段二：/list 仅在 heatEnabled=true 时下发逐条 heat，前端徽章三档
+// 配色且自门控（字段缺省自动隐藏）——卡片页脚、抽屉 meta、状态分布卡共用
+// 同一数据源，前端不感知开关状态。
+test("heat badges render from the /list projection and self-hide when off", () => {
+  assert.ok(
+    /const HeatBadge = \(\{ value, size = 12 \}\) =>/.test(clientSource),
+    "the heat badge component must exist"
+  );
+  assert.ok(
+    clientSource.includes("flame:"),
+    "the Lucide flame glyph must back the badge"
+  );
+  assert.ok(
+    /h\(HeatBadge, \{ value: m\.heat \}\)/.test(clientSource),
+    "the card foot must render the heat badge"
+  );
+  assert.ok(
+    clientSource.includes('t("memory.explorer.heat")'),
+    "the drawer must show a localized heat meta row"
+  );
+  assert.ok(
+    clientSource.includes("function HeatStatusCard"),
+    "the status grid must include the heat distribution card"
+  );
+  assert.ok(
+    clientSource.includes('typeof items[0].heat !== "number"'),
+    "the distribution card must self-hide when /list omits heat"
+  );
+  assert.ok(
+    /\.mneme-heat--hot\{/.test(clientSource),
+    "the three-tier heat colors must be styled"
+  );
+  // order=heat 的前端补口：热度是运行时投影无存储序，SQL 排不了——页内
+  // 对已加载条目降序，时间树保持 chrono；chip 自门控（heat 缺省不出现）。
+  assert.ok(
+    /const heatAvailable = visible\.some\(\(m\) => typeof m\.heat === "number"\);/.test(clientSource),
+    "the heat-sort chip must self-gate on the /list heat field"
+  );
+  assert.ok(
+    /const gridItems = heatSort[\s\S]{0,80}\(b\.heat \?\? 0\) - \(a\.heat \?\? 0\)/.test(clientSource),
+    "the cards grid must sort loaded items by heat in-page"
+  );
+  assert.ok(
+    clientSource.includes("if (!heatSort) switchViewMode(\"cards\")"),
+    "toggling heat sort must land on the cards view (sort does not apply to the month tree)"
+  );
+});
+
+// Token 去向三屏（#412）：前端只拿 by_day 的稀疏行渲染两种时间尺度，三个坑
+// 都在这一层，且都是「不报错但图错了」的静默失效，所以锁形状而非锁行为：
+// ① 柱状图必须补连续 7 天——by_day 是 GROUP BY 的稀疏结果，直接映射会缺列；
+// ② 热力图的 56 格必须来自独立的 days=56 请求——复用 days=7 的响应会让 56 格
+//    里 48 格恒 0（图看着正常，其实只有一周有数据）；
+// ③ 开合不能挂在 details 上——details 的 onClick 会连折叠区子卡片的点击一起
+//    吃掉（preventDefault 拦掉冒泡的激活事件），必须挂 summary。
+test("token flow: 7-day bars pad to a continuous week, heatmap uses its own 56-day window", () => {
+  // ① 连续 7 天：右端对齐今天 UTC，缺日填 0
+  assert.ok(
+    /Array\.from\(\{ length: 7 \}/.test(clientSource),
+    "the 7-day bars must be generated as a fixed 7-slot array, not mapped straight off by_day"
+  );
+  assert.ok(
+    /rawDayMap\.get\(key\) \?\? 0/.test(clientSource),
+    "missing days must fill 0 so the x-axis stays a continuous week"
+  );
+  // stats 为 null（未到）与 {}（已知为空）必须分开：前者不画柱，后者补零
+  assert.ok(
+    /const rawDays = stats && Array\.isArray\(stats\.by_day\) \? stats\.by_day : null;/.test(clientSource),
+    "an unloaded response must stay null, else the loading state paints 7 zero bars"
+  );
+  // ② 热力图独立 56 天窗口
+  assert.ok(
+    clientSource.includes('llm-audit/stats?days=56'),
+    "the heatmap must issue its own days=56 request"
+  );
+  assert.ok(
+    /heatStats && Array\.isArray\(heatStats\.by_day\)/.test(clientSource),
+    "the heatmap must read heatStats.by_day, not stats.by_day"
+  );
+  // ③ 开合挂 summary，不挂 details
+  assert.ok(
+    !/className: "mneme-legacy",\s*\n\s*open: legacyOpen,\s*\n\s*onClick/.test(clientSource),
+    "the click handler must not sit on <details>: it swallows clicks from child cards"
+  );
+  assert.ok(
+    /h\("summary", \{ onClick: \(e\) => \{ e\.preventDefault\(\); setLegacyOpen\(!legacyOpen\); \} \}/.test(clientSource),
+    "the toggle must be bound on <summary>, the native disclosure handle"
+  );
+});
+
+// 8 周沉淀图（热力右侧那块空白）是第二条独立数据源，四处静默失效都会让图看着
+// 正常但结论错掉，所以照样锁形状：
+// ① 必须自带 days=56 请求——复用 days=7 的响应会让 8 根柱子只有 1 根有数据；
+// ② sinkStats 为 null（未到）与 {}（已知为空）必须分开，否则加载态先画 8 根
+//    零高柱子，再「长出来」，用户看到的是一次假抖动；
+// ③ 图例/柱体不能在三总量全 0 时照画——那等于把「最近没有东西进库」这句
+//    谎话说成事实；
+// ④ 两列并排必须带窄容器回落，否则 480px 侧栏里热力与沉淀互相压扁。
+test("consolidation chart: own 56-day window, null-vs-empty split, and a narrow-container fallback", () => {
+  assert.ok(
+    clientSource.includes("semantic/consolidation-stats?days=56"),
+    "the consolidation chart must issue its own days=56 request"
+  );
+  assert.ok(
+    /if \(!sinkStats\) return null;/.test(clientSource),
+    "an unloaded consolidation response must stay null, else the loading state paints 8 empty weeks"
+  );
+  assert.ok(
+    /sinkDays && !sinkError/.test(clientSource),
+    "labels/legend must be gated on a loaded, non-erroring response"
+  );
+  assert.ok(
+    /sinkAddedTotal \+ sinkMergedTotal \+ sinkArchivedTotal === 0/.test(clientSource),
+    "an all-zero window must render the empty state, not eight zero-height bars"
+  );
+  // 两列：热力按内容宽 auto，沉淀吃剩余；窄容器回落单列。
+  assert.ok(
+    clientSource.includes("grid-template-columns:auto minmax(0,1fr)"),
+    "the heat row and the consolidation chart must sit in two columns"
+  );
+  assert.ok(
+    clientSource.includes("@container (max-width:960px){.mneme-flowrow{grid-template-columns:minmax(0,1fr)}}"),
+    "two columns must collapse to one in a narrow container"
+  );
+  // 两根柱的语义色必须走语义层，不能直接拿宿主 label token 当填充色（#178）。
+  assert.ok(clientSource.includes(".mneme-sinkbar--added{background:var(--mneme-sink-added)}"));
+  assert.ok(clientSource.includes(".mneme-sinkbar--merged{background:var(--mneme-sink-merged)}"));
+  // ⑤ 图例必须带色标：图上两根柱是两种颜色，图例却只有四段文字，读者只能猜
+  //    哪根是「进来的」哪根是「稳住的」。归档不画进柱，也要标明这点。
+  assert.ok(
+    clientSource.includes(".mneme-sinkdot--added{background:var(--mneme-sink-added)}") &&
+      clientSource.includes(".mneme-sinkdot--merged{background:var(--mneme-sink-merged)}"),
+    "the legend needs colour swatches matching the two bar colours"
+  );
+  assert.ok(
+    /sinkArchivedOff/.test(clientSource) && !/mneme-sinkdot--archived/.test(clientSource),
+    "the archived entry must say it is not plotted and must not get a swatch of its own (a hollow dot reads as a third bar)"
+  );
+});
+
+// 巩固/睡眠模型路由 UI：下拉数据来自宿主侧已注册适配器（/llm-providers，
+// 云端插件侧端点），「测试连通性」走 POST /test-model 真实最小调用。旧后端
+// 端点 404 时必须回退纯文本输入——前端自门控，不挡旧版本。
+test("consolidation/sleep model routing: provider dropdowns from /llm-providers, connectivity test via /test-model, graceful fallback", () => {
+  // 1. 端点探测与降级
+  assert.ok(
+    clientSource.includes('apiFetch("/api/dsh-mneme/llm-providers")'),
+    "the features card must probe GET /llm-providers for the route dropdowns"
+  );
+  assert.ok(
+    /setRoutes\(Array\.isArray\(j && j\.providers\) \? j\.providers : \[\]\)/.test(clientSource),
+    "the probe must only accept a {providers: []} shape"
+  );
+  assert.ok(
+    /Array\.isArray\(routes\)\s*\?\s*routeSelects\("dreamProvider", "dreamModel", dreamTest, setDreamTest, "dreamReasoningEffort"\)/.test(clientSource),
+    "dream routing must upgrade to dropdowns only when the probe succeeded (and pass its own effort key)"
+  );
+  assert.ok(
+    /:\s*h\(react\.Fragment, null, strRow\("dreamProvider"\), strRow\("dreamModel"\)\)/.test(clientSource),
+    "when /llm-providers is unavailable the plain text inputs must remain (old-backend fallback)"
+  );
+  // 2. 睡眠侧行：跟随 sleepModeEnabled 门控，与巩固共用数据源
+  assert.ok(
+    /const sleepSub = eff\.sleepModeEnabled && Array\.isArray\(routes\) && h\("div", \{ className: "mneme-featsub" \},\s*\n\s*routeSelects\("sleepProvider", "sleepModel", sleepTest, setSleepTest, "sleepReasoningEffort"\)/.test(clientSource),
+    "the sleep route row must gate on sleepModeEnabled and share the providers source"
+  );
+  // 2b. 睡眠路由的值必须进初始化草稿：FEATURE_STRINGS 漏键会导致重挂载后
+  // 下拉永远显示「跟随默认路由」（后端存了但前端读不回来）。
+  assert.ok(
+    /const FEATURE_STRINGS = \["dreamProvider", "dreamModel", "sleepProvider", "sleepModel",/.test(clientSource),
+    "sleepProvider/sleepModel must be restored into the draft on mount, not only written"
+  );
+  // 2c. 连通性测试状态按路由各持一份：共享单份会让点一个按钮两个组同时
+    // 显示「测试中/结果」且互相禁用。
+  assert.ok(
+    /const \[dreamTest, setDreamTest\] = useState\(null\);/.test(clientSource)
+      && /const \[sleepTest, setSleepTest\] = useState\(null\);/.test(clientSource),
+    "the connectivity test state must be per-route, not shared between dream and sleep"
+  );
+  assert.ok(
+    /runModelTest\(curP, curM, setTestState, effort\)/.test(clientSource),
+    "each route's test button must target its own test state and pass the route's configured effort"
+  );
+  // 3. 连通性测试：真实最小调用 + 结果展示（成功/失败 + 耗时 + 报错原因）
+  assert.ok(
+    clientSource.includes('apiFetch("/api/dsh-mneme/test-model", {'),
+    "the connectivity test must POST /test-model"
+  );
+  assert.ok(
+    /body: JSON\.stringify\(\{\s*provider, model,\s*\.\.\.\(reasoningEffort && reasoningEffort !== "none" \? \{ reasoningEffort \} : \{\}\)\s*\}\)/.test(clientSource),
+    "the test payload must carry provider/model plus the configured reasoningEffort, omitted for 'none'/unset (issue #215, same convention as the backend)"
+  );
+  assert.ok(
+    /typeof j\.durationMs === "number" \? j\.durationMs : Date\.now\(\) - started/.test(clientSource),
+    "the result duration must prefer the backend's durationMs and fall back to client timing"
+  );
+  assert.ok(
+    /detail: \[j\.modelId, j\.reply \? "「" \+ j\.reply \+ "」" : ""\]\.filter\(Boolean\)\.join\(" · "\)/.test(clientSource),
+    "the success line must surface the model's actual reply (backend caps it at 100 chars)"
+  );
+  assert.ok(
+    /detail: \[j\.modelId, j\.error \|\| "HTTP " \+ res\.status\]\.filter\(Boolean\)\.join\(" · "\)/.test(clientSource),
+    "the failure line must carry the tested modelId plus the backend error (502/400 bodies)"
+  );
+  assert.ok(
+    clientSource.includes("memory.features.modelTestOk") && clientSource.includes("memory.features.modelTestFail"),
+    "the result line must render success/failure with the localized labels"
+  );
+  // 4. 下拉改动即提交（与 embedProvider 一致），当前值不在枚举时保留为额外选项
+  assert.ok(
+    /setStrs\(\(c\) => \(\{ \.\.\.c, \[key\]: v \}\)\);\s*\n\s*put\(\{ \[key\]: v \}\)/.test(clientSource),
+    "select changes must commit through the features PUT like the embed provider select"
+  );
+  assert.ok(
+    /curM && !mVals\.includes\(curM\) \? h\("option", \{ key: "current", value: curM \},\s*\n\s*mStale \? curM \+ t\("memory\.features\.routeStaleMark"\) : curM\) : null/.test(clientSource),
+    "a configured value missing from the provider's model list must survive as an extra option, marked when stale (issue #191)"
+  );
+  // 5. 双语 i18n 与样式
+  for (const key of ["routeFollowDefault", "modelTest", "modelTesting", "modelTestOk", "modelTestFail", "modelTestHint", "routeStaleMark", "routeStaleHint", "sleepModelHint"]) {
+    const occurrences = clientSource.split(`"memory.features.${key}"`).length - 1;
+    assert.ok(occurrences >= 2, `i18n key memory.features.${key} must exist in both zh and en (got ${occurrences})`);
+  }
+  assert.ok(
+    clientSource.includes(".mneme-routeselect{width:240px;max-width:60%}"),
+    "the route selects must share the string-input width budget"
+  );
+});
+
+// issue #191：级联下拉刻意保留不在列表里的旧值（不丢配置），但此前与正常
+// 选项无差别展示——切 Provider 后残留的中继风格 model id 照常保存，用户分
+// 不清「改错了」还是「还没生效」。旧值必须显式标记 + 行级提示（改选或点连
+// 通性测试当场验证 + 重启生效）；适配器列表为空或 provider 未注册时前端无
+// 从校验 model，一律不标记防误报。
+test("stale route values are marked and explained at the row level (issue #191)", () => {
+  // 1. 旧值判定：仅在适配器列表非空时比对；model 只在 provider 已注册时校验
+  assert.ok(
+    /const hasProviders = entries\.length > 0;/.test(clientSource),
+    "stale checks must be gated on a non-empty provider registry (no false alarms)"
+  );
+  assert.ok(
+    /const pStale = hasProviders && !!curP && !entry;/.test(clientSource),
+    "a saved provider missing from /llm-providers must be flagged"
+  );
+  assert.ok(
+    /const mStale = hasProviders && !!entry && !!curM && !mVals\.includes\(curM\);/.test(clientSource),
+    "a saved model outside the selected provider's list must be flagged only when that provider is registered"
+  );
+  // 2. 标记落在选项文本上：下拉收起时也能看出旧值不在列表
+  assert.ok(
+    /pStale && p === curP \? p \+ t\("memory\.features\.routeStaleMark"\) : p/.test(clientSource),
+    "the preserved provider option must carry the stale mark"
+  );
+  // 3. 行级提示：⚠ 警示 + 改选/测试引导 + 重启生效，一条提示说完
+  assert.ok(
+    /\(pStale \|\| mStale\) && h\("div", \{ className: "mneme-featsubhint" \},\s*\n\s*"⚠ " \+ t\("memory\.features\.routeStaleHint"\)/.test(clientSource),
+    "the stale warning hint must render at the route row with the warning prefix"
+  );
+  // 3b. 旧值保留必须无条件：列表为空（端点刚起 / 零适配器）时也不得把已存
+  // provider 静默显示成「跟随默认路由」——只有标记带门，保留不带门。
+  assert.ok(
+    /curP && !entries\.some\(\(p\) => p\.provider === curP\) \? \[curP\] : \[\]/.test(clientSource),
+    "the preserved provider option must stay unconditional (empty list must not hide the saved value)"
+  );
+  // 3c. 英文提示不得把「不在列表」限定在 model 维度——provider 本身不在
+  // 列表时同样渲染此行（CodeRabbit #213 review）。
+  assert.ok(
+    !clientSource.includes("provider's model list"),
+    "the en stale hint must cover provider-absence too, not only the model case"
+  );
+  // 4. issue #215：三条路由各自透传自己的档位键——routeSelects 按路由行
+  // 传入键名、从生效配置取值。（曾在此断言「sleep 无回退重试，测试是事前
+  // 唯一的暴露口」：该前提自 939fbfc 起就不成立——sleep/梦/蒸馏都走
+  // withEffortFallback，档位被拒会丢字段重试，测试从不是唯一暴露口。）
+  assert.ok(
+    /const routeSelects = \(providerKey, modelKey, testState, setTestState, effortKey\) => \{/.test(clientSource)
+      && /const effort = effortKey \? \(eff\[effortKey\] \|\| ""\) : ""/.test(clientSource),
+    "routeSelects must take the route's effort key and read the configured value from effective settings"
+  );
+  assert.ok(
+    /routeSelects\("dreamProvider", "dreamModel", dreamTest, setDreamTest, "dreamReasoningEffort"\)/.test(clientSource)
+      && /routeSelects\("sleepProvider", "sleepModel", sleepTest, setSleepTest, "sleepReasoningEffort"\)/.test(clientSource)
+      && /routeSelects\("entityExtractionProvider", "entityExtractionModel", entityTest, setEntityTest, "entityExtractionReasoning"\)/.test(clientSource),
+    "each route row must pass its own reasoning effort key (dream/sleep/entityExtraction)"
+  );
+  // 4. 连通性测试按钮的说明与结果互斥（同一行槽位二选一，不堆叠）
+  assert.ok(
+    /\(testState && !testState\.running\s*\n\s*\? h\("div", \{ className: "mneme-featsubhint" \},/.test(clientSource)
+      && clientSource.includes('t("memory.features.modelTestHint")'),
+    "the test row must show either the result or the standing explanation, never both"
+  );
+});
+
+// 探针降级的如实呈现（issue #215 后续）：后端档位被拒时不再 502，而是丢字段
+// 重试成功 + effortDropped:true。面板必须把「连通了、但不是按你配的档位」讲出来
+// ——静默成功和静默失败一样有害：前者让人以为档位生效，后者把人赶去换 Provider。
+test("panel surfaces a downgraded connectivity test instead of a silent success or a red failure", () => {
+  // 1. 只有后端明确置位才算降级（旧后端无字段 → 不误报）
+  assert.ok(
+    /dropped: j\.effortDropped === true/.test(clientSource),
+    "the panel must read effortDropped strictly (=== true) so an older backend never renders a phantom downgrade"
+  );
+  // 2. 降级文案只在成功行追加，失败行不得出现（失败就是失败，别混进降级措辞）
+  assert.ok(
+    /\(testState\.ok && testState\.dropped \? " · " \+ t\("memory\.features\.modelTestDowngraded"\) : ""\)/.test(clientSource),
+    "the downgrade note must be appended only on the success line"
+  );
+  // 3. 双语词表各一条（按行首的 "key": "…" 计数，与上面的全键计数锁同口径；
+  //    用 split 会把渲染处的 t("…") 一起数进来，那是 3 次不是 2 次）
+  const tableRows = clientSource.match(/^\s*"memory\.features\.modelTestDowngraded"\s*:\s*"/gm) || [];
+  assert.equal(tableRows.length, 2, `memory.features.modelTestDowngraded must be declared exactly twice in the tables (zh + en), got ${tableRows.length}`);
+  // 4. 那条陈旧前提不得复活：面板不得再声称 sleep/梦 侧无回退重试
+  assert.ok(
+    !/无回退重试|无回退|no fallback retry/.test(clientSource),
+    "the panel must not re-assert the stale 'no fallback retry' claim that withEffortFallback already covers"
+  );
+});
+
+// 帮助与反馈入口（v0.8）：设置页底部三个反馈链接——GitHub 新建 issue 预填
+// （环境信息）、邮件反馈、浏览已知问题。纯前端链接零后端成本；插件版本从
+// /info 拉取（version 只读，不铺任何 token/凭据）。公开链接不得带个人邮箱。
+test("settings feedback card: prefilled issue + mailto + browse, version from /info", () => {
+  // 1. 版本预填端点
+  assert.ok(
+    clientSource.includes('apiFetch("/api/dsh-mneme/info")'),
+    "the feedback card must fetch the plugin version from /info"
+  );
+  assert.ok(
+    clientSource.includes("setPkgVersion"),
+    "the fetched version must land in component state"
+  );
+  // 2. GitHub 新建 issue：issues/new?title=&body= 预填环境信息（当前仓库无模板）
+  assert.ok(
+    clientSource.includes("https://github.com/slow-stack/mneme/issues/new?title="),
+    "the issue link must prefill title+body on issues/new"
+  );
+  assert.ok(
+    clientSource.includes("**插件版本**") && clientSource.includes("**平台**"),
+    "the prefill body must carry plugin version and platform"
+  );
+  // 3. 邮件反馈：官方邮箱（对外不写个人邮箱），mailto 预填 subject+body
+  assert.ok(
+    clientSource.includes("mailto:work@modusensus.space?subject="),
+    "the mailto link must point at the public support address"
+  );
+  // 4. 浏览已知问题：跳仓库 issues 列表页（去重前置步骤）
+  assert.ok(
+    clientSource.includes('href: "https://github.com/slow-stack/mneme/issues"'),
+    "the browse link must open the repo issues list"
+  );
+  // 5. 双语 i18n
+  for (const key of ["feedback.title", "feedback.newIssue", "feedback.email", "feedback.browse", "feedback.hint"]) {
+    const occurrences = clientSource.split(`"memory.settings.${key}"`).length - 1;
+    assert.ok(occurrences >= 2, `i18n key memory.settings.${key} must exist in both zh and en (got ${occurrences})`);
+  }
+});
+
+// UI 文案必须双语齐全（中英各一条）。用户明确要求所有 UI 文字都做 i18n，
+// 这条守卫用「每个键恰好出现两次」兜住：出现奇数次就是漏译，>2 次说明重复。
+test("i18n keys are bilingual: every key appears exactly twice (zh + en)", () => {
+  const counts = new Map();
+  for (const match of clientSource.matchAll(/^\s*"([a-zA-Z0-9_.]+)"\s*:\s*"/gm)) {
+    counts.set(match[1], (counts.get(match[1]) ?? 0) + 1);
+  }
+  const odd = [...counts.entries()].filter(([, n]) => n !== 2).map(([key, n]) => `${key}×${n}`);
+  assert.deepEqual(odd, [], `这些 i18n 键没有做到中英各一条：${odd.join(", ")}`);
+  assert.ok(counts.size > 100, `解析到的键太少（${counts.size}），正则可能没匹配到 i18n 表`);
+});
+
+// issue #135：向量状态卡必须区分「没配」与「配了却一条都没嵌上」。此前卡片只看
+// ready，而未配置的 legacy embedder（ready 恒 true）一路显示成正常 provider。
+test("vector status card surfaces the configured/degraded split", () => {
+  // 1. 读后端新字段，缺失（旧服务端）时退化成旧行为而不是误报未配置
+  assert.ok(
+    clientSource.includes('typeof j?.configured === "boolean" ? j.configured : null'),
+    "the card must read `configured` and tolerate older servers that omit it"
+  );
+  assert.ok(
+    clientSource.includes("j?.degraded === true"),
+    "the card must read `degraded`"
+  );
+  // 2. 三态互斥：未配置优先于初始化中，降级只在既非未配置也非初始化时成立
+  assert.ok(
+    clientSource.includes("const unconfigured = !off && state.configured === false;"),
+    "unconfigured must be its own state, not folded into ready"
+  );
+  assert.ok(
+    clientSource.includes("const pending = !off && !unconfigured && state.ready !== true;"),
+    "an unconfigured embedder must not be reported as initializing"
+  );
+  assert.ok(
+    clientSource.includes("const degraded = !off && !unconfigured && !pending && state.degraded === true;"),
+    "degraded must only apply to a configured, settled embedder"
+  );
+  // 3. 三个状态各自的标签/说明走 i18n，双语齐备
+  for (const key of ["vectorUnconfigured", "vectorUnconfiguredHint", "vectorDegradedHint"]) {
+    const occurrences = clientSource.split(`"memory.status.${key}"`).length - 1;
+    assert.ok(occurrences >= 2, `i18n key memory.status.${key} must exist in both zh and en (got ${occurrences})`);
+  }
+  assert.ok(
+    clientSource.includes('t("memory.status.vectorUnconfigured")'),
+    "the unconfigured state must render its own label"
+  );
+  assert.ok(
+    clientSource.includes('t("memory.status.vectorDegradedHint")'),
+    "the degraded state must render its own caption (0 of {m} indexed)"
+  );
+});
+
+// v0.8.0 A4（issue #17）：作用域隔离的面板面——设置卡新组（scopeEnabled /
+// strictScope 开关）+ 记忆条目的 scope provenance 展示。i18n 键必须中英双语
+// 齐全；徽章/详情行沿用 heat 徽章的「字段缺省即不渲染」模式，前端不感知开关。
+/**
+ * A4（issue #17）面板面回归：作用域隔离的设置卡分组、十个 i18n 键的中英双语
+ * 齐备（沿用 occurrences ≥ 2 模式），以及 ScopeBadge 组件与三处接线（cards
+ * 脚部 / timeline 行 / 详情抽屉 dmeta）的真实存在性——只做源码断言，不挂
+ * React 渲染环境，与文件内其他 clientSource 断言同一风格。
+ */
+test("scope isolation ships panel switches and provenance surfaces (A4)", () => {
+  assert.ok(
+    /key: "group\.scope", items: \["scopeEnabled", "strictScope"\]/.test(clientSource),
+    "FEATURE_GROUPS must carry a dedicated scope group"
+  );
+  for (const key of [
+    "memory.features.group.scope",
+    "memory.features.scopeEnabled",
+    "memory.features.scopeEnabled.hint",
+    "memory.features.strictScope",
+    "memory.features.strictScope.hint",
+    "memory.explorer.scopeBadge",
+    "memory.explorer.detail.agentScope",
+    "memory.explorer.detail.workspaceScope",
+    "memory.explorer.detail.sensitivity",
+    "memory.explorer.detail.occurred"
+  ]) {
+    const occurrences = clientSource.split(`"${key}"`).length - 1;
+    assert.ok(occurrences >= 2, `i18n key ${key} must exist in both zh and en (got ${occurrences})`);
+  }
+  assert.ok(/const ScopeBadge = \(\{ m, t \}\)/.test(clientSource), "ScopeBadge component must exist");
+  assert.ok(clientSource.includes("h(ScopeBadge, { m, t })"), "ScopeBadge must be wired into browse views");
+  assert.ok(clientSource.includes('t("memory.explorer.detail.agentScope")'), "drawer must render agent scope row");
+  assert.ok(clientSource.includes('t("memory.explorer.detail.occurred")'), "drawer must render occurred row");
+});
+
+// Issue #427：设置面板把折叠线从「冷门」挪到「新手之外」。锁四件事：
+// ①首屏层 = 常用组（3 总开关）+ 作用域组——scope 留在首屏是因为「它记的东西
+// 会不会被别的会话看到」是新用户的必答题，藏进折叠等于没答；②其余组整组收进
+// 「全部设置」（第一层折叠），「高级」降为它内部的第二层；③每条开关挂
+// 「默认 / 已改」徽标，信号取自 overrides（键不在其中 = 仍是 config schema
+// 默认值），面板自判、不加后端字段；④分组与折叠键中英成对。验收口径：首屏
+// 可点项 = 3 总开关 + autoInject 的 2 个子开关 + scope 2 开关 + 「全部设置」
+// 按钮 = 8（≤ 8），由 ①② 的组成正则共同钉死，不另数 DOM。
+// v0.9.0 复验修订：首屏加 group.mo（M.O. 独立组），可点项预算 8→9——产品
+// 主人点名「别藏在里面」，M.O. 独立成组却仍折在「全部设置」后等于换个地方
+// 继续藏。**v0.13.x 反转**：主人决定把 M.O. 下架，那一组连同首屏位一起摘掉，
+// 预算回到 8，本锁随之收紧回两组。反转是产品决策、不是放宽，注释留档防下次
+// 有人照着旧注释把组加回来。
+// **v0.13.x 第二次产品豁免（#607 后续）**：首屏加 group.ext（仓库地志 / 知识库 /
+// 日记本三个扩展子系统的总闸），可点项预算 8→11（3 总开关 + autoInject 2 子 +
+// 扩展 3 闸 + scope 2 + 「全部设置」按钮）。理由：这三个子系统此前分别散在
+// enhance 组尾（choro/diary）或压根没进 FEATURE_GROUPS（kb），用户「开了才
+// 找得到、找不到就没法开」——#607 报的「知识库没成型」一半是入口问题。它们
+// 是「装不装这个子系统」而非「每轮付多少」，与 enhance 的行为开关不同级，
+// 所以单列一组并提到首屏。**再往首屏塞东西前先问：它是不是同级子系统？**
+// **v0.13.x 第三次豁免（用户 2026-11-11 反馈「装了发现设置没情绪那一页的开关」）**：
+// 首屏加 group.dream（巩固与睡眠），可点项预算 11→13。豁免由头是 sleepModeEnabled
+// 的**同级性**——它是「巩固与睡眠」这个子系统的总闸，与 group.ext 的三个闸门同级，
+// 而它是首屏唯一缺席的子系统总闸（整组因此躺在「全部设置」里）。不是「用户要」：
+// 后半句能撑住判据，前半句不能。sleepAffectiveEnabled 是它的并列成员
+// （FEATURE_CHILDREN 里没有父子关系），跟着整组进来，不单拎进 group.basic——
+// 那里收的是新手敢动的自动类总开关，塞进巩固细节会打散该组的语义边界。
+test("settings card folds everything beyond the first screen behind All settings (issue #427)", () => {
+  // ① 首屏层组成：四组都要在（basic 总开关 / ext 子系统总闸 / dream 巩固总闸 /
+  // scope 必答题），且 basic 的成员是从 core/dream 移走的。
+  assert.ok(/const FEATURE_FIRST_SCREEN = \["group\.basic", "group\.ext", "group\.dream", "group\.scope"\];/.test(clientSource),
+    "the first screen must be the basic, ext, dream and scope groups (M.O. taken down in v0.13.x; ext and dream added as product exemptions 2 and 3)");
+  // M.O. 下架锁：组从 FEATURE_GROUPS 摘掉 ≠ 只把首屏位去掉。少了这一条，下次
+  // 有人「顺手把组加回来」时会折进「全部设置」，测试照绿而 M.O. 又出现在面板上。
+  assert.ok(!/\{ key: "group\.mo", items: \[/.test(clientSource),
+    "M.O. must stay off the panel: group.mo is deliberately absent from FEATURE_GROUPS (taken down in v0.13.x)");
+  // 但键本身不能删——config schema / settings 白名单里还在，恢复时零改动。
+  assert.ok(clientSource.includes("actionPipelineEnabled"),
+    "the M.O. flags must remain reachable (config + settings whitelist) so the takedown stays reversible");
+  assert.ok(/key: "group\.basic", items: \["autoInject", "autoSummarize", "autoDream"\]/.test(clientSource),
+    "group.basic must carry exactly the three master switches");
+  // 扩展组必须同时收三个子系统的总闸，且一个都不能漏：漏掉哪个，那个子系统就
+  // 退回 #607 的状态——后端接好了、面板上没有入口，用户只能靠改配置文件打开。
+  assert.ok(/key: "group\.ext", items: \["chorographyEnabled", "kbEnabled", "diaryEnabled"\]/.test(clientSource),
+    "group.ext must carry the three subsystem master switches (chorography / kb / diary)");
+  // 迁移锁：choro/diary 从 enhance 组移出（render-once，同一项只渲染一次）。
+  // 只把首屏位加上而不移成员，会让两个开关同时出现在两组里，状态还可能不同步。
+  // #427 revamp（2026-11-11）：group.enhance 进一步拆成 safety/pipeline/retrieve/
+  // persona——它曾是设置页「难找难看」的重灾区（14 个异质开关混装），拆完不许
+  // 有人顺手把旧组名加回来。
+  assert.ok(!/group\.enhance", items: \[/.test(clientSource),
+    "group.enhance must stay split into safety/pipeline/retrieve/persona (the revamp's core move)");
+  assert.ok(!/group\.core", items: \[/.test(clientSource),
+    "group.core must stay split too (its audit/defense rows moved to group.safety)");
+  for (const moved of ["chorographyEnabled", "diaryEnabled"]) {
+    const extItems = clientSource.match(/key: "group\.ext", items: \[([^\]]*)\]/)?.[1] ?? "";
+    assert.ok(extItems.includes(`"${moved}"`), `${moved} must stay in group.ext`);
+    const occurrencesInGroups = [...clientSource.matchAll(/items: \[([^\]]*)\]/g)]
+      .filter((m) => m[1].includes(`"${moved}"`)).length;
+    assert.equal(occurrencesInGroups, 1, `${moved} must render exactly once across all groups (render-once)`);
+  }
+  // 四个新组都在：少了哪个，那批开关就退回「没座位」状态。
+  for (const groupKey of ["group.safety", "group.pipeline", "group.retrieve", "group.persona"]) {
+    assert.ok(clientSource.includes(`key: "${groupKey}", items: [`),
+      `${groupKey} must exist in FEATURE_GROUPS (the revamp's regrouping)`);
+  }
+  // ② 两层折叠的接线：restGroups 只在 showAll 展开后渲染；「高级」按钮出现在
+  // 「全部设置」之后（同一渲染分支内），showAdv 展开的条目走第二层。
+  assert.ok(/showAll && h\(react\.Fragment, null,\s*restGroups\.map\(renderGroup\)/.test(clientSource),
+    "the remaining groups must render only behind the All settings fold");
+  const allBtn = clientSource.indexOf('t("memory.features.allToggle")');
+  const advBtn = clientSource.indexOf('t("memory.features.advancedToggle")');
+  assert.ok(allBtn >= 0 && advBtn > allBtn, "the advanced fold must be nested after All settings");
+  assert.equal(clientSource.match(/const FEATURE_ADVANCED_BOOLS = \[([^\]]*)\];/)[1].split(",").filter((s) => s.trim()).length, 9,
+    "the advanced second tier must hold exactly the 9 rarer switches the label promises (entityRecall + graphAnchoring joined in the revamp)");
+  // ③ 徽标：两类各一套中英文案；判定读 overrides 本地判，不引入后端字段。
+  // #427 revamp：tagDefault 的徽标不再渲染（默认态由开关位置本身表达），i18n
+  // 键随之下线——这里锁的是「不再渲染」这件事本身，防止有人把灰字墙加回来。
+  for (const key of ["memory.features.tagChanged", "memory.features.tagPending",
+    "memory.features.group.basic", "memory.features.allToggle", "memory.features.advancedToggle"]) {
+    const occurrences = clientSource.split("\"" + key + "\"").length - 1;
+    assert.ok(occurrences >= 2, `i18n key ${key} must exist in both zh and en (got ${occurrences})`);
+  }
+  assert.ok(clientSource.includes("Object.prototype.hasOwnProperty.call(ovr, k)"),
+    "the changed badge must be decided from overrides, not a new backend field");
+  // 「默认」徽标的下线锁：flagTag 对默认态必须 return null（CSS 类本身保留——
+  // 事实卡的 actor 徽标还用它），禁的是功能开关行再挂灰字墙。
+  assert.ok(/if \(!Object\.prototype\.hasOwnProperty\.call\(ovr, k\)\) return null;/.test(clientSource),
+    "flagTag must return null on default rows (no more always-grey 「默认」 chips)");
+  assert.ok(!clientSource.includes("memory.features.tagDefault"),
+    "the tagDefault copy must stay deleted along with its render site");
+});
+
+// C 项：入口可达性锁（用户 2026-11-11 反馈「装了发现设置没情绪那一页的开关」）。
+// FEATURE_GROUPS 是手写 key 数组——新开关要在首屏数组、折叠白名单、高级层、
+// 输入行这几处手工登记，漏一处就变成「后端接好了、面板上找不到」，而且不报错。
+// group.dream 这次就是这么漏的：整组躺在「全部设置」里，用户装完找不到巩固与
+// 睡眠。这条测试是唯一能防同类复发、又不用把数据结构改成 glob 模式的机制。
+// 解析口径：直接切 clientSource 的字面量，不 eval、不 import——这四个常量是
+// 面板的私有实现细节，测试只该看到文本形状，不应该把它们导出去。
+test("every settings group is reachable and every flag key owns exactly one seat", () => {
+  // 文本断言的假通过防线：注释里同样能写出 `FEATURE_ENUMS.map(` 这类片段。
+  // 谁把它写进注释、而真的渲染行早被删掉，断言就永远绿。所以下面的文本断言
+  // 一律跑在去注释副本上，且断言本身要求行首缩进 + 紧贴的调用形态（行尾注释
+  // 写不进那个位置）。剥法只去整行 `//` 与 `/* */` 段：行内注释不碰，因为
+  // 字符串里可能出现 `//`（URL），误剥会把真代码切坏。
+  const stripComments = (src) => src
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .split("\n")
+    .filter((line) => !/^\s*\/\//.test(line))
+    .join("\n");
+  const codeSource = stripComments(clientSource);
+
+  // 切出某个 `const X = [ ... ];` 的方括号内文本。FEATURE_GROUPS 的 items 里
+  // 只有 `}],` 收尾，第一个 `];` 就是常量本身结束，不会被组内的 `]` 提前截断。
+  const grabArray = (name) => {
+    const head = `const ${name} = [`;
+    const at = codeSource.indexOf(head);
+    assert.ok(at >= 0, `const ${name} must exist`);
+    const start = at + head.length;
+    const end = codeSource.indexOf("];", start);
+    assert.ok(end > start, `const ${name} must be a closed array literal`);
+    return codeSource.slice(start, end);
+  };
+  const grabObject = (name) => {
+    const head = `const ${name} = {`;
+    const at = codeSource.indexOf(head);
+    assert.ok(at >= 0, `const ${name} must exist`);
+    const start = at + head.length;
+    const end = codeSource.indexOf("};", start);
+    assert.ok(end > start, `const ${name} must be a closed object literal`);
+    return codeSource.slice(start, end);
+  };
+  const quoted = (text) => [...text.matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+
+  const groups = [...grabArray("FEATURE_GROUPS").matchAll(/\{ key: "(group\.[a-z]+)", items: \[([\s\S]*?)\] \}/g)]
+    .map((m) => ({ key: m[1], items: quoted(m[2]) }));
+  assert.ok(groups.length >= 8, `FEATURE_GROUPS must parse into its groups (got ${groups.length})`);
+  const firstScreen = quoted(grabArray("FEATURE_FIRST_SCREEN"));
+  const advanced = quoted(grabArray("FEATURE_ADVANCED_BOOLS"));
+  const strings = quoted(grabArray("FEATURE_STRINGS"));
+  const numbers = quoted(grabArray("FEATURE_NUMBERS"));
+  const enums = quoted(grabArray("FEATURE_ENUMS"));
+  const enumValuesBody = grabObject("FEATURE_ENUM_VALUES");
+  const childrenBody = grabObject("FEATURE_CHILDREN");
+  const children = [...childrenBody.matchAll(/\[([^\]]*)\]/g)].flatMap((m) => quoted(m[1]));
+
+  // ① 每个组必须二选一：进首屏，或显式登记在下面的折叠白名单里。两个都没写
+  // = 这一组的开关整组躺在「全部设置」里没人知道，正是 group.dream 的病。
+  // deepEqual 一次覆盖三件事：不重叠、不引用不存在的组、没有漏登记的组。
+  const FOLDED_GROUPS = ["group.safety", "group.pipeline", "group.retrieve", "group.persona"];
+  assert.deepEqual(
+    groups.map((g) => g.key).sort(),
+    [...firstScreen, ...FOLDED_GROUPS].sort(),
+    "every group must be on the first screen or explicitly listed as folded; a group that skips both has no entry"
+  );
+
+  // ② 空组等于白注册：组在、里面没有开关，用户点开是一片空白。
+  for (const g of groups) {
+    assert.ok(g.items.length > 0, `${g.key} must carry at least one switch`);
+  }
+
+  // ③ 一个开关只能有一个座位。同一 key 落进两组会渲染两次（render-once 破坏），
+  // 两个开关的显隐状态还可能不同步；落进组又落进「高级」更糟——同一项在两层
+  // 各画一遍。所以这里比覆盖，更比**互斥**。
+  const owner = new Map();
+  const claim = (keys, outlet) => {
+    for (const k of keys) {
+      assert.ok(!owner.has(k),
+        `${k} is rendered by both ${owner.get(k)} and ${outlet} — one switch, one seat`);
+      owner.set(k, outlet);
+    }
+  };
+  for (const g of groups) claim(g.items, g.key);
+  claim(children, "FEATURE_CHILDREN");
+  claim(advanced, "FEATURE_ADVANCED_BOOLS");
+  claim(strings, "FEATURE_STRINGS");
+  claim(numbers, "FEATURE_NUMBERS");
+  claim(enums, "FEATURE_ENUMS");
+
+  // ④ 反向：首屏数组引用的组必须真实存在（拼错组名 = 首屏少两组却没人发现）。
+  const known = new Set(groups.map((g) => g.key));
+  for (const k of firstScreen) assert.ok(known.has(k), `FEATURE_FIRST_SCREEN references a non-existent ${k}`);
+  // ⑤ 首屏与折叠白名单不能重叠：一个组同时出现在两边，语义上说不通。
+  for (const k of FOLDED_GROUPS) {
+    assert.ok(!firstScreen.includes(k), `${k} cannot be both folded and on the first screen`);
+  }
+
+  // ⑥ 登记了就必须真渲染。conflictLedgerMode 此前的处境是反过来的：渲染代码
+  // 里手写了一个下拉，但没在任何常量表里登记，所以上面五个出口都数不到它，
+  // #641 那个下拉被误删也不会有测试红。现在它进了表的第六个出口，剩下要锁的
+  // 是另一头——表里有这个 key、渲染代码却没人消费它，同样是静默消失。
+  assert.ok(/^\s+FEATURE_ENUMS\.map\(\(k\) => enumRow\(k\)\)/m.test(codeSource),
+    "FEATURE_ENUMS must be consumed by map() so every registered enum key renders a row");
+  assert.ok(/^\s+const enumRow = \(k, valuesOverride\) =>/m.test(codeSource),
+    "enumRow must stay the single shared renderer for enum keys (one row shape, not a second hand-written select); #653 added the valuesOverride param so the search branch reuses this renderer instead of cloning it");
+  // 取值表与登记表必须一一对应：表里多一个孤儿 setback 就没人渲染，
+  // 少一个取值表则下拉点开是空的。配上「至少两档」防止把枚举写成假开关。
+  const enumValueKeys = [...enumValuesBody.matchAll(/([A-Za-z][A-Za-z0-9_]*):\s*\[/g)].map((m) => m[1]);
+  assert.deepEqual(enumValueKeys.sort(), [...enums].sort(),
+    "every enum key must own exactly one value table, and no value table may be orphaned");
+  for (const k of enums) {
+    const at = enumValuesBody.indexOf(k + ":");
+    const values = [...(enumValuesBody.slice(at).match(/\[([^\]]*)\]/)?.[1] ?? "")
+      .matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+    assert.ok(values.length >= 2, `${k} must offer at least two states (an enum with one state is a hidden switch)`);
+  }
+  // ⑦ 已知枚举座位的反向锚。今天只有一个——它是面板上唯一「取值成档」的开关，
+  // 被整条摘掉时没有任何别的测试会发现（i18n 锁只扫组 items，扫不到枚举行）。
+  assert.deepEqual(enums, ["conflictLedgerMode"],
+    "conflictLedgerMode is the only enum seat today; losing it silently removes the #641 dropdown");
+});
+
+// B 项：页签闸门的加载态。features 是异步拉的，规则必须是「未到手就不渲染」——
+// 反过来先按默认值全渲染、到手再收起，会在加载完成那一瞬间闪一下消失，那是
+// 看得见的跳变；而「先不出现、到手后补上」只是渐显。这条锁规则本身，不锁渲染
+// 结果：组件没有导出，测试看不到 DOM，但能锁住「初值 null」「null 时恒假」
+// 「失败也关」这三个决定行为走向的字面量。
+test("tab seats wait for the feature flags instead of flashing a default", () => {
+  assert.ok(/const \[seatEff, setSeatEff\] = useState\(null\)/.test(clientSource),
+    "the flag snapshot must start as null (loading), not an optimistic default");
+  assert.ok(/const seatOpen = \(key\) => !!seatEff && !!seatEff\[key\]/.test(clientSource),
+    "seatOpen must be false while the snapshot is still null — a tab appears only once its flag is known");
+  assert.ok(/seatOpen\("sleepAffectiveEnabled"\) && \{ key: "affective"/.test(clientSource),
+    "the affective tab must be gated on its own master switch");
+  assert.ok(/seatOpen\("diaryEnabled"\) && \{ key: "diary"/.test(clientSource),
+    "the diary tab must be gated on its own master switch");
+  assert.ok(/\.catch\(\(\) => \{ if \(!cancelled\) setSeatEff\(\{\}\); \}\)/.test(clientSource),
+    "a failed flag fetch must close the gates (fail-closed), not open them");
+  // 页签没了、view 还停在那一格会渲染成空白页，必须回落 memory。
+  assert.ok(/if \(view === "affective" && !seatEff\.sleepAffectiveEnabled\) setView\("memory"\)/.test(clientSource),
+    "a view left on a now-hidden tab must fall back to the memory tab");
+});
+
+// #481：面板开关「改了不生效」的体验坑。开关在宿主启动时合并进冻结 cfg，
+// 此后面板改 kv 只是持久化——用户看到「已改」就以为生效了，实测（人格总闸）
+// 因此白白排查了一轮。这条锁三件事：①第三态徽标由后端的 pendingRestart 名单
+// 决定（前端算不出来：overrides 只说明「改了」，不说明「用没用上」）；
+// ②卡片顶部有整卡提示行；③中英文案与语义色齐备，且「待重启」不能靠
+// opacity 之类的弱化手段与「已改」区分（弱化在浅色主题下会掉到看不清）。
+test("feature switches expose a third badge state for saved-but-not-live overrides (#481)", () => {
+  // ① 判定来源必须是后端字段，而不是前端自己比 overrides。
+  assert.ok(/const pending = new Set\(\(state && state\.pendingRestart\) \|\| \[\]\)/.test(clientSource),
+    "the pending set must come from the backend pendingRestart list");
+  assert.ok(/pending\.has\(k\)[\s\S]{0,240}?mneme-badge--pending/.test(clientSource),
+    "flagTag must return the pending badge before falling back to default/changed");
+  // 后端字段缺失（旧宿主）时 pending 为空集，面板退回两态——不能因此崩掉。
+  assert.ok(/\(state && state\.pendingRestart\) \|\| \[\]/.test(clientSource),
+    "a missing pendingRestart must degrade to an empty set, not throw");
+
+  // ② 整卡提示行：只在有待重启项时出现，位置在说明之后、错误行之前。
+  const noticeAt = clientSource.indexOf('t("memory.features.pendingRestartNotice")');
+  const descAt = clientSource.indexOf('h("div", { className: "mneme-set-desc" }, t("memory.features.desc"))');
+  assert.ok(noticeAt > descAt && descAt >= 0, "the notice row must sit after the card description");
+  assert.ok(/pending\.size > 0 && h\("div", \{ className: "mneme-pending" \}/.test(clientSource),
+    "the notice row must render only when something is actually pending");
+
+  // ③ 双语齐备（各出现两次：zh 表 + en 表）。
+  for (const key of ["memory.features.tagPending", "memory.features.tagPending.hint",
+    "memory.features.pendingRestartNotice"]) {
+    const occurrences = clientSource.split("\"" + key + "\"").length - 1;
+    assert.ok(occurrences >= 2, `i18n key ${key} must exist in both zh and en (got ${occurrences})`);
+  }
+
+  // ④ 样式走语义色层（AGENTS.md 第 9 条），且不靠透明度弱化区分状态。
+  assert.ok(/\.mneme-badge--pending\{[^}]*var\(--mneme-warn\)[^}]*\}/.test(clientSource),
+    "the pending badge must use the --mneme-warn semantic colour");
+  assert.ok(!/\.mneme-badge--pending\{[^}]*opacity/.test(clientSource),
+    "the pending badge must not rely on opacity to distinguish itself from changed");
+  assert.ok(/\.mneme-pending\{[^}]*var\(--mneme-warn\)[^}]*\}/.test(clientSource),
+    "the notice row must use the --mneme-warn semantic colour");
+  assert.ok(/\.mneme-pending-dot\{[^}]*background:currentColor/.test(clientSource),
+    "the notice dot must inherit currentColor so the colour has one source");
+});
+
+// v0.8.0 冲突集中处理：状态页的待确认冲突队列（reason + 双方内容对比 +
+// 保留 A/B/仅标记动作），resolveConflictPending 的第一个前端出口。双语齐备。
+test("conflict queue ships a central review surface on the status tab", () => {
+  for (const key of [
+    "memory.status.conflictQueue.reason",
+    "memory.status.conflictQueue.sideA",
+    "memory.status.conflictQueue.sideB",
+    "memory.status.conflictQueue.keepA",
+    "memory.status.conflictQueue.keepB",
+    "memory.status.conflictQueue.markReviewed",
+    "memory.status.conflictQueue.applyHint",
+    "memory.status.conflictQueue.missing",
+    "memory.status.conflictQueue.refresh"
+  ]) {
+    const occurrences = clientSource.split(`"${key}"`).length - 1;
+    assert.ok(occurrences >= 2, `i18n key ${key} must exist in both zh and en (got ${occurrences})`);
+  }
+  assert.ok(/function ConflictsQueue\(\{ t \}\)/.test(clientSource), "ConflictsQueue component must exist");
+  assert.ok(clientSource.includes('"/api/dsh-mneme/conflicts?limit=200"'), "queue must fetch the conflicts endpoint");
+  assert.ok(clientSource.includes('"/api/dsh-mneme/conflicts/resolve"'), "queue must call the resolve endpoint");
+  assert.ok(clientSource.includes("h(ConflictsQueue, { t })"), "status tab must render the queue");
+});
+
+// Issue #603 第 3 层：服务端一直返回 { items, total }，面板此前既不带 limit 也不读
+// total——列 50 条而徽章 60，第 51–60 条翻不到、也没有任何提示。这条锁三件事：
+// 请求要取满服务端上限、total 要存下来、被截断时要说出来。
+test("#603 conflict queue: the panel asks for the server cap and admits truncation", () => {
+  assert.ok(clientSource.includes('"/api/dsh-mneme/conflicts?limit=200"'),
+    "the queue must request the server's 200-row cap, not the 50-row default");
+  assert.ok(clientSource.includes("setTotal(typeof d.total === \"number\" ? d.total : null)"),
+    "the response total must be kept (it was dropped before)");
+  assert.ok(clientSource.includes("memory.status.conflictQueue.truncated"),
+    "a truncated list must say so");
+  for (const key of ["memory.status.conflictQueue.truncated"]) {
+    const occurrences = clientSource.split(`"${key}"`).length - 1;
+    assert.ok(occurrences >= 2, `i18n key ${key} must exist in both zh and en (got ${occurrences})`);
+  }
+  // 差额才提示：总数等于行数时不该多出一行噪声。
+  assert.ok(clientSource.includes("total > shown ? total - shown : 0"),
+    "the notice must only appear when rows are actually hidden");
+});
+
+// --- issue #178 批次一：无障碍（aria-live 网络 / 语义标题 / 焦点管理 / 图摘要） ---
+
+// 面板瞬时反馈（保存/裁决/刷新/复制）不能只靠纯视觉 span：announce() 单例
+// polite live region 是唯一的播报通道，所有接线点都必须走它。
+test("a11y: announce() live region exists and every transient feedback routes through it", () => {
+  assert.ok(clientSource.includes('function announce(text)'), "module-level announce() must exist");
+  assert.ok(clientSource.includes('"aria-live"'), "live region must set aria-live");
+  assert.ok(clientSource.includes('"role", "status"'), "live region must carry role=status");
+  // 接线点：功能开关保存、画像、向量、token、模式、extapi 保存+复制、
+  // 记忆编辑保存、队列刷新、裁决完成 —— 至少 9 处。
+  const wired = (clientSource.match(/\bannounce\(t\(/g) || []).length;
+  assert.ok(wired >= 9, `announce() wiring points expected >= 9, got ${wired}`);
+});
+
+// 状态卡标题原来是 div，读屏无法按标题导航；统一 h3（CSS margin 归零防回归）。
+test("a11y: status card titles are real headings", () => {
+  assert.ok(clientSource.includes('h("h3", { className: "mneme-xcolhead" }'), "StatusCard title must be an h3");
+  const css = clientSource.match(/\.mneme-xcolhead\{[^}]*\}/);
+  assert.ok(css && css[0].includes("margin:0"), "h3 default margin must be neutralized in CSS");
+});
+
+// 弹层焦点管理：Tab 圈在面板内，关闭后焦点还给触发元素（两个 opener 都要标记）。
+test("a11y: overlay focus trap and focus restore are wired", () => {
+  const openers = (clientSource.match(/"data-mneme-overlay-opener"/g) || []).length;
+  assert.equal(openers, 2, "both overlay entry buttons must carry the opener marker");
+  assert.ok(clientSource.includes('querySelectorAll(\'button, input, select, textarea, a[href], [tabindex]:not([tabindex="-1"])\')'),
+    "overlay must enumerate focusables for the Tab cycle");
+  assert.ok(/querySelector\('\[data-mneme-overlay-opener\]'\)/.test(clientSource), "closing must restore focus to the opener");
+});
+
+// 冲突裁决按钮「保留 A/B」在同文案多卡片下不可区分，必须带条目标题的 aria-label。
+test("a11y: conflict keep buttons carry item-title aria-labels", () => {
+  const labels = (clientSource.match(/"aria-label": `\$\{t\("memory\.status\.conflictQueue\.keep/g) || []).length;
+  assert.equal(labels, 2, "keepA/keepB buttons must both set aria-label");
+});
+
+// ego 关系图对读屏是一块不可达 SVG，必须 role=img + 计数摘要（键中英各一）。
+test("a11y: entity graph svg exposes a count summary", () => {
+  assert.ok(clientSource.includes('role: "img"'), "graph svg must be role=img");
+  for (const key of ["memory.graph.summary"]) {
+    const occurrences = clientSource.split(`"${key}"`).length - 1;
+    assert.ok(occurrences >= 2, `i18n key ${key} must exist in both zh and en (got ${occurrences})`);
+  }
+});
+
+// --- issue #177：冲突队列交互与视觉重做 ---
+
+// 相似度进度条：优先取服务端落列的 similarity（#603 第 2 层），老行才回落到
+// 「相似度 X / similarity X」锚定短语（防把年份当相似度）；A/B 卡片带侧色类，
+// 冻结徽章替代预裁决阶段的「已归档」徽章。
+test("conflict queue: similarity bar, side colors and frozen badge", () => {
+  assert.ok(clientSource.includes("similarityOf(it)"), "the whole item must be parsed, not just reason");
+  assert.ok(clientSource.includes("typeof it.similarity === \"number\""), "the server-side column wins over text parsing");
+  assert.ok(clientSource.includes("/(?:相似度|similarity)\\s*([01](?:\\.\\d+)?)/i"), "parse must anchor on the similarity phrase");
+  for (const key of ["memory.status.conflictQueue.similarity", "memory.status.conflictQueue.frozenBadge"]) {
+    const occurrences = clientSource.split(`"${key}"`).length - 1;
+    assert.ok(occurrences >= 2, `i18n key ${key} must exist in both zh and en (got ${occurrences})`);
+  }
+  assert.ok(clientSource.includes('"mneme-conflict-side--a"'), "side A must carry the A color class");
+  assert.ok(clientSource.includes('"mneme-conflict-side--b"'), "side B must carry the B color class");
+  assert.ok(!/s\.archived && h\("span", \{ className: "mneme-badge mneme-badge--archived"/.test(clientSource),
+    "the pre-ruling archived badge must be replaced by the frozen badge");
+  assert.ok(clientSource.includes("mneme-badge--frozen"), "frozen badge class must exist");
+});
+
+// 词级 diff：LCS 对齐是纯函数，锁它的存在、上限护栏与渲染接线（无损性由
+// difftest 独立验证，此处只锁形状）。
+test("conflict queue: word diff is wired with size guards", () => {
+  assert.ok(clientSource.includes("function wordDiff(aText, bText)"), "wordDiff must exist");
+  assert.ok(clientSource.includes("mneme-conflict-mark--del"), "del highlight class must exist");
+  assert.ok(clientSource.includes("mneme-conflict-mark--ins"), "ins highlight class must exist");
+  assert.ok(clientSource.includes("n > 800 || m > 800"), "DP must bail on oversized inputs");
+});
+
+// 空态教育卡：0 冲突时也渲染（原来整块 return null），解释冻结是什么。
+test("conflict queue: empty-state explainer card", () => {
+  assert.ok(!/if \(!items \|\| items\.length === 0\) return null;/.test(clientSource),
+    "empty queue must render the explainer instead of nothing");
+  for (const key of ["memory.status.conflictQueue.emptyTitle", "memory.status.conflictQueue.emptyBody"]) {
+    const occurrences = clientSource.split(`"${key}"`).length - 1;
+    assert.ok(occurrences >= 2, `i18n key ${key} must exist in both zh and en (got ${occurrences})`);
+  }
+});
+
+// 状态卡待处理高亮 + 三个入口的 badge：宿主面板行图标（SidebarPanelGlyph）、
+// 老宿主的 portal 入口（SidebarTopEntry）、footer 回退按钮（SidebarFallbackTrigger）。
+// 三个都吃同一个模块级计数，所以这里锁的是「一个都没漏接」——漏一个的那台宿主
+// 上红点就不出现，而抽屉里仍然显示有待裁决冲突。
+test("conflict queue: actionable status card and every sidebar entry badge", () => {
+  assert.ok(clientSource.includes('"mneme-conflict-jump"'), "pending>0 card must carry the highlight class");
+  assert.ok(clientSource.includes("mneme-statuscard--actionable"), "highlight CSS must exist");
+  assert.equal((clientSource.match(/h\(ConflictBadge, \{ pending \}\)/g) || []).length, 3,
+    "badge must be wired into the panel-list glyph and both legacy entry surfaces");
+  assert.equal((clientSource.match(/= useConflictBadgeCount\(\);/g) || []).length, 3,
+    "all three entry components must subscribe to the shared badge count");
+  assert.ok(clientSource.includes('"/api/dsh-mneme/dream-status"'), "badge must reuse the dream-status endpoint");
+});
+
+// 用户反馈「裁决完红点消失得很慢」的根因：裁决成功时冲突队列广播
+// mneme:conflicts-changed，但只有状态卡订阅了它，侧边栏红点漏订——红点于是只能
+// 等 60s 兜底轮询。本用例锁三类回归：(a) 红点订阅该广播并立即重取；(b) 计数走
+// 模块级单例（原先 portal 与 footer 回退各起一个 60s 轮询 → 两份请求且互不同步）；
+// (c) 兜底轮询保留（后台 autoDream 自己产生/消解冲突时没人广播，靠它浮现）。
+test("sidebar badge clears on the conflicts-changed broadcast, not on the next poll", () => {
+  assert.ok(
+    /window\.addEventListener\("mneme:conflicts-changed", onChanged\)/.test(clientSource),
+    "the badge must subscribe to the broadcast the conflict queue already emits"
+  );
+  assert.ok(
+    clientSource.includes("const conflictBadgeCount = (() => {"),
+    "the count must live in one module-level store shared by both entry components"
+  );
+  assert.ok(
+    clientSource.includes("if (listeners.size === 1) {"),
+    "exactly one poll timer per store, refcounted by its subscribers"
+  );
+  assert.ok(
+    /setInterval\(refresh, 60_000\)/.test(clientSource),
+    "the 60s fallback poll must stay: background autoDream resolves conflicts without broadcasting"
+  );
+  assert.ok(
+    clientSource.includes("if (inflight) return inflight;"),
+    "concurrent refreshes (broadcast + open + first subscriber) must collapse into one request"
+  );
+});
+
+// 上一条锁的是"接线在不在"，这条锁"接线真的按预期跑"。把源码里那段 store 抠出来
+// 用受控的 apiFetch / setInterval 真跑一遍——用户抱怨的正是时序（慢），而
+// "存在某个字符串" 证明不了任何时序。回归表现：第二个订阅者又开一条轮询、
+// 广播后不立刻反映、并发 refresh 打两次请求、订阅者走光后定时器还在跑。
+test("badge store: one poll for both entries, immediate publish after a refresh", async () => {
+  const src = clientSource.match(/const conflictBadgeCount = \(\(\) => \{[\s\S]*?\}\)\(\);/);
+  assert.ok(src, "the badge store source block must be extractable verbatim");
+  const calls = [];
+  const resolvers = [];
+  const timers = [];
+  let cleared = 0;
+  const makeStore = new Function("apiFetch", "setInterval", "clearInterval",
+    `${src[0]}\nreturn conflictBadgeCount;`);
+  const store = makeStore(
+    (path) => {
+      calls.push(path);
+      return new Promise((resolve) => { resolvers.push(resolve); });
+    },
+    (fn, ms) => { timers.push({ fn, ms }); return timers.length; },
+    () => { cleared += 1; }
+  );
+  const settle = async (payload) => {
+    const batch = resolvers.splice(0, resolvers.length);
+    batch.forEach((r) => r({ ok: true, json: () => Promise.resolve(payload) }));
+    await new Promise((r) => setTimeout(r, 0));
+  };
+
+  const seen = [];
+  const un1 = store.subscribe((v) => seen.push(v));
+  assert.equal(calls.length, 1, "the first subscriber must trigger exactly one fetch");
+  assert.equal(timers.length, 1, "and exactly one timer");
+  assert.equal(timers[0].ms, 60_000, "the fallback cadence stays 60s");
+  const un2 = store.subscribe((v) => seen.push(v));
+  assert.equal(calls.length, 1, "a second subscriber must reuse the poll, not start another");
+  assert.equal(timers.length, 1, "still one timer for both entry buttons");
+
+  await settle({ pendingConflicts: 3 });
+  assert.deepEqual(seen, [0, 0, 3, 3], "both subscribers must see the same published value");
+
+  // 广播路径：冲突队列裁决成功后 dispatch mneme:conflicts-changed → hook 调 refresh()
+  store.refresh();
+  store.refresh();
+  assert.equal(calls.length, 2, "concurrent refreshes collapse into a single in-flight request");
+  await settle({ pendingConflicts: 0 });
+  assert.equal(store.get(), 0, "the count must drop as soon as the refreshed value lands");
+  assert.equal(seen[seen.length - 1], 0, "and both subscribers must be notified");
+
+  store.refresh();
+  await settle({ pendingConflicts: 0 });
+  assert.deepEqual(seen, [0, 0, 3, 3, 0, 0], "an unchanged value must not re-render subscribers");
+
+  un1();
+  assert.equal(cleared, 0, "the timer must survive while one subscriber remains");
+  un2();
+  assert.equal(cleared, 1, "the timer must stop when the last subscriber leaves");
+});
+
+// 通用失效广播（mneme:store-changed）：此前跨组件失效只有 mneme:conflicts-changed
+// 一个事件、三个状态侧监听者，记忆列表与冲突徽章、实体页、归档工作台全都不在
+// 名单里——裁决/删除之后要关面板重开才能看到落地（用户 2026-11-06 反馈）。
+// 本用例锁四类回归：(a) 事件名不被改名；(b) 发布点数量——新增改库动作忘了广播
+// 时这里先红（ledger 见断言消息）；(c) 此前漏订的数据视图都订阅了；(d) 裁决
+// 路径精准信号与通用信号并存，砍掉任何一个都会让现有监听者失去各自语义。
+test("store-changed broadcast: every mutation publishes, missed views subscribe", () => {
+  assert.ok(
+    clientSource.includes('new CustomEvent("mneme:store-changed"'),
+    "the broadcast must dispatch an event literally named mneme:store-changed"
+  );
+  // 发布点 ledger（lookahead 排除 helper 定义形参那一处）：conflict-resolve /
+  // memory-delete / memory-archive|restore|edit（applyMemoryUpdate 一处按分支发
+  // 一种）/ workbench restore / import×3 / create / pack-undo / reclaim = 10 处发布。
+  const dispatches = clientSource.match(/broadcastStoreChanged\((?!reason\b)/g) || [];
+  assert.equal(
+    dispatches.length, 10,
+    `every store-mutating action must publish exactly once (got ${dispatches.length}; ` +
+    "if you added a mutation, add its broadcast and bump this ledger)"
+  );
+  const subscribers = clientSource.match(/addEventListener\("mneme:store-changed"/g) || [];
+  assert.equal(
+    subscribers.length, 7,
+    `memory list, entities, workbench, conflict queue, badge hook and both dream-status consumers must subscribe (got ${subscribers.length})`
+  );
+  assert.ok(
+    clientSource.includes('broadcastStoreChanged("conflict-resolve")')
+      && clientSource.includes('new CustomEvent("mneme:conflicts-changed")'),
+    "resolve must keep emitting the precise conflicts-changed signal alongside the generic one"
+  );
+});
+
+// --- issue #179：注入预览（状态页卡片 + /inject-preview 端点透传的旁路快照） ---
+test("a11y+preview: inject preview card is wired on the status tab", () => {
+  assert.ok(clientSource.includes('"/api/dsh-mneme/inject-preview"'), "card must fetch the preview endpoint");
+  assert.ok(clientSource.includes("h(InjectPreviewCard, { t })"), "status grid must render the preview card");
+  for (const key of [
+    "memory.status.injectPreview",
+    "memory.status.injectPreviewNone",
+    "memory.status.injectPreview.chars",
+    "memory.status.injectPreview.empty"
+  ]) {
+    const occurrences = clientSource.split(`"${key}"`).length - 1;
+    assert.ok(occurrences >= 2, `i18n key ${key} must exist in both zh and en (got ${occurrences})`);
+  }
+});
+// --- issue #386 第 3 条：Markdown 镜像健康卡 ---
+// 镜像写失败（磁盘满/权限）在记忆库侧完全静默，状态页这张卡是最早的可见信号。
+// 关键不变量是 fail-closed：fetch 失败或 status 不是 ok/degraded 时必须渲染
+// 「未知」——这里锁死派生表达式，防止未来被「简化」成把未知当正常显示。
+test("mirror health: card wired with fail-closed unknown rendering", () => {
+  assert.ok(clientSource.includes('"/api/dsh-mneme/health"'), "mirror card must fetch the health endpoint");
+  assert.ok(clientSource.includes("h(MirrorHealthCard, { t })"), "overview grid must render the mirror card");
+  const status = clientSource.match(/const status = m && \(m\.status === "ok" \|\| m\.status === "degraded"\) \? m\.status : "unknown";/);
+  assert.ok(status, "non-ok/non-degraded status (incl. fetch failure) must collapse to unknown, never ok");
+  assert.ok(clientSource.includes('m.last_error === "no-space"'), "last_error no-space must be mapped to human text");
+  assert.ok(clientSource.includes('m.last_error === "permission"'), "last_error permission must be mapped to human text");
+  for (const key of [
+    "memory.status.mirror.ok",
+    "memory.status.mirror.degraded",
+    "memory.status.mirror.unknown",
+    "memory.status.mirror.err.noSpace",
+    "memory.status.mirror.err.permission",
+    "memory.status.mirror.err.syncFailed"
+  ]) {
+    const occurrences = clientSource.split(`"${key}"`).length - 1;
+    assert.ok(occurrences >= 2, `i18n key ${key} must exist in both zh and en (got ${occurrences})`);
+  }
+});
+
+// --- issue #275：库体积卡（容量预警，空间维度）---
+// 预警卡的关健不变量同样是 fail-closed：fetch 失败、老宿主没有 capacity 块、后端
+// status:"unknown" 三种情况都渲染「未知」，绝不显示「正常」；过线的检查逐条列出
+// 且值/阈值都给全（报警要能对上数字）。这里锁死派生表达式与 i18n 双语键，
+// 防止未来被「简化」成把未知当正常、或把过线行折成一句空话。
+test("capacity warning: card wired with fail-closed unknown rendering", () => {
+  assert.ok(clientSource.includes("function CapacityCard"), "库体积卡必须存在");
+  assert.ok(clientSource.includes("h(CapacityCard, { t })"), "overview grid must render the capacity card");
+  // 与镜像卡同一条 /health 路径读 capacity 块（「加一个库体积卡是同一条路径」）
+  const fetches = clientSource.split('"/api/dsh-mneme/health"').length - 1;
+  assert.ok(fetches >= 2, "capacity card must fetch the health endpoint (mirror card + capacity card)");
+  const unknown = clientSource.match(/const unknown = !c \|\| c\.status === "unknown";/);
+  assert.ok(unknown, "missing block / backend unknown must collapse to unknown, never ok");
+  // 过线行必须带 warn 标记走预警色，大数字同样（class 由 StatusCard 拼接）
+  assert.ok(clientSource.includes('"mneme-statrow mneme-statrow--warn"'), "tripped check rows must carry the warn class");
+  assert.ok(clientSource.includes('"mneme-statusnum mneme-statusnum--warn"'), "warned big number must carry the warn class");
+  // 三种检查的标签显式映射（不按键名拼 i18n key，缺键时会把键名漏给用户）
+  assert.ok(clientSource.includes('"memory.status.capacity.check.dbSize"'));
+  assert.ok(clientSource.includes('"memory.status.capacity.check.archivedRows"'));
+  assert.ok(clientSource.includes('"memory.status.capacity.check.archivedRatio"'));
+  for (const key of [
+    "memory.status.capacity",
+    "memory.status.capacity.unknown",
+    "memory.status.capacity.unknownFoot",
+    "memory.status.capacity.active",
+    "memory.status.capacity.archived",
+    "memory.status.capacity.reclaimable",
+    "memory.status.capacity.check.dbSize",
+    "memory.status.capacity.check.archivedRows",
+    "memory.status.capacity.check.archivedRatio",
+    "memory.status.capacity.foot"
+  ]) {
+    const occurrences = clientSource.split(`"${key}"`).length - 1;
+    assert.ok(occurrences >= 2, `i18n key ${key} must exist in both zh and en (got ${occurrences})`);
+  }
+});
+
+// --- issue #386 第 1 条：独立服务只读卡片 ---
+// 卡片展示 dsh-mneme-serve 示例命令并支持复制。关键锁：命令不能写成
+// `npx dsh-mneme-serve …` —— bin 名与包名不同，裸 npx 会尝试安装一个不存在
+// 的 npm 包「dsh-mneme-serve」，用户复制出去必然报错。
+test("serve card: sample command is npx-installable and card is wired", () => {
+  assert.ok(clientSource.includes('"memory.settings.serve.title"'), "serve card must exist in the settings view");
+  assert.ok(clientSource.includes("copyServeCmd"), "serve command must have a copy affordance");
+  assert.ok(clientSource.includes("npx -p @modusensus/dsh-mneme dsh-mneme-serve"), "sample command must name the real package via -p");
+  assert.equal(clientSource.includes("npx dsh-mneme-serve"), false, "bare `npx dsh-mneme-serve` would install a nonexistent package");
+  for (const key of [
+    "memory.settings.serve.title",
+    "memory.settings.serve.cmd",
+    "memory.settings.serve.hint"
+  ]) {
+    const occurrences = clientSource.split(`"${key}"`).length - 1;
+    assert.ok(occurrences >= 2, `i18n key ${key} must exist in both zh and en (got ${occurrences})`);
+  }
+});
+
+// --- issue #386 第 2 条：MCP 接入卡 ---
+// 可发现性缺口：dsh-mneme-mcp 此前面板一个字都没有。锁三件事：片段必须带
+// DSH_MNEME_TOKEN（MCP 数据面走外部访问 API 的 Bearer，不是面板本地
+// localStorage 那把）、复制入口存在、i18n 中英成对。
+test("mcp card: mount snippet is copyable and token-keyed to the external API", () => {
+  assert.ok(clientSource.includes('"memory.settings.mcp.title"'), "mcp card must exist in the settings view");
+  assert.ok(clientSource.includes("copyMcpSnippet"), "mcp snippet must have a copy affordance");
+  assert.ok(clientSource.includes("DSH_MNEME_TOKEN"), "snippet must key the external-API Bearer token");
+  assert.ok(clientSource.includes("mcpServers"), "snippet must be an .mcp.json fragment");
+  for (const key of [
+    "memory.settings.mcp.title",
+    "memory.settings.mcp.snippet",
+    "memory.settings.mcp.hint"
+  ]) {
+    const occurrences = clientSource.split(`"${key}"`).length - 1;
+    assert.ok(occurrences >= 2, `i18n key ${key} must exist in both zh and en (got ${occurrences})`);
+  }
+});
+// --- #400 冲突裁决窗可读性（报障原话：窗口太小又不能放大，完全对比不了内容，只好
+// 两个都删或胡乱选一个）---
+// 锁四件事：展开切换存在且默认收起（折叠态仍走 140 字预览，既有布局不回归）；
+// 展开态渲染未截断全文并去掉 diff 的行数钳制；判读依据行（类型/重要度/字数/
+// 新旧 + 单侧复制）在位；窄容器降级单列。缺任何一条，报障就复发。
+test("conflict queue: expandable full text with decision metadata", () => {
+  assert.ok(clientSource.includes('"memory.status.conflictQueue.expand"'), "collapsed state must offer 展开全文");
+  assert.ok(clientSource.includes('"memory.status.conflictQueue.collapse"'), "expanded state must offer 收起全文");
+  assert.ok(clientSource.includes('"aria-expanded": open'), "the toggle must expose aria-expanded");
+  assert.ok(/open \? \(s\.content \|\| ""\) : \(s\.content \|\| ""\)\.slice\(0, 140\)/.test(clientSource),
+    "collapsed keeps the 140-char preview while expanded must render untruncated content");
+  assert.ok(clientSource.includes("mneme-conflict-diff--full"), "expanded diff must drop the 4-line clamp");
+  // 展开态高度上限必须与视口无关：宿主可能把面板放进零高视口（隐藏 webview /
+  // 后台页），那时 vh 会算成 0px，「展开全文」直接看不见字——肉眼验收实测踩过。
+  assert.ok(clientSource.includes("max-height:28em"), "expanded height cap must be viewport-independent");
+  assert.equal(/\.mneme-conflict-(diff--full|text)\{[^}]*\d+vh/.test(clientSource), false,
+    "conflict expand rules must not use vh");
+  assert.ok(clientSource.includes('"memory.status.conflictQueue.chars"'), "each side must show its length");
+  assert.ok(clientSource.includes('"memory.status.conflictQueue.updated"'), "each side must show which one is newer");
+  assert.ok(clientSource.includes("copySide"), "each side must be copyable for external comparison");
+  assert.ok(clientSource.includes("@container (max-width:560px){.mneme-conflict-pair{grid-template-columns:1fr}}"),
+    "a narrow panel must fall back to one column instead of two unreadable halves");
+  for (const key of [
+    "memory.status.conflictQueue.expand",
+    "memory.status.conflictQueue.collapse",
+    "memory.status.conflictQueue.copySide",
+    "memory.status.conflictQueue.copiedSide",
+    "memory.status.conflictQueue.importance",
+    "memory.status.conflictQueue.chars",
+    "memory.status.conflictQueue.updated",
+    "memory.status.conflictQueue.created"
+  ]) {
+    const occurrences = clientSource.split(`"${key}"`).length - 1;
+    assert.ok(occurrences >= 2, `i18n key ${key} must exist in both zh and en (got ${occurrences})`);
+  }
+});
+
+// #386 第 5 条：面板手动新增记忆。这一块最容易悄悄退化——菜单项被删掉、弹层被
+// 从树里摘掉、或者表单又长回 scope/sensitivity 输入框（那会绕开详情抽屉的「放宽
+// 可见性」二次确认），面板表面上看不出坏，只是入口没了。所以既锁「入口存在」，
+// 也锁「入口真的挂在树上」。
+test("panel can create a memory by hand: menu entry wired to the dialog", () => {
+  // 入口在「更多操作」菜单里，且菜单项真的调用 setCreateOpen(true)——只断言文案
+  // 存在的话，把 onClick 摘掉测试照样绿。
+  assert.ok(clientSource.includes('"memory.explorer.newMemory"'), "menu entry label must exist");
+  assert.ok(/role: "menuitem", (?:disabled: bootstrapBusy, )?onClick: \(\) => \{ setCreateOpen\(true\); setMenuOpen\(false\); \}/.test(clientSource),
+    "the menu item must actually open the create dialog");
+  assert.ok(clientSource.includes("const [createOpen, setCreateOpen] = useState(false)"),
+    "the dialog needs its own open state");
+  // 弹层必须挂在树上并接上回调：onCreated 同时刷新列表与选中新行（并入既有条目时
+  // 返回的 id 是被并入那一行，也该滚进视野）。
+  assert.ok(/createOpen && h\(CreateDialog, \{/.test(clientSource), "the dialog must be mounted conditionally");
+  assert.ok(/onCreated: \(d\) => \{ setReloadKey\(\(k\) => k \+ 1\); broadcastStoreChanged\("create"\); if \(d && d\.id\) setSelectedId\(d\.id\); \}/.test(clientSource),
+    "creating must refresh the list, publish the invalidation broadcast and select the resulting row");
+  // 打后端的路由是 /create，不是 standalone 的 /memories：面板与工具必须走同一条
+  // saveWithDedupe 路径，否则「同标题并入」的提示在面板上会失灵。
+  assert.ok(clientSource.includes('apiFetch("/api/dsh-mneme/create"'),
+    "the dialog must post to the panel create route");
+  assert.ok(/d\.action === "merged" \? t\("memory\.explorer\.newMerged"\) : t\("memory\.explorer\.newCreated"\)/.test(clientSource),
+    "merged and created are different facts and must be reported differently");
+  // 弹层源码切片：下面「表单里有什么 / 没有什么」的断言一律在这段上做。在整包上做
+  // 等于没锁——这些字段名在 bundle 里到处都是，`clientSource.includes("title")` 恒真。
+  const dialogStart = clientSource.indexOf("function CreateDialog");
+  const dialogEnd = clientSource.indexOf("function MemoryExplorer", dialogStart);
+  assert.ok(dialogStart >= 0 && dialogEnd > dialogStart, "CreateDialog must be findable in the bundle");
+  const dialogSource = clientSource.slice(dialogStart, dialogEnd);
+  // 表单字段与 memory_save 工具对齐，且锁的是**真实请求体写法**：多一个字段（比如
+  // scope/sensitivity）这段就匹配不上，少一个 trim 也匹配不上。锁裸字段名会恒真。
+  assert.match(dialogSource,
+    /JSON\.stringify\(\{\s*type,\s*title: title\.trim\(\),\s*content: content\.trim\(\),\s*importance,\s*tags: tags\.split\(","\)\.map\(\(s\) => s\.trim\(\)\)\.filter\(Boolean\)\s*\}\)/,
+    "the create request body must carry exactly type/title/content/importance/tags");
+  // 成功路径**不得**重置 busy：提示要停 900ms 才关窗，这期间按钮若重新可点，第二次
+  // 同 type+title 会落进同一行并把正文再追加一遍（service 走 appendContent），一次
+  // 误触就写坏一条记忆。所以全弹层只允许 catch 那条路重置 busy。
+  assert.equal(dialogSource.split("setBusy(false)").length - 1, 1,
+    "only the error path may reset busy; the success path must stay disabled until the dialog closes");
+  assert.match(dialogSource, /\.catch\(\(\) => \{ setBusy\(false\); setErr\(t\("memory\.explorer\.newFailed"\)\); \}\)/,
+    "the single busy reset must be the error path");
+  // 按钮文案同理：成功后 busy 仍为 true，若只看 busy，写入早就完成了按钮还写着「保存
+  // 中…」——既骗用户又和旁边那行「已新建」自相矛盾。msg 一置上就切回正常文案。
+  assert.match(dialogSource, /busy && !msg \? t\("memory\.explorer\.newSaving"\) : t\("memory\.explorer\.newConfirm"\)/,
+    "once the write succeeded the button must stop claiming it is still saving");
+  assert.equal(/newScope|sensitivity/.test(dialogSource), false,
+    "the create form must not offer scope/sensitivity: that path bypasses the widen-confirm guard");
+  // document 不在类型下拉里：铸造口唯一（registerDocument，#230），后端也会 400。
+  assert.equal(dialogSource.includes('"document"'), false,
+    "document rows are minted only via registerDocument and must not be offered here");
+  // 类型白名单与 src/tools.js 的 memory_save enum 逐字一致（缺一个就会有人点进去才被拒）。
+  for (const k of ["preference", "project", "decision", "history", "rejected_solution", "pitfall", "constraint"]) {
+    assert.ok(dialogSource.includes(`"${k}"`), `type option ${k} must be offered`);
+  }
+  // 前端空值拦截只是省一次往返，服务端校验才是权威——但两者都得在，否则空标题会
+  // 一路发出去再弹一个 400 给用户看。
+  assert.ok(dialogSource.includes('if (!title.trim()) { setErr(t("memory.explorer.newNoTitle")); return; }'),
+    "empty title must be caught before the round trip");
+  assert.ok(dialogSource.includes('if (!content.trim()) { setErr(t("memory.explorer.newNoContent")); return; }'),
+    "empty body must be caught before the round trip");
+  // 十四个新键必须中英成对（与上面那条全局锁同口径，这里列出名字便于定位）。
+  for (const key of [
+    "memory.explorer.newMemory",
+    "memory.explorer.newTitle",
+    "memory.explorer.newHint",
+    "memory.explorer.newType",
+    "memory.explorer.newTitlePlaceholder",
+    "memory.explorer.newContentPlaceholder",
+    "memory.explorer.newTagsPlaceholder",
+    "memory.explorer.newConfirm",
+    "memory.explorer.newSaving",
+    "memory.explorer.newCreated",
+    "memory.explorer.newMerged",
+    "memory.explorer.newFailed",
+    "memory.explorer.newNoTitle",
+    "memory.explorer.newNoContent"
+  ]) {
+    const occurrences = clientSource.split(`"${key}"`).length - 1;
+    assert.ok(occurrences >= 2, `i18n key ${key} must exist in both zh and en (got ${occurrences})`);
+  }
+});
+// --- issue #386 第 4 条：存储回收卡（dry-run 预估 + 两步确认执行）---
+// 这是「不可逆的内容丢弃」在面板上的唯一入口，所以锁的不是「有没有这张卡」，而是三条
+// 不变量：执行必须两步、POST 必须逐字带确认门、VACUUM 失败不得渲染成干净的成功。
+// 所有断言都做在**卡片切片**上：路由串/dryRun/confirm 这些字面量在整包里到处都是，
+// 在 clientSource 上做 includes 恒真、等于没锁（#408 评审踩过的坑）。
+const maintCardSource = () => {
+  const start = clientSource.indexOf("function MaintenanceCard");
+  const end = clientSource.indexOf("function MirrorHealthCard", start);
+  assert.ok(start >= 0 && end > start, "MaintenanceCard must be findable in the bundle (切片锚点变了？)");
+  return clientSource.slice(start, end);
+};
+
+test("maintenance card: i18n keys are bilingual and the section is really rendered", () => {
+  for (const key of [
+    "memory.status.sec.maintenance",
+    "memory.status.maint",
+    "memory.status.maint.freelist",
+    "memory.status.maint.plannedInputs",
+    "memory.status.maint.plannedEmbeddings",
+    "memory.status.maint.window",
+    "memory.status.maint.windowUnit",
+    "memory.status.maint.windowLabel",
+    "memory.status.maint.reestimate",
+    "memory.status.maint.reestimating",
+    "memory.status.maint.stale",
+    "memory.status.maint.vacuum",
+    "memory.status.maint.vacuumHint",
+    "memory.status.maint.execute",
+    "memory.status.maint.confirm",
+    "memory.status.maint.running",
+    "memory.status.maint.cancel",
+    "memory.status.maint.confirmHint",
+    "memory.status.maint.badWindow",
+    "memory.status.maint.failed",
+    "memory.status.maint.done",
+    "memory.status.maint.size",
+    "memory.status.maint.reclaimed",
+    "memory.status.maint.clearedInputs",
+    "memory.status.maint.clearedEmbeddings",
+    "memory.status.maint.receipt",
+    "memory.status.maint.receiptNone",
+    "memory.status.maint.duration",
+    "memory.status.maint.vacuumRan",
+    "memory.status.maint.vacuumOff",
+    "memory.status.maint.vacuumFailed",
+    "memory.status.maint.vacuumFailedHint"
+  ]) {
+    // 数的是**字典行**（`"key": "` 顶格成行），不是裸字符串出现次数。裸数会把调用点
+    // 一起算进来：`t("...maint.done")` 在卡片里本来就有一次，删掉一整行英文译文之后
+    // 「字典 zh 行 + 调用点」照样凑够 2——锁恒真，就是这么漏的（本条第一版被 M1 变异
+    // 抓出来了）。行首锚定后，少一侧译文就只剩 1。
+    const entries = clientSource.match(new RegExp(`^\\s*"${key.replace(/\./g, "\\.")}"\\s*:\\s*"`, "gm"));
+    const count = entries ? entries.length : 0;
+    assert.equal(count, 2, `i18n key ${key} must appear as exactly one dictionary line per language (got ${count})`);
+  }
+  // 分区键只在字典里躺着不算加分区：必须真的渲染出「维护」这段扫读锚点。
+  assert.ok(clientSource.includes('h("div", { className: "mneme-statushead" }, t("memory.status.sec.maintenance"))'),
+    "the maintenance section head must render from the dictionary key");
+});
+
+test("maintenance card: the reclaim route is the in-process one, not the standalone data plane", () => {
+  const src = maintCardSource();
+  // 走 /api/dsh-mneme/... 这条 in-process 路由：它才有 requireAuth + 与 CLI 同一条
+  // reclaim 实现。写成 standalone 数据面的路径会绕开面板身份的鉴权口径。
+  assert.equal(src.split('"/api/dsh-mneme/maintenance/reclaim"').length - 1, 1,
+    "the card must name the in-process reclaim route exactly once (via its path constant)");
+  // 预估走 GET 且把窗口作为查询参数带上；粘在按钮上——键入即发会让数字在半截输入时跳。
+  assert.ok(src.includes("`${RECLAIM_PATH}?olderThanDays=${days}`"),
+    "re-estimating must GET the route with the current window as a query parameter");
+  assert.equal(src.split("onClick: estimate").length - 1, 1,
+    "only the re-estimate button may trigger an estimate (no request per keystroke)");
+  assert.ok(src.includes('onChange: (e) => setDays(e.target.value)'),
+    "typing in the window field must only update local state");
+});
+
+test("maintenance card: execution carries the verbatim dryRun:false + confirm:true gate", () => {
+  const src = maintCardSource();
+  // 逐字锁请求体：多一个字段、少一个空格、把 Number(days) 换成裸 days 都匹配不上。
+  // 锁裸字段名（dryRun/confirm）会恒真——它们在这段源码里各自还有别的出现位置。
+  assert.match(src,
+    /JSON\.stringify\(\{ dryRun: false, confirm: true, olderThanDays: Number\(days\), vacuum \}\)/,
+    "the executing body must be exactly dryRun:false + confirm:true + olderThanDays + vacuum");
+  // 全卡只有一处能改库：确认门之外的任何一次 POST 都是「第一次点就真清了」。
+  assert.equal(src.split('method: "POST"').length - 1, 1, "the card must issue exactly one POST");
+  assert.equal(src.split("dryRun: false").length - 1, 1, "exactly one mutating body may exist");
+  // 窗口非法时不得发请求：0 在服务端是「清掉全部快照」，畸形输入绝不能静默落进最坏解释。
+  assert.ok(src.includes('if (!/^\\d+$/.test(days)) { setError(t("memory.status.maint.badWindow")); setArmed(false); return; }'),
+    "a non-numeric window must be rejected locally before any round trip");
+  // 上界同样在本地拦：/^\d+$/ 放得过 1e20 与 400 位数字（后者化成 Infinity），后端
+  // 会回 400，但那时用户只看到一句「回收失败」，分不清是窗口不合法还是网络问题。
+  assert.match(src, /const MAX_WINDOW_DAYS = 3650;/,
+    "the card must carry the same upper bound as the backend");
+  assert.ok(src.includes('if (Number(days) > MAX_WINDOW_DAYS) { setError(t("memory.status.maint.badWindow")); setArmed(false); return; }'),
+    "an out-of-range window must be rejected locally, before any round trip");
+});
+
+test("maintenance card: 'no receipt' does not claim a single cause", () => {
+  // writeReceipt 返回 null 有两种成因：审计被关（config.llmAudit.enabled === false），
+  // 或回执写库失败（saveLlmAudit 抛错，只 warn）。旧文案「无（审计未启用）」把第二种
+  // 情况说成第一种——而这行出现在不可逆操作的结果区，用户会照它去对账。
+  for (const wording of [
+    '"memory.status.maint.receiptNone": "未记录（审计未启用或回执写入失败）"',
+    '"memory.status.maint.receiptNone": "Not recorded (audit disabled or receipt write failed)"'
+  ]) {
+    assert.ok(clientSource.includes(wording),
+      `the missing-receipt wording must name both causes: ${wording}`);
+  }
+});
+
+test("maintenance card: no window.confirm — the host webview cannot be relied on for it", () => {
+  const src = maintCardSource();
+  assert.equal(/window\.confirm/.test(src), false,
+    "window.confirm is not reliably available in the host webview; the in-card confirm state is the gate");
+  assert.equal(/(^|[^.\w])confirm\s*\(/.test(src), false,
+    "no blocking confirm() call may exist in the card (the confirm state is a rendered branch)");
+  assert.ok(src.includes("mneme-btndangerconfirm"),
+    "the armed state must use the repo's existing danger-confirm styling");
+});
+
+test("maintenance card: mounted in the status view under the maintenance section", () => {
+  // 组件存在但没挂上树 = 用户永远看不到，正是这条 issue 报的缺口。
+  const panelStart = clientSource.indexOf("function StatusPanel");
+  const panelEnd = clientSource.indexOf("function ", clientSource.indexOf("h(WorkbenchSection", panelStart));
+  assert.ok(panelStart >= 0 && panelEnd > panelStart, "StatusPanel must be findable in the bundle");
+  const panel = clientSource.slice(panelStart, panelEnd);
+  assert.ok(panel.includes("h(MaintenanceCard, { t })"),
+    "the status panel must render the maintenance card");
+  assert.ok(panel.includes('t("memory.status.sec.maintenance")'),
+    "the card must sit under the maintenance section head, not loose in the grid");
+});
+
+test("maintenance card: success state exists only behind the confirm gate", () => {
+  const src = maintCardSource();
+  // 第一次点只能「武装」，不得直连执行：默认态是红描边钮（mneme-btndanger），只有武装
+  // 后的实心红确认钮（mneme-btndangerconfirm）才允许调用 execute。
+  assert.match(src, /mneme-btndangerconfirm"[\s\S]{0,200}?onClick: execute/,
+    "only the armed danger-confirm button may fire the mutating call");
+  assert.match(src, /mneme-btndanger"[\s\S]{0,200}?onClick: \(\) => setArmed\(true\)/,
+    "the first click must only arm the confirm state, never execute");
+  assert.equal(src.split("onClick: execute").length - 1, 1,
+    "the executing click must have exactly one entry point in the card");
+  // 非 2xx 必须先 return，成功态才能写在它之后——否则失败也会渲染成成功。
+  const guard = src.indexOf("if (!r.ok) {");
+  const success = src.indexOf("setResult(r.body)");
+  assert.ok(guard >= 0 && success > guard,
+    "a non-2xx response must return before the success report is written");
+  assert.equal(src.split("setResult(r.body)").length - 1, 1,
+    "the success report must be written exactly once, from the confirmed call");
+  // 窗口改过却没重新估算时，确认态里摆出来的会是上一次的数字——对不可逆动作来说这是最坏
+  // 的一种错位，所以那种状态下执行钮必须是禁用的。
+  assert.ok(src.includes("const stale = !report || String(report.olderThanDays) !== days;"),
+    "an estimate that no longer matches the input must be detectable");
+  assert.match(src, /disabled: running \|\| loading \|\| estimating \|\| stale/,
+    "the run button must stay disabled while the estimate is stale");
+});
+
+// VACUUM 失败 ≠ 成功（契约 §5 的硬要求）。清理的两个 UPDATE 各自提交且不可逆，VACUUM
+// 只负责把文件缩回去；把半成功渲染成成功，用户会以为白清了一次。这条锁住那个三元分支，
+// 防止未来被「简化」成只看 dryRun/receipt。
+test("maintenance card: a failed VACUUM is reported, never rendered as a clean success", () => {
+  const src = maintCardSource();
+  assert.ok(src.includes("const vacuumError = rv.error == null ? null : String(rv.error);"),
+    "vacuum.error is string|null and must be read as the failure signal it is");
+  assert.match(src, /vacuumError \? t\("memory\.status\.maint\.vacuumFailed"\) : t\("memory\.status\.maint\.done"\)/,
+    "a non-null vacuum.error must replace the success headline");
+  assert.ok(src.includes('t("memory.status.maint.vacuumFailedHint")'),
+    "the failed state must state that the reclaim already happened, is irreversible, and that a rerun is idempotent");
+  // receipt 也要露面：不可逆动作没有回执号，出事时无法对账。锁的是**取值表达式**而不是
+  // 行标签——`t("...maint.receipt")` 只是左侧那行文案，把右侧渲染删空它照样在，锁标签
+  // 等于没锁（M12 变异验证过）。
+  assert.match(src, /result\.receipt == null \? t\("memory\.status\.maint\.receiptNone"\) : String\(result\.receipt\)/,
+    "the receipt value must be rendered (id when present, an explicit 'not recorded' when absent)");
+});
+
+test("maintenance card: VACUUM defaults to off and a failed run is reported verbatim", () => {
+  const src = maintCardSource();
+  // VACUUM 会短暂独占数据库（别的进程此时写入会 SQLITE_BUSY），它是**可选**动作，
+  // 默认必须关着——默认开等于每次回收都替用户独占一次库。契约 §5 的硬要求。
+  assert.ok(src.includes("const [vacuum, setVacuum] = useState(false);"),
+    "VACUUM must default to off");
+  // 非 2xx 必须把服务端给的 error 串如实带出来：只说「失败」，现场就分不清是 400 的
+  // confirm-required 还是 500 的 internal。
+  assert.ok(src.includes('setResultError(`${t("memory.status.maint.failed")} · ${(r.body && r.body.error) || `HTTP ${r.status}`}`);'),
+    "a non-2xx response must surface the server's own error string, not a bare 'failed'");
+  // 执行成功后必须复位确认态：否则下一次点击落在已武装的分支上，一步就把不可逆动作
+  // 放出去，两步确认名存实亡。
+  assert.match(src, /setResult\(r\.body\);\s*setArmed\(false\);/,
+    "the confirm state must be reset on the success path");
+});
+// 面板 bundle 在本文件里只被当**文本**读（上面的断言全是正则/字符串包含），
+// 而仓库的 CI 里没有任何一步**解析**它：于是重复声明这类语法错误能一路绿灯进
+// 主干，后果却是整个面板加载失败（__ModuleLoader__ 拿到的模块一执行就抛
+// SyntaxError）。lib/client.js 无 src 对应物、不参与 sync，也就没有别的闸门
+// 覆盖它——这里补一道解析闸（PR #320 rebase 时真实踩到：与上游新增的
+// summarizeSub 撞名，node --check 报 "Identifier 'summarizeSub' has already
+// been declared"，而当时 CI 全绿）。
+test("client bundle parses: 面板产物必须是合法 JS（无重复声明等语法错误）", () => {
+  const result = spawnSync(process.execPath, ["--check", join(root, "lib/client.js")], { encoding: "utf8" });
+  assert.equal(result.status, 0, `lib/client.js 解析失败：\n${result.stderr || result.stdout}`);
+});
+
+// #399 的两个留存键（distillRecords.enabled / retentionDays）此前只有后端
+// 白名单与 docs/CONFIGURATION.md 的「面板可启停」，面板里根本没有这一行——
+// 文档承诺了一个够不着的开关。补上 UI 之后，这条锁住四件容易被「简化」掉的事：
+//   ① 两个键真的进了渲染清单（enabled 在组里、retentionDays 在数值清单里）；
+//   ② 数值项的草稿必须从 effective 初始化——漏掉这一句，行会永远显示空值，
+//      用户以为配置丢了（#191 的睡眠路由键踩过同一个坑，见 :738 那条注释）；
+//   ③ 天数行必须由父开关门控（关着不留存，改天数没有意义）；
+//   ④ 非整数在本地就被挡下并把草稿退回生效值——留着非法文本会让人以为改成功了。
+test("distill retention switches are reachable from the panel (#399)", () => {
+  // 认「组里有没有」不要用 `"key"]` 这种子串——`eff["distillRecords.enabled"]`
+  // 也长这样，把组里那一项删掉它照样命中（变异验证实测：删项后仍全绿）。
+  // 必须把所属组的 items 数组抠出来单独看。#427 revamp 后归属 pipeline 组。
+  const pipelineGroup = clientSource.match(/key: "group\.pipeline", items: \[([\s\S]*?)\]/);
+  assert.ok(pipelineGroup, "the pipeline group must be declared");
+  assert.ok(
+    pipelineGroup[1].includes('"distillRecords.enabled"'),
+    "distillRecords.enabled must be an item of the pipeline group, not merely referenced elsewhere"
+  );
+  // 数值清单会随新键增长（v0.13 加了 diaryWriteEveryMinutes），所以钉「这三个都在、
+  // 且顺序不变」，不钉整行字面量——否则每加一个数值键这条锁就假红一次。
+  const numList = clientSource.match(/const FEATURE_NUMBERS = \[([\s\S]*?)\];/);
+  assert.ok(numList, "the numeric key list must be declared");
+  const numKeys = (numList[1].match(/"[^"]+"/g) || []).map((k) => k.slice(1, -1));
+  assert.deepEqual(
+    numKeys.slice(0, 3),
+    ["distillRecords.retentionDays", "dreamMaxTokens", "sleepMaxTokens"],
+    "retentionDays must stay in the numeric key list, after dreamMaxTokens/sleepMaxTokens (#478)"
+  );
+  assert.ok(numKeys.includes("distillRecords.retentionDays"), "retentionDays must be in the numeric key list");
+  assert.ok(
+    /for \(const key of FEATURE_NUMBERS\) numDraft\[key\] = String\(e\[key\] \?\? ""\);/.test(clientSource)
+      && /setNums\(numDraft\);/.test(clientSource),
+    "the numeric draft must be seeded from effective on mount, or the row always renders empty"
+  );
+  assert.ok(
+    /const distillSub = eff\["distillRecords\.enabled"\] && h\("div", \{ className: "mneme-featsub" \},\s*\n\s*numRow\("distillRecords\.retentionDays"\)/.test(clientSource),
+    "the retention-days row must be gated on the parent switch and live in its sub-block"
+  );
+  // 定义了不等于接线了：把 distillSub 从 subAfter 里摘掉，上面每条断言照样全绿
+  // （变异验证实测：摘掉后仍全绿）。#427 revamp 后子块一律走 subAfter 紧贴自己的
+  // 总闸（core 组已拆、组尾挂法退役），所以锁的是 subAfter 这条接线本身。
+  const subAfterMap = clientSource.match(/const subAfter = \{([^}]*)\}/);
+  assert.ok(subAfterMap, "the subAfter map must exist (sub-blocks ride next to their master switches)");
+  assert.ok(
+    /\bdistillSub\b/.test(subAfterMap[1]) && subAfterMap[1].includes('"distillRecords.enabled"'),
+    "distillSub must be wired to distillRecords.enabled via subAfter, not merely declared above"
+  );
+  for (const wired of ["entitySub", "summarizeSub", "choroSub", "diarySub"]) {
+    assert.ok(new RegExp(`\\b${wired}\\b`).test(subAfterMap[1]),
+      `${wired} must ride next to its master switch via subAfter (detached sub-blocks are the old mess)`);
+  }
+  assert.ok(
+    /if \(!\/\^\\d\+\$\/\.test\(raw\)\) \{\s*\n\s*setNums\(\(c\) => \(\{ \.\.\.c, \[key\]: String\(eff\[key\] \?\? ""\) \}\)\);\s*\n\s*return;\s*\n\s*\}/.test(clientSource),
+    "a non-integer draft must be rejected locally and reverted to the effective value"
+  );
+  for (const key of [
+    "memory.features.distillRecords.enabled",
+    "memory.features.distillRecords.enabled.hint",
+    "memory.features.distillRecords.retentionDays",
+    "memory.features.distillRecords.retentionDays.hint",
+    // #478：面板新暴露的两个 max_tokens 预算键，label 与 hint 缺一即哑行
+    "memory.features.dreamMaxTokens",
+    "memory.features.dreamMaxTokens.hint",
+    "memory.features.sleepMaxTokens",
+    "memory.features.sleepMaxTokens.hint"
+  ]) {
+    const occurrences = clientSource.split(`"${key}"`).length - 1;
+    assert.ok(occurrences >= 2, `i18n key ${key} must exist in both zh and en (got ${occurrences})`);
+  }
+});
+
+test("a rejected feature write is visible and reverts the draft", () => {
+  // 锁的是「保存失败从不显示」：错误提示原先只有一个座位、且带 `!state` 条件
+  // （首屏加载失败才渲染）——state 一到手，此后每次写入失败都静默，输入框里
+  // 留着没保存的值。整数项把「越界」变成可达路径后，人能在面板上看到 99999
+  // 却以为它生效了。
+  // 认「座位存在」不能只看 setSaveError 出现几次（函数里调它、渲染处读它，
+  // 两处都在就算命中），要把写入路径与渲染路径分别钉住。
+  assert.ok(
+    clientSource.includes('const [saveError, setSaveError] = useState("");'),
+    "save failures need their own state slot"
+  );
+  // 渲染座位必须在主卡片里（描述行之后、运行时块之前），而不是被 !state 挡住。
+  // 从描述行之后找：搜索结果分支里也有一处同款渲染（PR #677 评审回归），按首个
+  // 命中会把它误当座位——那正是本条要锁的位置语义。
+  const descAt = clientSource.indexOf('h("div", { className: "mneme-set-desc" }, t("memory.features.desc"))');
+  const seatAt = clientSource.indexOf('saveError && h("div", { className: "mneme-mainterr" }, saveError)', descAt);
+  const provAt = clientSource.indexOf("h(RuntimeProvisionBlock, { t })");
+  assert.ok(descAt > 0 && seatAt > descAt, "the save-error seat must live in the main card body");
+  assert.ok(provAt > seatAt, "the seat must sit in the card header area, before the runtime block");
+  const earlyReturn = clientSource.match(/if \(error && !state\) return[\s\S]{0,300}?error\)\);/);
+  assert.ok(earlyReturn, "the load-failure early return must still be there");
+  assert.ok(!earlyReturn[0].includes("saveError"), "the save-error seat must not ride the load-failure branch");
+
+  // 写入路径：服务端 400 的 body 带着键名与范围（api.js 那条 400 的设计），
+  // 要读出来；失败要能被调用方看见，所以返回值必须是真假。
+  const putBody = clientSource.match(/const put = async \(patch\) => \{([\s\S]*?)\r?\n      \};/);
+  assert.ok(putBody, "put must be declared");
+  assert.ok(putBody[1].includes("const detail = await res.json()"), "the server error body must be read");
+  assert.ok(putBody[1].includes('throw new Error(detail || ("HTTP " + res.status));'), "the body must win over the bare status");
+  assert.ok(putBody[1].includes("return true;") && putBody[1].includes("return false;"), "put must report success");
+  assert.ok(putBody[1].includes("setSaveError(`"), "a rejected write must set the visible error");
+
+  // 两个提交路径都要在同一处退回生效值：只报错不退，框里的值仍与在用的值分家。
+  assert.ok(clientSource.includes("put({ [key]: raw }).then((ok) => {"), "a rejected string draft must be revertible");
+  assert.ok(clientSource.includes("put({ [key]: Number(raw) }).then((ok) => {"), "a rejected number draft must be revertible");
+  assert.ok((clientSource.split("if (!ok) setStrs(").length - 1) >= 1, "the string draft must revert on rejection");
+  assert.ok((clientSource.split("if (!ok) setNums(").length - 1) >= 1, "the number draft must revert on rejection");
+
+  const occurrences = clientSource.split('"memory.features.saveFailed"').length - 1;
+  assert.ok(occurrences >= 2, `i18n key memory.features.saveFailed must exist in both zh and en (got ${occurrences})`);
+});
+
+// ── M.O.（Modus Operandi）面板的数据面 ────────────────────────────────────────
+// 第一版面板拿硬编码的 PIPELINE_MOCK 验证形状与交互（服务端管线当时还没落地）。
+// 接上真数据之后那份常量必须消失：留着它，面板随时可能退回展示一份并不存在的
+// 工作流——而这正是这一刀要修掉的东西。这里锁「没有」比锁「有什么」更要紧。
+test("M.O. panel carries no mock pipeline data", () => {
+  assert.equal(
+    clientSource.includes("PIPELINE_MOCK"),
+    false,
+    "the hardcoded PIPELINE_MOCK must be gone now that the panel reads the server"
+  );
+});
+
+// 四个座位——会话头图标、会话头浮层、右栏 tab、对话行结算卡——必须读同一份投影。
+// 分家的事故长这样：会话头说有 3 条候选、右栏说有 5 条，而两个数字都对、没人查得出来。
+// 所以缓存只许有一处（usePipeline），其余要么从它取，要么经 PipelineBrowser 取。
+test("M.O. seats share a single pipeline document", () => {
+  assert.equal(
+    (clientSource.match(/function usePipeline\(/g) || []).length,
+    1,
+    "usePipeline must be defined exactly once — one cache, every seat"
+  );
+  const bodyOf = (name) => {
+    const start = clientSource.indexOf(`function ${name}(`);
+    assert.ok(start > -1, `${name} must exist`);
+    const next = clientSource.slice(start + 1).indexOf("\n    function ");
+    return clientSource.slice(start, next > -1 ? start + 1 + next : clientSource.length);
+  };
+  for (const seat of ["PipelineHeaderEntry", "TurnRunCard"]) {
+    assert.ok(
+      bodyOf(seat).includes("usePipeline(project, null)"),
+      `${seat} must read the shared pipeline document`
+    );
+  }
+  // 另两个座位不再自己调 hook：它们把 project 交给 PipelineBrowser，由它按 openId 决定
+  // 读清单还是读某一条。hook 不能条件调用，所以这道分叉必须落在**组件之间**而不是
+  // 一个组件里的 if/else——后者会在点开那一下炸成「Rendered more hooks than during
+  // the previous render」，而那是运行期才看得见的错。
+  assert.ok(
+    bodyOf("PipelinePane").includes("h(PipelineBrowser, { t, project })"),
+    "PipelinePane must delegate to PipelineBrowser"
+  );
+});
+
+// 清单与图**同屏**。这条锁的形状换过两次，两次的教训都写在这里，免得再翻回去：
+//   一进来就是图 —— 没有名字、没有落点，要的是一串有名字的条目；
+//   清单 ⟷ 图两屏来回切 —— 条目有了，但画布藏在一次点击后面、界面上没有任何提示，
+//                          反馈连着两次说「看不到画布和节点」。
+// 所以锁的是：清单行渲染名字/作用域/规模，**且** 图与清单在同一个组件里同时出现。
+test("M.O. browser shows the named list and the canvas on one screen", () => {
+  const bodyOf = (name) => {
+    const start = clientSource.indexOf(`function ${name}(`);
+    assert.ok(start > -1, `${name} must exist`);
+    const next = clientSource.slice(start + 1).indexOf("\n    function ");
+    return clientSource.slice(start, next > -1 ? start + 1 + next : clientSource.length);
+  };
+  const list = bodyOf("PipelineWorkflowList");
+  assert.ok(list.includes("row.title || row.id"), "each row must show a name");
+  assert.ok(list.includes("memory.actions.scope.project"), "each row must show its scope");
+  assert.ok(list.includes("memory.actions.list.meta"), "each row must show its size");
+  const browser = bodyOf("PipelineBrowser");
+  assert.ok(browser.includes("PipelineWorkflowList"), "the named list must be on screen");
+  assert.ok(
+    browser.includes("h(PipelineView, { t, data: detailDoc })"),
+    "the canvas must be on the SAME screen — not behind a click"
+  );
+  assert.ok(browser.includes("rows.length ? rows[0].id : null"), "the first workflow must be expanded by default");
+});
+
+// 面板读的是服务端投影，不是本地算的：工作流本体住仓库、投影住服务端，
+// 面板只负责画。路由一旦改了名字、或者项目根忘了带，这条会先红。
+test("M.O. panel reads the server projection", () => {
+  assert.match(
+    clientSource,
+    /"\/api\/dsh-mneme\/pipeline" \+/,
+    "the panel must fetch the pipeline route"
+  );
+  // 项目根是**客户端从会话读出来带过去的**，不是服务端猜的：插件侧的 ctx 上没有 cwd
+  // （只有 logger / llm / reflect / webServer / inject / commands），猜不出来。
+  assert.ok(
+    clientSource.includes('params.push("project=" + encodeURIComponent(project))'),
+    "the panel must pass the session's project root to the route"
+  );
+  assert.ok(
+    clientSource.includes("function sessionProject(ctx, sessionId)"),
+    "the session cwd lookup must exist and stay named"
+  );
+  // 两条来源的先后：会话列表快照（byId[sessionId].cwd）是宿主给客户端的公开形状，
+  // sessions.get() 是宿主侧写法、客户端不一定有。顺序反了不会报错，只会让面板静悄悄
+  // 退回全局层——那跟「本项目还没有工作流」长得一模一样，是最难查的一类错。
+  // 而且两条必须各兜各的异常：一条抛了不能把另一条也带走，否则同样表现成「项目未知」。
+  const sessionProjectBody = clientSource.slice(
+    clientSource.indexOf("function sessionProject("),
+    clientSource.indexOf("function layoutDag(")
+  );
+  assert.ok(
+    sessionProjectBody.indexOf("sessions.list.getSnapshot") <
+      sessionProjectBody.indexOf("typeof sessions.get"),
+    "the host's public shape (list snapshot) must be tried before the host-side accessor"
+  );
+  const betweenLookups = sessionProjectBody.slice(
+    sessionProjectBody.indexOf("sessions.list.getSnapshot"),
+    sessionProjectBody.indexOf("typeof sessions.get")
+  );
+  assert.ok(
+    betweenLookups.includes("catch (err)"),
+    "each lookup must carry its own catch — a throwing accessor must not take out the next one"
+  );
+});
+
+// 右栏 tab 的正文单独包了一层具名组件，而不是把 hook 直接塞进 slots.register 的回调里：
+// 那个回调是不是当组件渲染由宿主决定，赌错就是「Rendered more hooks than during the
+// previous render」这种只在运行时炸、测试看不见的错。
+test("right-pane tab renders a named component instead of a bare hook callback", () => {
+  assert.match(clientSource, /function PipelinePane\(/, "PipelinePane must exist");
+  assert.ok(
+    clientSource.includes(
+      "}, (props) => h(PipelinePane, { t, project: sessionProject(ctx, props && props.sessionId) }));"
+    ),
+    "the tab callback must delegate to the named PipelinePane component, with the session's project"
+  );
+});
+
+// 「仓库里还没有工作流」与「一条运行记录都没有」是两句不同的话，都得中英齐全——
+// i18n 掉一边，界面上就是一行 key 裸奔。作用域那三句尤其不能缺：清单行上「项目」
+// 与「全局」是唯一的来源提示，缺了它，人分不清手里这条是本项目的还是跟着插件来的。
+// 日记本（v0.13）的四条形状锁。为什么值得单独立锁而不是靠上面的通用闸门：
+// ① 它的旗标闸必须**独立**——M.O. 那条 effect 读的是 actionPipelineEnabled，
+//    把日记塞进同一个 then 里，关掉 M.O. 会连带关掉日记，而两者毫无关系；
+// ② 右栏正文同样必须是具名组件（同 PipelinePane 的理由，hook 顺序只在运行时炸）；
+// ③ 「写成 / 今天写过 / 没素材」是三种不同结果，混成一句「成功」就是假成功；
+// ④ 503（没装配）与 409（没开）是两种不同的「不能用」，合并文案用户会以为日记坏了。
+test("diary pane: own gate, named component, and distinct outcomes", () => {
+  assert.match(clientSource, /function DiaryPane\(/, "DiaryPane must exist");
+  // 回调必须把「这个会话是谁」一路传进正文：project 定位素材、agent 定位人格卡。
+  // 少传 agent 就会退回 default 卡——自动轮是带 agentId 的，两个入口写同一天
+  // 会变成两个声音，这正是「只以这个人格的口吻写日记」没做到的那一半。
+  assert.match(
+    clientSource,
+    /\}, \(props\) => \{[\s\S]{0,400}?return h\(DiaryPane, \{[\s\S]{0,200}?project: sessionProject\(ctx, sid\),[\s\S]{0,200}?agent: sessionAgent\(ctx, sid\),[\s\S]{0,200}?session: sid \|\| null[\s\S]{0,40}?\}\);\s*\}\);/,
+    "the diary tab callback must delegate to the named DiaryPane component and pass agent + session"
+  );
+  assert.match(clientSource, /function sessionAgent\(ctx, sessionId\)/, "sessionAgent must exist to resolve the persona card");
+
+  // 从日记那段注释起算、到自己的 effect 名止：不能退 1600 字符去数，
+  // 那会把上面 M.O. 那段（它本来就写着 actionPipelineEnabled）一起框进来。
+  const gateHead = clientSource.indexOf("// --- v0.13 日记本（beta）：独立旗标门控 ---");
+  const gateAt = clientSource.indexOf('"dsh-mneme: diary gate"');
+  assert.ok(gateHead > -1, "the diary gate comment must exist");
+  assert.ok(gateAt > gateHead, "the diary must carry its own flag gate, after that comment");
+  // 只审代码、不审注释：那段注释本身就在解释「为什么不复用 M.O. 那条」，
+  // 会把 actionPipelineEnabled 这个字放进来说明——按注释判会把这个正确的说明当成违规。
+  const gateBody = clientSource
+    .slice(gateHead, gateAt)
+    .split("\n")
+    .filter((line) => !line.trim().startsWith("//"))
+    .join("\n");
+  assert.ok(gateBody.includes("eff.diaryEnabled"), "the diary gate must read its own flag");
+  assert.ok(
+    !gateBody.includes("actionPipelineEnabled"),
+    "the diary gate must not ride on actionPipelineEnabled — the two features are unrelated"
+  );
+
+  // 三种结果必须各有自己的分支，不能都落进同一句「成功」
+  for (const marker of ['b.status === "written"', '"already-written"', '"no-material"']) {
+    assert.ok(clientSource.includes(marker), "diary write outcome must be handled explicitly: " + marker);
+  }
+  // 503 与 409 分开成两种 gate 文案
+  assert.ok(
+    clientSource.includes("r.status === 503") && clientSource.includes("r.status === 409"),
+    "diary unavailable (503) and disabled (409) must be told apart"
+  );
+});
+
+// 日记本重做（2026-11-09，桉桉：「像本子一样的UI风格」/「导航应该是人格名」）。
+// 两件事都必须由测试锁住，因为它们都只错在「看起来还行」：
+// ①导航拿 frontmatter 括号里的 agent 名当人格名——本机旧数据里五个桶都写着
+//   `default (ptc)`，于是导航栏出现一排项目键加一个 ptc。正确名字只能从人格卡取。
+// ②纸张只存内存或只存一处，两个入口各选各的，同一本日记看起来像两个东西。
+test("diary book: navigation names come from persona cards, never from the agent tag", () => {
+  const start = clientSource.indexOf("function diaryBucketName(");
+  assert.ok(start > -1, "diaryBucketName must exist");
+  const end = clientSource.indexOf("function DiaryLibraryPanel(");
+  assert.ok(end > start, "diaryBucketName must sit before the panel");
+  // 注释里本来就要出现 `persona: default (ptc)` 这个反例，只审代码行。
+  const body = clientSource.slice(start, end).split("\n")
+    .filter((line) => !line.trim().startsWith("//")).join("\n");
+  const fn = new Function(body + "\n return diaryBucketName;")();
+  const store = {
+    default: { name: "Amarre" },
+    byAgent: { ptc: null, studio: { name: "Studio" } },
+    bySession: {}
+  };
+  // 括号里是 agent 名：必须换成人格卡的名字，不是 agent 名，也不是桶键。
+  assert.equal(fn({ key: "amarre-c836db6a", project: "amarre-c836db6a", persona: "default (ptc)" }, store), "Amarre",
+    "an agent tag must resolve to the default card's name, not to 'ptc'");
+  assert.equal(fn({ key: "x-1", project: "x-1", persona: "settings (studio)" }, store), "Studio",
+    "a named card must win over the default card");
+  // 还没挂卡（或卡被删了）时走默认卡，这是写日记时真实的回落口径。
+  assert.equal(fn({ key: "y-2", project: "y-2", persona: "settings (gone)" }, store), "Amarre",
+    "a missing agent card falls back to the default card, the same way writing does");
+  // 没有 store（人格卡还没读到）时绝不把 agent 名顶上，退回项目名。
+  assert.equal(fn({ key: "z-3", project: "z-3", persona: "default (ptc)" }, null), "z-3",
+    "without a card store the name must fall back to the project, never leak the agent tag");
+  // 完全没有 persona 行的老日记：项目名，再不行桶键。
+  assert.equal(fn({ key: "old-4", project: "老项目", persona: "" }, store), "老项目");
+  assert.equal(fn({ key: "only-5", project: "", persona: "" }, store), "only-5");
+});
+
+test("diary book: paper choice is one shared setting across both entries", () => {
+  // 一个 localStorage 键、一处读、一处写：两个入口看的是同一本日记。
+  assert.ok(clientSource.includes('const DIARY_BOOK_KEY = "dsh-mneme-diary-book"'),
+    "the paper choice needs a single storage key");
+  assert.equal((clientSource.match(/localStorage\.getItem\(DIARY_BOOK_KEY\)/g) || []).length, 1,
+    "reading the paper must go through readDiaryBook only");
+  assert.ok(clientSource.includes("function readDiaryBook()") && clientSource.includes("function writeDiaryBook("),
+    "read and write helpers must both exist");
+  // 右栏 DiaryPane 也要套同一套纸：只改左面板等于两处观感打架。
+  const pane = clientSource.slice(clientSource.indexOf("function DiaryPane("), clientSource.indexOf("function DiaryLibraryPanel("));
+  assert.ok(pane.includes("readDiaryBook"), "the right-side pane must read the same paper choice");
+  assert.ok(/mneme-diary-paper mneme-diary-paper--" \+ book/.test(pane),
+    "the right-side pane must apply the selected paper texture");
+  // 同页另一处入口收不到 storage 事件（那只在别的标签页触发），必须自己广播。
+  assert.ok(clientSource.includes('new CustomEvent("mneme:diary-book-changed")'),
+    "a same-page change must be broadcast, storage events never fire in the same document");
+  assert.ok(clientSource.includes('addEventListener("mneme:diary-book-changed"'),
+    "the other entry must listen for that broadcast");
+  // 三种纸都要有文案，否则按钮上是裸 key（牛皮已删：它只是同一层上色的换色相，
+  // 与素纸差 1.01:1，且是这块唯一硬编码 hex）。
+  for (const key of ["memory.diary.bookLabel", "memory.diary.book.plain", "memory.diary.book.ruled",
+    "memory.diary.book.grid"]) {
+    const occurrences = clientSource.split(`"${key}"`).length - 1;
+    assert.ok(occurrences >= 2, `i18n key ${key} must exist in both zh and en (got ${occurrences})`);
+  }
+  // 本子观感：正文用衬线、行高与纸纹 26px 网格对齐，否则横线会穿字。
+  // 源文件里这段 CSS 在 JS 字符串内，引号是转义的；这里只钉字体族的骨架。
+  assert.ok(clientSource.includes("font-family:Georgia,") && clientSource.includes("Songti SC") &&
+    clientSource.includes("Noto Serif SC") && clientSource.includes("serif"),
+    "the diary body needs a serif typeface to read like a notebook");
+  assert.ok(clientSource.includes("background-size:100% 26px"),
+    "the ruled texture must be locked to the 26px line height");
+});
+
+// 2026-11-11 查出来的真 bug：四条纸面风格（--ruled/--grid/--kraft/--plain）与基础规则
+// `.mneme-diary-paper` 同为 (0,1,0)、基础规则在数组里更靠后、且用 background 简写——
+// 前四条设的 background-image/color 被整条重置，四种纸实测全是 background-image:none，
+// 所以「几种风格毫无变化」不是没做完。修法两层：纹理挪到 .mneme-diary-text（后代选择器，
+// 结构上不再和基础规则抢同一个元素），基础规则只用 background-color。
+test("diary paper: 纹理挂在正文元素上，基础规则不许退回 background 简写", () => {
+  const at = clientSource.indexOf('".mneme-diary-paper{');
+  assert.ok(at > -1, "the base paper rule must exist");
+  const rule = clientSource.slice(at + 1, clientSource.indexOf('",', at));
+  assert.ok(rule.includes("background-color:"),
+    "the base rule must paint its tint with background-color");
+  assert.ok(!/(^|;|\s)background:/.test(rule),
+    "the base rule must not use the background shorthand — it resets every texture above it");
+  for (const key of ["--ruled", "--grid"]) {
+    assert.ok(clientSource.includes(".mneme-diary-paper" + key + " .mneme-diary-text{"),
+      "the " + key + " texture must hang off .mneme-diary-text, not off the base class");
+  }
+  assert.ok(clientSource.includes("--mneme-rule:"),
+    "the rule colour needs its own token (border-l1 is 1.09:1 on paper — invisible)");
+  assert.ok(!clientSource.includes("memory.diary.book.kraft"),
+    "kraft was removed; it only differed from plain by hue (1.01:1) and carried the block's only hardcoded hex");
+});
+
+// 走查发现：savedAt 只写不清 —— 保存成功后再改字段仍显示「已保存」，先成功后失败会
+// 「已保存」+「保存失败」两行并存。三处清零缺一处就会复现，所以按处数锁。
+test("persona save: 改任何字段都把「已保存」收回去（假成功回归锁）", () => {
+  const zeros = (clientSource.match(/setSavedAt\(0\)/g) || []).length;
+  assert.ok(zeros >= 3, "save 开头 / setField / toggleEnabled 三处都要清零（现有 " + zeros + " 处）");
+  assert.ok(clientSource.includes("setSavedAt(Date.now())"), "the success path still stamps the time");
+});
+
+// 窄侧栏（约 400px）下日记与人格原来是横向分栏：正文纸被挤到 250px、人格编辑区
+// 只剩 180px；六个页签还会各自折成两行。这两条都在 480 档容器查询里修，锁住防回退。
+test("窄容器：日记与人格上下堆叠，页签不折行", () => {
+  const at = clientSource.indexOf('"@container (max-width: 480px){');
+  assert.ok(at > -1, "the 480 container query must exist");
+  const block = clientSource.slice(at, clientSource.indexOf('"', at + 2));
+  assert.ok(block.includes(".mneme-diary-body{flex-direction:column}"),
+    "the diary list + paper must stack in a narrow panel");
+  assert.ok(block.includes(".mneme-persona-body{flex-direction:column}"),
+    "the persona card rail + editor must stack in a narrow panel");
+  assert.ok(block.includes("white-space:nowrap}"),
+    "panel tabs must not wrap their label onto two lines");
+});
+
+// 日记本不再占侧边栏座位（2026-11-09 桉桉：还保留旧版本的侧边栏打开，这个要去掉）。
+// 它现在是记忆面板内的一个标签页，和人格页并列；右栏那个入口是另一回事，保留。
+test("diary is a panel tab now, not a sidebar seat", () => {
+  assert.ok(!clientSource.includes('id: "dsh-mneme-diary"') && !clientSource.includes('key: "dsh-mneme-diary"'),
+    "the sidebar seat pair must be gone");
+  assert.ok(!clientSource.includes("disposeDiaryGlyph") && !clientSource.includes("disposeDiaryMain"),
+    "the seat disposers must be gone too, not just left dangling");
+  // 面板内必须有 diary 这个标签页，否则入口只剩下右栏那一个。
+  assert.match(clientSource, /\{ key: "diary", label: t\("memory\.diary\.title"\) \}/,
+    "the memory panel must carry the diary tab");
+  assert.match(clientSource, /view === "diary"[\s\S]{0,200}?DiaryLibraryPanel/,
+    "the diary tab must render the library panel");
+  // 右栏入口照旧保留：那是会话内的快速入口，不是侧边栏座位。
+  assert.ok(clientSource.includes("function registerDiarySeats(ctx, t) {"),
+    "the right-sidebar entry must stay");
+});
+
+// v0.13.0 第一次发出去时右栏页签类型注册了、正文座位也注册了，却没有任何一个
+// 能调 openTab 的按钮——页签永远打不开。当时的修法是往会话头塞一个入口按钮；
+// 2026-11-09 桉桉又要求把它撤掉：日记已经进了记忆面板当标签页，会话头顶再挂一个
+// 指向右栏的按钮，就是同一件事有两个入口。所以现在锁的是「没有第二个入口」。
+test("diary has exactly one entry: the panel tab, not a session header button", () => {
+  const start = clientSource.indexOf("function registerDiarySeats(ctx, t) {");
+  const end = clientSource.indexOf("function apply(ctx) {", start);
+  assert.ok(start > -1 && end > start, "registerDiarySeats must sit before apply()");
+  const body = clientSource.slice(start, end);
+
+  // ① 会话头入口必须彻底消失：座位、按钮组件、打开动作、失败文案一个都不留。
+  assert.ok(
+    !body.includes("conversation.session.header.actions"),
+    "the diary must not register a second entry in the session header"
+  );
+  assert.ok(!body.includes("openPane"), "the openPane helper only existed for the header button");
+  assert.ok(!body.includes("hasPane"), "hasPane only gated the header button");
+  assert.ok(
+    !/function DiaryEntryButton\s*\(/.test(clientSource),
+    "the header entry component must be gone, not just unregistered"
+  );
+  assert.ok(
+    !clientSource.includes("memory.diary.openFailed"),
+    "the \"cannot open\" copy is dead once nothing can fail to open it"
+  );
+
+  // ② 右栏那套照旧：页签类型 + 正文 + 标题都还在（宿主若有自己的页签选择器仍可达）。
+  assert.ok(body.includes('ctx.get("sidebarRightTabs")'), "tab type registration stays");
+  assert.ok(body.includes('name: "sidebar.right.pane.tab"'), "pane body stays registered");
+  assert.ok(body.includes('name: "sidebar.right.pane.tab.title"'), "pane title stays registered");
+});
+
+test("M.O. empty-state, list and scope copy exist in both languages", () => {
+  for (const key of [
+    "memory.actions.empty.title",
+    "memory.actions.empty.body",
+    "memory.actions.noRuns",
+    "memory.actions.zoom.in",
+    "memory.actions.zoom.out",
+    "memory.actions.zoom.fit",
+    "memory.actions.list.heading",
+    "memory.actions.list.count",
+    "memory.actions.list.meta",
+    "memory.actions.scope.project",
+    "memory.actions.scope.global",
+    "memory.actions.scope.none",
+    "memory.actions.broken",
+    // 手动沉淀的全部回执：这八句里缺任何一句，按钮点下去就是一行 key 裸奔，
+    // 而那恰好是「点了没反应」的观感来源。
+    "memory.actions.distill.action",
+    "memory.actions.distill.busy",
+    "memory.actions.distill.hint",
+    "memory.actions.distill.noProject",
+    "memory.actions.distill.saved",
+    "memory.actions.distill.none",
+    "memory.actions.distill.noSessions",
+    "memory.actions.distill.unreadable",
+    "memory.actions.distill.failed"
+  ]) {
+    const hits = (clientSource.match(new RegExp(`"${key.replace(/\./g, "\\.")}":`, "g")) || []).length;
+    assert.equal(hits, 2, `${key} must exist in both zh and en (got ${hits})`);
+  }
+});
+
+// 手动沉淀按钮：面板上「立即跑一次」的唯一入口。锁三件事，每件都对应一种会静默坏掉的情形：
+//   ① 它必须打 POST 且带上项目根——GET 是预览、不写盘，打成 GET 就成了「点了永远 0 条」；
+//   ② materialize 不许出现：按钮只产提议，落草稿是另一个决定；
+//   ③ 没有 project 时必须禁用——服务端只会回 400，点了必然失败的按钮比没有按钮更糟。
+test("M.O. pane offers a manual distill that posts the project root", () => {
+  const bodyOf = (name) => {
+    const start = clientSource.indexOf(`function ${name}(`);
+    assert.ok(start > -1, `${name} must exist`);
+    const next = clientSource.slice(start + 1).indexOf("\n    function ");
+    return clientSource.slice(start, next > -1 ? start + 1 + next : clientSource.length);
+  };
+  const bar = bodyOf("PipelineDistillButton");
+  assert.ok(bar.includes('"/api/dsh-mneme/nudge?project="'), "the button must hit the nudge route");
+  assert.ok(bar.includes("encodeURIComponent(project)"), "the project root must travel with the request");
+  assert.ok(bar.includes('method: "POST"'), "a preview GET writes nothing — the button must POST");
+  assert.ok(!bar.includes("materialize"), "the button must never materialize a draft");
+  assert.ok(bar.includes("!project"), "the button must be disabled when the project is unknown");
+  assert.ok(bar.includes("503"), "an unreadable session log must be told apart from an empty result");
+  // 座位：按钮挂在清单头上，且清单要拿到 project——漏传的话按钮永远禁用，
+  // 界面上看起来只是「这个功能没做好」。
+  assert.ok(bodyOf("PipelineWorkflowList").includes("PipelineDistillButton"), "the control belongs in the list header");
+  assert.ok(
+    bodyOf("PipelineBrowser").includes("activeId, onOpen: setPicked, project }"),
+    "the browser must hand the project root down to the list"
+  );
+});
+
+// 画布能放大缩小。锁的重点不是「有没有缩放」，而是滚轮那一条必须**自己挂非被动监听**：
+// React 的 onWheel 挂在 root 上且是 passive 的，preventDefault 会被浏览器忽略，
+// 于是 Ctrl+滚轮既缩放画布又缩放整页，谁也没拦住——这个错本地测不出来，只在真浏览器里响。
+test("M.O. canvas zooms: buttons plus a non-passive, modifier-gated wheel listener", () => {
+  const bodyOf = (name) => {
+    const start = clientSource.indexOf(`function ${name}(`);
+    assert.ok(start > -1, `${name} must exist`);
+    const next = clientSource.slice(start + 1).indexOf("\n    function ");
+    return clientSource.slice(start, next > -1 ? start + 1 + next : clientSource.length);
+  };
+  const view = bodyOf("PipelineView");
+  assert.ok(view.includes("PipelineZoomBar"), "the zoom control must be rendered");
+  assert.ok(view.includes("{ passive: false }"), "the wheel listener must be non-passive, or preventDefault is ignored");
+  assert.ok(view.includes("ev.ctrlKey") && view.includes("ev.metaKey"), "plain wheel must stay a scroll, not a zoom");
+  assert.ok(view.includes('width: (zoom * 100) + "%"'), "zoom must change the layout width so the container can scroll to it");
+  const bar = bodyOf("PipelineZoomBar");
+  assert.ok(bar.includes("memory.actions.zoom.in"), "zoom in must be reachable by button, not only by wheel");
+  assert.ok(bar.includes("memory.actions.zoom.out"), "zoom out must be reachable by button");
+});
+
+// 「tab 的类型」与「tab 的正文」必须是两件互不相干的事，而且类型注册要幂等。
+// 为什么会栽（2026-10-16 真机上现形）：宿主对重复的类型 id 会抛
+// （sidebarRight: tab type id "…" is already registered），而类型注册挂在宿主服务上、
+// 插件重挂（刷新 / 热重载 / 会话重建）时**留着**，正文座位却是挂插件 scope、随插件回收的。
+// 两件事原来同一个 try —— 第二次挂载时那一抛把正文一起带走，界面上只剩宿主的 fallback
+// 「这类内容还没有可用的查看方式」，错误只在浏览器控制台里，界面上零痕迹。
+test("M.O. tab type registration is idempotent and isolated from the pane body", () => {
+  const typeAt = clientSource.indexOf("id: PIPELINE_ACTIONS_TAB_ID,");
+  const bodyAt = clientSource.indexOf('ctx.slots.inject("sidebar.right.pane.tab"');
+  assert.ok(typeAt > -1, "the tab type registration must exist");
+  assert.ok(bodyAt > typeAt, "the pane body registration must exist, after the type");
+  assert.ok(
+    clientSource.includes("tabs.get(PIPELINE_ACTIONS_TAB_ID)"),
+    "the type registration must be idempotent — a re-mount must not re-register the id"
+  );
+  assert.ok(
+    clientSource.slice(typeAt, bodyAt).includes("catch (err)"),
+    "the type registration must carry its own catch — its failure must not take out the pane body"
+  );
+});
+
+// 回归锁：M.O. 段里每个 .mneme-pipe-* 类名在样式表里只许有**一条**规则。
+// 为什么会栽在这里（2026-10-16，真机上才现形）：新写的详情屏容器与既有的「节点详情」面板
+// 撞了同名 .mneme-pipe-detail —— 后写的 flex:1 赢下冲突，先写的 max-height:180px; overflow:auto
+// 却留着，于是详情屏被钉在 180px、里面的画布 flex:1 分到 0 像素，屏幕上只剩空白加一条滚动条。
+// 只查颜色的 contrast.test.js 抓不到这类撞车；它只有在屏幕上看才现形，所以要在这里钉住。
+test("M.O. class names do not collide in the stylesheet", () => {
+  const declared = new Map();
+  for (const m of clientSource.matchAll(/"\.mneme-pipe-([a-z0-9-]+)\{/g)) {
+    declared.set(m[1], (declared.get(m[1]) || 0) + 1);
+  }
+  const dupes = [...declared].filter(([, n]) => n > 1).map(([k, n]) => `.mneme-pipe-${k}×${n}`);
+  assert.deepEqual(dupes, [], `duplicate .mneme-pipe-* rule(s): ${dupes.join(", ")}`);
+  // 扫描量也得钉：正则一旦匹配不到东西，上面那条会静默变绿（例如样式表被整块挪走）。
+  assert.ok(declared.size >= 20, `the scan must actually see the pipeline stylesheet (saw ${declared.size})`);
+});
+
+// 回归锁（v0.9.0 复验轮沉淀）：面板的两种「静默消失」假绿形状一起钉住。
+// ① i18n 缺定义：既有的「每键恰好两次」锁只统计**字典里存在**的键，一个只有
+//   用法、零字典行的键在计数里整个消失——本轮就查出 4 个这种键（zoom.value 自
+//   基线即断）。所以这里反向查：每一处用法都必须能找到定义行。三种用法形状：
+//   字面量 t("k")、模板 t(`memory.features.${g.key}`) 按 FEATURE_GROUPS 的组键
+//   展开、模板 t(`memory.features.${k}`) 按各 items 旗标键展开（boolRow 的
+//   name/hint 各一路）。不做全量动态键解析——拼接形态的键在此设防范围外。
+// ② 图标名未注册：Icon 对查不到的名字 return null（无回退、无告警），闸门照绿
+//   而屏幕上图标没了。本轮 star 入口就是这么哑掉的。这里钉「每个用到的名字都在
+//   ICON_PATHS 注册表里」+ 提取与注册表的最低数量（防正则空转的静默绿）。
+test("panel copy and icons must not silently vanish (missing dict lines, unregistered icon names)", () => {
+  const defined = (key) => clientSource.includes('"' + key + '":');
+
+  // ①-a 字面量用法（右括号紧贴字符串，排除 "前缀" + 变量 拼接形态）
+  const usedKeys = new Set();
+  for (const m of clientSource.matchAll(/\bt\("([a-zA-Z0-9_.]+)"\)/g)) usedKeys.add(m[1]);
+  assert.ok(usedKeys.size >= 300, `the literal scan must actually see the panel's t() calls (saw ${usedKeys.size})`);
+  // ①-b 模板展开：组键 与 旗标键（label + .hint 两路）
+  const groupKeys = [...clientSource.matchAll(/key: "(group\.[a-z]+)"/g)].map((m) => m[1]);
+  assert.ok(groupKeys.length >= 5, `FEATURE_GROUPS must be parseable (saw ${groupKeys.length} groups)`);
+  for (const g of groupKeys) usedKeys.add("memory.features." + g);
+  const flagKeys = [...new Set([...clientSource.matchAll(/items: \[((?:[^\]]|\n)*)\]/g)]
+    .flatMap((m) => [...m[1].matchAll(/"([a-zA-Z0-9_.]+)"/g)].map((x) => x[1])))];
+  assert.ok(flagKeys.length >= 20, `group items must be parseable (saw ${flagKeys.length})`);
+  for (const k of flagKeys) { usedKeys.add("memory.features." + k); usedKeys.add("memory.features." + k + ".hint"); }
+  // ①-c 枚举行：标签、提示、每一档的取值标签全走模板串（t(`memory.features.${k}`)），
+  // ①-a 的字面量扫描看不见，①-b 只扫组 items。所以 conflictLedgerMode 这整组
+  // 文案在收进 FEATURE_ENUMS 之前，从来没被这条测试覆盖过——文案丢了界面会裸奔
+  // 出键名，而闸门照绿。
+  const enumHead = "const FEATURE_ENUMS = [";
+  const enumAt = clientSource.indexOf(enumHead);
+  assert.ok(enumAt >= 0, "FEATURE_ENUMS must exist (enum keys have no other seat registry)");
+  const enumBody = clientSource.slice(enumAt + enumHead.length, clientSource.indexOf("];", enumAt));
+  const enumKeys = [...enumBody.matchAll(/"([a-zA-Z0-9_]+)"/g)].map((m) => m[1]);
+  assert.ok(enumKeys.length >= 1, "FEATURE_ENUMS must be parseable");
+  const valuesHead = "const FEATURE_ENUM_VALUES = {";
+  const valuesAt = clientSource.indexOf(valuesHead);
+  assert.ok(valuesAt >= 0, "FEATURE_ENUM_VALUES must exist");
+  const valuesBody = clientSource.slice(valuesAt + valuesHead.length, clientSource.indexOf("};", valuesAt));
+  for (const k of enumKeys) {
+    usedKeys.add("memory.features." + k);
+    usedKeys.add("memory.features." + k + ".hint");
+    const at = valuesBody.indexOf(k + ":");
+    assert.ok(at >= 0, `enum ${k} must have a value table (an empty dropdown is a dead control)`);
+    const values = [...(valuesBody.slice(at).match(/\[([^\]]*)\]/)?.[1] ?? "").matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+    for (const v of values) usedKeys.add("memory.features." + k + "." + v);
+  }
+
+  const missing = [...usedKeys].filter((k) => !defined(k)).sort();
+  assert.deepEqual(missing, [], `用而无典的 i18n 键（界面会裸奔出键名）：${missing.join(", ")}`);
+
+  // ② 图标名：注册表形状（顶层对象、六空格缩进）+ Icon 表达式与 feedRow 首参的提取
+  const registered = new Set([...clientSource.matchAll(/^\s{6}([a-zA-Z]+): \[\[/gm)].map((m) => m[1]));
+  assert.ok(registered.size >= 10, `the ICON_PATHS registry must be parseable (saw ${registered.size})`);
+  const iconNames = new Set();
+  for (const m of clientSource.matchAll(/h\(Icon, \{ name: ([^}]+?) [,}]/g)) {
+    const expr = m[1];
+    const direct = expr.match(/^"([a-zA-Z]+)"$/);
+    if (direct) { iconNames.add(direct[1]); continue; }
+    // 只取三元分支的纯字母串；"===" 比较对象前面是运算符不是 ? : ，不会误伤
+    for (const b of expr.matchAll(/[?:]\s*"([a-zA-Z]+)"/g)) iconNames.add(b[1]);
+  }
+  for (const m of clientSource.matchAll(/feedRow\(\s*"([a-zA-Z]+)"/g)) iconNames.add(m[1]);
+  // 页签图标走 TAB_ICONS 查表（子视图 key -> 图标名），不是 h(Icon, ...) 字面量，
+  // 上面两条提取器看不见它。这里把表里的值按 ICON_PATHS 的同形状收进来——否则
+  // 改表时把某个 key 指向未注册名字，闸门照绿而屏幕上那格图标是空的。
+  const tabTable = clientSource.match(/const TAB_ICONS = \{((?:[^}]|\n)*?)\}/);
+  assert.ok(tabTable, "TAB_ICONS must be parseable (subview key -> icon name)");
+  const tabEntries = [...tabTable[1].matchAll(/([a-zA-Z]+):\s*"([a-zA-Z]+)"/g)];
+  assert.ok(tabEntries.length >= 7, `TAB_ICONS must cover every subview (saw ${tabEntries.length})`);
+  for (const m of tabEntries) iconNames.add(m[2]);
+  // 反向：每个 subviews 的 key 都得在表里有一行，否则那一格掉到 ?? "settings" 上。
+  const subviewsBlock = clientSource.match(/const subviews = \[((?:[^\]]|\n)*?)\]/);
+  assert.ok(subviewsBlock, "subviews must be parseable");
+  const subviewKeys = [...subviewsBlock[1].matchAll(/key: "([a-zA-Z]+)"/g)].map((m) => m[1]);
+  assert.ok(subviewKeys.length >= 7, `subviews must be parseable (saw ${subviewKeys.length})`);
+  const unmapped = subviewKeys.filter((k) => !tabEntries.some((m) => m[1] === k));
+  assert.deepEqual(unmapped, [], `页签没有图标映射（会退化成设置齿轮）：${unmapped.join(", ")}`);
+  assert.ok(iconNames.size >= 8, `icon usage must be parseable (saw ${iconNames.size})`);
+  const noIcon = [...iconNames].filter((n) => !registered.has(n)).sort();
+  assert.deepEqual(noIcon, [], `Icon 静默 return null 的未注册名：${noIcon.join(", ")}`);
+});
+
+// 人格定义页（beta）面板面回归：形状沿用 A4 的「分组 + i18n 双语 occurrences ≥ 2
+// + 关键接线」断言风格（只做源码断言，不挂 React 渲染环境）。
+test("persona page is a panel tab, not a settings card (beta v2)", () => {
+  // 开关进 FEATURE_GROUPS 的 persona 组（#427 revamp：从 enhance 拆出）。按组解析
+  // 成员再逐个点名，而不是把某一行写成字面量正则——那样往组里加第二个键就会把
+  // 这条护栏弄红（实测踩过）。
+  const personaGroup = clientSource.match(/group\.persona", items: \[((?:[^\]]|\n)*)\]/);
+  assert.ok(personaGroup, "FEATURE_GROUPS group.persona must be parseable");
+  for (const flag of ["personaEnabled", "personaStrictAddressing"]) {
+    assert.ok(personaGroup[1].includes(`"${flag}"`), `FEATURE_GROUPS group.persona must carry ${flag}`);
+  }
+  // i18n 键中英双语齐备（occurrences ≥ 2 模式；label + .hint 两路由字典锁统一覆盖）
+  for (const key of [
+    "memory.features.personaEnabled",
+    "memory.features.personaEnabled.hint",
+    "memory.features.personaStrictAddressing",
+    "memory.features.personaStrictAddressing.hint",
+    "memory.explorer.tabPersona",
+    "memory.persona.title",
+    "memory.persona.hint",
+    "memory.persona.cards",
+    "memory.persona.defaultCard",
+    "memory.persona.name",
+    "memory.persona.personality",
+    "memory.persona.replyStyle",
+    "memory.persona.scenario",
+    "memory.persona.mesExample",
+    "memory.persona.save",
+    "memory.persona.saved",
+    "memory.persona.saveFailed",
+    "memory.persona.enabled",
+    "memory.persona.preview",
+    "memory.persona.previewEmpty",
+    "memory.persona.previewUnknown",
+    "memory.persona.diary",
+    "memory.persona.diaryHint",
+    "memory.persona.loading"
+  ]) {
+    const occurrences = clientSource.split(`"${key}"`).length - 1;
+    assert.ok(occurrences >= 2, `i18n key ${key} must exist in both zh and en (got ${occurrences})`);
+  }
+  // 形态：面板自己的第五个标签页，设置页那张卡搬走（不是并存）
+  assert.ok(clientSource.includes('{ key: "persona", label: t("memory.explorer.tabPersona") }'),
+    "the persona view must be registered in the panel's subviews");
+  assert.ok(clientSource.includes('view === "persona" &&'), "the panel must route a persona view branch");
+  assert.ok(clientSource.includes("h(PersonaMainPanel, { t })"), "the persona tab must render PersonaMainPanel");
+  assert.ok(!clientSource.includes('t("memory.settings.persona")'),
+    "the settings card must be gone, not duplicated next to the new page");
+  // 只读卡「Agent 眼中的你」的职能并进本页预览：它自己的键与渲染都不许残留
+  assert.ok(!clientSource.includes("memory.settings.personaView"),
+    "the read-only injected-view card must be removed; this page's preview owns that job");
+  // 保存走 PUT /persona，且必须三维全量（settings.setPersona 是全量替换）
+  assert.ok(clientSource.includes('apiFetch("/api/dsh-mneme/persona"'), "persona page must talk to /persona");
+  assert.ok(clientSource.includes('method: "PUT"'), "persona save must PUT");
+  assert.ok(clientSource.includes("bySession"), "the store shape must carry bySession through saves");
+  // 预览必须由后端渲染：前端再拼一份就是第二张皮
+  assert.ok(clientSource.includes("preview.text"), "the preview must render the backend-rendered block");
+  assert.ok(!clientSource.includes('"- " + profile.trim()'), "frontend hand-splicing of the injected block must be gone");
+  // 读不到就说读不到：失败不许停在上一张卡的旧文本
+  assert.ok(clientSource.includes("setPreview(null)"), "a failed preview must fail closed to 未知, not to a stale block");
+  // 预览只能有一个所有者，且要丢掉过期响应：先切卡 A 再切卡 B 时，A 的 GET 可能后回来。
+  assert.ok(clientSource.includes("if (seq !== previewSeq.current) return;"), "preview must drop stale responses");
+  // #514：轻量档压制要有告示，且这一页自己得说（人是在这里开关人格的）
+  assert.ok(clientSource.includes('t("memory.status.minimalPresetTitle")'), "the page must carry the minimal-preset notice");
+});
+
+test("persona page is multi-card with visible field labels and save-failure error", () => {
+  for (const key of [
+    "memory.persona.cards",
+    "memory.persona.defaultCard",
+    "memory.persona.add",
+    "memory.persona.newPlaceholder",
+    "memory.persona.delete",
+    "memory.persona.saveFailed",
+    "memory.persona.saved",
+    "memory.persona.enabledOn",
+    "memory.persona.enabledOff"
+  ]) {
+    const occurrences = clientSource.split(`"${key}"`).length - 1;
+    assert.ok(occurrences >= 2, `i18n key ${key} must exist in both zh and en (got ${occurrences})`);
+  }
+  // 多卡接线：加卡/删卡/改字段/保存全链函数存在
+  for (const fn of ["addCard", "removeCard", "saveEditing", "setField"]) {
+    assert.ok(clientSource.includes(fn), `multi-card wiring must include ${fn}`);
+  }
+  // 可见字段标签：五处字段都走同一个 field() helper，helper 里必须是真 <label>
+  // （v1.1 反馈：aria-label 看不见）。分别锁「字段被渲染成 label」与「builder 用 label 元素」。
+  for (const f of ["name", "personality", "replyStyle", "scenario", "mesExample"]) {
+    assert.ok(
+      new RegExp('field\\("' + f + '", t\\("memory\\.persona\\.' + f + '"\\)').test(clientSource),
+      "persona field " + f + " must go through the labeled field builder"
+    );
+  }
+  assert.ok(/h\("label", \{ className: "mneme-persona-label", htmlFor:/.test(clientSource),
+    "the field builder must render a real label element, not an aria-only name");
+  // 保存失败提示：error 状态有渲染路径（非仅 setState）
+  assert.ok(clientSource.includes('t("memory.persona.saveFailed")'), "save failure must render an error line");
+  // 卡删除 × 常显回归锁 v2（#457 内联覆写被 #459 回滚的教训）：× 不得复用
+  // mneme-set-del（opacity:0 仅在 .mneme-set-row:hover 解除，卡标签不在该容器
+  // → 永远不可见），必须用独立类 mneme-persona-del 且该类常显（opacity 不得为 0）。
+  assert.ok(
+    /className: "mneme-persona-del"/.test(clientSource),
+    "persona card delete × must use the dedicated always-visible class"
+  );
+  const delStyle = clientSource.match(/\.mneme-persona-del\{[^}]*\}/);
+  assert.ok(delStyle, "mneme-persona-del style rule must exist");
+  assert.ok(!/opacity:0/.test(delStyle[0]), "mneme-persona-del must not be transparent");
+  // 不许再把 mneme-set-del 挂回卡删除按钮（防 #457 式修法回归）；直接锁按钮
+  // 的 className 值（onClick 前最近的 className 属性，注释文字不参与）。
+  const delBtn = clientSource.match(/className: "([^"]+)"[\s\S]{0,300}?onClick: \(\) => removeCard\(id\)/);
+  assert.ok(delBtn, "card delete button wiring must exist");
+  assert.strictEqual(delBtn[1], "mneme-persona-del", "card delete × must use mneme-persona-del, not mneme-set-del");
+});
+
+
+// 回归锁（复验实测踩中）：面板「检测更新」的状态名必须与后端 classify
+// （src/version-check.js）逐字对齐。此前前端误写 "latest"/"up_to_date"（后端
+// 从未返回过），检测成功也掉进 error 兜底——按钮永远报「检测失败」。
+// 这条缝两端各有测试（version-check.test.js 测 classify、面板测试测渲染），
+// 但契约本身没人管。锁三件事：①前端比较的字面量是后端真实返回值；②后端
+// classify 的返回集合没有前端漏接的成员；③apiFetch 的路由路径与后端注册一致。
+test("update-check status names match the backend classify contract verbatim", () => {
+  const vcSource = readFileSync(join(root, "src/version-check.js"), "utf8");
+  // ① 后端 classify 的全部返回字面量
+  const backendStatuses = new Set(
+    [...vcSource.matchAll(/return "([a-z-]+)";/g)].map((m) => m[1])
+  );
+  assert.ok(backendStatuses.has("up-to-date") && backendStatuses.has("outdated") && backendStatuses.has("ahead") && backendStatuses.has("unknown"),
+    `classify must return the known status set (saw ${[...backendStatuses].join(", ")})`);
+  // ② 前端 checkResultText 比较的每个状态名都必须 ∈ 后端集合（防再发明新名）
+  const iStart = clientSource.indexOf("function checkResultText");
+  assert.ok(iStart > 0, "checkResultText must exist");
+  // 函数块取到下一个同级 function 声明为止：indexOf("}") 会切在首个 if 的
+  // 右括号，比较分支被截断成 1 个（2026-10-17 实测）。
+  const iEnd = clientSource.slice(iStart).search(/\n {6}function /);
+  const block = clientSource.slice(iStart, iEnd > 0 ? iStart + iEnd : undefined);
+  const compared = [...block.matchAll(/updateInfo\.status === "([a-zA-Z_-]+)"/g)].map((m) => m[1]);
+  assert.ok(compared.length >= 2, `the panel must compare real statuses (saw ${compared.length})`);
+  const unknown = [...new Set(compared)].filter((s) => !backendStatuses.has(s));
+  assert.deepEqual(unknown, [], `前端比较了后端不会返回的状态名（检测成功也会显示失败）：${unknown.join(", ")}`);
+  // ③ 路由契约：前端 fetch 的路径必须与后端注册的 exact path 一致
+  assert.ok(clientSource.includes('apiFetch("/api/dsh-mneme/version-check")'),
+    "the panel must call the registered version-check route");
+  const apiSource = readFileSync(join(root, "src/api.js"), "utf8");
+  assert.ok(apiSource.includes('path: "/api/dsh-mneme/version-check"'),
+    "the backend must register the version-check route");
+});
+
+// 画像提取草稿（#497）面板面：路由对齐、四种结局各有自己的话、按钮坐在哪张卡上、
+// 以及草稿**只出副本**（2026-11-04 改口径：不再把草稿写进画像字段）。
+// 严格寻址的「第一张卡」陷阱（Persis 复验）：live 库 personaStrictAddressing=true，
+// 现在 byAgent/bySession 都空，走 #587 例外回落 default，所以注入正常。但只要在这个
+// 页面建出第一张卡，anyCard 就变 true，strict 立刻生效——所有没建卡的会话（含主会话）
+// 人格静默不再注入，界面一个字都不报。这种「改一个开关，别处的行为跟着变且无提示」
+// 必须在建卡之前就写在脸上，所以锁三件事：①两个阶段的文案都在；②按现有卡数选话；
+// ③文案确实渲染进人格页，而不是定义完没人读。
+test("strict addressing warns before the first card quietly changes everyone else", () => {
+  for (const key of ["memory.persona.strictBefore", "memory.persona.strictAfter"]) {
+    const occurrences = clientSource.split(`"${key}"`).length - 1;
+    assert.ok(occurrences >= 2, `i18n key ${key} must exist in both zh and en (got ${occurrences})`);
+  }
+  // 生效值来自 /features 的真实快照，不许前端猜默认
+  assert.ok(/personaStrictAddressing === true/.test(clientSource),
+    "the guardrail must read the effective flag from /features, not assume a default");
+  // 两条话按「现在有几张卡」分流：没有卡时说「建第一张会变严」，有了之后说「已经变严」
+  assert.ok(clientSource.includes('t(cardCount > 0 ? "memory.persona.strictAfter" : "memory.persona.strictBefore")'),
+    "the notice must pick its wording from the current card count");
+  // 只有严格寻址真的开着才说，否则是假警报
+  assert.ok(/strict \? h\("div"/.test(clientSource),
+    "the notice must be gated on the effective strict flag");
+});
+
+test("profile extraction ships its button, distinct outcomes and correct save wiring", () => {
+  const apiSource = readFileSync(join(root, "src/api.js"), "utf8");
+  assert.ok(clientSource.includes('apiFetch("/api/dsh-mneme/profile/extract"'),
+    "the panel must call the extract route");
+  assert.ok(apiSource.includes('path: "/api/dsh-mneme/profile/extract"'),
+    "the backend must register the extract route");
+
+  // 四种结局（成功草稿 / 未启用 / 没有可用记忆 / 模型没配合）必须各有一句人话：
+  // 压成一句「没有草稿」就等于让用户自己猜是坏了还是本来就没东西。
+  for (const key of [
+    "memory.settings.profileExtract",
+    "memory.settings.profileExtracting",
+    "memory.settings.profileExtractHint",
+    "memory.settings.profileExtractDisabled",
+    "memory.settings.profileExtractEmpty",
+    "memory.settings.profileExtractNoRoute",
+    "memory.settings.profileExtractFailed",
+    "memory.settings.profileSaveFailed",
+    "memory.settings.profileDraftTitle",
+    "memory.settings.profileDraftRows",
+    "memory.settings.profileDraftTruncated",
+    "memory.settings.profileDraftCopy",
+    "memory.settings.profileDraftCopied",
+    "memory.settings.profileDraftCopyHint",
+    "memory.settings.profileDraftCopyFailed",
+    "memory.settings.profileDraftDiscard",
+    "memory.features.profileExtractEnabled",
+    "memory.features.profileExtractEnabled.hint"
+  ]) {
+    const occurrences = clientSource.split(`"${key}"`).length - 1;
+    assert.ok(occurrences >= 2, `i18n key ${key} must exist in both zh and en (got ${occurrences})`);
+  }
+  assert.ok(/group\.persona[\s\S]{0,700}"profileExtractEnabled"/.test(clientSource),
+    "FEATURE_GROUPS group.persona must carry profileExtractEnabled");
+
+  // 位置锁（2026-11-09 再改口径）：提取按钮属于「用户画像」卡，而画像卡本身
+  // 已经从设置页搬进记忆面板的「人格」页（桉桉：mneme 设置里面的个性化还没移走）。
+  // 两处都在同一份客户端里，光比先后会被设置页的规则卡骗过——必须先切出
+  // 人格页那一段再比，并额外断言设置页里不再有画像卡（搬回去就红）。
+  const personaStart = clientSource.indexOf("function PersonaMainPanel(");
+  const settingsStart = clientSource.indexOf("function SettingsContent(");
+  assert.ok(settingsStart > 0 && personaStart > settingsStart, "both panels must exist");
+  const settingsSlice = clientSource.slice(settingsStart, personaStart);
+  const personaSlice = clientSource.slice(personaStart);
+  const profileTitle = 'h("div", { className: "mneme-set-title" }, t("memory.settings.profile"))';
+  assert.ok(!settingsSlice.includes(profileTitle),
+    "the profile card must be gone from the settings page (it moved into the persona page)");
+  const profileCardIdx = personaSlice.indexOf(profileTitle);
+  const extractButtonIdx = personaSlice.indexOf('t("memory.settings.profileExtract")');
+  assert.ok(profileCardIdx > 0 && extractButtonIdx > profileCardIdx,
+    "the extract button must render inside the user-profile card on the persona page");
+  // 只出副本（2026-11-04 桉桉定的口径）：草稿不许再走落库路径。此前 applyProfileDraft 会
+  // 直接 PUT /profile —— 把用户手写的那份覆盖掉，且没有撤销。
+  assert.ok(clientSource.includes("function copyProfileDraft()"), "the draft action must be a copy, not a save");
+  assert.ok(!clientSource.includes("if (await saveProfile(text))"), "a draft must never be committed to the profile field");
+  assert.ok(clientSource.includes("copyProfileDraftFallback(text)"),
+    "the draft action must copy the draft text, with a fallback when the clipboard API is unavailable");
+  // 复制是这条路径唯一的产出：静默失败等于让用户以为复制成功、粘贴时拿到旧文本。
+  assert.ok(clientSource.includes('t("memory.settings.profileDraftCopyFailed")'),
+    "a failed copy must say so instead of silently doing nothing");
+  // 光 announce() 不够：那个 live region 是 1px 裁剪元素，只有屏幕阅读器读得到。
+  // 视力正常的用户看到按钮文字不变、页面不变，会以为复制成功，粘贴时拿到旧内容。
+  assert.ok(clientSource.includes("const [profileDraftCopyFailed, setProfileDraftCopyFailed] = react.useState(false)"),
+    "the failed copy needs its own state, not just an announce() to a hidden live region");
+  assert.ok(clientSource.includes("setProfileDraftCopyFailed(true)"),
+    "the failure branch must flip the visible state");
+  const copyFailedIdx = clientSource.indexOf("profileDraftCopyFailed ? h(\"span\"");
+  assert.ok(copyFailedIdx > 0, "the failure must render as visible text near the copy button, not only in the live region");
+  assert.ok(clientSource.slice(copyFailedIdx, copyFailedIdx + 220).includes('role: "alert"'),
+    "the visible failure text should announce itself to assistive tech too");
+  // 颜色走语义层：宿主 label-tertiary 这类低对比层当正文色会掉到 AA 以下（#178）。
+  assert.ok(clientSource.slice(copyFailedIdx, copyFailedIdx + 220).includes('style: { color: "var(--mneme-danger)" }'),
+    "the failure text must use the --mneme-danger semantic layer, not a raw host token");
+  // 采用路径没了之后，保存按钮仍不能把 click 事件当参数传进去（保存函数带默认参数）。
+  assert.ok(!clientSource.includes("onClick: saveProfile }"), "the save button must not receive the click event as its value argument");
+  // apiFetch 是 fetch 的薄壳：非 2xx 不抛。画像这条以前没判 res.ok（同页的 persona
+  // 一直判），于是服务端 403/413 时界面照样闪「画像已保存」。
+  const profileSaver = clientSource.slice(clientSource.indexOf("async function saveProfile("));
+  assert.ok(profileSaver.slice(0, 900).includes('if (!res.ok) throw new Error("HTTP "'),
+    "the profile saver must verify the response status before reporting success");
+  // 没配模型是一句可行动的话（先去选模型），不能和「模型没按格式回」共用一条文案。
+  assert.ok(clientSource.includes('"no-route" ? "noroute"'), "no-route must map to its own panel outcome, not the generic failure");
+});
+
+// 「Agent 眼中的你」自动事实（2026-11-06）面板面：路由对齐、维护轮的五种结局各有
+// 自己的话、卡片坐在 personaView 与规则卡之间、以及**事实绝不落 user_settings**。
+// 最后这条是 #497「草稿按钮写画像」的镜像教训：事实管理块的写路径只许是
+// /profile-facts/apply（写 profile_facts 三表），任何 PUT /profile 的捷径都会把手填
+// 画像原文覆盖掉——那次是草稿按钮，这次是事实管理，一个动机：图省事。
+test("profile facts card ships management UI, run outcomes and never touches the hand-filled profile", () => {
+  const apiSource = readFileSync(join(root, "src/api.js"), "utf8");
+  for (const pathLiteral of [
+    'path: "/api/dsh-mneme/profile-facts"',
+    'path: "/api/dsh-mneme/profile-facts/apply"',
+    'path: "/api/dsh-mneme/profile-facts/run"'
+  ]) {
+    assert.ok(apiSource.includes(pathLiteral), `the backend must register ${pathLiteral}`);
+  }
+  assert.ok(clientSource.includes("apiFetch(`/api/dsh-mneme/profile-facts?agent="),
+    "the panel must load facts per card");
+  assert.ok(clientSource.includes('apiFetch("/api/dsh-mneme/profile-facts/apply"'),
+    "panel edits must go through the apply route");
+  assert.ok(clientSource.includes('apiFetch("/api/dsh-mneme/profile-facts/run"'),
+    "the manual run must go through the run route");
+
+  // 维护轮的五种结局（ok / noop / 功能关 / 没配模型 / 失败）各有一句人话：
+  // 「跑完没变化」与「压根没跑」必须可区分（#493 同一条教训：故障被读成空结果）。
+  for (const key of [
+    "memory.settings.factsTitle",
+    "memory.settings.factsRun",
+    "memory.settings.factsRunOk",
+    "memory.settings.factsRunNoop",
+    "memory.settings.factsRunDisabled",
+    "memory.settings.factsRunNoRoute",
+    "memory.settings.factsRunFailed",
+    "memory.features.profileFactsEnabled",
+    "memory.features.profileFactsEnabled.hint"
+  ]) {
+    const occurrences = clientSource.split(`"${key}"`).length - 1;
+    assert.ok(occurrences >= 2, `i18n key ${key} must exist in both zh and en (got ${occurrences})`);
+  }
+  assert.ok(/group\.persona[\s\S]{0,1200}"profileFactsEnabled"/.test(clientSource),
+    "FEATURE_GROUPS group.persona must carry profileFactsEnabled");
+
+  // 位置锁（2026-11-09 改口径）：画像卡与事实卡一起搬进了人格页，事实卡仍是画像卡
+  // 之后的一张。切段比较，防止设置页的规则卡把顺序骗过去；设置页里两张卡都不许再有。
+  const personaStart = clientSource.indexOf("function PersonaMainPanel(");
+  const settingsStart = clientSource.indexOf("function SettingsContent(");
+  assert.ok(settingsStart > 0 && personaStart > settingsStart, "both panels must exist");
+  const settingsSlice = clientSource.slice(settingsStart, personaStart);
+  const personaSlice = clientSource.slice(personaStart);
+  assert.ok(!settingsSlice.includes('t("memory.settings.factsTitle")'),
+    "the facts card must be gone from the settings page (it moved into the persona page)");
+  assert.ok(!settingsSlice.includes('h("div", { className: "mneme-set-title" }, t("memory.settings.profile"))'),
+    "the profile card must be gone from the settings page (it moved into the persona page)");
+  const profileCardIdx = personaSlice.indexOf('h("div", { className: "mneme-set-title" }, t("memory.settings.profile"))');
+  const factsCardIdx = personaSlice.indexOf('t("memory.settings.factsTitle")');
+  assert.ok(profileCardIdx > 0 && factsCardIdx > profileCardIdx,
+    "the facts card must sit after the user-profile card on the persona page");
+  // 手填画像神圣：事实域的全部面板代码（loadFacts 起到事实卡渲染止）里不许出现
+  // PUT /profile 的路径字面量。断言的是**带闭引号**的精确串——/profile-facts/* 的
+  // 路径都以 /profile 开头，不带闭引号的话这个断言会自己误伤自己。
+  // 两个下标必须在同一个坐标系里比：factsCardIdx 是相对 personaSlice 的，
+  // 而 handlersStart 相对整份源码——混用会切出空片，让下面每条断言都空跑。
+  const handlersStart = personaSlice.indexOf("const loadFacts");
+  const factsSlice = personaSlice.slice(handlersStart, factsCardIdx);
+  assert.ok(handlersStart > 0 && factsSlice.length > 0, "the facts handlers must exist");
+  assert.ok(!factsSlice.includes('"/api/dsh-mneme/profile"'),
+    "the facts domain must never write the hand-filled profile (PUT /profile is off-limits here)");
+  for (const fragment of ["/api/dsh-mneme/profile-facts?agent=", "/api/dsh-mneme/profile-facts/apply", "/api/dsh-mneme/profile-facts/run"]) {
+    assert.ok(factsSlice.includes(fragment), `the facts handlers must call ${fragment}`);
+  }
+  // 人工 apply 成功后注入预览必须跟着刷新。2026-11-09 起画像卡与事实卡同在人格页，
+  // 不再跨视图写别人的状态——事实卡仍然不直接调 loadPreview，刷新走人格页自己的
+  // tick 哨兵；所以锁两条：①事实处理段不直接碰 loadPreview；②页面有 tick 刷新。
+  assert.ok(!factsSlice.includes("loadPreview("),
+    "the facts card must not write the persona view's preview state from another view");
+  assert.ok(clientSource.includes("setPreviewTick((n) => n + 1)"),
+    "the persona page must refetch its own preview after a save");
+  // 总闸快照要跟着功能开关走：FeaturesCard 即改即存并广播 mneme:features-changed，
+  // 事实卡监听重读——不然按提示开了「自动事实」，按钮还得关面板重开才解禁
+  // （评审 P2：快照 effect 是 [] 依赖，监听缺失等于回到「重开才生效」的老病）。
+  assert.ok(clientSource.includes('new CustomEvent("mneme:features-changed")'),
+    "FeaturesCard must broadcast a features-changed event when a save lands");
+  assert.ok(clientSource.includes('addEventListener("mneme:features-changed", loadFlag)'),
+    "the facts card must re-read its flag snapshot when features change");
+});
+
+// 复制的竞态（CodeRabbit #559 第二轮）：剪贴板是异步的，回调属于哪一份草稿必须能认出来。
+// 复制 A 还没落地时又提取出草稿 B，A 的回调就会在 B 上打勾或报错——B 一个字都没被复制过，
+// 而「已复制」会挂 1.5 秒，于是同一屏上可能出现「已复制」和「复制没成功」两句相反的话。
+test("profile draft copy ticket keeps stale copy callbacks off a newer draft", () => {
+  const copySrc = clientSource.slice(
+    clientSource.indexOf("function copyProfileDraft("),
+    clientSource.indexOf("function copyProfileDraft(") + 2000
+  );
+  assert.ok(clientSource.includes("const profileCopyTicket = react.useRef(0)"),
+    "each copy attempt needs a ticket so a stale clipboard callback can be told apart");
+  assert.ok(copySrc.includes("const ticket = ++profileCopyTicket.current"),
+    "every attempt must take a fresh ticket before the async clipboard call");
+  assert.ok(copySrc.includes("const current = () => ticket === profileCopyTicket.current"),
+    "the callback must compare its ticket against the live one");
+  // 成功与失败两条回调都要判票：只判一条，另一条照样会污染新草稿。
+  assert.equal((copySrc.match(/if \(\(?!current\(\)\)\) return;/g) || []).length >= 2 ||
+    (copySrc.match(/if \(!current\(\)\) return;/g) || []).length >= 2, true,
+    "both the success and failure callbacks must drop themselves when their ticket is stale");
+  // 失败必须撤掉「已复制」：成功态能挂 1.5 秒，这期间重试失败会同时显示两句相反的话。
+  const failSrc = copySrc.slice(copySrc.indexOf("const failed = () =>"));
+  assert.ok(failSrc.slice(0, 200).includes("setProfileDraftCopied(false)"),
+    "a failed retry must clear the lingering copied state instead of showing both messages");
+  // 换草稿（重新提取 / 丢弃）都要让旧票作废，并清掉旧提示。
+  const extractSrc = clientSource.slice(clientSource.indexOf("async function extractProfileDraft("));
+  assert.ok(extractSrc.slice(0, 400).includes("profileCopyTicket.current += 1"),
+    "starting a new extraction must invalidate the previous copy attempt");
+  const discardSrc = clientSource.slice(clientSource.indexOf('t("memory.settings.profileDraftDiscard")') - 400);
+  assert.ok(discardSrc.slice(0, 400).includes("profileCopyTicket.current += 1") &&
+    discardSrc.slice(0, 400).includes("setProfileDraftCopyFailed(false)"),
+    "discarding the draft must clear both the ticket and the error text it left behind");
+});
+
+// 实体总数读不到时不许拿切片长度冒充（CodeRabbit #559 第二轮）：路由回落时把
+// entities.length 写进 total，面板再把它当全库数显示，等于把「这次取回多少」说成
+// 「全库有多少」——那正是这条路由原来「永远 500」的错法换个方向复发。
+test("entity card shows an unknown total instead of passing a slice off as the library", () => {
+  for (const key of ["memory.status.entitiesUnknown"]) {
+    const occurrences = clientSource.split(`"${key}"`).length - 1;
+    assert.ok(occurrences >= 2, `i18n key ${key} must exist in both zh and en (got ${occurrences})`);
+  }
+  const cardSrc = clientSource.slice(
+    clientSource.indexOf("function EntitiesStatusCard("),
+    clientSource.indexOf("function EntitiesStatusCard(") + 2600
+  );
+  assert.ok(cardSrc.includes("j.totalExact === true"),
+    "the card must gate the big number on the backend's exactness flag");
+  assert.ok(cardSrc.includes('state.totalKnown === false ? "—"'),
+    "an inexact total must render as unknown, not as a plausible-looking number");
+  assert.ok(cardSrc.includes('t("memory.status.entitiesUnknown")'),
+    "the card must say why the total is missing, not just blank it out");
+});
+
+// Issue #521：degraded 轮的跳过明细必须能在面板上看见。此前 skipped 只落库，
+// 响应里没有聚合，status: degraded + applied: 3 从外面看完全是健康轮的样子——
+// 一整类动作 100% 被拦要自己写 SQL 才看得出，那个 bug 跑了一整天才被发现。
+test("dream status card surfaces normalized skip reasons, not just status (issue #521)", () => {
+  // 三个新文案键 zh/en 各一份。
+  for (const key of [
+    "memory.status.skippedTitle",
+    "memory.status.skippedHint",
+    "memory.status.skippedMore"
+  ]) {
+    const occurrences = clientSource.split(`"${key}"`).length - 1;
+    assert.ok(occurrences >= 2, `i18n key ${key} must exist in both zh and en (got ${occurrences})`);
+  }
+
+  // 面板必须真的消费后端给的聚合字段，而不是自己再拼一份（归一化只有一份实现，
+  // 住在 src/dream/decisions.js，与产生这些 error 的校验器同文件）。
+  assert.ok(clientSource.includes("skippedReasons"), "the card must read the aggregated skippedReasons field");
+
+  // 归一化实现只许有一份，且必须在 decisions.js 里（与校验器同文件，措辞不会漂移）。
+  const decisionsSource = readFileSync(new URL("../src/dream/decisions.js", import.meta.url), "utf8");
+  assert.ok(decisionsSource.includes("export function normalizeSkipReason("), "normalization lives in decisions.js");
+  assert.ok(decisionsSource.includes("export function summarizeSkipped("), "aggregation lives in decisions.js");
+  assert.ok(!clientSource.includes("normalizeSkipReason("), "the panel must not re-implement normalization");
+  // 序号前缀必须被剥掉：不剥的话 decision[0]/decision[1] 会被拆成 N 组（#521 实测 280 条拆成 20 组）。
+  // #522 评审：一条决策可能攒下多条错误（用 "; " 拼接），所以剥前缀必须覆盖每一段，
+  // 不是只剥行首那一个——先按 "; decision[N]:" 切段，逐段再剥。
+  assert.ok(/replace\(\/\^decision\\\[\\d\+\\\]:/.test(decisionsSource), "the decision[N]: prefix is stripped");
+  assert.ok(/split\(\/;\\s\*\(\?=decision/.test(decisionsSource), "multi-error strings are split before prefix stripping");
+});
+
+// #522 评审：跳过明细原先只挂在 StatusPanel 折叠区里的 DreamStatusCards 上，而那个
+// 折叠区默认收起、收起时连子卡都不挂载——于是「一整类动作 100% 被拦」在首屏照样
+// 看不见，等于把 #521 的病换个地方犯。这条锁住：明细由 TokenFlowSection（首屏，
+// 就在 KPI 带下方）渲染，且只有一份实现（SkippedReasonsNotice）。
+test("skipped reasons are visible without expanding the collapsed detail section (#522)", () => {
+  assert.ok(clientSource.includes("function SkippedReasonsNotice("),
+    "the notice must be its own component so both call sites share one implementation");
+  // 首屏：TokenFlowSection 的返回值里必须出现这个组件（KPI 带之后、tokenflow 之前）。
+  const tokenFlow = clientSource.slice(
+    clientSource.indexOf("function TokenFlowSection("),
+    clientSource.indexOf("function DreamStatusCards(")
+  );
+  assert.ok(tokenFlow.includes("h(SkippedReasonsNotice,"),
+    "the first screen must render the skip notice, not only the collapsed section");
+  // 折叠区那份不再重复渲染：同一个数字在首屏与展开区各出现一次，读者会以为有两批跳过。
+  const dreamCards = clientSource.slice(
+    clientSource.indexOf("function DreamStatusCards("),
+    clientSource.indexOf("function InjectStatusCard(")
+  );
+  assert.ok(!dreamCards.includes("h(SkippedReasonsNotice,"),
+    "the collapsed section must not render the same notice a second time");
+  assert.ok(!dreamCards.includes("skippedReasons"),
+    "the collapsed card no longer needs its own copy of the skip buckets");
+});
+
+// #495：organize 与巩固共用 dream_runs，一次 agent 主动整理写两行。这张卡的标题是
+// 「最近巩固」，若面板继续拿 lastRun 取数，一次整理就把卡面变成整理回执——正是
+// issue 报的那个现象。锁三件事：① 卡面读 lastConsolidation；② 退回 lastRun 时必须
+// 先排除 organize（旧服务端没有新键，不能拿 organize 行冒充巩固）；③ KPI 带那块
+// 「上一轮跳过什么」同样改读巩固轮，organize 的 skipped 不是巩固决策。
+test("dream status card reads the consolidation run, not whatever ran last (issue #495)", () => {
+  const dreamCards = clientSource.slice(
+    clientSource.indexOf("function DreamStatusCards("),
+    clientSource.indexOf("function InjectStatusCard(")
+  );
+  assert.ok(dreamCards.includes("state.lastConsolidation"),
+    "the card must consume lastConsolidation from /dream-status");
+  assert.ok(dreamCards.includes('state.lastRun.run_type === "organize"'),
+    "falling back to lastRun must still refuse an organize row — an old server may omit the new key");
+  assert.ok(/const run = state\.lastConsolidation\s*\n?\s*\|\| \(state\.lastRun && !organizedOnly/.test(dreamCards)
+    || dreamCards.includes("|| (state.lastRun && !organizedOnly"),
+    "the fallback branch must skip the row it just identified as organize");
+  // 脚注：最近一次后台运行确实是 organize 时点名它，而不是静默把它当巩固。
+  assert.ok(dreamCards.includes("memory.status.dreamOrganizeOnly"),
+    "an organize-only history must be named in a footnote, not shown as a consolidation");
+  // ① 的取数还必须晚于本卡自己那次 fetch，不能只是把键名写进注释里。
+  const fetchIdx = dreamCards.indexOf('apiFetch("/api/dsh-mneme/dream-status")');
+  const useIdx = dreamCards.indexOf("state.lastConsolidation");
+  assert.ok(fetchIdx >= 0 && useIdx > fetchIdx, "the key must be read from the /dream-status payload");
+
+  const tokenFlow = clientSource.slice(
+    clientSource.indexOf("function TokenFlowSection("),
+    clientSource.indexOf("function DreamStatusCards(")
+  );
+  assert.ok(tokenFlow.includes("d.lastConsolidation || d.lastRun"),
+    "the skip-reason KPI belongs to consolidation; organize skipped buckets would read as blocked consolidation");
+});
+// 设置页目录（#518）：用户要的是「左侧一个分类，直接跳到某一节」。这里锁五件事：
+// ① 目录由 tocGroups 一张表生成，五项分组标题全部走 groupHead(key) 渲染——两处各写
+//    一遍清单是这类索引最典型的腐烂方式，而腐烂后的目录会把人领到不存在的锚点；
+// ② 点一下必须真的滚（scrollIntoView），不是摆设；
+// ③ 文案双语齐备——只有中文键的目录在英文界面下会渲染出键名；④⑤ 两条是布局锁，见断言末尾。
+test("settings page ships a section index that jumps to each group (#518)", () => {
+  // 目录与标题同源：tocGroups 的每一项都必须从 group.<key> 取文案。
+  const tocBlock = clientSource.match(/const tocGroups = \[([\s\S]*?)\];/);
+  assert.ok(tocBlock, "the settings view must declare tocGroups");
+  const tocKeys = [...tocBlock[1].matchAll(/key: "([^"]+)"/g)].map((m) => m[1]);
+  assert.deepEqual(tocKeys, ["personal", "engine", "search", "connect", "help"],
+    "the index must cover every settings group, in render order");
+  for (const key of tocKeys) {
+    assert.ok(tocBlock[1].includes('t("memory.settings.group.' + key + '")'),
+      'tocGroups entry "' + key + '" must read its label from memory.settings.group.' + key);
+    // 分组标题只有一条通路：正文里的五个标题都经过 groupHead(key)，
+    // 没有一处再手写 className 为 mneme-set-grouphead 的 div。
+    const headCalls = clientSource.split('groupHead("' + key + '")').length - 1;
+    assert.equal(headCalls, 1, 'group "' + key + '" must be rendered exactly once, via groupHead()');
+  }
+  const rawHeads = clientSource.split('className: "mneme-set-grouphead"').length - 1;
+  assert.equal(rawHeads, 1, "no section may hand-write the group head; only groupHead() may (it owns the jump ref)");
+
+  // 跳转必须落到 ref 上并调用 scrollIntoView——目录不滚动等于没有目录。
+  assert.match(clientSource, /tocRefs\.current\[key\] = node/,
+    "every group head must register itself as a jump target");
+  assert.match(clientSource, /node\.scrollIntoView\(\{ block: "start"/,
+    "jumping must scroll the target section into view");
+
+  // 双语：三条新键都要在 zh 与 en 各出现一次（en 块在后，计数 >= 2）。
+  for (const key of [
+    "memory.settings.toc.label",
+    "memory.settings.toc.aria",
+    "memory.settings.toc.jump"
+  ]) {
+    const occurrences = clientSource.split('"' + key + '"').length - 1;
+    assert.ok(occurrences >= 2, "i18n key " + key + " must exist in both zh and en (got " + occurrences + ")");
+  }
+  // 占位符是唯一的插值点：写成裸文案就等于把 "{name}" 直接显示给用户。
+  assert.ok(clientSource.includes('"memory.settings.toc.jump": "跳到「{name}」"'),
+    "the jump tooltip must keep its {name} placeholder");
+
+  // ④ 粘顶条会盖住跳转目标：只锁 scrollIntoView 存在，看不出标题停在目录背后——
+  //    布局里唯一还能在源码上判的一条就是那个偏移，所以钉住它。
+  const headRule = clientSource.match(/"\.mneme-set-grouphead\{([^"]*)\}/);
+  assert.ok(headRule && /scroll-margin-top:\d+px/.test(headRule[1]),
+    "the jump target must clear the sticky index via scroll-margin-top");
+
+  // ⑤ 窄屏是横向滚动，不是换行：换行会把粘顶条撑高，上面那个偏移跟着失准。
+  const listRule = clientSource.match(/"\.mneme-set-toclist\{([^"]*)\}/);
+  assert.ok(listRule && /overflow-x:auto/.test(listRule[1]) && !/flex-wrap:wrap/.test(listRule[1]),
+    "the chip row must scroll sideways on narrow panels instead of wrapping under the sticky bar");
+});
+
+// #514：用户以为插件「轻量」关掉了人格定义，实际是宿主 minimal 预设整体压制了注入。
+// 三道锁防复发：① 设置页那两个会被人开关的卡（运行模式 / 人格）都要能看到这条
+// 告示，且两处共用同一份取数与同一组文案，不许各自长一套；② 宿主的 minimal 与
+// 插件的 light 必须在文案里被明确区分，否则两个词在同一个页面里出现就还是混；
+// ③ 告示只在 suppressed 为真时出现——关掉注入的用户、preset 未知的宿主不该被吓。
+test("minimal preset notice reaches the settings page, not just the status tab (issue #514)", () => {
+  for (const key of ["memory.status.minimalPresetTitle", "memory.status.minimalPresetBody", "memory.settings.mode.hostPresetHint"]) {
+    const occurrences = clientSource.split(`"${key}"`).length - 1;
+    assert.ok(occurrences >= 2, `i18n key ${key} must exist in both zh and en (got ${occurrences})`);
+  }
+  // ② 区分两个词：文案里必须同时点名宿主的极简/预设与插件的轻量档。
+  assert.ok(clientSource.includes("极简模式（minimal 预设）"), "the zh copy must name the host's minimal preset explicitly");
+  assert.ok(/轻量档不会关闭人格定义|Light never disables persona/.test(clientSource),
+    "the copy must say that light mode does not disable persona — that is the exact misreading in #514");
+
+  // ① 两处消费：告示必须在运行模式卡与人格卡各出现一次，且都读同一个 minimalWarn。
+  const uses = clientSource.split('t("memory.status.minimalPresetTitle")').length - 1;
+  assert.ok(uses >= 2, `the notice must render in both the mode card and the persona card (got ${uses})`);
+  assert.ok(clientSource.includes("const minimalWarn = !injectStatus.loading && injectStatus.suppressed;"),
+    "the notice must be gated on the shared inject-status state, not on a second fetch of its own");
+
+  // 取数只有一份：useInjectStatus 之外不许再有人直接打 /inject-status。
+  const fetches = clientSource.split('"/api/dsh-mneme/inject-status"').length - 1;
+  assert.equal(fetches, 1, "inject-status must have exactly one reader; a second fetch lets the two surfaces drift");
+
+  // 3 未压制时零打扰：settings 里判的必须是 injectStatus.suppressed。
+  assert.ok(!/minimalWarn\s*=\s*true/.test(clientSource), "the notice must never be hard-wired on");
+});
+
+// 上面那条只证明"声明字符串存在"，证明不了"每个消费点的作用域里有它"。
+// 人格页搬进 SettingsContent 之后，运行模式卡这一处读的是自由变量：渲染即 ReferenceError，
+// 而宿主只记一句 "import failed: client-modules: could not load @modusensus/dsh-mneme"，
+// 看起来像整个插件加载不了，实际是一个 JSX 分支炸了（本机 crash-*-web-boot.log 实录）。
+// 不变量是"每个消费点的作用域里有声明"，不是"声明数量等于消费点数量"：
+// 同一个组件消费两次（SettingsContent 里两张卡各一处）只需要一份声明，按数量判会把正确代码钉红。
+test("each minimalWarn consumer resolves the declaration inside its own component", () => {
+  const lines = clientSource.split("\n");
+  const components = [];
+  lines.forEach((line, i) => {
+    const m = /^(?:    |      )(?:function |const )([A-Z]\w*)/.exec(line);
+    if (m) components.push({ line: i + 1, name: m[1] });
+  });
+  const owner = function (at) {
+    let found = null;
+    for (const c of components) {
+      if (c.line <= at) found = c;
+      else break;
+    }
+    return found;
+  };
+  assert.ok(components.length > 0, "component scan matched nothing — bundle layout changed; fix this lock, don't delete it");
+
+  const decls = [];
+  const uses = [];
+  lines.forEach((line, i) => {
+    if (!line.includes("minimalWarn") || line.trim().startsWith("//")) return;
+    (/const minimalWarn\s*=/.test(line) ? decls : uses).push(i + 1);
+  });
+  assert.ok(uses.length >= 2, `expected the notice in both surfaces (got ${uses.length} use sites)`);
+
+  const byComponent = new Map();
+  for (const d of decls) {
+    const name = owner(d).name;
+    if (!byComponent.has(name)) byComponent.set(name, []);
+    byComponent.get(name).push(d);
+  }
+  for (const u of uses) {
+    const c = owner(u);
+    const inScope = (byComponent.get(c.name) || []).filter((d) => d < u);
+    assert.ok(inScope.length > 0,
+      `line ${u} reads minimalWarn inside ${c.name} (opens at ${c.line}) which has no declaration before it — ` +
+      "renders as ReferenceError and the host reports only \"import failed\"");
+  }
+});
+
+// --- 移动端适配（mobile-adapt 车道）---
+// 面板在 320–430px 容器里原本是「骨架级失衡」而不是「略挤」：记忆页左栏固定
+// 216px、卡片最小轨道 252+48=300px，要 ≥517px 才排得下；实体页 rail 224px +
+// 属性网格 200+48=248px，要 ≥473px。目标区间上沿只有 430，靠收窄数值永远追
+// 不上，所以适配必须换骨架（row → column）而不是继续动宽度。
+// 下面这组锁防三类回归：
+// ① 有人把新规则写成 @media——面板有两种形态（overlay 弹层与 better-sidebar
+//    工作台 tab），容器宽度与视口宽度并不相等，@media 只在 overlay 形态对，
+//    tab 形态会整块失效；
+// ② 有人在双花括号块里写 color —— contrast.test.js 的规则提取器按单层花括号
+//    匹配，\`@container{...{...}}\` 整串不匹配会被跳过，等于绕过 #178 的 AA 主锁
+//    （静默失效，比写错颜色更糟）；\`background\` 同理，它是合成对比度的基底；
+// ③ 有人删掉 \`min(...,100%)\` 的最小轨道下限——只要容器比轨道窄，网格就会横向
+//    溢出，而外层 .mneme-xcontent 是 overflow:hidden，溢出部分直接被切掉。
+test("mobile: the narrow-container breakpoints reflow the two-column skeletons instead of shrinking numbers", () => {
+  const cssStart = clientSource.indexOf("const css = [");
+  const cssEnd = clientSource.indexOf('].join("\\n");', cssStart);
+  assert.ok(cssStart > 0 && cssEnd > cssStart, "lib/client.js 里找不到 CSS 数组（切片锚点变了？）");
+  const cssBlock = clientSource.slice(cssStart, cssEnd);
+
+  // 断点表只许三档：640（原收窄档，数值不动）、480（本轮主断点）、360（图标/内边距）。
+  for (const max of ["480px", "360px"]) {
+    assert.ok(
+      cssBlock.includes("@container (max-width: " + max + "){"),
+      "@container (max-width: " + max + ") 必须存在——" + max + " 是移动端骨架换向档，删了就等于整套适配没生效"
+    );
+  }
+  // 480 是主断点：记忆页与实体页都要换向，且 rail/xside 满宽、限高、可滚。
+  const c480 = /@container \(max-width: 480px\)\{([\s\S]*?)\}\*?\*?\s*",/.exec(cssBlock);
+  assert.ok(c480, "480 档规则必须是一条完整的 CSS 字符串（单行，便于本测试切片）");
+  const body = c480[1];
+  for (const sel of [".mneme-xmain{flex-direction:column}", ".mneme-ent{flex-direction:column}"]) {
+    assert.ok(body.includes(sel), "480 档必须让 " + sel + " —— 左右分栏在窄容器里只能改上下");
+  }
+  assert.ok(/\.mneme-xside\{[^}]*width:100%/.test(body), "记忆页左栏在窄容器里必须满宽");
+  assert.ok(/\.mneme-xside\{[^}]*max-height:min\(/.test(body),
+    "记忆页左栏必须限高可滚：6 段筛选集群在 320px 下自然高 260–320px，不限高会把主区挤成 0");
+  assert.ok(/\.mneme-entrail\{[^}]*width:100%/.test(body), "实体页 rail 在窄容器里必须满宽");
+  assert.ok(/\.mneme-entrail\{[^}]*max-height:min\(/.test(body), "实体页 rail 必须限高可滚");
+  // 换向之后这两条 rail 是「限高」的，限高必须能真收缩：flex:none 在矮工作区里
+  // 不肯让位——42vh 只是上限、不是需求，可 flex:none 让它按内容撑满，主区被
+  // .mneme-xmain 的 overflow:hidden 直接裁成 0 高（CodeRabbit #542）。改成可收缩
+  // 的 flex:0 1 auto 后，min-height:0 才允许它压到上限以下。
+  for (const sel of [".mneme-xside", ".mneme-entrail"]) {
+    assert.ok(new RegExp("\\" + sel + "\\{[^}]*flex:0 1 auto").test(body),
+      sel + " 在窄容器里必须可收缩（flex:0 1 auto），flex:none 会在矮视口里把主区挤没");
+    assert.ok(new RegExp("\\" + sel + "\\{[^}]*min-height:0").test(body),
+      sel + " 必须带 min-height:0，否则 flex 项的内容高度下限会让收缩失效");
+  }
+  // overscroll-behavior 不继承，只能写在真正的滚动容器上：.mneme-entrail 的 base 规则
+  // 是 overflow:hidden（lib/client.js:2042），滚动的是内层 .mneme-entrailbody
+  // （lib/client.js:2046 的 overflow-y:auto）。写在 rail 上等于没写，触屏滚到底会
+  // 串到外层（Copilot #542）。.mneme-xside 的 base 本身是滚动容器，写在它身上对。
+  assert.ok(/\.mneme-entrailbody\{[^}]*overscroll-behavior:contain/.test(body),
+    "滚动链的 overscroll-behavior 必须写在 .mneme-entrailbody（真滚动容器）上，写在 .mneme-entrail 上无效");
+  assert.ok(!/\.mneme-entrail\{[^}]*overscroll-behavior/.test(body),
+    ".mneme-entrail 是 overflow:hidden 的非滚动容器，overscroll-behavior 写在它身上是死代码");
+  // 抽屉是覆盖层，窄容器里 52% 只剩 166px；满宽不丢关闭入口（✕ 在 .mneme-drawerbar）。
+  assert.ok(body.includes(".mneme-drawer{width:100%}"), "详情抽屉在窄容器里必须满宽");
+  // 网格轨道的 100% 下限不再锚定在本档：它的作用域是「所有宽度」，而 481–519px
+  // （480 主断点之上、两栏又排不下的中间带）恰恰落回基础规则。锁在基础规则上，
+  // 见本用例末尾的 topLevel 那组。本档只保留窄屏特有的 padding 与滚动链。
+  // 固定宽弹层在 320px 会顶边：340px 的分享弹层比视口还宽。
+  assert.ok(/\.mneme-sharedialog\{[^}]*calc\(100cqw - 32px\)/.test(body), "分享弹层宽度必须跟着容器收");
+  assert.ok(/\.mneme-impdialog\{[^}]*calc\(100cqw - 32px\)/.test(body), "导入弹层宽度必须跟着容器收");
+  // 页签的横向滚动必须住在 480 主断点，而不是 360 兜底档：4 个带图标的 tab 约 436px，
+  // 而 480 档给 .mneme-xbar 的可用宽度是容器宽减 62px（左 10 + 右 52 让位给绝对定位
+  // 的 ⋯），480px 时只剩 418px——整段 361–480px 都会把页签顶到 ⋯ 底下。写错档位的
+  // 失败形态最难查：窄屏照样溢出，而只锁「360 档有这条规则」的测试全绿。
+  assert.ok(/\.mneme-vtabs\{[^}]*min-width:0[^}]*overflow-x:auto/.test(body),
+    "页签横向滚动属于 480 档：只在 360 档兜底等于把溢出留在主断点的整个区间");
+  // 三处窄屏宽度都得带 box-sizing:border-box：全文件没有 *{box-sizing} 兜底，声明的
+  // 那个数是内容宽，外宽还要再加 padding+border——impdialog +30px、menu +12px，320px
+  // 视口下比屏幕还宽，会被 overlay 裁掉。CodeRabbit 只点了 sharedialog，另两处同病。
+  for (const sel of ["menu", "impdialog", "sharedialog"]) {
+    assert.ok(new RegExp("\\.mneme-" + sel + "\\{[^}]*box-sizing:border-box").test(body),
+      ".mneme-" + sel + " 的窄屏宽度必须按外宽算（box-sizing:border-box），否则声明值加完 padding+border 就溢出容器");
+  }
+
+  // .mneme-overlay 不在 .mneme-x 之内，容器查询够不到它——它只能走 @media，
+  // 且必须保留基线声明（client.test.js 上有 width:min(1240px,calc(100vw - 88px)) 的锁）。
+  assert.match(cssBlock, /@media \(max-width: 640px\)\{\.mneme-overlay\{/,
+    ".mneme-overlay 是容器查询够不到的祖先，它的移动端外框必须用 @media 覆盖");
+
+  // ② 双花括号块内不得出现颜色声明（见文件头注释的失效机制）。
+  const nested = [...cssBlock.matchAll(/@(?:container|media)[^{]*\{/g)];
+  assert.ok(nested.length >= 4, "移动端适配应当新增 ≥4 条 @container/@media 规则（当前 " + nested.length + "）");
+  for (const m of nested) {
+    const at = m.index + m[0].length;
+    let depth = 1, i = at;
+    while (i < cssBlock.length && depth > 0) {
+      if (cssBlock[i] === "{") depth++;
+      else if (cssBlock[i] === "}") depth--;
+      i++;
+    }
+    const inner = cssBlock.slice(at, i - 1);
+    const hit = /(?:^|[;{])\s*(color|fill|stroke|background(?:-color)?)\s*:/.exec(inner);
+    assert.equal(hit, null,
+      "@container/@media 块内不得写颜色（" + (hit && hit[1]) + "）：contrast.test.js 的单层花括号提取器会整串跳过该块，" +
+      "写进去的色值不会被 AA 主锁审计——这是静默绕过 #178，不是优化");
+  }
+
+  // 触屏没有 hover：设置页删除钮必须常显（#457/#459 两次回滚都是因为连带改了 hover 配色，
+  // 这里只许加 opacity:1，不许在同一条里再动 color）。
+  assert.match(cssBlock, /@media \(hover:none\)\{\.mneme-set-del\{opacity:1/,
+    "触屏设备上 .mneme-set-del 必须常显——它的 base 是 opacity:0，只靠 :hover 恢复，手机上等于永久不可见");
+  // 断点之外还有一段中间带：481–519px 容器宽（480 主断点之上、两栏又排不下）。
+  // 这一段落回基础规则，所以 min(…,100%) 的轨道下限必须写在基础规则上，只在断点里
+  // 写等于给中间带留缺口。本组锁都作用在「剥掉嵌套块之后的顶层规则」上——否则
+  // 480 档里的同名声明会让断言假绿。
+  const topLevel = (() => {
+    let out = "";
+    let i = 0;
+    while (i < cssBlock.length) {
+      const at = cssBlock.indexOf("@", i);
+      out += cssBlock.slice(i, at === -1 ? cssBlock.length : at);
+      if (at === -1) break;
+      const open = cssBlock.indexOf("{", at);
+      if (open === -1) { out += cssBlock.slice(at); break; }
+      let depth = 0, j = open;
+      while (j < cssBlock.length) {
+        if (cssBlock[j] === "{") depth++;
+        else if (cssBlock[j] === "}") { depth--; if (depth === 0) { j++; break; } }
+        j++;
+      }
+      i = j;
+    }
+    return out;
+  })();
+  assert.ok(topLevel.length > 10000, "顶层规则切片异常（" + topLevel.length + " 字符）——切片实现坏了，下面的锁会假绿");
+  assert.match(topLevel, /\.mneme-cards\{[^}]*minmax\(min\(252px,100%\),1fr\)/,
+    "卡片网格的 100% 轨道下限必须写在基础规则上：481–519px 是 480 主断点之外的中间带，" +
+    "只在断点里兜底等于让这一段横向溢出 2–11px（外层 overflow:hidden 直接切掉）");
+  assert.match(topLevel, /\.mneme-attrgrid\{[^}]*minmax\(min\(200px,100%\),1fr\)/,
+    "属性网格同理：481–519px 时实体页 detail 只剩 257–276px，裸 200px 下限会溢出");
+  // 图谱的 touch-action 保持 none（这里是从 pan-y 回退后补的锁）。pan-y 那一版想解决
+  // 「手指在图上竖划时页面滚不动」，但它同时把纵向手势交给浏览器做页面平移，而图谱的
+  // 拖拽只挂了 mousedown/mousemove（全仓 onPointerDown/onTouchStart 命中 0）——触屏上
+  // 纵向拖拽到底走哪条路，浏览器是否派发兼容鼠标事件，没有真机无法定论。宁可保留现状
+  // 也不做无法复验的行为变更；真要两步都能用，得改成 Pointer Events，另开车道。
+  assert.match(topLevel, /\.mneme-graphsvg\{[^}]*touch-action:none/,
+    "图谱的 touch-action 必须写在基础规则上：481–519px 这段中间带落回基础规则，" +
+    "只在断点里声明等于给中间带留缺口");
+  assert.doesNotMatch(topLevel, /\.mneme-graphsvg\{[^}]*touch-action:pan-y/,
+    ".mneme-graphsvg 不得改回 touch-action:pan-y —— 纵向手势会被浏览器拿去滚页面，" +
+    "而图谱的拖拽只有鼠标事件实现，触屏拖拽行为无真机无法验证（见上方注释）");
+});
+
+// Issue #512：面板详情抽屉要能说清「这条记忆是从哪来的」。
+//
+// 归因分两层：窗口级（哪一段原文蒸出来的）与行级（哪一轮铸造的）。这两层
+// 任何一层缺失都必须显示成「没有归因」，而不是让用户看到空白以为自己眼花了。
+test("memory drawer surfaces distillation provenance, both layers (issue #512)", () => {
+  for (const key of [
+    "memory.explorer.detail.provenance",
+    "memory.explorer.detail.provenanceEmpty",
+    "memory.explorer.detail.provenanceMint",
+    "memory.explorer.detail.provenanceWindow",
+    "memory.explorer.detail.provenanceNoRun",
+    "memory.explorer.detail.provenanceRecords"
+  ]) {
+    // 只数字典定义处（"key": 形态）——键在渲染里还会被 t("…") 再引一次，
+    // 数全量出现次数会把两种用法混为一谈。
+    const defined = clientSource.split(`"${key}":`).length - 1;
+    assert.equal(defined, 2, `i18n key ${key} must be defined exactly once in zh and once in en (got ${defined})`);
+  }
+
+  // 必须真的去读那一个端点，且是读不是算——归因的判据只有后端一处。
+  assert.ok(clientSource.includes("/api/dsh-mneme/memory/provenance?id="),
+    "the drawer must fetch the provenance endpoint");
+  // 两层都要渲染：只渲染窗口会让铸造出来的 pattern 永远显示「没有来源」，
+  // 而它们恰恰是归因最该说清的一类（没有会话区间可看）。
+  // 断到 .map( 为止：只写 "provenance.mints" 会被空态判断里的 .length 满足，
+  // 于是「渲染被整段删掉」这种回归照样能过（本用例的变异自证就是从这里翻车的）。
+  assert.ok(clientSource.includes("provenance.mints.map("), "mint-level attribution (which run minted the row) must render");
+  assert.ok(clientSource.includes("provenance.windows.map("), "window-level attribution (which transcript) must render");
+  assert.ok(clientSource.includes("\"memory.explorer.detail.provenanceNoRun\""),
+    "a legacy link without a run id must say so explicitly, not render an empty cell");
+
+  // 读失败要落回「没读到」而不是伪造一份空归因：两者在界面上是不同的话。
+  assert.ok(clientSource.includes("/api/dsh-mneme/memory/provenance?id=") && clientSource.includes("setProvenance(null)"),
+    "a failed read must clear the block instead of pretending there is no attribution");
+});
+
+// Issue #24 块4：被动确认让「正常触达」自动抬高边的权重——这是唯一会悄悄改变
+// 检索形状的写动作，所以它必须有一个能查的地方，否则「自动确认」与「没人看过的
+// 自动确认」在界面上没有区别。这里锁四件事：
+// ① 复核区读的是那条专用端点，而不是把 ego 的边自己过滤一遍（抬高量 gain 只有
+//    后端知道——它要和来源基线比对，前端手里只有当前 weight）；
+// ② 边侧卡必须同时显示 weight 和 source：只看 weight 会把「tag 边被抬到 0.5」
+//    误读成「比 manual 边弱」，而 0.3→0.5 恰恰是被用出来的证据；
+// ③ 闸关着时要说「闸关着」，而不是显示「还没有边被抬过」——后者让人以为系统
+//    在工作但没数据，前者才说明是开关没开；
+// ③c 空表文案也不能断言「从未抬过权」：端点只列「权重高于其来源基线」的边，
+//    一条人工边以 0.5 建立、被抬到 0.6 仍然低于基线 1.0，它确实被抬过却不在表里。
+//    文案只能描述「当前筛选结果为空」（评审第四轮指出）。
+// ④ 收起时不发请求（默认收起是刻意的：这是审计视角，不是日常视角）。
+test("entity graph surfaces the passive-confirmation review surface (issue #24)", () => {
+  for (const key of [
+    "memory.graph.boosted.title",
+    "memory.graph.boosted.hint",
+    "memory.graph.boosted.empty",
+    "memory.graph.boosted.loadFailed",
+    "memory.graph.boosted.gateOff",
+    "memory.graph.boosted.show",
+    "memory.graph.boosted.hide",
+    "memory.graph.boosted.gain",
+    "memory.graph.weight",
+    "memory.graph.source",
+    "memory.graph.src.manual",
+    "memory.graph.src.confirmed",
+    "memory.graph.src.tag",
+    "memory.graph.src.llm"
+  ]) {
+    const defined = clientSource.split(`"${key}":`).length - 1;
+    assert.equal(defined, 2, `i18n key ${key} must be defined exactly once in zh and once in en (got ${defined})`);
+  }
+
+  // ① 专用端点
+  assert.ok(clientSource.includes("/api/dsh-mneme/semantic/graph/boosted-relations?limit="),
+    "the review surface must read the boosted-relations endpoint");
+
+  // ② 边侧卡：weight 与 source 一起出现，且 source 走字典而不是直接上屏原词
+  assert.ok(clientSource.includes("memory.graph.weight\").replace(\"{w}\""),
+    "the edge side card must render the weight");
+  assert.ok(clientSource.includes("memory.graph.src.${selected.edge.source}"),
+    "the edge side card must localize the source, not print the raw enum");
+
+  // ③ 闸关与空表是两句不同的话。
+  // 断言必须落在「闸关分支之后的那一小段」而不是全文件 contains：gateOff 这个键
+  // 在字典定义里本来就有一次，全文件搜一遍，把渲染处换成 empty 也照样命中——
+  // 本条用例的首版变异自证就是这么翻车的。
+  const gateIdx = clientSource.indexOf("boosted.passiveConfirmEnabled !== true");
+  assert.ok(gateIdx > 0, "the off-gate branch must be driven by the server's passiveConfirmEnabled, not guessed");
+  const gateBranch = clientSource.slice(gateIdx, gateIdx + 700);
+  assert.ok(gateBranch.includes("memory.graph.boosted.gateOff"),
+    "a closed gate must say so instead of looking like an empty table");
+  // 闸关时既有的提升仍然要列出来（评审指出：关掉闸只表示今后不再自动抬，
+  // 隐藏整张表会让人永远没法复核已经发生过的提升）。
+  assert.ok(/off\s*&&\s*h\([^)]*gateOff/.test(gateBranch),
+    "the off-gate notice must be rendered alongside the list, not as a replacement for it");
+  assert.ok(gateBranch.includes("items.length === 0"),
+    "the empty-table copy must be decided by item count, independently of the gate");
+  // 空表提示本身也不能被闸门状态挡住：闸关且一条都没有时，光说「下面列的是此前
+  // 已经抬过的边」却不给任何行，读起来像这一屏坏了（评审第二轮指出）。
+  assert.ok(!/items\.length === 0\s*\?\s*\(!\s*off/.test(gateBranch),
+    "the empty-table copy must render even when the gate is closed");
+  assert.ok(!/off\s*\?[^:]*gateOff[^:]*:\s*\(boosted\.items/.test(gateBranch),
+    "the gate must not short-circuit the list branch");
+
+  // ③c 空表文案只描述「当前筛选为空」，不能断言「从未有边被抬过」：端点按
+  // gain > 0 筛，而 gain 是相对来源基线算的——manual 边 0.5→0.6 涨了，却仍低于
+  // 基线 1.0，不在表里。说「还没抬过」就是事实错误。
+  for (const lang of ["zh", "en"]) {
+    const re = new RegExp(`"memory\\.graph\\.boosted\\.empty": "([^"]*)"`, "g");
+    const all = [...clientSource.matchAll(re)].map((m) => m[1]);
+    assert.equal(all.length, 2, `empty copy must exist in both languages (${lang})`);
+    for (const copy of all) {
+      assert.ok(!/还没|从未|nothing raised|no edge has been raised/i.test(copy),
+        `empty copy must not claim nothing was ever raised: ${copy}`);
+      assert.ok(/筛选|filter|筛选下|只列|only edges/i.test(copy),
+        `empty copy must describe the current filter instead: ${copy}`);
+    }
+  }
+
+  // ③b 加载失败不能被说成「闸关」或「没有数据」——那会把接口故障误导成配置问题
+  const failIdx = clientSource.indexOf("boosted.error === true");
+  assert.ok(failIdx > 0, "the panel must distinguish a failed fetch from a closed gate");
+  assert.ok(clientSource.slice(failIdx, failIdx + 160).includes("memory.graph.boosted.loadFailed"),
+    "a failed fetch must render its own copy");
+
+  // ④ 收起时不取数
+  assert.ok(clientSource.includes("if (boostedOpen) loadBoosted();"),
+    "the review surface must not fetch while collapsed");
+});
+
+// issue #553：`MemoryDrawer` 用了 `provenance` / `setProvenance`，而那句 useState 却落在
+// 同文件的上一个组件 `EntityPanel` 里——于是打开任何一条记忆详情都会在渲染期抛
+// `ReferenceError: provenance is not defined`，整个 renderer 被带走（DSH 直接重启）。
+//
+// 这个形状不是笔误级别的，它躲得过三样东西：
+//   · 眼睛——两个组件隔了三千多行，同名的 useState 看起来完全正常；
+//   · 语法检查——`provenance` 是合法标识符，只是不在作用域里；
+//   · 现有用例——它们读的是源码字符串，从不执行组件。
+// 所以这里不锁某一个名字，而是把**每个组件里「调了 setter 却没有声明」**这件事整体扫一遍，
+// 才对得起「别再有人把 state 放进隔壁组件」这个意图。
+test("panel exposes the bootstrap entry and the config-key coverage card (issue #386)", () => {
+  // 第 6 条：从目录引导。后端从 #220 就在，缺的是面板入口——所以锁四件事：
+  // 菜单项存在、弹层真的挂在菜单上、请求打的是新路由、错误分码显示。
+  assert.ok(
+    /setBootstrapOpen\(true\); setMenuOpen\(false\)/.test(clientSource),
+    "the overflow menu needs a bootstrap item that opens its dialog"
+  );
+  assert.ok(
+    /bootstrapOpen && h\(BootstrapDialog, \{/.test(clientSource),
+    "the dialog must actually be mounted, not just declared"
+  );
+  // 菜单按钮的 onClick 里必须也关掉它，否则点「⋯」会留下上一个弹层。但它现在带一个
+  // 条件：引导请求在飞时不关（否则等于绕过弹层里那两道 busy 禁用的锁，评审
+  // #4452245292）。#558 起关闭同时把任务态回 idle——用户看得见这次关闭，terminal
+  // 状态不留在 store 里（重开弹层要干净，#558 只保留没人看过的那份）。
+  assert.ok(
+    /setImportOpen\(false\);\s*\n\s*\/\/[\s\S]{0,300}?if \(!bootstrapBusy\) \{ resetBootstrapJob\(\); setBootstrapOpen\(false\); \}/.test(clientSource),
+    "the overflow toggle must close the bootstrap dialog (and reset the job) when it is not busy"
+  );
+  // 父组件的 busy 守卫必须真的有来源：#558 起它订阅模块级 bootstrapJob 派生
+  // （prop 钻孔链拆了——tab 注册的 explorer 没有 onBusyChange，原本就报不上来）。
+  assert.ok(
+    /const bootstrapBusy = bootstrapJob\.phase === "running"/.test(clientSource),
+    "the parent derives bootstrapBusy from the module-level job, or the guard above means nothing"
+  );
+  assert.ok(
+    /function BootstrapDialog\(\{ t, onClose, onImported \}\)/.test(clientSource),
+    "the dialog no longer takes onBusyChange: busy lives in the store, not in prop drilling"
+  );
+  // 会挂弹层的菜单项在忙碌时必须禁用（评审 #4452539738）：新建 / 导入 / 引导 / 分享 /
+  // 接收共五处，加上「⋯」按钮自己（见下），再加上四个视图标签（评审 #4453639221，
+  // 源码里那一处在 `.map` 里，一处覆盖四个）。数个数而不是逐个锁字符串——少一处就
+  // 等于留了一条绕过弹层的路，而这条路的代价是用户看不到自己那次引导的结果。
+  assert.equal(
+    clientSource.split("disabled: bootstrapBusy").length - 1,
+    7,
+    "every dialog-mounting menu item, the overflow toggle and the view tabs must be disabled while bootstrap is busy"
+  );
+  // 视图标签离开 memory 会连 `.mneme-xtools` 与其中的 BootstrapDialog 一起卸载
+  // （评审 #4453639221）。两道锁都要有：`disabled` 是第一道，onClick 走 leaveMemory
+  // 是第二道——将来有人给标签换一种可点的实现时，函数里的判断还在。
+  assert.ok(
+    /disabled: bootstrapBusy,[\s\S]{0,300}?onClick: \(\) => leaveMemory\(s\.key\)/.test(clientSource),
+    "view tabs must route through leaveMemory, not setView directly"
+  );
+  assert.ok(
+    /const leaveMemory = \(key\) => \{[\s\S]{0,120}?if \(bootstrapBusy\) return;[\s\S]{0,80}?setView\(key\);/.test(clientSource),
+    "leaveMemory must refuse to switch views while a bootstrap request is in flight"
+  );
+  // 视图标签不是唯一的出口：记忆视图里那个实体 chip（`openGraphFor`）也把 view 切到
+  // "entity"，同样会把 BootstrapDialog 一起卸掉。这条是变异自证抓出来的——四个变异体
+  // 里只有它活下来，说明我先前只锁了标签、漏了这条真实的旁路。
+  assert.ok(
+    /const openGraphFor = \(name\) => \{[\s\S]{0,120}?if \(bootstrapBusy\) return;/.test(clientSource),
+    "the entity chip's graph jump must also refuse to leave memory while bootstrap is busy"
+  );
+  // 「⋯」按钮自己也要禁用（评审 #4453225585）：菜单与引导弹层共用同一个绝对定位锚点、
+  // 同一层 z-index，弹层排在菜单之后渲染，会把菜单顶上那两项导出盖住——它们没有
+  // disabled，却点不到。上一轮我以为「导出项不挂弹层所以照旧可点」就没事了，那是错的：
+  // 可点的是菜单项本身，但它被遮住了。不开菜单，才不存在「可点但被遮住」。
+  assert.ok(
+    /title: t\("memory\.explorer\.more"\),[\s\S]{0,600}?disabled: bootstrapBusy,[\s\S]{0,200}?onClick: \(\) => \{\s*\n\s*setMenuOpen\(!menuOpen\);/.test(clientSource),
+    "the overflow toggle must be disabled while bootstrap is busy, so the dialog never covers its items"
+  );
+  const bsIdx = clientSource.indexOf("function BootstrapDialog");
+  // 切到下一个弹层为止，而不是给一个拍脑袋的字符数：这轮改动静悄悄把窗口撑破了，
+  // 断言于是在一个截断的片段上做，失败信息还指着「输入框没禁用」这种不存在的毛病。
+  const bsEnd = clientSource.indexOf("// --- 分享包弹层 ---", bsIdx);
+  const bsBody = clientSource.slice(bsIdx, bsEnd > bsIdx ? bsEnd : bsIdx + 4200);
+  assert.ok(bsIdx > 0, "BootstrapDialog must exist");
+  // 任务态必须**同步**进 store（评审 #4452539705 的结构化解法）：#558 起三处守卫
+  // （explorer 的「⋯」、overlay 的 Esc/背板/✕）都订阅同一份 bootstrapJob，submit
+  // 里 setBootstrapJob(running) 一落，监听者同步被唤醒——不再有「等渲染提交后才
+  // 追上」的那一拍。
+  assert.ok(
+    /setBootstrapJob\(\{ phase: "running"[\s\S]{0,200}?apiFetch\("\/api\/dsh-mneme\/bootstrap"/.test(bsBody),
+    "running must hit the store synchronously before the fetch leaves"
+  );
+  assert.ok(
+    /apiFetch\("\/api\/dsh-mneme\/bootstrap"/.test(bsBody),
+    "the dialog must POST to the bootstrap route"
+  );
+  assert.ok(
+    /JSON\.stringify\(\{ dir \}\)/.test(bsBody),
+    "the request body carries the raw dir string"
+  );
+  // 请求在飞时锁住三处：输入框、取消、提交。少了输入框那一处，用户改成 B 之后回来的
+  // 提示会贴在 B 旁边、而它讲的是 A 的结果（评审 #4452245279）。断言从 `type: "text"`
+  // 一路看到 `onChange`，而不是只说「附近有个 disabled: busy」——后者底下的按钮也能满足。
+  assert.ok(
+    /type: "text",[\s\S]{0,400}?disabled: busy,[\s\S]{0,400}?onChange: \(e\) => \{ setDir/.test(bsBody),
+    "the dir input must be disabled while the request is in flight"
+  );
+  // 成功路径把 done 写进 store 并保持 900ms 阅读窗（fresh done 期间提交钮锁住），
+  // 且定时器句柄要能清：否则第二次提交的结果会写进已经卸载的组件（评审
+  // #4452245256）。断言窗口取「onImported…到 setTimeout」之间——再往后就是 catch
+  // 的网络错误兜底，那一处写 failed 是对的。
+  const doneIdx = bsBody.indexOf("memory.explorer.bootstrapDone");
+  const timerIdx = bsBody.indexOf("timerRef.current = setTimeout(");
+  assert.ok(timerIdx > doneIdx, "the success branch must schedule its close through the stored ref");
+  const successTail = bsBody.slice(doneIdx, timerIdx);
+  assert.ok(/phase: "done"/.test(successTail), "the success path must land done in the store (survives tab close)");
+  assert.ok(!/resetBootstrapJob\(\)/.test(successTail), "the success path must not reset the job during the reading window");
+  assert.ok(/clearTimeout\(timerRef\.current\)/.test(bsBody), "the stored timer must actually be cleared on unmount");
+  // 刷新必须同步调、不能排进定时器（评审 #4452539711）：切视图会卸载本组件并把
+  // timerRef 清掉，若刷新也挂在那 900ms 后面，它就静默丢了——库已经写进去了，
+  // 列表却还是旧的。而这条路径上用户刚看到「新建 N 条」，最容易立刻去翻列表。
+  const importedIdx = bsBody.indexOf("onImported();");
+  assert.ok(importedIdx > 0, "the success path must refresh the list");
+  assert.ok(
+    importedIdx < timerIdx,
+    "onImported must run synchronously, not inside the close timer"
+  );
+  assert.ok(
+    !/setTimeout\(\(\)\s*=>\s*\{?\s*onImported/.test(bsBody),
+    "the refresh must not be deferred into the close timer"
+  );
+  // 错误按服务端的码分开说（missing-dir / dir-not-found / not-a-directory /
+  // bootstrap-unavailable），不能一律「引导失败」——三种情况下用户该做的事不同。
+  assert.ok(
+    /"memory\.explorer\.bootstrapErr\." \+ String\(job\.error/.test(bsBody),
+    "error codes must be mapped to distinct messages (code lives in the store, derived at render)"
+  );
+  for (const key of [
+    "memory.explorer.bootstrap",
+    "memory.explorer.bootstrapTitle",
+    "memory.explorer.bootstrapHint",
+    "memory.explorer.bootstrapConfirm",
+    "memory.explorer.bootstrapDone",
+    "memory.explorer.bootstrapNoDir",
+    "memory.explorer.bootstrapFailed",
+    "memory.explorer.bootstrapErr.missing-dir",
+    "memory.explorer.bootstrapErr.dir-not-found",
+    "memory.explorer.bootstrapErr.not-a-directory",
+    "memory.explorer.bootstrapErr.bootstrap-unavailable"
+  ]) {
+    assert.ok(
+      clientSource.split(`"${key}"`).length - 1 >= 2,
+      `i18n key ${key} must exist in both dictionaries`
+    );
+  }
+  // #558 的存活规则锁（在原测试内追加）：见文件尾的 issue #558 专项测试。
+
+  // 第 7 条：配置键覆盖面只读卡。
+  const ckIdx = clientSource.indexOf("function ConfigKeysCard");
+  assert.ok(ckIdx > 0, "ConfigKeysCard must exist");
+  const ckBody = clientSource.slice(ckIdx, ckIdx + 2900);
+  assert.ok(/apiFetch\("\/api\/dsh-mneme\/config-keys"\)/.test(ckBody), "the card must read the new route");
+  // 取数失败与「真的没有只读键」必须分开说，否则失败会被读成「清单是空的」。
+  assert.ok(
+    !/state\.failed \|\| !counts\s*\?\s*null/.test(ckBody),
+    "a failed fetch must not collapse into an empty list"
+  );
+  assert.ok(/memory\.settings\.configKeys\.loadFailed/.test(ckBody), "the failed branch needs its own copy");
+  // 摘要里的三类数字都必须来自服务端算好的桶：只填 {file} 会让「schema − panel」与
+  // 展开后「只能改文件」那段对不上（评审 #4452245244）。
+  assert.ok(
+    /\.replace\("\{undefaulted\}", String\(counts\.undefaulted\)\)/.test(ckBody),
+    "the summary must report the undefaulted bucket too, not make the reader subtract"
+  );
+  // 只列键名，不渲染任何值。
+  assert.ok(/className: "mneme-keychip"/.test(ckBody), "keys render as chips");
+  assert.ok(!/\.value/.test(ckBody.replace(/display:\s*"flex"[\s\S]{0,80}/g, "")), "the card must not render any key value");
+  for (const key of [
+    "memory.settings.configKeys.title",
+    "memory.settings.configKeys.desc",
+    "memory.settings.configKeys.summary",
+    "memory.settings.configKeys.fileOnlyHead",
+    "memory.settings.configKeys.undefaultedHead",
+    "memory.settings.configKeys.undefaultedHint",
+    "memory.settings.configKeys.show",
+    "memory.settings.configKeys.hide",
+    "memory.settings.configKeys.loadFailed"
+  ]) {
+    assert.ok(
+      clientSource.split(`"${key}"`).length - 1 >= 2,
+      `i18n key ${key} must exist in both dictionaries`
+    );
+  }
+  // 卡片要真的挂到设置页上（connect 组尾、help 组头之前），不是写了没插。
+  const mountIdx = clientSource.indexOf("h(ConfigKeysCard, { t })");
+  const helpIdx = clientSource.indexOf('groupHead("help")');
+  assert.ok(mountIdx > 0, "ConfigKeysCard must be mounted in the settings page");
+  assert.ok(mountIdx < helpIdx, "the card belongs to the end of the connect group, before the help section");
+  // 引导成功只递增 reloadKey；搜索态的列表走 remoteItems 那条 effect，它若不吃
+  // reloadKey，搜索词不变就永远看不到新导入的行（评审 #4452245305）。
+  assert.ok(
+    /\}, \[query, semantic, searchTopK, reloadKey\]\);/.test(clientSource),
+    "the search effect must re-run after an import/bootstrap bumps reloadKey"
+  );
+});
+
+test("the memory overlay refuses to close while a library request is in flight (issue #386)", () => {
+  // 引导请求在飞时，Esc / 背板 / ✕ 三条关闭路径都必须在。少一处，弹层连同
+  // MemoryExplorer 一起卸载，POST 还在飞——回来那句「新建几条、并入几条」就没有
+  // 地方显示，用户会以为没成功，而库其实已经写进去了（评审 #4453225573）。
+  const ovIdx = clientSource.indexOf("function MemoryOverlay");
+  assert.ok(ovIdx > 0, "MemoryOverlay must exist");
+  // 切到下一个模块级定义为止：给字符数会在下一次改动里被悄悄撑破。
+  const ovEnd = clientSource.indexOf("const EXPLORER_TYPES", ovIdx);
+  const ovBody = clientSource.slice(ovIdx, ovEnd > ovIdx ? ovEnd : ovIdx + 2600);
+
+  // 忙碌标志必须与 Explorer 同源：#558 起两处各自订阅模块级 bootstrapJob——
+  // overlay 不再依赖子组件回报（tab 注册的 explorer 没有 onBusyChange，原本就
+  // 报不上来，守卫对那条路径是空的）。
+  assert.ok(
+    /useBootstrapJob\(\)/.test(ovBody) && /explorerBusy = bootstrapJob\.phase === "running"/.test(ovBody),
+    "the overlay derives its busy flag from the module-level job store"
+  );
+  assert.ok(
+    /h\(MemoryExplorer, \{ t \}\)/.test(ovBody),
+    "the explorer no longer reports busy up: both sides subscribe to the same store"
+  );
+  // 用 ref 读、不把 busy 列进那个 effect 的依赖：effect 每次重跑都会
+  // closeBtnRef.current.focus()，请求一起一落就把正在输目录的用户踢出输入框。
+  assert.ok(
+    /const explorerBusyRef = useRef\(false\)/.test(ovBody),
+    "the guard must read through a ref, so busy changes do not re-run the focus effect"
+  );
+  assert.ok(
+    /explorerBusyRef\.current = explorerBusy/.test(ovBody),
+    "the ref must track the state"
+  );
+  assert.ok(
+    !/\[open, explorerBusy\]/.test(ovBody),
+    "explorerBusy must stay out of the focus effect's deps"
+  );
+
+  // 三条关闭路径逐一检查：Esc、背板、✕ 都走同一个守卫。
+  assert.equal(
+    ovBody.split("if (!explorerBusyRef.current) setOpen(false);").length - 1,
+    3,
+    "all three close paths (Escape, backdrop, ✕) must guard on the busy ref"
+  );
+  assert.ok(
+    /if \(e\.key === "Escape"\) \{ if \(!explorerBusyRef\.current\) setOpen\(false\); return; \}/.test(ovBody),
+    "Escape must not close the overlay while a request is in flight"
+  );
+  // ✕ 用 aria-disabled 而不是真的 disabled：真 disabled 会把焦点从按钮上拿走，
+  // 而 #178 的 Tab 环拿 closeBtnRef 当入口，焦点落空就出不去。
+  assert.ok(
+    /"aria-disabled": String\(explorerBusy\)/.test(ovBody),
+    "the close button must announce the blocked state"
+  );
+  assert.ok(
+    !/className: "mneme-footbtn",\s*\n\s*ref: closeBtnRef,\s*\n\s*disabled: /.test(ovBody),
+    "the close button must not be hard-disabled — that would break the #178 focus ring"
+  );
+});
+
+test("every client component declares the setters it calls (issue #553)", () => {
+  // 浏览器/宿主全局，不是 React state，不该被要求声明
+  const GLOBALS = new Set([
+    "setTimeout", "setInterval", "setImmediate", "setAnimationFrame",
+    "setState" // 子组件把 setter 当参数传下去时，形参名会命中，由 params 分支放行
+  ]);
+
+  const lines = clientSource.split("\n");
+  // 组件 = 缩进 4 空格的 function 声明（本文件所有 UI 组件都是这个形状）。
+  // 排除自身名字就叫 `setXxx` 的——那是普通的 setter 函数定义，不是组件
+  // （`openLibrary` / `setOverlayOpen` 就是一对模块级函数，后者调用自身是递归）。
+  const comps = [];
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(/^    function ([A-Za-z_$][\w$]*)\s*\(([^)]*)\)\s*\{/);
+    if (!m || /^set[A-Z]/.test(m[1])) continue;
+    let end = lines.length;
+    for (let j = i + 1; j < lines.length; j++) {
+      if (/^    function /.test(lines[j]) || /^\s{0,3}(const|let|export|class) /.test(lines[j])) {
+        end = j;
+        break;
+      }
+    }
+    comps.push({ name: m[1], params: m[2], start: i + 1, text: lines.slice(i, end).join("\n") });
+  }
+  assert.ok(comps.length > 50, `expected the component scan to find many components, got ${comps.length}`);
+
+  const offenders = [];
+  // 模块作用域里已经存在同名绑定时不算越界（`openLibrary` 调 `setOverlayOpen` 就是这类：
+  // 后者是模块级的普通函数，不是 React setter，而且函数声明会提升，先调后声明也成立）。
+  // 整个 bundle 包在 `__ModuleLoader__.load({...})` 里，所以「模块顶层」= 缩进正好 4 空格。
+  const moduleScope = new Set();
+  for (const l of lines) {
+    if (!/^    \S/.test(l)) continue;
+    const f = l.match(/^    function\s+([A-Za-z_$][\w$]*)/);
+    if (f) moduleScope.add(f[1]);
+    const c = l.match(/^    (?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=/);
+    if (c) moduleScope.add(c[1]);
+  }
+
+  for (const c of comps) {
+    const declared = new Set();
+    // const [x, setX] = ... / const setX = ...
+    for (const m of c.text.matchAll(/const\s*\[[^\]]*?,\s*(set[A-Za-z_$][\w$]*)\s*\]\s*=/g)) declared.add(m[1]);
+    for (const m of c.text.matchAll(/const\s+(set[A-Za-z_$][\w$]*)\s*=/g)) declared.add(m[1]);
+    // 形参：组件自身的、以及体内嵌套函数/箭头函数的形参——
+    // setter 经常这样往下传（`routeSelects(providerKey, modelKey, testState, setTestState, …)`）。
+    for (const m of c.params.matchAll(/(set[A-Za-z_$][\w$]*)/g)) declared.add(m[1]);
+    for (const m of c.text.matchAll(/\(([^()]*)\)\s*(?:=>|\{)/g)) {
+      for (const p of m[1].matchAll(/set[A-Za-z_$][\w$]*/g)) declared.add(p[0]);
+    }
+    // 调用点：setXxx( ——排除 obj.setXxx(
+    for (const m of c.text.matchAll(/(?<![.\w$])(set[A-Z][A-Za-z0-9_$]*)\s*\(/g)) {
+      const name = m[1];
+      if (GLOBALS.has(name) || declared.has(name) || moduleScope.has(name)) continue;
+      offenders.push(`${c.name} (line ${c.start}) calls ${name} without declaring it`);
+    }
+  }
+
+  assert.deepEqual(offenders, [],
+    "a setter must be declared in the component that calls it — a state hook placed in the "
+    + "neighbouring component compiles fine but throws ReferenceError at render time (#553)");
+});
+
+// --- 实体页计数口径（#562 真机验证发现） ---
+// 实体页左侧栏此前固定显示「500 个实体」：它拿 `entities.length` 当总数，而那份列表
+// 是 `/entities?limit=500` 取回的最新 500 个。库里一万六千个实体被截成一个看起来正常
+// 的数字，用户据此判断「实体太少」——#559 只修了状态页那张卡，实体页这一处漏了。
+// 本用例锁四件事，防的回归各不相同：
+//   ① 总数来源必须是后端回的 `total`+  `totalExact`，不是切片长度；
+//   ② 全库数读不到时（老宿主 / 计数失败）退回切片长度而不是显示空白；
+//   ③ 列表本身仍只有 500 条，必须在界面上说清「总数是全库、列表是最近 N 个」，
+//      否则数字对了而列表还是 500 行，同一处观感错位只是换了个方向；
+//   ④ 那句说明走 i18n（中英各一条），不能硬编码中文。
+test("the entity rail counts the whole library, not the newest slice", () => {
+  const start = clientSource.indexOf("function EntityPanel(");
+  assert.ok(start > 0, "EntityPanel must exist");
+  const nextFn = clientSource.indexOf("\n    function ", start + 10);
+  assert.ok(nextFn > start, "EntityPanel must be followed by another module-level function");
+  const body = clientSource.slice(start, nextFn);
+
+  // ① 总数取自 totalExact 守门的 total。
+  assert.ok(
+    body.includes("setEntityTotal(j.totalExact === true && typeof j.total === \"number\" ? j.total : null)"),
+    "the rail total must come from the backend's total/totalExact, not the slice length"
+  );
+
+  // ② 计数行用全库数，读不到才退回切片长度。
+  assert.ok(
+    body.includes('t("memory.entities.count").replace("{n}", String(entityTotal !== null ? entityTotal : entities.length))'),
+    "the rail count must print the whole-library total with a slice-length fallback"
+  );
+  assert.ok(
+    !body.includes('t("memory.entities.count").replace("{n}", String(entities.length))'),
+    "printing entities.length directly is the \"always 500\" bug this test exists to prevent"
+  );
+
+  // ③ 列表只列最近 N 个这件事必须写出来（且只在真有截断时写）。
+  assert.ok(
+    /entityTotal !== null && entityTotal > entities\.length[\s\S]{0,200}memory\.entities\.countSampled/.test(body),
+    "a truncated list must say so instead of letting one number stand for both"
+  );
+  assert.ok(
+    body.includes('t("memory.entities.countSampled").replace("{shown}", String(entities.length))'),
+    "the notice must name how many entities the list actually shows"
+  );
+
+  // ④ 文案双语齐备，样式走语义色层。
+  for (const key of ["memory.entities.countSampled"]) {
+    const defined = clientSource.split(`"${key}":`).length - 1;
+    assert.equal(defined, 2, `i18n key ${key} must be defined exactly once in zh and once in en (got ${defined})`);
+  }
+  assert.ok(
+    clientSource.includes(".mneme-xcountnote{") && /color:var\(--mneme-fg-dim\)/.test(clientSource.slice(clientSource.indexOf(".mneme-xcountnote{"))),
+    "the notice needs its own dim style on the semantic colour layer"
+  );
+});
+
+// --- issue #622 可观测性：错峰时段串解析失败的面板提示 ---
+// parsePeakSpec 的失败语义是「整串视为未配置」（排程是省钱手段，不救错——这个契约
+// 不动）。但静默意味着用户写错格式的唯一症状是「功能悄悄没生效」。本批的可见性分
+// 工：校验在服务端（/features 的 invalidPeakHours，parsePeakSpec 只此一份实现），
+// 面板只渲染提示行——独立 bundle 复制一份解析器必然漂移，这里锁死这个分工不被
+// 「优化」成面板自己解析。
+test("peak hours observability: invalid-spec hint renders from server field, never parses locally", () => {
+  // 两个键的提示行都接上了（蒸馏侧与巩固侧各一处）
+  const uses = clientSource.split("peakInvalidHint(").length - 1; // 两处调用（定义处是 "= (key)"，不匹配）
+  assert.ok(uses >= 2, `peakInvalidHint must be wired for both peak rows (got ${uses})`);
+  assert.ok(clientSource.includes('peakInvalidHint("summarizePeakHours")'), "distill-side row must carry the hint");
+  assert.ok(clientSource.includes('peakInvalidHint("dreamPeakHours")'), "dream-side row must carry the hint");
+  // 数据源是服务端字段，不是面板本地解析
+  assert.ok(clientSource.includes("state?.invalidPeakHours"), "hint must read the server-computed field");
+  // 反拷贝锁匹配**调用形态**而非名字——注释里提到解析器名字是允许的，调用不许有
+  assert.ok(!/parsePeakSpec\(|invalidPeakSpecs\(/.test(clientSource), "panel must not copy the parser (single implementation stays in src/peak-hours.js)");
+  // i18n 双语键成对出现
+  for (const key of [
+    "memory.features.summarizePeakHours.invalid",
+    "memory.features.dreamPeakHours.invalid"
+  ]) {
+    const occurrences = clientSource.split(`"${key}"`).length - 1;
+    assert.ok(occurrences >= 2, `i18n key ${key} must exist in both zh and en (got ${occurrences})`);
+  }
+});
+
+// --- issue #558：引导任务在飞态活得比标签页体长 ---
+// better-sidebar 关 tab 会把 MemoryExplorer 与引导弹层整个卸载（keepMounted 覆盖
+// 隐藏与切视图、不含关闭）。POST 照样跑完、行照样落库，但旧实现的成功/失败提示
+// 写进已卸载组件的 setState（无处显示）、忙碌态也丢——重开还能再提交一次。锁四
+// 件事：状态住模块级 store；弹层是 store 的视图（busy/msg/err 派生而非本地 state）；
+// 只有「人看得见的关闭」才把 terminal 态回 idle；卸载发生在 running 时的那一份
+// 留给重开回放（本 issue 修的就是它）。
+test("bootstrap job outlives the tab body: store in module scope, replay on remount (issue #558)", () => {
+  // store 是模块级的（apply 作用域、所有面板组件共享），带订阅者集合与读写口
+  assert.ok(/const bootstrapJob = \{ phase: "idle"/.test(clientSource), "the job store must be module-level, not component state");
+  assert.ok(/function setBootstrapJob\(/.test(clientSource) && /function useBootstrapJob\(/.test(clientSource), "store needs its setter and subscription hook");
+  // 弹层从 store 派生三态；重放挂载时输入框播种上次的目录（重试同目录是最常见的下一步）
+  const bs558Idx = clientSource.indexOf("function BootstrapDialog");
+  const bs558End = clientSource.indexOf("// --- 分享包弹层 ---", bs558Idx);
+  const bs558Body = clientSource.slice(bs558Idx, bs558End > bs558Idx ? bs558End : bs558Idx + 5000);
+  assert.ok(/const job = useBootstrapJob\(\)/.test(bs558Body), "the dialog must be a view over the job store");
+  assert.ok(/const busy = job\.phase === "running"/.test(bs558Body), "busy derives from the store");
+  assert.ok(/useState\(job\.dir \|\| ""\)/.test(bs558Body), "the dir input seeds from the last job's dir on replay");
+  // 存活规则：卸载发生在 running 时 → 结果留给重开；非 running 卸载 → 回 idle
+  // （保持「重开是干净弹层」的既有行为）。
+  assert.ok(
+    /useEffect\(\(\) => \(\) => \{\s*\n\s*if \(bootstrapJob\.phase !== "running"\) resetBootstrapJob\(\);/.test(clientSource),
+    "unmount keeps a running job for replay and resets a seen terminal one"
+  );
+  // fresh done 的 900ms 阅读窗锁提交钮，但不锁取消（done 是 store 态、可能被重开
+  // 回放——取消若也锁死，旧结果会把弹层永久焊住）。
+  assert.ok(/const freshDone = job\.phase === "done" && timerRef\.current !== null/.test(bs558Body), "the reading window must be distinguished from a replayed result");
+  assert.ok(/disabled: submitBlocked, onClick: submit/.test(bs558Body), "submit is locked during the fresh-done window");
+  assert.ok(/disabled: busy, onClick: onClose/.test(bs558Body), "cancel stays available for a replayed result");
+  // terminal 化只写 store（组件可能已被 tab 关闭卸载——那正是要修的路径）
+  assert.ok(/setBootstrapJob\(\{ phase: "failed", error:/.test(bs558Body), "failure must land in the store, not in unmounted component state");
+  assert.ok(/setBootstrapJob\(\{ phase: "done", result:/.test(bs558Body), "success must land in the store too");
+});
+
+// #619 可见化 C：情绪一栏的「三种状态不许互相冒充」。
+// 界面在这里最容易犯的错是把「请求失败」渲染成「没有数据」——两者对用户的
+// 含义完全相反（前者是系统坏了，后者是功能没用），而空列表长得一模一样。
+test("affective panel keeps loading, error and empty apart (#619)", () => {
+  const start = clientSource.indexOf("function AffectivePanel({ t })");
+  assert.ok(start > 0, "AffectivePanel must exist");
+  const end = clientSource.indexOf("function StatusPanel({ t, onBrowse })", start);
+  assert.ok(end > start, "panel body must be bounded");
+  const body = clientSource.slice(start, end);
+
+  // 失败分支必须 role=alert 且用 error 文案，不能掉进空态文案。
+  assert.ok(/state\.error\)\s*\{[\s\S]*?memory\.affective\.error/.test(body),
+    "失败时要显式说「这是取失败」，不能用空态文案顶替");
+  assert.ok(/memory\.affective\.empty/.test(body), "真的一条都没有时才有空态文案");
+
+  // catch 里不许把 items 落在 []，否则「上游挂了」与「还没记过情绪」同形。
+  const catchBlock = body.slice(body.indexOf(".catch("));
+  assert.ok(/error:\s*true/.test(catchBlock), "catch 必须立 error 标记");
+  assert.ok(!/items:\s*\[\]/.test(catchBlock.split("\n").slice(0, 3).join("\n")) ||
+            /error:\s*true/.test(catchBlock),
+    "catch 分支不能只留空列表而丢掉失败");
+
+  // 截断与跳过都要显式说出来，不能静默截断。
+  assert.ok(/memory\.affective\.truncated/.test(body), "截断要说出来");
+  assert.ok(/memory\.affective\.skipped/.test(body), "没情绪名的边要报出来");
+
+  // trait 与 occasion 必须用不同文案，否则「这次」被读成「一贯」。
+  assert.ok(/memory\.affective\.trait/.test(body) && /memory\.affective\.occasion/.test(body),
+    "trait 与 occasion 两档文案都要在");
+
+  // 页签要注册，不然这一栏根本没有入口。
+  assert.ok(clientSource.includes('{ key: "affective", label: t("memory.explorer.tabAffective") }'),
+    "情绪页签必须注册");
+  assert.ok(clientSource.includes('view === "affective"'), "视图分支必须存在");
+});
+
+// 回归锁：情绪行必须说出「谁」，页签图标必须各自认领（v0.13.0 复验轮）。
+// 这两处都是「数据在、界面没显示」的假绿形状：服务端一直带 person、ICON_PATHS
+// 之外的页签则静默落到 else 分支，闸门全绿而屏幕上少一块信息。
+test("affective rows name the person, and every tab owns its icon (#619)", () => {
+  const start = clientSource.indexOf("function AffectivePanel({ t })");
+  const end = clientSource.indexOf("function StatusPanel({ t, onBrowse })", start);
+  const body = clientSource.slice(start, end);
+
+  // 谁：person 必须进渲染，缺名给占位，不许把 undefined 打到界面上。
+  assert.ok(/it\.person/.test(body), "情绪行要渲染 person（服务端 from_name 一直都在）");
+  assert.ok(/it\.person\s*\?\?\s*"/.test(body), "person 缺失时要给占位符，不能渲染出 undefined");
+  // 顺序：谁 -> 情绪 -> 对什么。少了前半句「不安」就不知道是谁对谁。
+  const order = [body.indexOf('className: "mneme-affective-person"'), body.indexOf('className: "mneme-affective-emotion"'), body.indexOf('className: "mneme-affective-target"')];
+  assert.ok(order.every((i) => i > 0) && order[0] < order[1] && order[1] < order[2],
+    `情绪行的字段顺序必须是 谁 · 情绪 · 对什么（实际 ${order.join(",")}）`);
+
+  // 页签图标：affective 与 diary 各自有名字，且都在 ICON_PATHS 注册表里。
+  const tabTable = clientSource.match(/const TAB_ICONS = \{((?:[^}]|\n)*?)\}/);
+  assert.ok(tabTable, "TAB_ICONS must exist");
+  const map = Object.fromEntries([...tabTable[1].matchAll(/([a-zA-Z]+):\s*"([a-zA-Z]+)"/g)].map((m) => [m[1], m[2]]));
+  assert.equal(map.affective, "heart", "情绪页签要用 heart");
+  assert.equal(map.diary, "book", "日记页签要用 book");
+  for (const [key, icon] of Object.entries(map)) {
+    assert.ok(new RegExp(`^\\s{6}${icon}: \\[\\[`, "m").test(clientSource),
+      `页签 ${key} 指向的图标 ${icon} 没在 ICON_PATHS 注册（会静默渲染成空）`);
+  }
+  // 页签渲染只许走查表；再长出嵌套三元就又会把新页签塞到 else 分支。
+  assert.ok(/h\(Icon, \{ name: TAB_ICONS\[s\.key\]/.test(clientSource),
+    "页签图标必须走 TAB_ICONS 查表，不许回到嵌套三元");
+});
+
+// #725：人工修正通道的前端接线。端点与账本读必须真实出现在 bundle 里——
+// 「页面上有按钮但没连到路由」是「数据在、界面没显示」假绿的镜像形状。
+test("affective page wires the manual apply channel (#725)", () => {
+  assert.ok(clientSource.includes("/api/dsh-mneme/semantic/graph/affective/apply"),
+    "apply 端点必须被前端真实调用");
+  assert.ok(clientSource.includes("/api/dsh-mneme/semantic/graph/affective/journal"),
+    "账本读必须接上（最近变更不是摆设）");
+  assert.ok(clientSource.includes("mneme:store-changed"),
+    "apply 成功后要广播失效事件，依赖方不能等 60s 兜底轮询");
+});
+
+// formatRelativeTime(value, t) 的 t 是必填的：它内部要 t("memory.time.now")
+// 之类的文案，少传就抛 TypeError，而它跑在 render 里 —— 整个面板会白屏，
+// 且不写进任何日志。v0.14.0-beta.1/2 的「情绪页一点就全白」就是这么来的
+// （AffectivePanel 里 formatRelativeTime(it.lastSeen) 漏了 t）。
+// 没有 React 渲染级测试可依赖（deps 无 react-dom），所以用静态扫描兜：
+// 逐个调用点做括号配对、数顶层逗号，实参少于 2 个即为回归。
+test("every formatRelativeTime call passes the translator (a missing t blanks the panel)", () => {
+  const name = "formatRelativeTime";
+  const re = new RegExp(`\\b${name}\\(`, "g");
+  const offenders = [];
+  let match;
+  while ((match = re.exec(clientSource))) {
+    // 定义行本身不是调用点。
+    const lineStart = clientSource.lastIndexOf("\n", match.index) + 1;
+    const lineText = clientSource.slice(lineStart, clientSource.indexOf("\n", match.index));
+    if (lineText.includes(`function ${name}`)) continue;
+
+    let i = match.index + match[0].length;
+    const argsStart = i;
+    let depth = 1;
+    while (i < clientSource.length && depth > 0) {
+      const ch = clientSource[i];
+      if (ch === "(") depth++;
+      else if (ch === ")") depth--;
+      i++;
+    }
+    const args = clientSource.slice(argsStart, i - 1);
+    let argDepth = 0;
+    let argc = args.trim() ? 1 : 0;
+    for (const ch of args) {
+      if ("([{".includes(ch)) argDepth++;
+      else if (")]}".includes(ch)) argDepth--;
+      else if (ch === "," && argDepth === 0) argc++;
+    }
+    if (argc < 2) {
+      const lineNo = clientSource.slice(0, match.index).split("\n").length;
+      offenders.push(`:${lineNo} (argc=${argc}) ${lineText.trim().slice(0, 120)}`);
+    }
+  }
+  assert.deepEqual(
+    offenders,
+    [],
+    `formatRelativeTime 必须带上 t，否则 render 里抛 t is not a function、面板整块白屏：\n${offenders.join("\n")}`
+  );
+});
+
+// #661：选了「off（人审队列）」却还能刷到待审冲突卡片——冻结优先于档位这条
+// 互斥关系只写在设置项提示里，用户在档位下拉旁边看不到，于是反复以为档位没生效。
+//
+// #641 收尾把这一格拆成两种，判据仍只有一个（enumFrozen），措辞分成两条：
+//   · off / shadow + freeze —— 冻结照常停车，队列会继续涨（frozenOverrides）。
+//   · enforce + freeze —— 只可能来自配置文件（面板写入已原子归一）。运行期降到
+//     shadow：记账照跑、处置不跑（frozenDegraded）。旧口径说着「enforce 不会被
+//     标注」，那是在归一之前；归一之后这个组合反而最需要说清「你以为在自动处置，
+//     其实没有」。
+// 这里锁四件事：①两个判定存在且同源于 enumFrozen，判据与后端 src/conflict-mode.js
+// 一致；②都真接到了 enumRow 渲染里，不是写了没调用；③两条文案中英各一条；
+// ④两条互斥渲染，enforce 时不能同时出现「队列会涨」那条。
+test("conflict ledger mode warns when freeze overrides the chosen tier (#661)", () => {
+  // ① 判定：基谓词只认 conflictLedgerMode + effective freeze
+  const base = clientSource.match(/const enumFrozen = \(k\) =>([\s\S]{0,200}?);\r?\n/);
+  assert.ok(base, "enumFrozen must exist — both notices share one predicate");
+  const baseBody = base[1];
+  assert.match(baseBody, /k === "conflictLedgerMode"/,
+    "the freeze notice only applies to conflictLedgerMode (other enum keys have no freeze)");
+  assert.match(baseBody, /eff\.conflictFreezeEnabled === true/,
+    "the notice must read the effective freeze flag, not the saved override");
+
+  // 降级谓词必须叠在基谓词上，且只认 enforce 一档
+  const degraded = clientSource.match(/const enumDegraded = \(k\) =>([\s\S]{0,200}?);\r?\n/);
+  assert.ok(degraded, "enumDegraded must exist — enforce+freeze needs its own wording");
+  const degradedBody = degraded[1];
+  assert.match(degradedBody, /enumFrozen\(k\)/,
+    "enumDegraded must build on enumFrozen, not restate the freeze check");
+  assert.match(degradedBody, /eff\[k\] === "enforce"/,
+    "only enforce is degraded — off/shadow+freeze is the normal review-queue combination");
+
+  // ② 接线：两个判定都真的消费在 enumRow 里（写了不调用 = 永远不显示）
+  // 锚点只认前缀不认完整签名：#653 给 enumRow 加了 valuesOverride 形参（搜索
+  // 分支复用同一渲染器画定制枚举键），这条测试锁的是提示接线，不是签名形状。
+  const enumRowStart = clientSource.indexOf("const enumRow = (k");
+  assert.ok(enumRowStart > 0, "enumRow must exist");
+  const enumRowEnd = clientSource.indexOf("const flagRow = (k) =>", enumRowStart);
+  assert.ok(enumRowEnd > enumRowStart, "enumRow must end before flagRow");
+  const renderer = clientSource.slice(enumRowStart, enumRowEnd);
+  assert.match(renderer, /enumDegraded\(k\) && h\("div", \{ className: "mneme-featsubhint" \}/,
+    "enumRow must render the degraded notice from enumDegraded(k)");
+  assert.match(renderer, /!enumDegraded\(k\) && enumFrozen\(k\) && h\("div", \{ className: "mneme-featsubhint" \}/,
+    "enumRow must render the override notice from enumFrozen(k) and skip it when degraded wins");
+  assert.match(renderer, /memory\.features\.\$\{k\}\.frozenDegraded/,
+    "the degraded notice text must come from the per-key dictionary entry");
+  assert.match(renderer, /memory\.features\.\$\{k\}\.frozenOverrides/,
+    "the override notice text must come from the per-key dictionary entry");
+
+  // ③ 文案双语：各恰好中英各一条（奇数次 = 漏译，>2 = 重复）
+  for (const key of ["frozenOverrides", "frozenDegraded"]) {
+    const occurrences = clientSource.split(`"memory.features.conflictLedgerMode.${key}"`).length - 1;
+    assert.equal(occurrences, 2,
+      `the ${key} notice must exist as exactly one dictionary line per language (got ${occurrences})`);
+  }
+  // 文案要点：两条都必须点名「矛盾冻结」，否则用户仍不知道要动哪个开关；
+  // 降级那条还必须说清「实际是 shadow / 处置不跑」，否则等于没说。
+  const overridesText = (clientSource.match(/"memory\.features\.conflictLedgerMode\.frozenOverrides":\s*"([^"]+)"/g) ?? []).join(" ");
+  assert.match(overridesText, /\u77db\u76fe\u51bb\u7ed3|conflict freeze/i,
+    "the override notice must name the freeze switch so the user knows what to turn off");
+  const degradedText = (clientSource.match(/"memory\.features\.conflictLedgerMode\.frozenDegraded":\s*"([^"]+)"/g) ?? []).join(" ");
+  assert.match(degradedText, /\u77db\u76fe\u51bb\u7ed3|conflict freeze/i,
+    "the degraded notice must name the freeze switch");
+  assert.match(degradedText, /shadow/i,
+    "the degraded notice must say the mode is effectively shadow — otherwise it reads as a no-op");
+});
+
+// ---- #653 设置页搜索 ------------------------------------------------------
+// 折叠层（「全部设置」/「高级」）里的行不在 DOM 里，浏览器的页内查找永远够
+// 不到它们——这正是 #653 的原始抱怨（搜不到「知识库」的入口）。搜索索引因此
+// 必须从六张常量表拼出来（组项/子项/折叠布尔/枚举/字符串/整数），任何一张表
+// 被绕开，那一层的行就从搜索里消失了。
+
+function sliceClientFn(name, next) {
+  const start = clientSource.indexOf(`function ${name}(`);
+  assert.ok(start > 0, `${name} must exist`);
+  const end = clientSource.indexOf(`function ${next}(`, start);
+  assert.ok(end > start, `${name} must end before ${next}`);
+  return clientSource.slice(start, end);
+}
+
+test("settings search: index is built from the canonical row tables, including both folds (#653)", () => {
+  const body = sliceClientFn("buildSettingsSearchIndex", "filterSettingsIndex");
+  // 六张表一张都不能少：FEATURE_GROUPS（组项+子项）是正常视图的主体，
+  // FEATURE_ADVANCED_BOOLS / FEATURE_ENUMS 是「高级」折叠，FEATURE_STRINGS /
+  // FEATURE_NUMBERS 是子块行——漏一张，那一层的行就搜不到。
+  for (const table of ["FEATURE_GROUPS", "FEATURE_CHILDREN", "FEATURE_ADVANCED_BOOLS", "FEATURE_ENUMS", "FEATURE_STRINGS", "FEATURE_NUMBERS"]) {
+    assert.ok(body.includes(table), `the search index must walk ${table}`);
+  }
+  // 四个定制枚举键经 SEARCH_ENUM_SOURCES 补登记（各自手写下拉、无通用渲染器），
+  // 取值必须引用各自已有的常量（EMBED_PROVIDERS / ENTITY_REASONING /
+  // SUMMARIZE_REASONING / CHORO_TIERS），不得在索引里抄第二份取值表。
+  const sources = clientSource.match(/const SEARCH_ENUM_SOURCES = \{([\s\S]*?)\n    \};/);
+  assert.ok(sources, "SEARCH_ENUM_SOURCES must exist");
+  for (const [k, constant] of [
+    ["embedProvider", "EMBED_PROVIDERS"],
+    ["entityExtractionReasoning", "ENTITY_REASONING"],
+    ["summarizeReasoningEffort", "SUMMARIZE_REASONING"],
+    ["chorographyInject", "CHORO_TIERS"]
+  ]) {
+    assert.ok(sources[1].includes(`${k}: ${constant}`),
+      `SEARCH_ENUM_SOURCES must register ${k} with values from ${constant}`);
+  }
+});
+
+test("settings search: every searchable key has a label in both dictionaries (#653)", () => {
+  // 搜索命中靠 label/hint/key 三路；label 若缺，双语界面会有一侧把键名当
+  // 标签渲染。锁定「索引里的每个键在两份词典各有一条 memory.features.<k>」。
+  const grab = (re) => { const m = clientSource.match(re); return m ? m[1] : ""; };
+  const tables = [
+    grab(/const FEATURE_GROUPS = \[([\s\S]*?)\n    \];/),
+    grab(/const FEATURE_CHILDREN = \{([\s\S]*?)\n    \};/),
+    grab(/const FEATURE_ADVANCED_BOOLS = \[([^\]]*)\]/),
+    grab(/const FEATURE_ENUMS = \[([^\]]*)\]/),
+    grab(/const FEATURE_STRINGS = \[([\s\S]*?)\];/),
+    grab(/const FEATURE_NUMBERS = \[([^\]]*)\]/),
+    grab(/const SEARCH_ENUM_SOURCES = \{([\s\S]*?)\n    \};/)
+  ];
+  const keys = new Set();
+  for (const t of tables) {
+    // 带引号的键（组项、子项、折叠行、字符串/整数键）。数组可能内嵌注释行
+    // （group.pipeline 的 items 就有一行），所以只认引号包裹的串，不做逗号
+    // 切分——切分会把「注释 + 换行 + 键」并成同一个假键。
+    for (const m of t.matchAll(/"([a-zA-Z][a-zA-Z0-9.]*)"/g)) keys.add(m[1]);
+    // 不带引号的键（SEARCH_ENUM_SOURCES 的 `key: 常量` 形状）。
+    for (const m of t.matchAll(/^\s*([a-zA-Z][a-zA-Z0-9.]*):/gm)) keys.add(m[1]);
+  }
+  assert.ok(keys.size >= 60, `the index should cover the full row surface (got ${keys.size})`);
+  const missing = [...keys].filter((k) => {
+    const n = clientSource.split(`"memory.features.${k}"`).length - 1;
+    return n < 2;
+  });
+  assert.deepEqual(missing, [],
+    `every searchable key needs a label in BOTH dictionaries (missing: ${missing.join(", ")})`);
+});
+
+test("settings search: box replaces the toc while searching, rows render through the same renderers (#653)", () => {
+  // 输入框常驻、目录让位、清除钮与空态在场。
+  assert.match(clientSource, /memory\.settings\.search\.placeholder/, "search input placeholder key");
+  assert.match(clientSource, /!searching && h\("nav", \{ className: "mneme-set-toc"/,
+    "the toc must yield while a search is active (its jump targets are filtered away)");
+  assert.match(clientSource, /"aria-label": t\("memory\.settings\.search\.clear"\)/,
+    "the clear button must be reachable by assistive tech");
+  assert.match(clientSource, /searching && !anySectionVisible && h\("section"/,
+    "a global empty state must render when every section is filtered out");
+  // 功能开关卡只走一次调用点：搜索分支经 searchEntries 进去，正常视图零改动。
+  assert.equal(clientSource.match(/h\(FeaturesCard, \{/g)?.length, 1,
+    "FeaturesCard must have exactly one call site");
+  assert.match(clientSource, /h\(FeaturesCard, \{ t, searchEntries: featuresSearchEntries \}\)/,
+    "the call site must forward the filtered entries");
+  // 搜索分支必须复用四类行渲染器（保证搜索路径改的行与正常路径行为一致），
+  // 且组标题命中时整节原样展示、不切平铺（featuresSearchEntries 判据里有
+  // !secMatch("engine")）。
+  const branch = clientSource.slice(
+    clientSource.indexOf("if (state && Array.isArray(searchEntries)"),
+    clientSource.indexOf("if (error && !state)")
+  );
+  assert.ok(branch.length > 0, "the search branch must sit before the error path in FeaturesCard");
+  for (const r of ["enumRow(e.k, e.values)", "strRow(e.k)", "numRow(e.k)", "boolRow(e.k)"]) {
+    assert.ok(branch.includes(r), `the search branch must render rows via ${r}`);
+  }
+  assert.match(clientSource, /featuresSearchEntries = searching && !secMatch\("engine"\)/,
+    "a group-title hit must show the whole section, not a flattened subset");
+});
+
+test("settings search: the four i18n keys exist exactly once per language (#653)", () => {
+  // 只数词典定义行（键后跟 `":` 的那两行）：search.aria 还被空态卡标题在 JSX
+  // 里复用一次，整文件字符串计数会把「复用」误判成第三份词典。
+  for (const key of ["memory.settings.search.placeholder", "memory.settings.search.aria", "memory.settings.search.clear", "memory.settings.search.noResults"]) {
+    const defLines = clientSource.match(new RegExp('^\\s*"' + key + '":', "gm")) ?? [];
+    assert.equal(defLines.length, 2, `${key} must exist as exactly one dictionary line per language (got ${defLines.length})`);
+  }
+  // 空态要点名搜索范围（名称/说明/键名），否则「搜不到」读起来像坏了。
+  const texts = clientSource.match(/"memory\.settings\.search\.noResults":\s*"([^"]+)"/g) ?? [];
+  assert.equal(texts.length, 2, "noResults must be bilingual");
+  assert.ok(texts.every((line) => /\{q\}/.test(line)), "noResults must interpolate the query");
+});
+
+// ---- #653 评审回归（CodeRabbit 在 PR #677 上提的四条）--------------------
+
+test("settings search: every literal-rendered row key is registered in a searchable table (#653)", () => {
+  // 这一条锁的是「渲染了却没登记」整类：搜索索引只扫六张常量表，而某些行是在
+  // 子块里用字面量渲染的（#637 的 injectRotationTurns 就挂在自己的总闸下、不在
+  // 任何组项数组里）。只断言「索引引用了六张表」抓不到这种漏，必须反过来从
+  // 渲染点收键、再要求它出现在某张表里。
+  const grabTables = () => {
+    const grab = (re) => { const m = clientSource.match(re); return m ? m[1] : ""; };
+    return [
+      grab(/const FEATURE_GROUPS = \[([\s\S]*?)\n    \];/),
+      grab(/const FEATURE_CHILDREN = \{([\s\S]*?)\n    \};/),
+      grab(/const FEATURE_ADVANCED_BOOLS = \[([^\]]*)\]/),
+      grab(/const FEATURE_ENUMS = \[([^\]]*)\]/),
+      grab(/const FEATURE_STRINGS = \[([\s\S]*?)\];/),
+      grab(/const FEATURE_NUMBERS = \[([^\]]*)\]/),
+      grab(/const SEARCH_ENUM_SOURCES = \{([\s\S]*?)\n    \};/)
+    ];
+  };
+  const registered = new Set();
+  for (const t of grabTables()) {
+    for (const m of t.matchAll(/"([a-zA-Z][a-zA-Z0-9.]*)"/g)) registered.add(m[1]);
+    for (const m of t.matchAll(/^\s*([a-zA-Z][a-zA-Z0-9.]*):/gm)) registered.add(m[1]);
+  }
+  const literals = new Set();
+  for (const re of [/numRow\("([^"]+)"\)/g, /strRow\("([^"]+)"\)/g, /boolRow\("([^"]+)"/g]) {
+    for (const m of clientSource.matchAll(re)) literals.add(m[1]);
+  }
+  const missing = [...literals].filter((k) => !registered.has(k));
+  assert.deepEqual(missing, [],
+    `every row rendered with a literal key must be searchable; not registered: ${missing.join(", ")}`);
+});
+
+test("settings search: the result view keeps the save-failure notice (#653)", () => {
+  // 搜索结果分支会提前 return；put() 失败时控件回滚到生效值，若这条分支不渲染
+  // saveError，用户只会看到「改了没反应」（CodeRabbit PR #677 的 Major）。
+  const branch = clientSource.slice(
+    clientSource.indexOf("if (state && Array.isArray(searchEntries)"),
+    clientSource.indexOf("if (error && !state)")
+  );
+  assert.ok(branch.includes("saveError && h(\"div\", { className: \"mneme-mainterr\" }, saveError)"),
+    "the search branch must render saveError, otherwise a failed PUT looks like a no-op");
+});
+
+test("settings search: every card title in a section is reachable by title (#653)", () => {
+  // configKeys 卡在 connect 组里，但它的标题此前不在 SECTION_TITLE_KEYS.connect——
+  // 搜「配置键覆盖面」会落到空态。锁「connect 组渲染的每一张卡标题都登记过」是
+  // 这个类的最小形状（手工比对 JSX 与映射表，加卡时能看见）。
+  const map = clientSource.match(/const SECTION_TITLE_KEYS = \{([\s\S]*?)\n      \};/);
+  assert.ok(map, "SECTION_TITLE_KEYS must exist");
+  for (const key of ["memory.settings.rules", "memory.settings.commands", "memory.settings.mode.title", "memory.features.title",
+    "memory.settings.vectorTitle", "memory.settings.extapi.title", "memory.settings.serve.title", "memory.settings.mcp.title",
+    "memory.settings.apiTokenTitle", "memory.settings.configKeys.title", "memory.settings.feedback.title"]) {
+    assert.ok(map[1].includes(`"${key}"`), `${key} must be listed in SECTION_TITLE_KEYS so its section is reachable`);
+  }
+});
+
+test("settings search: the placeholder and empty state describe the real match scope (#653)", () => {
+  // 索引只覆盖功能开关行；非功能卡片只按组标题/卡片标题匹配。文案说「搜索设置」
+  // 会让人以为「端口」「API Key」这类也能搜到（CodeRabbit PR #677）。
+  const zh = clientSource.match(/"memory\.settings\.search\.placeholder": "([^"]+)"/)?.[1] ?? "";
+  const en = clientSource.match(/"memory\.settings\.search\.placeholder": "([^"]+)"/g) ?? [];
+  assert.match(zh, /功能开关/);
+  assert.ok(en.some((line) => /switches/i.test(line)), "the English placeholder must name the switch scope too");
+  const zhNo = clientSource.match(/"memory\.settings\.search\.noResults": "([^"]+)"/g) ?? [];
+  assert.ok(zhNo.some((line) => /功能开关/.test(line) && /分组与卡片/.test(line)),
+    "no-results copy must separate switch matching from title matching");
+  assert.ok(zhNo.some((line) => /Feature switches/.test(line) && /groups and cards/.test(line)),
+    "English no-results copy must separate the two match scopes");
+});
+
+test("settings search: an unparsed peak-hours string stays visible in results (#653)", () => {
+  // 正常视图在 peakHours 输入框下方用 peakInvalidHint 标红「这串没生效」；
+  // 搜索结果若只渲染 strRow，用户在搜索态改完时段就看不到失败提示（PR #677 评审）。
+  const branch = clientSource.slice(
+    clientSource.indexOf("if (state && Array.isArray(searchEntries)"),
+    clientSource.indexOf("if (error && !state)")
+  );
+  assert.ok(branch.includes("peakInvalidHint(e.k)"),
+    "the str branch must keep peakInvalidHint so an unparsed peak-hours spec is still reported");
+});
+// ---- #582 wiki 渲染三处 ----
+
+// 机器标记行（CHORO:T1 / CHORO:HUMAN 的 HTML 注释包装）是 t0/t1 剥段与回填用
+// 的段落边界，给人看的排版里是裸文本噪音。跳过判定必须挂在围栏分支**之后**：
+// 代码块里的 `<!--` 是内容不是标记，先剥了它 ``` 示例就缺行。
+test("wiki renderer hides machine marker lines but keeps them inside code fences (#582)", () => {
+  const start = clientSource.indexOf("function renderWikiMarkdown(");
+  const end = clientSource.indexOf("function renderDiaryBody(", start);
+  assert.ok(start > 0 && end > start, "renderWikiMarkdown must exist before renderDiaryBody");
+  const body = clientSource.slice(start, end);
+  // 围栏要记字符与长度（PR #678 评审）：只认三反引号时 `~~~html` 里的注释会被
+  // 当成正文删掉，四反引号块里的 ``` 也会提前结束代码态。锁三件事：识别两种
+  // 围栏字符、记录开启长度、结束必须同字符且不短于开启。
+  const fenceAt = body.indexOf("const fenceOpen = /^(`{3,}|~{3,})(.*)$/.exec(line.trim());");
+  assert.ok(fenceAt > 0, "the renderer must recognize both ``` and ~~~ fences");
+  assert.ok(body.includes("fence = { ch: fenceOpen[1][0], len: fenceOpen[1].length };"),
+    "the opening fence must record its character and length");
+  assert.ok(body.includes("fenceOpen[1][0] === fence.ch && fenceOpen[1].length >= fence.len"),
+    "a closing fence must use the same character and be at least as long as the opener");
+  // 注意 \\s 要写成双反斜杠：JS 字符串里的 \s 会塌成 s，indexOf 就永远找不到。
+  const skipAt = body.indexOf("if (/^\\s*<!--/.test(line)) continue;");
+  assert.ok(skipAt > fenceAt, "the marker-skip must come after the fence branch so fenced comments survive");
+  // 日记与 wiki 共用这个渲染器：日记正文没有 CHORO 标记，跳过规则对它是空转
+  // 的——但如果将来日记里出现「整行 HTML 注释」，同样按注释隐藏（预期行为）。
+});
+
+// 树缩进必须看 parent_id 真父子：slugify 把路径分隔与一切非字母数字都变成
+// `-`，连字符计数会把目录名自带的连字符与去重序号（-2）当成层级——
+// `packages-computer-use-src` 会被画成三层深（#582 的原始截图）。
+test("wiki tree indents by parent_id, not by hyphen count (#582)", () => {
+  const start = clientSource.indexOf("树的层级看 parent_id 真父子");
+  assert.ok(start > 0, "the parent_id tree builder must exist");
+  const region = clientSource.slice(start, start + 2400);
+  assert.ok(region.includes("mod.parent_id"), "tree depth must derive from parent_id");
+  assert.ok(!region.includes("slug.match(/-/g)"), "hyphen counting must be gone from the tree builder");
+  assert.ok(region.includes("walk(null, 0)"), "roots (no parent) must seed the walk");
+  assert.ok(region.includes("depthById.has(mod.id)"), "cycle defense must guard the walk");
+  // 兜底要接住走不到的模块：宁可用根层平铺也不能静默丢行（树少一页 = 入口没了）。
+  assert.ok(region.includes("!depthById.has(mod.id)"), "unreached modules must fall back instead of vanishing");
+});

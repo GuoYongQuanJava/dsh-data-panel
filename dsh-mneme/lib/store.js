@@ -1,0 +1,6605 @@
+import { DatabaseSync } from "node:sqlite";
+import { randomUUID } from "node:crypto";
+import { statSync } from "node:fs";
+import { contentHashOf } from "./content-hash.js";
+// 质量分回填要的判据与扣分表。只取常量与纯函数：依赖方向 store → quality-filter 单向
+// （quality-filter.js 不 import 任何本包模块，是纯函数模块），不构成环，也不会让存储层
+// 反向依赖服务层。判据只许有一份——回填另写一个 0.7 就会与写入路径悄悄分叉。
+import { REPETITION_THRESHOLD, SIGNAL_DEDUCTIONS, repetitionRatio } from "./quality-filter.js";
+// 政策轴（issue #471）的归一化函数。刻意只取归一化，不取判定：判定（buildPausedIndex /
+// matchPausedScopes / createScopeStateGate）留在 scope-state.js，由 service 侧消费，
+// 存储层只管「一格状态怎么落」。依赖方向 store → scope-state → scope 是单向的
+// （scope.js 不 import 任何本包模块），所以不构成环。
+import {
+  normalizeScopeStateDimension,
+  normalizeScopeStateState,
+  normalizeScopeStateValue
+} from "./scope-state.js";
+// 工作区维比较键（#743 评审）：写入盖章与读取比较必须是同一把钥匙。依赖方向
+// store → scope 单向（scope.js 不 import 任何本包模块），不构成环。
+import { workspaceLabelKey } from "./scope.js";
+// 外来行的**唯一**定义住在 memory-source.js，这里只取那个常量：store 的查询口径与
+// service/sleep 的 isImportedRow 必须是同一个字符串，自己再拼一份字面量就是第二个口径，
+// 而「本库不巩固别人导入的原文」这条契约正靠它只有一个人说得出口。
+// 依赖方向 store → memory-source 单向（该模块不 import 任何东西），不构成环。
+import { IMPORTED_SOURCE } from "./memory-source.js";
+
+const SCHEMA = `
+CREATE TABLE IF NOT EXISTS memories (
+  id          TEXT PRIMARY KEY,
+  type        TEXT NOT NULL,
+  title       TEXT NOT NULL,
+  content     TEXT NOT NULL,
+  tags        TEXT NOT NULL DEFAULT '[]',
+  importance  INTEGER NOT NULL DEFAULT 3,
+  forgotten   INTEGER NOT NULL DEFAULT 0,
+  archived    INTEGER NOT NULL DEFAULT 0,
+  -- Issue #275 第二批：归档时刻的精确列。archived 是标志位，updated_at 只是
+  -- 「最后一次写」——对已归档行做一次 update 就会刷它，代理口径因此高估归档
+  -- 净增速率。本列只在「从活跃面进入归档面」那一次落值，取消归档置 NULL。
+  archived_at TEXT,
+  source      TEXT,
+  content_history TEXT,
+  content_hash TEXT,
+  embedding   TEXT,
+  epistemic_status TEXT NOT NULL DEFAULT 'subjective',
+  last_accessed_at  TEXT,
+  _full_content     TEXT,
+  evidence    TEXT,
+  doc_path    TEXT,
+  created_at  TEXT NOT NULL,
+  updated_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(type);
+CREATE INDEX IF NOT EXISTS idx_memories_importance ON memories(importance);
+-- Issue #202：all()/list() 按 updated_at 排序，无索引时走临时 B 树全表排序
+-- （5k 行实测 all() 231ms → 135ms）。IF NOT EXISTS 幂等，存量库启动即建。
+CREATE INDEX IF NOT EXISTS idx_memories_updated ON memories(updated_at);
+
+-- 一次性数据迁移的登记表：一条迁移一行，跑过就记下。看起来多余（本文件其余迁移都
+-- 靠「条件式 SQL 恒等幂等」），但存量回填那类迁移的条件在跑完之后**恒不命中、却仍要
+-- 全表扫一遍才能证明不命中**——质量分回填的探测在本机 12,827 行上是 36.7 ms，而
+-- createStore 稳态才 3.3 ms，等于每次打开都白付十倍的开销。登记表把这一步变成一次
+-- 主键 seek。
+-- 为什么不是 PRAGMA user_version：实测它在 BEGIN 里设值**不随 ROLLBACK 回退**，与回填
+-- 放不进同一个事务（先置标记再回填中途失败 = 永久漏跑）；而且它全库只有一个整数，被
+-- 单条迁移占掉之后，日后真需要 schema 版本号就没地方放了。普通表既能跟着事务回退，
+-- 也能一条迁移一行。
+CREATE TABLE IF NOT EXISTS applied_migrations (
+  id          TEXT PRIMARY KEY,
+  applied_at  TEXT NOT NULL
+);
+
+-- autoDream audit trail: one row per consolidation run, capturing the exact
+-- input snapshot digest + the LLM decision list + per-id outcome + a compact
+-- receipt. This makes every decision replayable so silent consolidation errors
+-- (high pass rate but wrong merge/conflict) can be located after the fact.
+CREATE TABLE IF NOT EXISTS dream_runs (
+  id             TEXT PRIMARY KEY,
+  created_at     TEXT NOT NULL,
+  status         TEXT NOT NULL,          -- ok | noop | degraded | reconcile | failed
+  error          TEXT,
+  provider       TEXT,
+  model          TEXT,
+  snapshot_hash  TEXT NOT NULL,
+  input_count    INTEGER NOT NULL,
+  input          TEXT,                   -- JSON: full input snapshot (id/type/title/content/importance/updated_at)
+  decisions      TEXT,                   -- JSON: raw LLM decision list
+  outcome        TEXT,                   -- JSON: { byId: {id: action} }
+  applied        INTEGER NOT NULL DEFAULT 0,
+  summary_stored INTEGER NOT NULL DEFAULT 0,
+  receipt        TEXT NOT NULL,
+  policy_epoch   INTEGER NOT NULL DEFAULT 0,  -- 裁决规则版本：规则升级后旧裁决降级为历史证据
+  run_type       TEXT NOT NULL DEFAULT 'auto', -- auto | sleep | organize：周期审计的类别区分
+  skipped        TEXT,                    -- JSON: degraded 轮被跳过的逐条明细（index/action/ids/error）
+  -- Issue #89（基线半边）：本轮成功刷新后的活跃记忆「条数 / 正文字符数」——阈值判定的
+  -- 基线原本只活在调度器闭包内存里，进程重启归零 → 库里记忆多于阈值时，重启后第一条
+  -- 写入就绕过阈值开跑整轮（#291 只持久化了 lastRunAt 那半边）。成功轮才落这两列，
+  -- 失败/降级不推进基线的既有语义不变；两列同时有值或同时为 NULL。
+  store_count    INTEGER,
+  store_chars    INTEGER,
+  -- #534：失败轮（拿得到模型输出，但解析或校验没过）的原始输出截断副本。
+  -- 此前失败轮只留一行 logger.warn，进程一退现场就没了——#534 实测 19 轮里
+  -- 17 轮整轮无效，事后一条模型原文都查不到。做成独立列而不是塞进 decisions：
+  -- 那一列的语义是「可重放的决策数组」，失败轮已被 _validationFailed 哨兵占着，
+  -- 塞原文进去会污染按决策数组消费的下游（重放、面板）。
+  raw_output     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_dream_runs_created ON dream_runs(created_at);
+
+-- recall_runs: recall-layer receipt. One row per retrieval scene — the query,
+-- mode, top-k, threshold and the exact candidate list (id/title/content/score/
+-- source) that was returned — so retrieval behavior can be audited and
+-- replayed after the fact. Sibling of the dream judgment-layer audit trail.
+CREATE TABLE IF NOT EXISTS recall_runs (
+  id          TEXT PRIMARY KEY,
+  query       TEXT NOT NULL,
+  mode        TEXT NOT NULL,
+  top_k       INTEGER,
+  threshold   REAL,
+  candidates  TEXT NOT NULL,   -- JSON: 召回候选数组（含 id/title/content/score/source）
+  created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_recall_runs_created ON recall_runs(created_at);
+CREATE INDEX IF NOT EXISTS idx_recall_runs_query ON recall_runs(query);
+
+-- recall_evals: retrieval evaluation/test snapshots, kept SEPARATE from the
+-- recall_runs production audit so test runs never inflate the production trail.
+-- One row per evaluateRetrieval call that opted into persistence
+-- (config.evalPersistTestResults): the query, the expected ids the operator
+-- marked relevant, the actual ids retrieval returned, and the computed
+-- metrics (precision/recall/mrr). recall_run_id optionally links to the
+-- recall_runs audit row that captured the same retrieval scene (null when the
+-- eval did not also record a run). Bookkeeping like the other audit tables: it
+-- never triggers write hooks.
+CREATE TABLE IF NOT EXISTS recall_evals (
+  id            TEXT PRIMARY KEY,
+  recall_run_id TEXT,                -- FK → recall_runs.id (optional linkage)
+  query         TEXT NOT NULL,
+  expected_ids  TEXT NOT NULL,       -- JSON: relevant ids expected by the evaluator
+  actual_ids    TEXT NOT NULL,       -- JSON: ids actually retrieved
+  metrics       TEXT NOT NULL,       -- JSON: { precision, recall, mrr, hit_count }
+  eval_type     TEXT NOT NULL DEFAULT 'manual',
+  created_at    TEXT NOT NULL,
+  FOREIGN KEY (recall_run_id) REFERENCES recall_runs(id)
+);
+CREATE INDEX IF NOT EXISTS idx_recall_evals_created ON recall_evals(created_at);
+CREATE INDEX IF NOT EXISTS idx_recall_evals_run ON recall_evals(recall_run_id);
+
+-- failure_memories: records user corrections / reflection failures. Captures
+-- what a memory was (actual) vs what the user changed it to (expected)
+-- so later reflection passes can mine recurring correction patterns.
+-- before holds a JSON snapshot of the pre-change title/content/importance,
+-- so a title-only or importance-only correction is still traceable.
+CREATE TABLE IF NOT EXISTS failure_memories (
+  id           TEXT PRIMARY KEY,
+  query        TEXT,
+  expected     TEXT,
+  actual       TEXT,
+  before       TEXT,
+  failure_type TEXT NOT NULL,
+  memory_id    TEXT,
+  created_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_failure_memories_created ON failure_memories(created_at);
+CREATE INDEX IF NOT EXISTS idx_failure_memories_type ON failure_memories(failure_type);
+
+-- receipt_chain: per-record receipt chain. One row per mutable verdict
+-- (merge/conflict/update), carrying the input digest (the basis of the
+-- decision, content-addressed) and the idempotency check counters
+-- count_before → count_after. Replaying the same decision must reproduce the
+-- same result; a digest match with a divergent outcome pinpoints drift to the
+-- specific record/run. Sibling of the run-level dream audit trail.
+CREATE TABLE IF NOT EXISTS receipt_chain (
+  receipt_id   TEXT PRIMARY KEY,
+  run_id       TEXT NOT NULL,
+  record_id    TEXT NOT NULL,
+  kind         TEXT NOT NULL,         -- merge | conflict | update
+  input_digest TEXT NOT NULL,
+  winner_id    TEXT,
+  loser_id     TEXT,
+  keep_source  TEXT,
+  sources      TEXT,                  -- JSON: merge 全部参与 id 数组
+  verdict      TEXT NOT NULL,         -- live | revoked | historical
+  count_before INTEGER NOT NULL,
+  count_after  INTEGER NOT NULL,
+  policy_epoch INTEGER NOT NULL DEFAULT 0,
+  created_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_receipt_chain_record ON receipt_chain(record_id);
+CREATE INDEX IF NOT EXISTS idx_receipt_chain_run ON receipt_chain(run_id);
+
+-- conflict_pending: conflicts parked for manual review (conflict freeze mode,
+-- opt-in via config.conflictFreezeEnabled). When enabled, the dream layer does
+-- NOT auto-adjudicate winner/loser — the conflicting pair is parked here until
+-- a human reviews it. resolveConflictPending stamps resolved_at (plus the chosen
+-- winner) so the review action stays auditable. Like the other audit tables this
+-- is bookkeeping: it never triggers write hooks.
+CREATE TABLE IF NOT EXISTS conflict_pending (
+  id              TEXT PRIMARY KEY,
+  run_id          TEXT,
+  memory_a        TEXT NOT NULL,
+  memory_b        TEXT NOT NULL,
+  reason          TEXT,
+  created_at      TEXT NOT NULL,
+  resolved_at     TEXT,
+  resolved_winner TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_conflict_pending_unresolved ON conflict_pending(resolved_at);
+
+-- differentiated_pairs: 「这一对已经判过 differentiate」的裁决账本（issue #533）。
+-- 起因：#126 的 differentiate 把同一段差异注记同时追加到两侧正文，指望「注记进
+-- embedding 后下一轮就不再判重复」；离线复现证伪了这个假设——两侧共享同一段
+-- 后缀时向量同向靠拢（0.876→0.960/5 轮，注记截到 0 字也一样），而字面 includes
+-- 幂等在措辞漂移下失效，于是同一对每轮都被追加一段，单条堆到 19 段。
+-- 这里记的是「(a,b) 已裁决」这件事本身，正文一个字节都不动；hash_a/hash_b 是
+-- 裁决当时两侧正文的 content_hash，任一侧后来被改写就让该对重新进入候选（宁可
+-- 再判一次，不静音真的演化）。与 conflict_pending 同款的 bookkeeping 表：只做
+-- 裁决记账，不触发 write hooks。
+CREATE TABLE IF NOT EXISTS differentiated_pairs (
+  id           TEXT PRIMARY KEY,
+  memory_a     TEXT NOT NULL,
+  memory_b     TEXT NOT NULL,
+  hash_a       TEXT,
+  hash_b       TEXT,
+  -- 模型给出的差异点（JSON 数组）。不再写进正文，留在这里只为了让「当初为什么
+  -- 判它们互补」事后查得到——裁决本身必须可审计，否则和静音丢弃没有区别。
+  distinctions TEXT,
+  run_id       TEXT,
+  created_at   TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_differentiated_pairs_pair ON differentiated_pairs(memory_a, memory_b);
+
+-- conflict_reviewed: 机器侧裁决台账（issue #529）。冲突相位真正送给 LLM 的每一对
+-- 都在这里留一行，连同最后拿到的结果——判 keep 的对因此不会在下一轮被原样再送。
+--
+-- 为什么不复用 conflict_pending：那张表是**人工**待审队列，countConflictPending()
+-- 与 listConflictPending() 的口径直接喂面板的待确认徽标。机器记账混进去，用户打开
+-- 面板看到的就是几百条自己从没要求审的条目，人工裁决会被淹掉。两者的生命周期也相反：
+-- pending 是「等人来」，reviewed 是「人不用来了」。
+--
+-- 主键就是归一化后的对（sort 过，与 saveConflictPending 同一口径），同一对只留最新
+-- 一次判决，INSERT OR REPLACE 天然幂等。「是否还需重判」不靠本表自身判定，而是比
+-- 两侧 updated_at 与 judged_at（宽松代理，与 conflict_pending 复核项 4 同一条约定：
+-- 任何字段更新都算「值得再看一眼」，宁可多看一眼，不静音真冲突）。
+CREATE TABLE IF NOT EXISTS conflict_reviewed (
+  memory_a  TEXT NOT NULL,
+  memory_b  TEXT NOT NULL,
+  judged_at TEXT NOT NULL,
+  outcome   TEXT,
+  run_id    TEXT,
+  PRIMARY KEY (memory_a, memory_b)
+);
+CREATE INDEX IF NOT EXISTS idx_conflict_reviewed_judged ON conflict_reviewed(judged_at);
+
+-- conflict_ledger: 冲突分诊账本（issue #641 beta 第一阶段，shadow 档）。conflict
+-- 相位的每一对候选在送进 freeze/LLM 之前先过确定性分诊（dup / cross-scope-dup /
+-- evolution / conflict，判据唯一实现见 src/dream/triage.js），分档结果落在这里。
+-- shadow 档只记账不改任何行为——它存在的目的就是让「分诊分布是否复现真实库的
+-- 46/20/5/27」这件事在真实运行里可测，切 enforce 前先有一周的真实分布可对。
+--
+-- 为什么不复用 conflict_reviewed：那张表的语义是「这一对被机器**裁决**过」，键的
+-- 消费方（alreadyJudged 预筛）拿它挡重送；本表语义是「这一对被分诊**观察**过」，
+-- 挡重送反而错误——同一对每轮都要重新观察（两侧内容变了 tier 可能变），它不是
+-- 处置记录，是测量记录。也不复用 conflict_pending（人工队列，见上表注释）。
+--
+-- 主键归一化后的对，与 conflict_reviewed 同一口径；ON CONFLICT 只刷新 tier/
+-- signals/last_*，first_seen_at/first_run_id 保留首次检出时刻——同召率与「挂账
+-- 时长」这类惰性消解指标都以此为准。status 是 enforce 阶段消解落账的方向
+-- （open → superseded / differentiated / zombied），shadow 期恒为 open。
+CREATE TABLE IF NOT EXISTS conflict_ledger (
+  memory_a      TEXT NOT NULL,
+  memory_b      TEXT NOT NULL,
+  tier          TEXT NOT NULL,          -- dup | cross-scope-dup | evolution | conflict
+  similarity    REAL,
+  signals       TEXT,                   -- JSON: 分诊依据（crossScope/annotated/gapDays/dupMin/similarity）
+  status        TEXT NOT NULL DEFAULT 'open',
+  first_run_id  TEXT,
+  last_run_id   TEXT,
+  first_seen_at TEXT NOT NULL,
+  last_seen_at  TEXT NOT NULL,
+  PRIMARY KEY (memory_a, memory_b)
+);
+CREATE INDEX IF NOT EXISTS idx_conflict_ledger_status ON conflict_ledger(status);
+
+-- scope_changes: v0.8.1 底座（issue #170）scope 归属的人工修正审计。显式声明
+-- （memory_save/memory_update 的 scope 参数、面板编辑）每次改变某条记忆的
+-- agent/workspace 归属都落一行：改动前后值 + 来源 + actor（tool=模型侧 /
+-- panel=人工侧）。与 conflict_pending 同款的 bookkeeping 表：只做审计，
+-- 不触发 write hooks。放宽可见性（label→global）的候选筛选与回放都靠它。
+CREATE TABLE IF NOT EXISTS scope_changes (
+  id                    TEXT PRIMARY KEY,
+  memory_id             TEXT NOT NULL,
+  actor                 TEXT NOT NULL,
+  prev_agent_scope      TEXT,
+  prev_workspace_scope  TEXT,
+  next_agent_scope      TEXT,
+  next_workspace_scope  TEXT,
+  agent_scope_source    TEXT,
+  workspace_scope_source TEXT,
+  decided_at            TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_scope_changes_memory ON scope_changes(memory_id);
+
+-- scope_state: v0.9.1 政策轴（issue #471）。与 scope_changes 那条事实轴相对：
+-- scope_changes 记「某条记忆的归属被人工改过」（跟着记忆走），本表记「某个作用域
+-- 现在通不通」（跟着作用域走）。按下/松开都是单方面动作，不触碰任何记忆行，
+-- 松开即恢复——所以它是可逆的，而逐条 forget/archive 不是。
+-- dimension 只认 'agent'|'workspace'（scopeKeyOf 那两个维度）；scope_value='*'
+-- 表示该维度全局。一行一格，重复按下同一状态不刷新 decided_at（见 setScopeState）。
+-- Bookkeeping like the other audit tables: it never triggers write hooks.
+CREATE TABLE IF NOT EXISTS scope_state (
+  id           TEXT PRIMARY KEY,
+  dimension    TEXT NOT NULL,
+  scope_value  TEXT NOT NULL,
+  state        TEXT NOT NULL,               -- active | paused
+  note         TEXT,
+  decided_at   TEXT NOT NULL
+);
+-- 唯一性靠独立索引（本仓惯例：UNIQUE 不进 CREATE TABLE，见 idx_memory_provenance_link）。
+-- 它同时是 setScopeState 那条 UPSERT 的冲突目标，所以不能省。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_scope_state_key ON scope_state(dimension, scope_value);
+
+-- pinned_memories: #249 第二批，显式 pin。旧口径把「类型是 constraint/preference」
+-- 当成 pin（隐含假设），于是 1163 条自动变「每轮必进」而预算只有 5——池子本身
+-- 就太大，靠相关性排序永远轮不到「署名」「拒绝谄媚」这类稳定偏好。本表把
+-- 「哪些是用户亲手钉的」变成一条显式事实：注入侧只认这张表，不再认类型。
+--
+-- 为什么是独立表而不是 memories 的布尔列：回退只需一条 DROP，不碰 31 列的主表；
+-- 且「pin 是用户与记忆之间的一条关系」天然是关系表——created_at 还能给出
+-- pin 顺序（按 pin 先后注入，而不是按「最近改过」）。外泄面天然为零：
+-- mirror/share 都不 SELECT 本表，pin 标记不会出现在导出物里。
+--
+-- 幂等靠 CREATE TABLE IF NOT EXISTS（本文件其余建表同款），不登记
+-- applied_migrations——那是给「跑完恒不命中却仍要全表扫一遍」的 data migration
+-- 用的，本表没有回填步骤。存量库升级后本表为空，注入侧据此回落到旧的类型口径
+-- （见 service.injectCandidates 的 type-fallback 分支），升级即等价。
+CREATE TABLE IF NOT EXISTS pinned_memories (
+  memory_id  TEXT PRIMARY KEY,
+  created_at TEXT NOT NULL,
+  note       TEXT
+);
+-- 按 pin 顺序注入要读 created_at 全序；本表行数以「人手钉的条数」计（个位到几十），
+-- 索引只为把排序的临时 B 树换成一次有序扫，不承担过滤。
+CREATE INDEX IF NOT EXISTS idx_pinned_created ON pinned_memories(created_at);
+
+-- llm_audit_logs: every background LLM call (autoDream consolidation + summary,
+-- autoSummarize compression) is recorded here — tokens in/out, duration, status
+-- and the trigger that caused it (Bug8). Failures are captured as status='error'
+-- and never block the calling feature. retentionDays is enforced by a boot-time
+-- purge (deleteOldLlmAudits). Bookkeeping like the other audit tables: it never
+-- triggers write hooks.
+CREATE TABLE IF NOT EXISTS llm_audit_logs (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  timestamp         TEXT NOT NULL,
+  trigger_source    TEXT NOT NULL,          -- autoDream | autoSummarize | manual ...
+  operation_type    TEXT NOT NULL,          -- dream_consolidate | dream_summarize | summarize_compress ...
+  model_id          TEXT NOT NULL,
+  input_tokens      INTEGER NOT NULL DEFAULT 0,
+  output_tokens     INTEGER NOT NULL DEFAULT 0,
+  total_tokens      INTEGER NOT NULL DEFAULT 0,
+  cost_usd          REAL NOT NULL DEFAULT 0,
+  duration_ms       INTEGER NOT NULL DEFAULT 0,
+  status            TEXT NOT NULL,          -- success | error | skipped
+  error_message     TEXT,
+  related_memory_ids TEXT,                  -- JSON: ids the call operated on
+  metadata          TEXT,                   -- JSON: free-form extras
+  session_key       TEXT                    -- #254 写入准入的会话键（LLM 调用行恒 NULL）
+);
+CREATE INDEX IF NOT EXISTS idx_llm_audit_timestamp ON llm_audit_logs(timestamp);
+CREATE INDEX IF NOT EXISTS idx_llm_audit_source ON llm_audit_logs(trigger_source);
+
+-- autoSummarize 的增量蒸馏游标：按 session.id 持久化最近一次成功消费的事件序。
+-- 游标是蒸馏窗口的恢复事实，不与 user_settings 或记忆内容混用。
+CREATE TABLE IF NOT EXISTS distill_cursors (
+  session_id TEXT PRIMARY KEY,
+  last_seq   INTEGER NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+-- #399 蒸馏窗口的原始公开记录（凭证）。蒸馏此前只把会话压成记忆、原文随即消失，
+-- 于是「这句原文没进任何记忆」永远不可测——留存一份原始副本，蒸馏就从「替换」
+-- 降级成「叠加索引」（arXiv 2609.36059 §3 Eq.1：与原文并存的旁路索引不丢信息）。
+-- 主键 (session_id, seq) 承担幂等：额度耗尽 / 宿主重启后会重跑同一 seq 窗口
+-- （summarize.js 的 max-runs 门刻意不消费游标），重跑必须不产生重复记录。
+-- 落盘文本不受 distillMaxChars / trim() 三刀约束——留存的意义就是整段原文。
+-- 刻意不加 sensitivity 列：机密级是**记忆级**判断，写记录那一刻它还不存在
+-- （一个窗口里什么都有），加了就是往 schema 里写一个做不到的承诺。
+CREATE TABLE IF NOT EXISTS distill_records (
+  session_id   TEXT    NOT NULL,
+  seq          INTEGER NOT NULL,
+  role         TEXT    NOT NULL,   -- user | assistant | agent（lang.js 的三种公开形态）
+  text         TEXT    NOT NULL,   -- 未截断的公开正文
+  window_id    TEXT,
+  distilled_at TEXT    NOT NULL,
+  PRIMARY KEY (session_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_distill_records_window ON distill_records(window_id);
+-- 到期裁剪按 distilled_at 扫（与 llm_audit_logs.timestamp 同一口径）。
+CREATE INDEX IF NOT EXISTS idx_distill_records_distilled_at ON distill_records(distilled_at);
+
+-- #399 记忆级溯源：一条记忆由哪个蒸馏窗口的哪个 seq 区间派生。归因用**区间**而非
+-- 逐事件外键——蒸馏窗口本身就是连续 seq 段，窗口级归因第一步够用。
+-- 删除语义：到期裁剪只删 distill_records，本表保留并指向空区间（面板/CLI 显示
+-- 「来源已过期」），绝不级联删记忆；删记忆只清链接、记录保留——一个窗口的凭证
+-- 不该因删掉其中一条派生记忆而消失。
+-- memory_id 是 TEXT 而非 issue 草稿里的 INTEGER：memories.id 是 TEXT 主键，
+-- 类型必须与父表一致（否则 join 恒空）。
+-- ON DELETE CASCADE 在本库是**生效的**：createStore 走 new DatabaseSync(path) 不带选项，
+-- 而 node:sqlite 的 enableForeignKeyConstraints 默认为真（实测：新库上 PRAGMA foreign_keys
+-- 返回 1，删父行确实级联清掉本表）。本库两条 FK 都因此一直是活的——这一条，以及
+-- recall_evals(recall_run_id) → recall_runs(id)。级联在兜底，remove() 仍然显式清链接，
+-- 理由不是「FK 没开」，而是这份清理不该挂在一条没人钉过的驱动默认上：连接哪天被以
+-- enableForeignKeyConstraints:false 打开，悬空链接只有那条 DELETE 挡得住。见 remove() 的注释。
+CREATE TABLE IF NOT EXISTS memory_provenance (
+  memory_id  TEXT    NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+  session_id TEXT    NOT NULL,
+  seq_start  INTEGER NOT NULL,
+  seq_end    INTEGER NOT NULL,
+  created_at TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_memory_provenance_memory ON memory_provenance(memory_id);
+CREATE INDEX IF NOT EXISTS idx_memory_provenance_session ON memory_provenance(session_id);
+-- issue 草稿没有唯一约束，但重跑同一窗口会重复插同一链接（幂等测试锁 1 会挂）。
+-- 同一 (记忆, 会话, 区间) 只有一条事实，用唯一索引 + ON CONFLICT DO NOTHING 表达。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_provenance_link
+  ON memory_provenance(memory_id, session_id, seq_start, seq_end);
+
+-- #512 蒸馏运行（run）：一次 autoSummarize 调用就是一轮。此前这条链路只在
+-- llm_audit_logs 里留一条计费痕迹，记忆侧的链接却只记到「会话 + seq 区间」——
+-- 「这条记忆是哪一次蒸馏带进来的」答不上，同一个区间重跑两次更分不出前后。
+-- 与 llm_audit_logs 的关系是**归因主体与它的开销读数**：run 是被归因的那一轮，
+-- audit 行是那一轮的开销；两边靠 distill_runs.audit_id 直接连，不靠时间戳猜。
+-- 为什么不复用 llm_audit_logs 的行 id 当 run id：audit 表按 llmAudit.retentionDays
+-- 到期裁剪（index.js 启动即调 deleteOldLlmAudits），归因会悬空；而 memory_provenance
+-- 与蒸馏窗口刻意活得更久（见 clearDistillRecords 注释）。归因不能挂在会被删掉的表上。
+-- 为什么不复用 dream_runs：那张表的每一列（snapshot_hash / input_count / decisions /
+-- outcome / receipt）都是巩固的语义，硬塞一个 run_type='autoSummarize' 会让
+-- 「dream_runs 的每一行都能回放一次巩固」这条契约失效。两张表各自的形状才是真的。
+-- audit_id 可空：llmAudit 关掉时那一轮没有 audit 行，run 仍然成立（归因不该依赖计费开关）。
+CREATE TABLE IF NOT EXISTS distill_runs (
+  id             TEXT PRIMARY KEY,
+  created_at     TEXT NOT NULL,
+  status         TEXT NOT NULL,   -- ok | degraded | noop | failed | aborted
+  error          TEXT,
+  -- 只放**有窗口**的蒸馏（autoSummarize，以及将来手动的 manual）。dream / sleep 的
+  -- 轮次不进这张表：它们是 dream_runs 的行，把同一轮复制成两行会让「哪张表是事实源」
+  -- 这个问题永远没有答案；那些记忆的归因走 memory_mints（见下）。
+  run_type       TEXT NOT NULL,   -- autoSummarize | manual
+  trigger_source TEXT NOT NULL,   -- autoSummarize | manual
+  session_id     TEXT,
+  seq_start      INTEGER,
+  seq_end        INTEGER,
+  memory_count   INTEGER NOT NULL DEFAULT 0,
+  provider       TEXT,
+  model          TEXT,
+  audit_id       INTEGER          -- llm_audit_logs.id（NULL = 那一轮没有 audit 行）
+);
+CREATE INDEX IF NOT EXISTS idx_distill_runs_created ON distill_runs(created_at);
+
+-- #512 记忆级「出生自哪一轮」。为什么它不是 memory_provenance 的一列：那张表的
+-- 粒度是 (记忆, 会话, seq 区间)，能表达的只有**窗口派生**的归因；而 dream / sleep
+-- 铸造的记忆根本没有窗口（session 与 seq 都不存在），硬塞一个合成区间就是
+-- 「看起来能追、实际是编的」。所以归因分两层，各自只记它真知道的事：
+--   · memory_provenance（+ distill_run_id）= 窗口级，「这段原文是哪一轮蒸出来的」；
+--   · 本表 = 行级，「这条记忆出生自哪一轮」，覆盖没有窗口的铸造路径。
+-- 只填 **create** 一种动作：merge/conflict/update/supersede 对既有行的改动，receipt_chain
+-- 已经按 (run_id, record_id) 记过了——再造一份就是第二套账。create 是那边唯一的洞
+-- （buildRecordReceipts 不给 create/create_merged 产行：新行没有「改动前后的账」可记，
+-- 只有「出生自哪一轮」，那正是本表的事）。#619 起 buildOutcome 会给 create 派
+-- disposition（created / created-refreshed），那是审计面读的结果，与 receipt_chain
+-- 产不产行是两件事；created-refreshed 是原地刷新，没有出生，本表也不记。
+-- run_type / trigger_source 就地冗余：run_id 在 dream_runs 与 distill_runs 两张表里
+-- 各有自己的主键域，读侧不该为了显示一个类型去 union 两张审计表。
+-- ON DELETE CASCADE：记忆行没了，归因没有指代对象；remove() 仍显式清（与
+-- memory_provenance 同一口径，不把清理挂在驱动默认上）。
+CREATE TABLE IF NOT EXISTS memory_mints (
+  memory_id      TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+  run_id         TEXT NOT NULL,
+  run_type       TEXT NOT NULL,   -- dream | sleep
+  trigger_source TEXT NOT NULL,   -- autoDream | sleep
+  created_at     TEXT NOT NULL,
+  PRIMARY KEY (memory_id, run_id)
+);
+CREATE INDEX IF NOT EXISTS idx_memory_mints_run ON memory_mints(run_id);
+
+-- 图像溯源（v2）：一条记忆由哪个蒸馏窗口派生（memory_provenance 已记），而那个
+-- 窗口里出现过哪几张图。两者合成一个问题：「这条记忆能回指哪张原图」。
+--
+-- 为什么粒度是**窗口级**而不是逐条记忆：蒸馏是模型从整段转录里提炼的，没有任何
+-- 信号能证明「这张图只贡献了第 3 条记忆」。按行去猜（比如拿描述文本跟记忆正文做
+-- 匹配）会把「恰好同词」写成「确有此证」——归因宁可粗，不能编。与 memory_provenance
+-- 的选择同源：能表达的只有窗口，就只记窗口。
+--
+-- attachment_id 是宿主的 AttachmentId（dsh-attachment 明确承诺「never a filesystem
+-- path or bearer URL」），拿它交给宿主 attachments.readImage() 才能取回原图；本表
+-- **不存图字节、不存路径**——记忆库不托管原图这条边界没有变。
+-- fallback_key 永远有值：attachmentId 缺席时按元数据四元组+序号降级，此时
+-- key_stability='unstable'——重发一次同名同尺寸的图就可能对上同一个键，读侧必须
+-- 能看见这个不确定性，不能把它当成稳定外键用。
+CREATE TABLE IF NOT EXISTS image_sources (
+  memory_id     TEXT    NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+  session_id    TEXT    NOT NULL,
+  seq           INTEGER NOT NULL,   -- 图块所在事件的 seq（窗口内定位）
+  attachment_id TEXT,               -- 宿主 AttachmentId；NULL = 只有降级键
+  fallback_key  TEXT    NOT NULL,   -- 稳定键或降级键，恒非空
+  key_stability TEXT    NOT NULL,   -- stable | unstable
+  media_type    TEXT,
+  name          TEXT,
+  width         INTEGER,
+  height        INTEGER,
+  created_at    TEXT    NOT NULL,
+  PRIMARY KEY (memory_id, session_id, seq, fallback_key)
+);
+CREATE INDEX IF NOT EXISTS idx_image_sources_memory ON image_sources(memory_id);
+-- 反向：一张图被哪些记忆引用过。attachment_id 可空，SQLite 的索引不排斥 NULL，
+-- 降级键那些行因此不出现在这个方向的查询里——那是对的，它们本来就不是稳定身份。
+CREATE INDEX IF NOT EXISTS idx_image_sources_attachment ON image_sources(attachment_id);
+
+-- #493 补充 §②：连续解析失败的**跨进程**计数（失败护栏 summarizeParseFailureMaxRetries
+-- 的判据）。原先只活在 summarize.js 的进程内 Map 里，于是重启即清零——而这条护栏要
+-- 防的恰恰是「确定性失败反复重试」，重启一次就绕过去了。
+-- 独立成表、不并进 distill_cursors 的三条理由：
+-- 1) 写 streak 不必先有游标行（窗口可能还没成功消费过任何一个 seq）；
+-- 2) 成功即归零是 DELETE，而游标那句 UPSERT 是 last_seq = MAX(...)（单调），
+--    两种语义塞进同一句会把「归零」写成「保留最大值」，护栏永远不解除；
+-- 3) 失效判据要读时间戳，就地一行更省事。
+-- 失效由读侧判（streakStaleAfterMs）：超过窗口没更新就当作 0，**不在写侧定时清**——
+-- 停了几周的会话再开跑时，若拿旧 streak 直接触发熔断，护栏本身就成了新的误伤路径。
+CREATE TABLE IF NOT EXISTS distill_parse_failures (
+  session_id TEXT PRIMARY KEY,
+  streak     INTEGER NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+-- entity gene (v0.3.0): named entities mentioned across memories, with
+-- time-boxed attributes (valid_from → valid_until) and typed relations.
+-- Attributes follow the snapshot style: saveAttr invalidates the previous
+-- value for the same entity+key before inserting a new row, so the current
+-- value is always the row with valid_until IS NULL.
+CREATE TABLE IF NOT EXISTS entities (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  type TEXT,
+  first_seen TEXT NOT NULL,
+  last_seen TEXT NOT NULL,
+  mention_count INTEGER DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name);
+CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(type);
+-- #688: 写入侧归一的查找键是 lower(trim(name)) + type（见 findEntityByName）。表达式索引
+-- 让这条查询不必扫全表——本机实体表 25,474 行，实体抽取是每条记忆都要走的写入热路径。
+-- 折叠在 SQL 里做（不是先在 JS 里折好再绑），是为了让「命中键」与「索引键」逐字节同源：
+-- JS 的 toLowerCase 与 SQLite 的 lower() 只在 ASCII 上一致，混用会在含特殊字符的名字上
+-- 造出一行查不到自己的孤儿。存量行不改写，索引只是给旧值补一个可查的键。
+CREATE INDEX IF NOT EXISTS idx_entities_name_key ON entities(lower(trim(name)), type);
+
+CREATE TABLE IF NOT EXISTS entity_attrs (
+  id TEXT PRIMARY KEY,
+  entity_id TEXT NOT NULL,
+  attr_key TEXT NOT NULL,
+  attr_value TEXT NOT NULL,
+  memory_id TEXT,
+  valid_from TEXT NOT NULL,
+  valid_until TEXT,
+  confidence REAL DEFAULT 1.0,
+  source TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_attrs_entity ON entity_attrs(entity_id);
+CREATE INDEX IF NOT EXISTS idx_attrs_key ON entity_attrs(attr_key);
+CREATE INDEX IF NOT EXISTS idx_attrs_valid ON entity_attrs(valid_from, valid_until);
+CREATE INDEX IF NOT EXISTS idx_attrs_memory ON entity_attrs(memory_id);
+
+CREATE TABLE IF NOT EXISTS entity_relations (
+  id TEXT PRIMARY KEY,
+  from_entity TEXT NOT NULL,
+  to_entity TEXT NOT NULL,
+  relation_type TEXT NOT NULL,
+  memory_id TEXT,
+  created_at TEXT NOT NULL,
+  metadata TEXT,
+  -- issue #24 块2（权重演化）：边权重 + 建边来源。初值按 source 映射
+  -- （manual 1.0 / confirmed 保持 / tag 0.3 / llm 0.4），演化只经
+  -- bumpRelationWeight（只加不减、封顶），触达侧由 touch 门控驱动。
+  weight REAL NOT NULL DEFAULT 1.0,
+  source TEXT NOT NULL DEFAULT 'manual'
+);
+CREATE INDEX IF NOT EXISTS idx_relations_from ON entity_relations(from_entity);
+CREATE INDEX IF NOT EXISTS idx_relations_to ON entity_relations(to_entity);
+CREATE INDEX IF NOT EXISTS idx_relations_type ON entity_relations(relation_type);
+-- Issue #219：图召回轴按 memory_id 反查关系行，无索引时退化为全表扫描。
+CREATE INDEX IF NOT EXISTS idx_relations_memory ON entity_relations(memory_id);
+
+-- mirror 渲染状态 (F-NEW-03): 单行持久记录 mirror 同步失败/成功状态，使
+-- syncMirror 失败不再只靠瞬时 console.warn —— dirty=1 提示镜像脏了需重渲染，
+-- last_error/last_attempt 记录失败原因与最近尝试，success_at 记录最近成功。
+-- 上层可据此在启动时重试、提供人工 reconcile 入口与健康状态查询。
+-- v0.3.6: 新增 generation/applied_generation/type_status —— desired-applied
+-- 建模镜像债务：generation 是期望同步轮次，applied_generation 是已成功应用
+-- 轮次（成功清 dirty 必须 CAS/fence 到具体轮次，旧 worker 不能清新故障），
+-- type_status 逐 type 记录部分成功状态。旧库经 PRAGMA table_info 检查后
+-- ALTER 补列，幂等且不丢数据。
+CREATE TABLE IF NOT EXISTS mirror_state (
+  id TEXT PRIMARY KEY,               -- 单一状态行（用 'main'）
+  dirty INTEGER NOT NULL DEFAULT 0,  -- 1=镜像脏了需重渲染
+  last_error TEXT,                   -- 最近失败原因
+  last_attempt TEXT,                 -- 最近尝试时间（ISO）
+  success_at TEXT,                   -- 最近成功时间（ISO）
+  generation INTEGER NOT NULL DEFAULT 0 CHECK (generation >= 0 AND generation <= 9007199254740991 AND generation = CAST(generation AS INTEGER)),         -- 期望的同步轮次（desired）
+  applied_generation INTEGER NOT NULL DEFAULT 0 CHECK (applied_generation >= 0 AND applied_generation <= 9007199254740991 AND applied_generation = CAST(applied_generation AS INTEGER)), -- 已成功应用的轮次
+  type_status TEXT                               -- JSON: 逐 type 状态 {type: {dirty, applied_gen, last_error}}
+);
+
+-- #249 N3（压缩边缘双落点）：连续性提案。压缩边缘只落**提案**行，不进 memories
+-- ——边缘产出若直接进记忆库，一个长会话就会攒出第 N 条同主题条目，正是 #275 记的
+-- 失败形态；转正通道与 #254 的二次确认共用一套，阶段二才打开，本批只写 pending。
+-- 唯一键 (session_id, kind) 就是形态约定里的「同一会话同一类只留一条」：再次触发
+-- 是刷新同一行，不是新增一行。status 为转正通道预留（pending → promoted/discarded）：
+-- 「实际触发率」= 提案行数、「采纳率」= promoted/总数，都能就地统计（#249 §8）。
+-- 时间戳是 ISO（与 memories 同款），created_at 在刷新时不动，updated_at 记最近边缘。
+CREATE TABLE IF NOT EXISTS continuity_proposals (
+  id             TEXT PRIMARY KEY,
+  session_id     TEXT NOT NULL,
+  kind           TEXT NOT NULL,
+  current_work   TEXT,
+  next_step      TEXT,
+  open_questions TEXT,
+  status         TEXT NOT NULL DEFAULT 'pending',
+  edge_seq       INTEGER,            -- 触发本次刷新的压缩事件 seq（证据/复现用）
+  created_at     TEXT NOT NULL,
+  updated_at     TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_continuity_session_kind ON continuity_proposals(session_id, kind);
+CREATE INDEX IF NOT EXISTS idx_continuity_status ON continuity_proposals(status, updated_at);
+
+-- ============================================================
+-- chorography（仓库地志，spec: docs/specs/2026-11-04-chorography-design.md）。
+-- 与记忆行物理隔离的硬边界落在这组表上：wiki 的行永不进 memories /
+-- saveWithDedupe / dream / 质量过滤的任何池子（spec §3）——autoDream 的
+-- 「对核心知识库长期参考价值较低」归档理由一旦够得着 wiki 行，机器生成页就会
+-- 被巩固流程自己归档掉（dream-archive-guardrail 测的正是这个语义）。
+-- M0 只有 T0 确定性骨架（零模型）；choro_claims / choro_vectors 此时是空壳，
+-- 分别在 M2（T1 生成轮出 claims）与 M1/M2（embedder 接入）开始灌数据。
+--
+-- 仓库登记（实现计划 P2 补口）：spec §5 的 choro_modules.repo_id 指向这里；
+-- 消费面「按工作目录匹配已登记仓库」（spec §7）也要求登记行。root_path 存
+-- realpath——Windows 上大小写不同的两条路径指向同一目录，登记表按 realpath
+-- 收敛成一行。唯一性照本仓惯例走独立索引，不进 CREATE TABLE。
+CREATE TABLE IF NOT EXISTS choro_repos (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  root_path        TEXT NOT NULL,
+  name             TEXT NOT NULL,
+  plan_fingerprint TEXT,              -- 上次成功 run 的 plan.yaml 内容 sha256
+  git_baseline     TEXT,              -- 上次成功 run 的 HEAD
+  created_at       TEXT NOT NULL,
+  updated_at       TEXT NOT NULL,
+  portable_key     TEXT               -- 可移植身份（#581）：remote URL 归一化，无 remote 退化根提交哈希（git:<sha>）
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_choro_repos_root ON choro_repos(root_path);
+
+-- 每机一份的位置表（#581）：身份与位置分家——memory.db 可以跨端共享，工作
+-- 副本的位置不能。host_id 取 os.hostname()（src/wiki/portable.js）；同一身份
+-- 同一台机器只有一行，T0/T1 登记时 upsert。读侧按当前 host 取本机路径，取
+-- 不到回退 choro_repos.root_path（行上的 root_path 从此是「最近一次登记的
+-- 位置」，单机库两个值恒等，行为不变）。
+CREATE TABLE IF NOT EXISTS choro_repo_paths (
+  repo_key     TEXT NOT NULL,
+  host_id      TEXT NOT NULL,
+  root_path    TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  PRIMARY KEY (repo_key, host_id)
+);
+
+-- 模块划分与依赖边。fingerprint = 模块文件集 + 边集的内容 sha256：幂等语义靠
+-- replaceChoroGraph 的整仓替换，不靠逐行 diff，所以本表没有「上次见过的划分」
+-- 之外的账要记。
+CREATE TABLE IF NOT EXISTS choro_modules (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  repo_id     INTEGER NOT NULL,
+  slug        TEXT NOT NULL,
+  title       TEXT NOT NULL,
+  parent_id   INTEGER,                -- 最近祖先模块（目录包含关系），无则 NULL
+  file_count  INTEGER NOT NULL DEFAULT 0,
+  fingerprint TEXT,
+  updated_at  TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_choro_modules_repo_slug ON choro_modules(repo_id, slug);
+
+-- 页面 ↔ baseline ↔ 状态。rel_path 是仓库相对路径（.chorography/modules/<slug>.md）：
+-- 真源在仓库磁盘的 MD 里（spec §4），本表只做索引与状态账，删了可以整表重算。
+CREATE TABLE IF NOT EXISTS choro_pages (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  module_id         INTEGER NOT NULL,
+  rel_path          TEXT NOT NULL,
+  status            TEXT NOT NULL DEFAULT 'skeleton',  -- skeleton | enriched | stale | failed
+  git_baseline      TEXT,
+  template_version  TEXT,
+  generated_at      TEXT,
+  human_block_count INTEGER NOT NULL DEFAULT 0,
+  -- 语义段的「对着哪个提交验证的」（openwiki/deepwiki-rs 式的锚点溯源）：只有 T1 写，
+  -- T0 重建整页时随 T1 正文一起归 NULL。全仓 git_baseline 是 T0 的时点，拿它当 claims
+  -- 的比对起点会把「T1 之前就发生、claim 早已算进去」的改动误报成 touched。
+  verified_baseline TEXT,
+  verified_at       TEXT,
+  -- 验证那一刻工作区里哪些文件还没进提交（#648，JSON 数组）。claims 的行号取自磁盘
+  -- 内容，这些文件的改动在 baseline..head 的 diff 里永远看不到，只能凭这份清单判
+  -- 「无法用提交核对」。NULL = 不知道当时的工作区状态（本列之前富化的老数据）。
+  verified_dirty_files TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_choro_pages_module ON choro_pages(module_id);
+
+-- 溯源知识卡（M2 起写）：陈述 + 出处锚点（相对路径#Lx-Ly）。kind 限定五类
+-- （spec §5），不在别处发明第六类。
+CREATE TABLE IF NOT EXISTS choro_claims (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  page_id     INTEGER NOT NULL,
+  statement   TEXT NOT NULL,
+  kind        TEXT NOT NULL,          -- architecture | convention | tech-stack | setup | unknown
+  source_path TEXT,
+  start_line  INTEGER,
+  end_line    INTEGER,
+  confidence  TEXT,
+  created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_choro_claims_page ON choro_claims(page_id);
+
+-- 向量壳（收尾档 P36/P38 落地）：owner_id 指向 choro_pages（v1 只做页级；
+-- claims 级留待真有精排需求）。向量与记忆向量不共表、不共查询——两边换模型
+-- 版本的节奏不同（V4 的答案在此：model/dim 记行内，**不锁死**——dim 失配 =
+-- 惰性全量重嵌，代价只是几十页重嵌而不是作废记忆向量）。
+-- vector 存 JSON 数组（与 memories.embedding 同款 TEXT 形态）；source_generated_at
+-- 记嵌入时刻页面的 generated_at——页面富化/重建后该值变化，检索侧据此判 staleness。
+CREATE TABLE IF NOT EXISTS choro_vectors (
+  owner_id            INTEGER NOT NULL,
+  dim                 INTEGER NOT NULL,
+  model               TEXT NOT NULL,
+  vector              TEXT,
+  source_generated_at TEXT,
+  created_at          TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_choro_vectors_owner_model ON choro_vectors(owner_id, model);
+
+-- 模块间依赖边（M1 补口，实现计划 P8）：spec §7 的 choro_module_map 要画依赖图，
+-- M0 schema 漏了这张。只记跨模块边（from_slug ≠ to_slug），模块内部边不进库——
+-- 模块页正文里已经有完整文件级清单，库只存图需要的那一层。
+CREATE TABLE IF NOT EXISTS choro_edges (
+  id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  repo_id   INTEGER NOT NULL,
+  from_slug TEXT NOT NULL,
+  to_slug   TEXT NOT NULL,
+  weight    INTEGER NOT NULL DEFAULT 1
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_choro_edges_triple ON choro_edges(repo_id, from_slug, to_slug);
+CREATE INDEX IF NOT EXISTS idx_choro_edges_to ON choro_edges(repo_id, to_slug);
+
+-- profile_facts：「Agent 眼中的你」自动事实（2026-11-06 需求，对标 DS Bot 每 bot
+-- 一份 MEMORY.md 事实清单的设计）。与手填画像（user_settings.profile）**物理分离**
+-- ——那是用户的原文，模型只有读权（profile-extract #497 的「只出草稿不落库」口径
+-- 不变）；本表是 agent 侧对用户的独立认知，模型可在 dream 轮里增改、用户可在面板
+-- 上逐条修正。agent_key='' 是 default 卡（解析不到会话身份的会话），非空值是会话
+-- 身份，与 persona byAgent 同一取值域（session.header.agentPreset）。
+-- 输入行严格分区不互串：agent 卡只吃 agent_scope=自己 的记忆行，default 卡只吃
+-- agent_scope IS NULL 的行；外来行（source=imported）整体排除（memory-source.js
+-- 那条「本库不巩固别人导入的原文」延伸到画像事实：导入的包不该改写本库对用户的认知）。
+CREATE TABLE IF NOT EXISTS profile_facts (
+  id                TEXT PRIMARY KEY,
+  agent_key         TEXT NOT NULL DEFAULT '',
+  content           TEXT NOT NULL,
+  status            TEXT NOT NULL DEFAULT 'active',  -- active | archived
+  source_memory_ids TEXT NOT NULL DEFAULT '[]',      -- JSON：这条事实的出处记忆 id
+  created_at        TEXT NOT NULL,
+  updated_at        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_profile_facts_card ON profile_facts(agent_key, status);
+
+-- 逐 op 账本（scope_changes 式）：谁（auto 轮 / 面板人工）、何时、把哪条事实从什么
+-- 改成了什么。审计纪律同 dream_runs / llm_audit_logs：只记账，不触发任何 hook。
+CREATE TABLE IF NOT EXISTS profile_fact_journal (
+  id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  at        TEXT NOT NULL,
+  agent_key TEXT NOT NULL DEFAULT '',
+  run_id    TEXT,                                -- auto 轮的回执 id；人工操作为 NULL
+  fact_id   TEXT,
+  op        TEXT NOT NULL,                       -- add | update | archive | restore | delete
+  before    TEXT,
+  after     TEXT,
+  actor     TEXT NOT NULL DEFAULT 'auto'         -- auto | manual
+);
+CREATE INDEX IF NOT EXISTS idx_profile_fact_journal_card ON profile_fact_journal(agent_key, id);
+
+-- 每轮回执（dream_runs 式）：游标（该卡消费到 memories.updated_at 的哪一刻）、
+-- 输入条数、落地 op 数。游标从最近一次 ok 轮读取——failed 轮不推进游标，下次
+-- 重跑同一窗口（与蒸馏游标同款纪律：失败不消费）。
+CREATE TABLE IF NOT EXISTS profile_fact_runs (
+  id             TEXT PRIMARY KEY,
+  agent_key      TEXT NOT NULL DEFAULT '',
+  trigger_source TEXT NOT NULL,                   -- auto | manual
+  status         TEXT NOT NULL,                   -- ok | noop | failed
+  cursor         TEXT,                            -- 本轮消费到的 memories.updated_at
+  input_count    INTEGER NOT NULL DEFAULT 0,
+  ops_applied    INTEGER NOT NULL DEFAULT 0,
+  detail         TEXT,
+  started_at     TEXT NOT NULL,
+  finished_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_profile_fact_runs_card ON profile_fact_runs(agent_key, started_at);
+
+-- 情绪边的人工修正账本（#725）：谁（面板 manual）、何时、对哪条边做了什么。
+-- 审计纪律同 profile_fact_journal：只记账，不触发任何 hook。自动轮不写这张表
+-- ——写入方只有 POST /semantic/graph/affective/apply（token-write）。before/after
+-- 存 JSON 摘要（emotion / attribution / archivedAt 的变化），给「恢复」与追溯用。
+CREATE TABLE IF NOT EXISTS affective_journal (
+  id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  at        TEXT NOT NULL,
+  edge_id   TEXT,
+  op        TEXT NOT NULL,                       -- rename | archive | restore | promote | demote
+  before    TEXT,
+  after     TEXT,
+  actor     TEXT NOT NULL DEFAULT 'manual'
+);
+CREATE INDEX IF NOT EXISTS idx_affective_journal_edge ON affective_journal(edge_id, id);
+
+-- ============================================================
+-- knowledge base（知识库第二层，spec: docs/plans/2026-11-08-kb-qoder-parity.md §3.3）。
+-- 与记忆行物理隔离的硬边界同 choro 那组表：kb 的行永不进 memories /
+-- saveWithDedupe / dream / 质量过滤的任何池子。这里存的是「用户/agent 主动
+-- 收进知识库的资料」——文件、网页、仓库地志页的**副本**与索引，天生属于外来
+-- 原文，让巩固流程够得着它就会把用户刚存的手册自己归档掉。
+-- 幂等键是 (collection_id, rel_key)：同一来源重入库按 sha256 判 no-op，
+-- 变了才替换 chunks（替换语义在 replaceKbDoc 里，事务包住删除与插入）。
+-- rel_key 是来源的稳定相对键（本地文件=绝对路径、网页=URL、地志页=repo#slug），
+-- 不是展示名——展示名在 kb_docs.title。
+CREATE TABLE IF NOT EXISTS kb_collections (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  key         TEXT NOT NULL,
+  title       TEXT NOT NULL,
+  description TEXT,
+  created_at  TEXT NOT NULL,
+  updated_at  TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_kb_collections_key ON kb_collections(key);
+
+-- kind 限定三类（§3.3）：file | url | choro_page。sha256 是**正文内容**的哈希，
+-- 不是文件 stat 的指纹——文件 mtime 变了内容没变时重入库必须是 no-op，
+-- 否则每次保存键盘敲一下都全量重切块。
+CREATE TABLE IF NOT EXISTS kb_docs (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  collection_id INTEGER NOT NULL,
+  rel_key       TEXT NOT NULL,
+  kind          TEXT NOT NULL,
+  source_path   TEXT,
+  title         TEXT NOT NULL,
+  bytes         INTEGER NOT NULL DEFAULT 0,
+  sha256        TEXT,
+  indexed_at    TEXT NOT NULL,
+  status        TEXT NOT NULL DEFAULT 'ok',
+  error         TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_kb_docs_collection_relkey ON kb_docs(collection_id, rel_key);
+
+-- 分块正文。heading 是块所属的二级标题节（无节则空串），ordinal 是块在
+-- 文档内的序号——检索命中要能回指「第几块、哪一节」，面板/工具靠它跳段落。
+-- text 存原文切片（含分块时带的标题行？不含：标题在 heading 里，text 只放正文，
+-- 免得同一条命中把标题算两遍）。
+CREATE TABLE IF NOT EXISTS kb_chunks (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  doc_id     INTEGER NOT NULL,
+  ordinal    INTEGER NOT NULL,
+  heading    TEXT NOT NULL DEFAULT '',
+  text       TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_kb_chunks_doc_ordinal ON kb_chunks(doc_id, ordinal);
+
+`;
+
+// Exported for API-layer type validation (standalone API POST /memories and
+// the /status byType breakdown); the set itself stays the single source of
+// truth for what store.save accepts.
+export const TYPES = new Set(["preference", "project", "decision", "history", "summary", "pattern", "rejected_solution", "pitfall", "constraint",
+  // #230：agent 产长文档的指针行（摘要 + doc_path + evidence）。铸造口唯一
+  // （registerDocument）——saveWithDedupe/updateMemory 另有守卫拒绝旁路铸造。
+  "document"]);
+
+// #249 N3：连续性提案的 pending 队列上限。「队列满则弃新」是形态约定的一半——满时丢
+// 掉本次触发，**不是**淘汰旧行：旧行是别的会话还没转正的活状态，用"更近的边缘"把它挤
+// 掉，等于让长会话的噪音吃掉短会话的真实工作状态。这个数是存储侧策略，与抽取/注入的
+// 截断上限（continuity.js）是两件事。
+const MAX_CONTINUITY_PENDING = 200;
+
+// dream_runs.run_type 的取值域（schema 注释同款）。既是白名单也是下推条件的护栏：
+// listDreamRuns 的 excludeRunType 会拼进 SQL 的 != 比较，非白名单值一律忽略。
+const DREAM_RUN_TYPES = ["auto", "sleep", "organize"];
+
+// Epistemic status: what kind of evidence a memory rests on. Defaults to
+// 'subjective' so legacy rows (and rows without any signal) stay compatible.
+const EPISTEMIC_STATUSES = new Set(["observation", "subjective", "inferred"]);
+// Rule-based inference markers, checked in priority order (observation >
+// inferred > subjective). The default fallback is 'subjective'.
+const OBSERVATION_RE = /实测|观察到|观测|测得|测量|结果表明|数据显示|实验|统计|结果/;
+const INFERRED_RE = /推断|推测出|推导|推论|由此可|据此|综上|意味着|所以|因此/;
+const SUBJECTIVE_RE = /我推测|我猜|我觉得|我感觉|可能|大概|也许|认为|猜想|似乎|猜测|感觉/;
+
+/**
+ * Heuristically infer a memory's epistemic status from its content (and the
+ * AI-generated types). summary/pattern entries are always 'inferred' (derived
+ * from other memories); otherwise content markers decide. Pure rule-based, so
+ * it never throws and always returns a value in EPISTEMIC_STATUSES.
+ */
+function inferEpistemicStatus(memory) {
+  if (memory.type === "summary" || memory.type === "pattern") return "inferred";
+  const text = `${memory.title ?? ""} ${memory.content ?? ""}`;
+  if (OBSERVATION_RE.test(text)) return "observation";
+  if (INFERRED_RE.test(text)) return "inferred";
+  if (SUBJECTIVE_RE.test(text)) return "subjective";
+  return "subjective";
+}
+
+/** Resolve a requested epistemic_status: explicit valid value wins, otherwise
+ *  re-infer from (possibly updated) content. Never returns an invalid value. */
+function resolveEpistemicStatus(memory, patch) {
+  if (patch?.epistemic_status !== undefined) {
+    return EPISTEMIC_STATUSES.has(patch.epistemic_status) ? patch.epistemic_status : "subjective";
+  }
+  // Re-infer whenever any signal that feeds the heuristic changed: content
+  // (marker words), title (marker words), or type (summary/pattern are always
+  // inferred). Otherwise keep the stored status.
+  const changed = ["content", "title", "type"].some(
+    (k) => patch?.[k] !== undefined && patch[k] !== memory?.[k]
+  );
+  if (changed) {
+    return inferEpistemicStatus({ ...memory, ...patch });
+  }
+  return memory?.epistemic_status ?? "subjective";
+}
+
+// Per-type mirror sync receipts (peer blocker 4): a type is either committed
+// (file written + fence applied), failed (last sync round errored for it), or
+// pending (still owed a write).
+const VALID_TYPE_STATUS = new Set(["committed", "failed", "pending"]);
+
+// Pure helpers: no shared module state.
+
+function sanitizePage(limit, offset, defaultLimit) {
+  const lim = Number.isInteger(limit) && limit > 0 ? limit : defaultLimit;
+  const off = Number.isInteger(offset) && offset > 0 ? offset : 0;
+  return { limit: lim, offset: off };
+}
+
+function escapeLike(q) {
+  return q.replace(/[\\%_]/g, (c) => `\\${c}`);
+}
+
+// 日期过滤参数归一化（list/count 共用，保证分页 total 与行同过滤）：接受 ISO
+// 日期（"2026-09-01"）或完整时间戳，返回闭区间的 UTC ISO 边界。date-only 的
+// updatedFrom 按当天 00:00:00.000Z 起、updatedTo 按当天 23:59:59.999Z 收；非
+// 法值一律返回 undefined → 不进 WHERE（忽略而非报错：面板传坏参数时宁可放宽
+// 过滤也不要白屏）。updated_at 列是 toISOString 产生的 UTC "Z" 字符串，字典
+// 序与时间序一致，SQL 里可直接比较。
+// v0.8.0 A2：导出复用——occurred_at 时间过滤（service 的搜索后置过滤）与
+// updated_at 过滤共用同一套边界归一化，坏参数口径一致。
+export function updatedAtBounds(updatedFrom, updatedTo) {
+  const norm = (raw, endOfDay) => {
+    if (typeof raw !== "string" || !raw.trim()) return undefined;
+    const s = raw.trim();
+    const dateOnly = /^\d{4}-\d{2}-\d{2}$/.test(s);
+    const ms = Date.parse(dateOnly ? `${s}T00:00:00.000Z` : s);
+    if (Number.isNaN(ms)) return undefined;
+    if (dateOnly && endOfDay) return `${s}T23:59:59.999Z`;
+    return new Date(ms).toISOString();
+  };
+  return { from: norm(updatedFrom, false), to: norm(updatedTo, true) };
+}
+
+function parseTags(raw) {
+  try {
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr : [];
+  } catch {
+    return [];
+  }
+}
+
+// scope 列（agent_scope/workspace_scope/sensitivity）写入归一化：非空 trim 字符串
+// 原样收下，其余（undefined/null/空串/非字符串）一律 NULL。存储层不做枚举校验——
+// scope 值是宿主身份标签（agentPreset id / 目录路径 / 自由 sensitivity 标签），
+// 语义由调用方负责；这里只保证「脏输入落 NULL，绝不阻塞写入」。
+function normalizeScopeText(raw) {
+  if (typeof raw !== "string") return null;
+  const s = raw.trim();
+  return s ? s : null;
+}
+
+// scope 来源列（issue #170 底座）：'auto'=载体自动标注，'explicit'=显式声明。
+// 只认这两个枚举值，其余（含 NULL）落 NULL——NULL 语义是「未标注，或 0.8.1
+// 之前落库的存量标注（视为 auto 的软效力，第 3 步语义收窄时按此口径读）」。
+function normalizeScopeSource(raw) {
+  return raw === "auto" || raw === "explicit" ? raw : null;
+}
+
+// occurred_at：事件发生时间（区别于 created_at 的入库时间）。可解析的时间戳
+// 统一归一到 UTC ISO（A2 的时间过滤要按字典序直接比较）；解析失败落 NULL，
+// 同样不阻塞写入。
+function normalizeOccurredAt(raw) {
+  if (typeof raw !== "string" || !raw.trim()) return null;
+  const ms = Date.parse(raw.trim());
+  if (Number.isNaN(ms)) return null;
+  return new Date(ms).toISOString();
+}
+
+function toRow(row) {
+  if (!row) return undefined;
+  return {
+    id: row.id,
+    type: row.type,
+    title: row.title,
+    content: row.content,
+    content_hash: row.content_hash ?? undefined,
+    tags: parseTags(row.tags),
+    importance: row.importance,
+    forgotten: row.forgotten === 1,
+    archived: row.archived === 1,
+    // Issue #275 第二批：NULL（存量归档行、或落地前的历史数据）读作 undefined，
+    // 与 sensitivity/occurred_at 同款——调用方必须显式处理「时刻不可知」，不能
+    // 顺手 `?? updated_at` 把代理口径捡回来。
+    archived_at: row.archived_at ?? undefined,
+    source: row.source ?? undefined,
+    // 车道 C：外来行身份两格。NULL 读作 undefined（与 archived_at 同款「不可知就不编
+    // 值」）。注意「这行是不是外来行」的判据仍是 source（memory-source.js 的
+    // isImportedRow）——这两格只回答「来自哪个包 / 幂等键是什么」，不回答身份。
+    share_pack_id: row.share_pack_id ?? undefined,
+    share_external_id: row.share_external_id ?? undefined,
+    // Issue #641 取代链：NULL 读作 undefined（未被取代），与 archived_at 同款
+    // 「时刻不可知就不编值」。
+    superseded_by: row.superseded_by ?? undefined,
+    superseded_at: row.superseded_at ?? undefined,
+    content_history: parseJsonArray(row.content_history),
+    evidence: parseJsonArray(row.evidence),
+    doc_path: row.doc_path ?? undefined,
+    quality_score: row.quality_score !== null && row.quality_score !== undefined ? Number(row.quality_score) : undefined,
+    epistemic_status: row.epistemic_status ?? "subjective",
+    agent_scope: row.agent_scope ?? undefined,
+    workspace_scope: row.workspace_scope ?? undefined,
+    agent_scope_source: row.agent_scope_source ?? undefined,
+    workspace_scope_source: row.workspace_scope_source ?? undefined,
+    scope_decided_at: row.scope_decided_at ?? undefined,
+    sensitivity: row.sensitivity ?? undefined,
+    occurred_at: row.occurred_at ?? undefined,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    last_accessed_at: row.last_accessed_at ?? undefined,
+    _full_content: row._full_content ?? undefined
+  };
+}
+
+function toDreamRun(row) {
+  if (!row) return undefined;
+  return {
+    id: row.id,
+    created_at: row.created_at,
+    status: row.status,
+    error: row.error ?? undefined,
+    provider: row.provider ?? undefined,
+    model: row.model ?? undefined,
+    snapshot_hash: row.snapshot_hash,
+    input_count: row.input_count,
+    input: row.input ? JSON.parse(row.input) : undefined,
+    decisions: row.decisions ? JSON.parse(row.decisions) : undefined,
+    outcome: row.outcome ? JSON.parse(row.outcome) : undefined,
+    applied: row.applied,
+    summary_stored: row.summary_stored === 1,
+    receipt: row.receipt,
+    policy_epoch: row.policy_epoch ?? 0,
+    run_type: row.run_type ?? "auto",
+    // Issue #104：degraded 轮的逐条跳过明细（JSON 列，NULL = 该轮无跳过项）。
+    skipped: row.skipped ? JSON.parse(row.skipped) : undefined,
+    // Issue #89（基线半边）：成功轮落下的阈值基线（NULL = 该轮没有推进基线）。
+    store_count: row.store_count ?? undefined,
+    store_chars: row.store_chars ?? undefined,
+    // #534：失败轮的模型原始输出截断副本（NULL = 该轮没留下，或该轮是历史行）。
+    raw_output: row.raw_output ? JSON.parse(row.raw_output) : undefined
+  };
+}
+
+function toDistillRun(row) {
+  if (!row) return undefined;
+  return {
+    id: row.id,
+    created_at: row.created_at,
+    status: row.status,
+    error: row.error ?? undefined,
+    run_type: row.run_type,
+    trigger_source: row.trigger_source,
+    session_id: row.session_id ?? undefined,
+    seq_start: row.seq_start ?? undefined,
+    seq_end: row.seq_end ?? undefined,
+    memory_count: row.memory_count ?? 0,
+    provider: row.provider ?? undefined,
+    model: row.model ?? undefined,
+    // NULL = 那一轮没有 audit 行（llmAudit 关着，或还没写回）。
+    audit_id: row.audit_id ?? undefined
+  };
+}
+
+function toReceipt(row) {
+  if (!row) return undefined;
+  return {
+    receipt_id: row.receipt_id,
+    run_id: row.run_id,
+    record_id: row.record_id,
+    kind: row.kind,
+    input_digest: row.input_digest,
+    winner_id: row.winner_id ?? undefined,
+    loser_id: row.loser_id ?? undefined,
+    keep_source: row.keep_source ?? undefined,
+    sources: parseJsonArray(row.sources),
+    verdict: row.verdict,
+    count_before: row.count_before,
+    count_after: row.count_after,
+    policy_epoch: row.policy_epoch ?? 0,
+    created_at: row.created_at
+  };
+}
+
+function toConflictPending(row) {
+  if (!row) return undefined;
+  return {
+    id: row.id,
+    run_id: row.run_id ?? undefined,
+    memory_a: row.memory_a,
+    memory_b: row.memory_b,
+    reason: row.reason ?? undefined,
+    // Issue #603 第 2 层：入队时的相似度。存量行与调用方没给的行是 NULL，
+    // 这里如实透出 undefined（条件展开：带 undefined 键会让 in-process schema
+    // 校验判违规，同 toApiList 的处理）。
+    ...(typeof row.similarity === "number" ? { similarity: row.similarity } : {}),
+    created_at: row.created_at,
+    resolved_at: row.resolved_at ?? undefined,
+    resolved_winner: row.resolved_winner ?? undefined
+  };
+}
+
+function toDifferentiatedPair(row) {
+  if (!row) return undefined;
+  return {
+    id: row.id,
+    memory_a: row.memory_a,
+    memory_b: row.memory_b,
+    hash_a: row.hash_a ?? undefined,
+    hash_b: row.hash_b ?? undefined,
+    distinctions: row.distinctions ? JSON.parse(row.distinctions) : undefined,
+    run_id: row.run_id ?? undefined,
+    created_at: row.created_at
+  };
+}
+
+function toScopeChange(row) {
+  if (!row) return undefined;
+  return {
+    id: row.id,
+    memory_id: row.memory_id,
+    actor: row.actor,
+    prev_agent_scope: row.prev_agent_scope ?? undefined,
+    prev_workspace_scope: row.prev_workspace_scope ?? undefined,
+    next_agent_scope: row.next_agent_scope ?? undefined,
+    next_workspace_scope: row.next_workspace_scope ?? undefined,
+    agent_scope_source: row.agent_scope_source ?? undefined,
+    workspace_scope_source: row.workspace_scope_source ?? undefined,
+    decided_at: row.decided_at
+  };
+}
+
+// scope_state 行 → 读侧对象（issue #471）。NULL note 落 undefined，与
+// toScopeChange 同口径。
+function toScopeState(row) {
+  if (!row) return undefined;
+  return {
+    id: row.id,
+    dimension: row.dimension,
+    scope_value: row.scope_value,
+    state: row.state,
+    note: row.note ?? undefined,
+    decided_at: row.decided_at
+  };
+}
+
+// pinned_memories 行 → 读侧对象（#249 第二批）。NULL note 落 undefined，
+// 与 toScopeState 同口径。
+function toPinned(row) {
+  if (!row) return undefined;
+  return {
+    memory_id: row.memory_id,
+    created_at: row.created_at,
+    note: row.note ?? undefined
+  };
+}
+
+function toRecallRun(row) {
+  if (!row) return undefined;
+  return {
+    id: row.id,
+    query: row.query,
+    mode: row.mode,
+    topK: row.top_k,
+    threshold: row.threshold,
+    candidates: parseJsonArray(row.candidates),
+    created_at: row.created_at
+  };
+}
+
+// issue #24 块2：建边来源 → 初值权重映射。tag 延续 LLM 偏差取低起步，
+// llm 抽取自动建边取中低，manual 全权（1.0 是满权，不含演化余量的上限）。
+export const RELATION_SOURCE_DEFAULTS = Object.freeze({
+  manual: 1.0,
+  confirmed: 1.0, // manual_confirmed：已人工确认，维持满权
+  tag: 0.3,
+  llm: 0.4
+});
+
+function toRecallEval(row) {
+  if (!row) return undefined;
+  let metrics;
+  if (row.metrics != null) {
+    try { metrics = JSON.parse(row.metrics); } catch { metrics = undefined; }
+  }
+  return {
+    id: row.id,
+    recall_run_id: row.recall_run_id ?? undefined,
+    query: row.query,
+    expected_ids: parseJsonArray(row.expected_ids),
+    actual_ids: parseJsonArray(row.actual_ids),
+    metrics,
+    eval_type: row.eval_type,
+    created_at: row.created_at
+  };
+}
+
+function toEntity(row) {
+  if (!row) return undefined;
+  return {
+    id: row.id,
+    name: row.name,
+    type: row.type ?? undefined,
+    first_seen: row.first_seen,
+    last_seen: row.last_seen,
+    mention_count: row.mention_count
+  };
+}
+
+function toAttr(row) {
+  if (!row) return undefined;
+  return {
+    id: row.id,
+    entity_id: row.entity_id,
+    attr_key: row.attr_key,
+    attr_value: row.attr_value,
+    memory_id: row.memory_id ?? undefined,
+    valid_from: row.valid_from,
+    valid_until: row.valid_until ?? undefined,
+    confidence: row.confidence,
+    source: row.source ?? undefined
+  };
+}
+
+function toRelation(row) {
+  if (!row) return undefined;
+  let metadata;
+  if (row.metadata != null) {
+    try {
+      metadata = JSON.parse(row.metadata);
+    } catch {
+      metadata = row.metadata;
+    }
+  }
+  return {
+    id: row.id,
+    from_entity: row.from_entity,
+    to_entity: row.to_entity,
+    relation_type: row.relation_type,
+    memory_id: row.memory_id ?? undefined,
+    created_at: row.created_at,
+    weight: row.weight ?? 1.0,
+    source: row.source ?? "manual",
+    metadata
+  };
+}
+
+function toLlmAudit(row) {
+  if (!row) return undefined;
+  let metadata;
+  if (row.metadata != null) {
+    try {
+      metadata = JSON.parse(row.metadata);
+    } catch {
+      metadata = row.metadata;
+    }
+  }
+  return {
+    id: row.id,
+    timestamp: row.timestamp,
+    trigger_source: row.trigger_source,
+    operation_type: row.operation_type,
+    model_id: row.model_id,
+    input_tokens: row.input_tokens,
+    output_tokens: row.output_tokens,
+    total_tokens: row.total_tokens,
+    cost_usd: row.cost_usd,
+    duration_ms: row.duration_ms,
+    status: row.status,
+    error_message: row.error_message ?? undefined,
+    related_memory_ids: parseJsonArray(row.related_memory_ids),
+    metadata,
+    // #254 写入准入的会话键；LLM 调用行恒 NULL。
+    session_key: row.session_key ?? undefined
+  };
+}
+
+function toMirrorState(row) {
+  if (!row) {
+    return {
+      dirty: false,
+      last_error: null,
+      last_attempt: null,
+      success_at: null,
+      generation: 0,
+      applied_generation: 0,
+      type_status: {}
+    };
+  }
+  let typeStatus = {};
+  if (row.type_status) {
+    try {
+      typeStatus = JSON.parse(row.type_status) || {};
+    } catch {
+      typeStatus = {};
+    }
+  }
+  return {
+    id: row.id,
+    dirty: row.dirty === 1,
+    last_error: row.last_error,
+    last_attempt: row.last_attempt,
+    success_at: row.success_at,
+    generation: Number(row.generation) || 0,
+    applied_generation: Number(row.applied_generation) || 0,
+    type_status: typeStatus
+  };
+}
+
+function parseJsonArray(raw) {
+  try {
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr : [];
+  } catch {
+    return [];
+  }
+}
+
+export function createStore(path) {
+  const db = new DatabaseSync(path);
+  // Set busy_timeout BEFORE the journal-mode switch (audit peer: 8-process WAL
+  // init). Switching a fresh DB to WAL takes an exclusive lock; when several
+  // processes open the same path simultaneously, that lock can fail with
+  // SQLITE_BUSY before the timeout is armed. With the timeout installed first,
+  // the WAL transition (and every later write) blocks and retries instead of
+  // failing outright, so concurrent init converges to a stable 447/447.
+  db.exec("PRAGMA busy_timeout = 5000;");
+  db.exec("PRAGMA journal_mode = WAL;");
+  db.exec(SCHEMA);
+
+  // Schema migrations for legacy databases (idempotent). Each ADD COLUMN is
+  // also race-safe: two concurrently-opening processes can both pass the
+  // PRAGMA table_info check before either ALTERs, so the ALTER itself is
+  // guarded against the "duplicate column name" error SQLite raises when the
+  // other process won the race (SQLite has no ADD COLUMN IF NOT EXISTS).
+  const addColumn = (table, column, ddl) => {
+    const cols = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
+    if (!cols.includes(column)) {
+      try {
+        db.exec(ddl);
+      } catch (e) {
+        if (!/duplicate column name/i.test(String(e?.message ?? e))) throw e;
+      }
+    }
+  };
+
+  addColumn("memories", "archived", "ALTER TABLE memories ADD COLUMN archived INTEGER NOT NULL DEFAULT 0");
+  // Issue #275 第二批：归档时刻精确列。可空不带 DEFAULT——存量库的已归档行
+  // 零重写，读侧 NULL = 「本列落地前归档，时刻不可追溯」。刻意不回填：用
+  // updated_at 回填等于把被推翻的代理口径重新固化进列里，偏差（偏高）会从
+  // 「已知的口径差」变成「看不见的脏数据」。
+  addColumn("memories", "archived_at", "ALTER TABLE memories ADD COLUMN archived_at TEXT");
+  addColumn("memories", "embedding", "ALTER TABLE memories ADD COLUMN embedding TEXT");
+  addColumn("memories", "last_accessed_at", "ALTER TABLE memories ADD COLUMN last_accessed_at TEXT");
+  addColumn("memories", "_full_content", "ALTER TABLE memories ADD COLUMN _full_content TEXT");
+  // 叙述条证据链（#164 对齐）：[{memory_id, op, at}] JSON 数组——叙述/模式类
+  // 记忆回链其支撑原子记忆，写入前与候选集求交防模型捏造。
+  addColumn("memories", "evidence", "ALTER TABLE memories ADD COLUMN evidence TEXT");
+  // #230：document 指针行的文件定位。只有 registerDocument 写它，普通行恒 NULL。
+  addColumn("memories", "doc_path", "ALTER TABLE memories ADD COLUMN doc_path TEXT");
+  addColumn("memories", "epistemic_status", "ALTER TABLE memories ADD COLUMN epistemic_status TEXT NOT NULL DEFAULT 'subjective'");
+  addColumn("memories", "content_history", "ALTER TABLE memories ADD COLUMN content_history TEXT");
+  addColumn("memories", "quality_score", "ALTER TABLE memories ADD COLUMN quality_score REAL");
+
+  // chorography（M2，实现计划 P17）：T1 生成轮的页级失败计数。T0 建的表没有它
+  // （M0 只写 skeleton），存量库经 PRAGMA 检查后补列，幂等。
+  addColumn("choro_pages", "fail_count", "ALTER TABLE choro_pages ADD COLUMN fail_count INTEGER NOT NULL DEFAULT 0");
+  // chorography ①（语义段 provenance）：页级验证基线 + 验证时刻。可空不带 DEFAULT——
+  // 存量行的 NULL 就是事实（那批页富化时还没记这个），不要伪造一个提交号。
+  addColumn("choro_pages", "verified_baseline", "ALTER TABLE choro_pages ADD COLUMN verified_baseline TEXT");
+  addColumn("choro_pages", "verified_at", "ALTER TABLE choro_pages ADD COLUMN verified_at TEXT");
+  // 工作区脏文件清单（#648）：同样是「不知道就留 NULL」，不给老行编一个空数组——
+  // 空数组的意思是「当时工作区是干净的」，与 NULL 的「没记过」必须分开。
+  addColumn("choro_pages", "verified_dirty_files", "ALTER TABLE choro_pages ADD COLUMN verified_dirty_files TEXT");
+  // chorography 收尾档（P36）：v0.11.0 的 choro_vectors 是空壳表（spec §5 漏了
+  // 向量本体列），存量库经 PRAGMA 检查补列。
+  addColumn("choro_vectors", "vector", "ALTER TABLE choro_vectors ADD COLUMN vector TEXT");
+  addColumn("choro_vectors", "source_generated_at", "ALTER TABLE choro_vectors ADD COLUMN source_generated_at TEXT");
+  // chorography 跨端身份（#581）：存量行的 portable_key 留 NULL——键只在它
+  // 自己的机器上重跑 T0/T1 时补上，不猜（remote URL 拿不到就是拿不到）。
+  // choro_repo_paths 建表走 SCHEMA 的 CREATE TABLE IF NOT EXISTS，老库重开自动补。
+  addColumn("choro_repos", "portable_key", "ALTER TABLE choro_repos ADD COLUMN portable_key TEXT");
+  // 身份唯一（PR #679 评审）：同一 portable_key 只许一行，否则并发登记会各自插入、
+  // 之后任意取其中一行。部分索引（键非空才约束）保证升格前的 NULL 行不受影响。
+  // 建索引可能因存量重复键失败（本功能尚未发布，概率趋零，但不能因此让插件起不来）
+  // ——失败时退成非唯一索引，upsert 的「插入撞唯一键→回读再更新」分支只在索引建成
+  // 时生效，退化的库上并发仍可能重复，这是启动可用性与约束强度之间的取舍。
+  try {
+    db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_choro_repos_portable ON choro_repos(portable_key) WHERE portable_key IS NOT NULL;");
+  } catch (err) {
+    // 静默降级会让「约束没建成」这件事永远没人知道（PR #679 评审）：留一行 warn，
+    // 说明退到哪一档、后果是什么，然后照常启动。
+    db.exec("CREATE INDEX IF NOT EXISTS idx_choro_repos_portable ON choro_repos(portable_key);");
+    console.warn(
+      "[mneme] choro_repos.portable_key 唯一索引未能建立（存量重复键？），已退化为普通索引：" +
+      "跨端并发登记可能产生重复行，建议先合并重复的 portable_key。" +
+      ` 原因：${String(err?.message ?? err)}`
+    );
+  }
+
+  // v0.8.0 A1（issue #17）scope 隔离存储层：四列全部可空、不带 DEFAULT——存量行
+  // 零重写，读侧把 NULL 视为未标注（= 全局可见）。是否落值由 scopeEnabled 门控
+  // （service/tools 层），存储层只负责归一化（normalizeScopeText/normalizeOccurredAt）。
+  addColumn("memories", "agent_scope", "ALTER TABLE memories ADD COLUMN agent_scope TEXT");
+  addColumn("memories", "workspace_scope", "ALTER TABLE memories ADD COLUMN workspace_scope TEXT");
+  addColumn("memories", "sensitivity", "ALTER TABLE memories ADD COLUMN sensitivity TEXT");
+  addColumn("memories", "occurred_at", "ALTER TABLE memories ADD COLUMN occurred_at TEXT");
+
+  // v0.8.1 底座（issue #170）：scope 标注的来源与决策时间。三列全部可空不带
+  // DEFAULT（与 A1 同款零重写迁移）。来源拆成 agent/workspace 各一列而非单列
+  // scope_source：混合来源（agent 维显式 + workspace 维自动）必须可表达——否则
+  // 「提升回全局」之后遗留的自动 workspace 标签会在效力收窄时被一并当成显式，
+  // 恰好复活 issue #170 抱怨的「自动标签吃硬过滤」问题。存量标注行三列皆 NULL，
+  // 读侧按 auto（软效力）口径解释。
+  addColumn("memories", "agent_scope_source", "ALTER TABLE memories ADD COLUMN agent_scope_source TEXT");
+  addColumn("memories", "workspace_scope_source", "ALTER TABLE memories ADD COLUMN workspace_scope_source TEXT");
+  addColumn("memories", "scope_decided_at", "ALTER TABLE memories ADD COLUMN scope_decided_at TEXT");
+
+  // #254 计量信号：内容归一化哈希（口径与动机写在 content-hash.js 的文件头）。派生
+  // 列，不参与任何判定——只给「同一内容又被写了一次」当等值锚。索引建在加列之后：
+  // 老库打开时 SCHEMA 的 CREATE TABLE 对既有表不生效，列还不存在，把索引写进 SCHEMA
+  // 会直接报 no such column（与下方 llm_audit_logs.session_key 同理）。
+  addColumn("memories", "content_hash", "ALTER TABLE memories ADD COLUMN content_hash TEXT");
+  // 每条向量的出身（行级 model hash，如 `qwen3.7-text-embedding-flash#17a6a0b1`）。
+  // 为什么必须行级：vector_meta 只有一个 model_hash，它记的是「最后一次成功写入
+  // 的模型」，换模型时被整表覆盖——于是上一代模型产出的向量在元数据上看起来完全
+  // 合规，实际与新模型的查询向量不可比。没有这一列，「这条向量是不是当前模型产
+  // 的」就无从判断（content_hash 是内容归一化哈希，与向量模型无关；dimension 在
+  // 同为 1024 维的模型间也区分不出来）。
+  // 存量行的值是 NULL，且**不推断**：按 updated_at 猜出的模型名会变成日后审计信
+  // 以为真的证据。NULL 一律读作「出身未知」，等价的补法是重算，不是猜。
+  addColumn("memories", "embedding_model", "ALTER TABLE memories ADD COLUMN embedding_model TEXT");
+  // 车道 C：外来行的身份两件套。share_pack_id 是「整包退出」的寻址键，share_external_id
+  // 是导入的幂等键。它们只对自己铸造的行有意义，所以缺省是 NULL 而不是 ''：空串会参与
+  // 唯一性（第二条本地行就撞响），而存量行零重写、读侧 undefined = 「不是外来行」。
+  addColumn("memories", "share_pack_id", "ALTER TABLE memories ADD COLUMN share_pack_id TEXT");
+  addColumn("memories", "share_external_id", "ALTER TABLE memories ADD COLUMN share_external_id TEXT");
+  // Issue #641（beta 第三阶段，取代链）：T3（时序演进）的处置不归档——旧行写
+  // superseded_by 指向取代它的新行，检索侧降权、注入不再选中，但行本身保持
+  // 活跃、随时可人工恢复。存量行两列皆 NULL：历史裁决走的是「归档」路径，
+  // 反推不出该指给谁（receipt_chain 有 winner/loser，但那是另一套语义），宁可
+  // 不填也不猜。superseded_at 是裁决时刻（服务器单调时钟），与内容时间无关。
+  addColumn("memories", "superseded_by", "ALTER TABLE memories ADD COLUMN superseded_by TEXT");
+  addColumn("memories", "superseded_at", "ALTER TABLE memories ADD COLUMN superseded_at TEXT");
+  // 部分索引：降权查询只关心「已被取代」的行；未取代行（绝大多数）不进索引。
+  db.exec("CREATE INDEX IF NOT EXISTS idx_memories_superseded ON memories(superseded_by) WHERE superseded_by IS NOT NULL;");
+  // 索引建在加列之后而非写进 SCHEMA（本文件 content_hash 那段：存量库打开时 CREATE TABLE
+  // 是 no-op，列还不存在就建索引会直接 no such column）。
+  // 部分索引（WHERE ... IS NOT NULL）是刻意的，但它承重的地方要说准：SQLite 的 UNIQUE
+  // 本就把 NULL 视为互不相等，本地行（这一格恒 NULL）挂在普通 UNIQUE 上也不撞——变异检验
+  // 证实摘掉 WHERE 五个用例照绿。它承的是另外两件事：①约束的适用范围写进索引本身，
+  // 「只有导入路径铸造的 id 参与唯一性」这条语义没有别的表达渠道，读代码的人不必再去猜
+  // NULL 在这里算什么；②本地行不进这棵 b 树——普通 UNIQUE 要给每一条本地记忆插一个永不
+  // 生效的空键，而库里绝大多数是本地行，每次写都白付一次索引维护。
+  // 「NULL 必须自由共享」那条用例锁的是行为而非实现：它防的是将来有人把空串当缺省值写
+  // 进来（'' 参与唯一性，第二条 '' 直接撞响），不是防 WHERE 子句消失。
+  db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_share_external ON memories(share_external_id) WHERE share_external_id IS NOT NULL");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_memories_share_pack ON memories(share_pack_id)");
+  // Issue #505：saveWithDedupe 的定向候选是 `type = ? AND TRIM(title) = ?`。只有
+  // idx_memories_type 时这条语句等于「把该类型的行全读一遍、逐行 TRIM」，代价随最大
+  // 类型的行数线性长（本机 node:sqlite 实测同类型 1000 / 5000 / 20000 行 = 0.13 /
+  // 0.68 / 4.63 ms，而它是每存一条都要付一次的写路径）。TRIM 本身不是瓶颈——同句去掉
+  // TRIM 只差 0.07 ms，缺的是能把整个条件当 seek 用的索引；建好之后同一查询在同一批
+  // 数据上 ~0.00 ms。索引表达式必须与 SQL 里的写法逐字相同（TRIM(title)，不是 title），
+  // 差一点优化器就静默不认，而所有行为用例照样全绿——所以 dedupe-candidate-window
+  // 那条用例用 EXPLAIN QUERY PLAN 钉住它真的被选中。改 service 的 WHERE 必须同时改这里。
+  db.exec("CREATE INDEX IF NOT EXISTS idx_memories_type_trimmed_title ON memories(type, TRIM(title))");
+  // issue #24 块2（权重演化）：entity_relations 加 weight + source。存量关系
+  // 行缺列 → 默认 manual 1.0（最保守：既有语义不因迁移而变弱）。
+  addColumn("entity_relations", "weight", "ALTER TABLE entity_relations ADD COLUMN weight REAL NOT NULL DEFAULT 1.0");
+  addColumn("entity_relations", "source", "ALTER TABLE entity_relations ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'");
+
+  // #688：entities.canonical_memory_id 是 v0.7.1 预留的「规范行指针」，此后长成了
+  // 一根孤儿——全仓只有 plumbing（DDL、行映射、INSERT、patch、UPDATE），没有一处 SELECT
+  // 或业务写入，真实库里 25,474 行全是 NULL。留着它不是中性的：下一位读者会把它当成
+  // 一条可用的判据（#688 的实体归并讨论里就差点被当成「同一条记忆的实体该并」）。
+  // 删列没有数据要保（本来就全空），也不需要 applied_migrations 登记——判定条件是
+  // 「列还在不在」，跑完恒不命中，和 addColumn 同一族。
+  //
+  // 前提：SQLite >= 3.35 才有 DROP COLUMN（本项目 node:sqlite 在支持的运行时上是
+  // 3.46+，本机 3.51.3）。竞态与 addColumn 同理：两个进程可能同时通过检查，后到的
+  // 那个收到的是 "no such column"，那是预期结局而不是错误。
+  const dropColumn = (table, column) => {
+    const cols = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
+    if (!cols.includes(column)) return false;
+    try {
+      db.exec(`ALTER TABLE ${table} DROP COLUMN ${column}`);
+      return true;
+    } catch (e) {
+      if (/no such column/i.test(String(e?.message ?? e))) return false;
+      throw e;
+    }
+  };
+  dropColumn("entities", "canonical_memory_id");
+  // 列序是 content_hash 打头：哈希几乎唯一，等值 seek 就已收窄到候选行，type 只当同
+  // 一次 seek 里的第二列过滤；反过来（type 打头）下面的存量回填就得全表扫——每次打开
+  // 都要把全部正文读一遍。
+  db.exec("CREATE INDEX IF NOT EXISTS idx_memories_content_hash ON memories(content_hash, type)");
+  // 存量回填：老库（含归档区）的行都没有值，而「归档行纳入去重候选集」这条口径正是
+  // 要靠既有归档行出数据。只算 NULL 行、幂等；改口径不是补 NULL 能修好的，要整列重算
+  // （见 content-hash.js 的文件头）。空标题空正文的行算不出锚，跳过不写——否则每次
+  // 打开都要为这些行再跑一遍 UPDATE。
+  {
+    const updates = db
+      .prepare("SELECT id, title, content FROM memories WHERE content_hash IS NULL")
+      .all()
+      .map((row) => [contentHashOf(row), row.id])
+      .filter(([hash]) => hash);
+    if (updates.length) {
+      const stmt = db.prepare("UPDATE memories SET content_hash = ? WHERE id = ? AND content_hash IS NULL");
+      // 一个事务包住整批：逐条自动提交是每行一次 WAL 提交，几千行的存量库上纯属浪费。
+      runAtomically(() => {
+        for (const [hash, id] of updates) stmt.run(hash, id);
+      });
+    }
+  }
+
+  // 一次性数据迁移 #1：撤回旧重复度度量的误判（#560 的收尾）。
+  //
+  // v0.7.12 起 repetitive 用的是「唯一字符数 ÷ 总长度 < 0.3」，这个比率随长度单调下降，
+  // 于是长中文记忆被系统性判成重复：本机 12,827 条里 800–2000 字的 94.3%、2000 字以上的
+  // 100% 命中。0.11.0 把度量换成 trigram 重复率（> 0.7），那只管住了**新写入**——
+  // evaluateMemoryQuality 全仓只有 service 的写路径一处调用，更新路径不重算 quality_score，
+  // 所以库里那批标签与扣分原封不动。
+  //
+  // 口径是「手术式撤销」，不是「整列重算」：整列重算会顺手重新裁一遍别人的分——实测会
+  // 新命中 90 条 meta 与 98 条 self_referential（判据没变、但评分当时没跑到这些行），
+  // 那是双向改写，越过了「只撤除被修掉的那个误判」的范围。这里只动带 repetitive 的行，
+  // 且必须**用新度量复算仍然不重复**才动；新度量下依旧 > 0.7 的是真重复，标签有效，保持原样。
+  //
+  // 分数据「只升不降」：重建值来自存活标签的扣分表，取 max(存量, 重建) 而不是直接取重建——
+  // 存量分不是纯标签函数（实测有 3 行与任何标签组合都对不上，历史上有信号被改路径抹掉过），
+  // 直接用重建值会把这批行往下压。这次迁移的理由是「它被误扣了 50」，只有加回去才对得上。
+  //
+  // 不碰 archived / archived_at / updated_at / content_hash / embedding，也不 bump
+  // generation：归档位是另一个决定（撤销归档 = 把 300 条重新放进注入池），不夹带在
+  // 「修分数」里；不刷 updated_at 则代表镜像不重排——代价是镜像文件里这些行的 tags 行
+  // 会显示已删掉的 repetitive，而 parseHumanEdits 不解析 tags，陈旧只停留在显示层、不回灌。
+  // 这层陈旧还会自己收敛：镜像每次 syncMirror 都是全量重渲染（store.list limit:null），
+  // 所以启动后第一次业务写就把这批行刷对了——为这几分钟专门接一条「打开库即全量重绘」
+  // 的路径，代价（新导出 syncMirror + createStore 回传标记 + 两个启动点各改一行）大于收益。
+  //
+  // 用 applied_migrations 登记而不是条件式恒等幂等：这批条件在跑完之后**恒不命中**，
+  // 但要全表扫一遍才能证明不命中（本机实测 36.7 ms，而 createStore 稳态只有 3.3 ms）——
+  // 每次打开都白付十倍开销。登记表把它变成一次主键 seek（PRAGMA user_version 做不到：
+  // 实测它在 BEGIN 里设值不随 ROLLBACK 回退，先置标记再回填会永久漏跑）。
+  //
+  // 回填分批提交、登记行最后单独提交，不做「一个大事务包住全部」：逐批提交才不会把
+  // 「候选行数 × 全文长度」攒在内存与一次 WAL 里；而这样拆之所以仍然安全，是因为
+  // **修过的行就不再是候选**（repetitive 已撤），中途崩掉重跑只会从断点接着走，不会
+  // 重复加回分数。登记行只认「全部批次都跑完、且没有一条被 CAS 挡下」，半截进度不落地。
+  {
+    const MIGRATION_ID = "2026-11-quality-repetitive-backfill";
+    const applied = db.prepare("SELECT 1 FROM applied_migrations WHERE id = ?").get(MIGRATION_ID);
+    if (!applied) {
+      // LIKE 只负责候选裁剪，真正的判据是下一段的 tags.includes("repetitive")——把
+      // LIKE 放松成 %repetitive% 也筛不出错误结果（变异自证里它是等价变异）。用带引号
+      // 的形态是为了缩小候选集、少解析几条将来可能出现的坏 JSON，不是为了防误伤。
+      // 按 rowid 键集翻页，每批独立提交：候选行带全文，一次 .all() 会把「行数 × 正文
+      // 长度」全攒在内存里（本机 1,476 条合计 726 KB，大库不是这个量级）。分批之所以
+      // 仍然安全，是因为候选集自己会收缩——修过的行撤掉 repetitive 就不再命中；
+      // 中途崩掉重跑只会从断点接着走，不会把已经加回去的分再加一遍。
+      const BATCH = 200;
+      const selectBatch = db.prepare(
+        `SELECT rowid AS rid, id, content, _full_content, tags, quality_score
+           FROM memories
+          WHERE tags LIKE '%"repetitive"%' AND rowid > ?
+          ORDER BY rowid
+          LIMIT ?`
+      );
+      // CAS：带上读到的旧 tags、旧 quality_score 与两列正文作为条件。多宿主共用一个库是
+      // 支持形态（busy_timeout + WAL），SELECT 到 UPDATE 之间别的进程可能刚改过这一行——
+      // 那就以它为准、跳过这一条，不拿这次读到的旧判断覆盖它。正文两列也要带：判据读的是
+      // 正文，只校验 tags/quality_score 时，正文被换成重复文本而另两列未变仍会 CAS 通过，
+      // 于是把本该保留的 repetitive 撤掉。
+      const stmt = db.prepare(
+        `UPDATE memories SET tags = ?, quality_score = ?
+          WHERE id = ? AND tags = ? AND quality_score IS ?
+            AND content IS ? AND _full_content IS ?
+            AND tags LIKE '%"repetitive"%'`
+      );
+      // CAS 落空的行这一趟没修到，它们仍是候选——那就别登记「已完成」，下次打开整条重跑
+      // （修过的行已不是候选，重跑天然幂等）。否则一条被别处同时改写而保留 repetitive 的行
+      // 会带着旧分与旧标签一直留在库里。
+      let casMisses = 0;
+      let cursor = 0;
+      for (;;) {
+        const rows = selectBatch.all(cursor, BATCH);
+        if (rows.length === 0) break;
+        cursor = rows[rows.length - 1].rid;
+        const updates = [];
+        for (const row of rows) {
+          let tags;
+          try {
+            tags = JSON.parse(row.tags);
+          } catch {
+            continue; // 坏 tags 不动：这条迁移不该顺手重写一个解析不了的值
+          }
+          if (!Array.isArray(tags) || !tags.includes("repetitive")) continue;
+          // 含非字符串元素的行整条放过：下面 Object.hasOwn 对对象元素会先做属性键转换，
+          // 抛 TypeError（JSON.parse('{"toString":1}') 这类值可达），而这里没有任何 catch，
+          // 异常会直接让 createStore 中止、迁移永远登不上记，下次打开原地再撞同一行。
+          if (!tags.every((t) => typeof t === "string")) continue;
+          // 判据落在**原文**上：已降级的行 content 只剩前 120 字摘要（demoteToSummary
+          // 把正文挪进 _full_content，且它不重算 quality_score），拿摘要判重复会把
+          // 「前缀不重复、后段大量重复」的原文放过去——而那恰好是旧度量最容易误判的
+          // 那一类。未降级的行 _full_content 为 NULL，退回 content，与原判据一致。
+          const body = String(row._full_content ?? row.content ?? "");
+          // 新度量下仍然重复 → 标签是对的，保持原样（不重算分数：那会变成整列重算）
+          if (repetitionRatio(body.trim()) > REPETITION_THRESHOLD) continue;
+          const kept = tags.filter((t) => t !== "repetitive");
+          let rebuilt = 100;
+          // 只减自有键：SIGNAL_DEDUCTIONS 是普通对象字面量，查「constructor」命中的
+          // 是原型链上的函数，`?? 0` 挡不住，会把分数算成 NaN 再写进列里。
+          for (const tag of kept) {
+            if (Object.hasOwn(SIGNAL_DEDUCTIONS, tag)) rebuilt -= SIGNAL_DEDUCTIONS[tag];
+          }
+          rebuilt = Math.max(0, Math.min(100, Math.round(rebuilt)));
+          const stored = Number.isFinite(row.quality_score) ? row.quality_score : null;
+          const score = stored === null ? rebuilt : Math.max(stored, rebuilt);
+          // low_quality 是分数的派生态（< 30 必须有、≥ 30 必须没有），分数动了它就跟着动。
+          // 显式同步而不是留给下次写入：不重算的路径不会自己把它修好。
+          const next = kept.filter((t) => t !== "low_quality");
+          if (score < 30) next.push("low_quality");
+          updates.push([
+            JSON.stringify(next),
+            score,
+            row.id,
+            row.tags,
+            row.quality_score,
+            row.content,
+            row._full_content
+          ]);
+        }
+        if (updates.length === 0) continue;
+        const batch = updates;
+        // 一批一个事务：逐条自动提交是每行一次 WAL 提交（与 content_hash 回填同一个教训）。
+        runAtomically(() => {
+          for (const u of batch) {
+            if (stmt.run(u[0], u[1], u[2], u[3], u[4], u[5], u[6]).changes === 0) casMisses += 1;
+          }
+        });
+      }
+      // 登记行单独提交，且只在**所有批次都跑完、且没有一条 CAS 落空**之后：它是「这条迁移
+      // 已完成」的证据，半截进度不能落地，否则重跑会被自己挡住、剩下的行再也修不回来。
+      const mark = db.prepare("INSERT OR IGNORE INTO applied_migrations (id, applied_at) VALUES (?, ?)");
+      // 时间戳这里直接用 new Date()：nowIso 的单调守卫是给 memories.updated_at 用的，
+      // 而且它依赖的 lastTs 此刻还没初始化（TDZ），调它会在打开库时直接抛。
+      if (casMisses === 0) runAtomically(() => mark.run(MIGRATION_ID, new Date().toISOString()));
+    }
+  }
+
+  // Legacy dream_runs without policy_epoch → backfill with the default epoch.
+  addColumn("dream_runs", "policy_epoch", "ALTER TABLE dream_runs ADD COLUMN policy_epoch INTEGER NOT NULL DEFAULT 0");
+  addColumn("dream_runs", "run_type", "ALTER TABLE dream_runs ADD COLUMN run_type TEXT NOT NULL DEFAULT 'auto'");
+  // Issue #104：degraded（合法子集已应用）轮被跳过的决策明细。此前只进 logger.warn，
+  // 离线回放 dream_runs 无法定位 degraded 成因（跨类型 merge / update 保护期 / unknown id）。
+  addColumn("dream_runs", "skipped", "ALTER TABLE dream_runs ADD COLUMN skipped TEXT");
+  // Issue #89（基线半边）：阈值基线跨重启持久化。存量行两列皆 NULL——历史行反推不出
+  // 「那轮结束时库有多大」（input_count 是窗口条数，不是库规模），所以升级后第一次
+  // 成功轮之前播种端拿不到基线，行为与升级前一致；跑过一轮之后闸门即跨重启生效。
+  addColumn("dream_runs", "store_count", "ALTER TABLE dream_runs ADD COLUMN store_count INTEGER");
+  addColumn("dream_runs", "store_chars", "ALTER TABLE dream_runs ADD COLUMN store_chars INTEGER");
+  // #534：失败轮的模型原始输出。存量行两列皆 NULL——历史失败轮反推不出原文
+  // （那正是这条要补的口子），升级后新失败轮才有值。
+  addColumn("dream_runs", "raw_output", "ALTER TABLE dream_runs ADD COLUMN raw_output TEXT");
+
+  // Legacy mirror_state without v0.3.6 generation columns → add each missing
+  // column idempotently (old DBs open cleanly, no data loss).
+  addColumn("mirror_state", "generation", "ALTER TABLE mirror_state ADD COLUMN generation INTEGER NOT NULL DEFAULT 0");
+  addColumn("mirror_state", "applied_generation", "ALTER TABLE mirror_state ADD COLUMN applied_generation INTEGER NOT NULL DEFAULT 0");
+  addColumn("mirror_state", "type_status", "ALTER TABLE mirror_state ADD COLUMN type_status TEXT");
+
+  // #254 写入准入（第一阶段只计量）：准入决策行按会话聚合——「会话内新建了几行」
+  // 与「同话题重复间隔」都靠它算出来，所以会话键必须是可等值查询的列，而不是塞在
+  // metadata 里做 JSON 匹配。列可空且不带 DEFAULT（存量行零重写）。索引建在加列
+  // 之后：老库打开时列还不存在（SCHEMA 的 CREATE TABLE 只对新建库生效）。
+  addColumn("llm_audit_logs", "session_key", "ALTER TABLE llm_audit_logs ADD COLUMN session_key TEXT");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_llm_audit_session ON llm_audit_logs(session_key);");
+
+  // #512：把每条溯源链接指回产出它的那一轮蒸馏（distill_runs.id）。
+  // 存量链接一律留 NULL——那是**本次改造之前的历史**，按 (session, 区间, created_at)
+  // 反推一个合成 id 会得到「读数正常、实际是猜的」归因，比不填更坏（与 #534
+  // raw_output「历史失败轮反推不出原文」同一口径：补不出的就承认补不出）。
+  // 索引建在加列之后：老库打开时列还不存在（SCHEMA 的 CREATE TABLE 只对新建库生效）。
+  addColumn("memory_provenance", "distill_run_id", "ALTER TABLE memory_provenance ADD COLUMN distill_run_id TEXT");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_memory_provenance_run ON memory_provenance(distill_run_id);");
+
+  // Issue #603 第 2 层：冲突待审队列此前只能按 created_at 倒序排。一次 sleep 轮次
+  // 里产出的对全部落在同一毫秒（实测 60 条挤在 60ms 内），排序键全同，队列在面板
+  // 上看起来是随机的——而「哪一对最该先看」的唯一客观信号是相似度，此前只存在
+  // reason 文本里（「相似度 0.87」），前端靠正则回收。落成列之后排序键是数据，
+  // 不是解析结果。
+  //
+  // 可空且不带 DEFAULT：存量行没有这个信息，NULL = 「入队时没记」（比填 0 诚实——
+  // 0 会被排到最后，等于替用户断言「这两条毫不相似」）。排序用 NULLS LAST。
+  addColumn("conflict_pending", "similarity", "ALTER TABLE conflict_pending ADD COLUMN similarity REAL");
+  // 索引建在加列之后（同 idx_memory_provenance_run 的理由）：老库打开时列才刚加上。
+  db.exec("CREATE INDEX IF NOT EXISTS idx_conflict_pending_similarity ON conflict_pending(similarity DESC, created_at DESC);");
+
+  // Audit peer F: a legacy DB may hold a non-integer generation/applied_generation
+  // (pre-v0.3.9 the JS gate truncated with Math.trunc and SQLite's CHECK only
+  // enforced >= 0). Such a value is ambiguous — it cannot map to a real applied
+  // round — so surface it as a hard error on open instead of silently reading it
+  // as a coherent generation. Fail-closed: the operator must repair or reset the
+  // state row rather than continue with a lie.
+  for (const col of ["generation", "applied_generation"]) {
+    const bad = db.prepare(
+      `SELECT id FROM mirror_state WHERE ${col} IS NOT NULL AND ${col} != CAST(${col} AS INTEGER) LIMIT 1`
+    ).get();
+    if (bad) {
+      throw new RangeError(
+        `mirror_state.${col} holds a non-integer value (legacy dirty state); ` +
+        `repair or reset the row before opening this database`
+      );
+    }
+  }
+
+  // Issue #202：embedding 解析缓存。检索路径此前每次调用都对全部带向量行
+  // JSON.parse（993 × 512 维 ≈ 48 ms/次，且 SQL 拖着 10 MB 的 TEXT），余弦本身
+  // 只占 3%。向量只经 setEmbedding 写入（单一失效点），把解析结果按 id 缓存，
+  // 命中即零解析。
+  //
+  // 上限为什么不能是固定常量（2026-11-05 实测）：上限 4000、活跃带向量行 6685，
+  // 扫到第 4001 条开始驱逐自己刚填的条目，扫完只剩最后 4000 条，下一轮又从第
+  // 一条 miss——四轮实测命中率恒 0.0%，缓存等于不存在，每次检索都全量重解析
+  // （实测 624 ms）。固定调大只是把复发推到下个月（活跃行近 30 天净增 6156 条，
+  // 上限 20000 也只撑到 2027-01-09），所以上限跟工作集自适应：
+  //   · 每次全量扫（searchVector / vectorDimensionState）在循环前把上限抬到
+  //     「本次扫到的行数 ×1.25」，一次扫完不会被自己的驱逐打断；
+  //   · 内存预算封顶（默认 256 MB），超预算的行仍按 FIFO 驱逐——大库退化回
+  //     「部分命中」，不会无界吃内存。
+  // 存储用 Float32Array。同一口径（GC 后 heapUsed + arrayBuffers，6730 条
+  // 1024 维全常驻）实测：number[] 56.4MB → Float32Array 29.7MB（heap 1.9 +
+  // arrayBuffers 27.8），省 26.7MB / 47%。注意 heapUsed 不统计 TypedArray 的
+  // 底层 ArrayBuffer，只看 heapUsed 会读成「省 96%」的假象；旧实现若保持上限
+  // 4000 则装不下工作集（常驻 31.9MB 但命中率 0%），两者不可比，所以对照组是
+  // 把旧上限抬到 20000 让工作集全常驻。cosine 全量 25.4ms → 18.0ms，前 50 条
+  // 排序精度差 0.00e+0。对外契约不变：
+  // getParsedEmbedding / getEmbeddings 仍返回 number[]，只有内部热路径
+  // （readVector）拿 Float32Array。
+  const embeddingCache = new Map();
+  const EMBEDDING_CACHE_FLOOR = 4000;
+  const EMBEDDING_CACHE_BUDGET_BYTES = 256 * 1024 * 1024;
+  let embeddingCacheCap = EMBEDDING_CACHE_FLOOR;
+  let embeddingCacheHits = 0;
+  let embeddingCacheMisses = 0;
+
+  /** Vector-like = number[] or Float32Array (typed). All cosine guards use this
+   *  instead of Array.isArray, which is false for typed arrays — with the old
+   *  guard every cached vector would silently score 0. */
+  function isVectorLike(v) {
+    return Array.isArray(v) || (ArrayBuffer.isView(v) && !(v instanceof DataView));
+  }
+
+  function cacheEmbedding(id, vector) {
+    if (embeddingCache.size >= embeddingCacheCap && !embeddingCache.has(id)) {
+      const oldest = embeddingCache.keys().next().value;
+      embeddingCache.delete(oldest);
+    }
+    embeddingCache.set(id, vector);
+  }
+
+  /** Raise the cap to fit a sweep of `rows` rows (×1.25 headroom), clamped by
+   *  the memory budget. Called before a full scan so the scan itself does not
+   *  evict what it just cached. */
+  function noteSweep(rows, avgDim) {
+    if (!rows || !avgDim) return;
+    const perVector = avgDim * Float32Array.BYTES_PER_ELEMENT;
+    const budgetRows = Math.floor(EMBEDDING_CACHE_BUDGET_BYTES / perVector);
+    const want = Math.ceil(rows * 1.25);
+    embeddingCacheCap = Math.max(EMBEDDING_CACHE_FLOOR, Math.min(budgetRows, want));
+  }
+
+  /** Cache-first read returning Float32Array (internal hot path only).
+   *  undefined when none/parse failure. */
+  function readVector(id) {
+    const cached = embeddingCache.get(id);
+    if (cached) { embeddingCacheHits += 1; return cached; }
+    embeddingCacheMisses += 1;
+    const row = db.prepare("SELECT embedding FROM memories WHERE id = ?").get(id);
+    if (!row?.embedding) return undefined;
+    try {
+      const parsed = JSON.parse(row.embedding);
+      if (Array.isArray(parsed) && parsed.length) {
+        const v = new Float32Array(parsed);
+        cacheEmbedding(id, v);
+        return v;
+      }
+    } catch { /* corrupt embedding text: treated as absent */ }
+    return undefined;
+  }
+
+  /** Parsed embedding for one id (cache-first); undefined when none/parse
+   *  failure. Single read path shared by searchVector / getEmbedding(s).
+   *  Public contract: returns number[] (callers guard with Array.isArray). */
+  function getParsedEmbedding(id) {
+    const v = readVector(id);
+    return v ? Array.from(v) : undefined;
+  }
+
+  /** Cache instrumentation for the regression lock (hit rate must not collapse
+   *  back to 0 when the working set outgrows a fixed cap). */
+  function embeddingCacheStats() {
+    const total = embeddingCacheHits + embeddingCacheMisses;
+    return {
+      size: embeddingCache.size,
+      cap: embeddingCacheCap,
+      hits: embeddingCacheHits,
+      misses: embeddingCacheMisses,
+      hitRate: total ? embeddingCacheHits / total : 0
+    };
+  }
+
+  // all()/list() 的显式列清单：从实际 schema 派生（迁移后），只排除 embedding
+  // 列——consolidation/sleep/inject 的消费方都不读向量，而它是全表里最重的一列
+  // （5k 行库 ≈ 9.4 MB TEXT），每次全表调用都白搬。经 PRAGMA 派生而非硬编码，
+  // schema 演进时自动跟随。
+  const memoryColumns = db.prepare("PRAGMA table_info(memories)").all()
+    .map((c) => c.name)
+    .filter((n) => n !== "embedding");
+  const memoryColumnList = memoryColumns.join(", ");
+
+  // Per-instance monotonic timestamp guard: consecutive writes within the same
+  // millisecond must still produce strictly increasing timestamps (test asserts
+  // updated_at != created_at). State lives in the store closure, not module scope.
+  let lastTs = "";  function nowIso() {
+    let ts = new Date().toISOString();
+    if (lastTs && ts <= lastTs) {
+      const d = new Date(lastTs);
+      d.setMilliseconds(d.getMilliseconds() + 1);
+      ts = d.toISOString();
+    }
+    lastTs = ts;
+    return ts;
+  }
+
+  /** 返回指定会话持久化的 autoSummarize 游标；不存在时返回 undefined。 */
+  function getDistillCursor(sessionId) {
+    if (typeof sessionId !== "string" || sessionId.length === 0) return undefined;
+    const row = db.prepare(
+      "SELECT session_id, last_seq, updated_at FROM distill_cursors WHERE session_id = ?"
+    ).get(sessionId);
+    return row
+      ? { session_id: row.session_id, last_seq: Number(row.last_seq), updated_at: row.updated_at }
+      : undefined;
+  }
+
+  /**
+   * 单调持久化会话游标。调用方若同时写入记忆，必须放在外层 SQLite 事务内。
+   */
+  function setDistillCursor(sessionId, lastSeq) {
+    if (typeof sessionId !== "string" || sessionId.length === 0) {
+      throw new TypeError("setDistillCursor: sessionId must be a non-empty string");
+    }
+    if (!Number.isSafeInteger(lastSeq)) {
+      throw new TypeError("setDistillCursor: lastSeq must be a safe integer");
+    }
+    db.prepare(`
+      INSERT INTO distill_cursors (session_id, last_seq, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(session_id) DO UPDATE SET
+        last_seq = MAX(distill_cursors.last_seq, excluded.last_seq),
+        updated_at = excluded.updated_at
+    `).run(sessionId, lastSeq, nowIso());
+    return getDistillCursor(sessionId);
+  }
+
+  /**
+   * 读指定会话的连续解析失败计数。
+   *
+   * `staleAfterMs` 是**读侧**失效窗口（#493 补充 §②）：超过这么久没更新就把计数
+   * 当作 0，而不是拿几周前攒下的值去触发熔断。劣化方向选得很明确——宁可多试一次
+   * （多花一次 LLM 调用），也不要因为「会话停了很久」而误判一个其实健康的窗口。
+   * 传 0 或负数表示不判失效（照原样返回），测试用它构造边界。
+   * @returns {number} 0 表示没有在途失败（含「已失效」与「从未记录」两种）
+   */
+  function getDistillParseFailureStreak(sessionId, { staleAfterMs = 0, nowMs = Date.now() } = {}) {
+    if (typeof sessionId !== "string" || sessionId.length === 0) return 0;
+    const row = db.prepare(
+      "SELECT streak, updated_at FROM distill_parse_failures WHERE session_id = ?"
+    ).get(sessionId);
+    if (!row) return 0;
+    if (staleAfterMs > 0) {
+      const stamp = Date.parse(row.updated_at);
+      // 时间戳读不出来时按「已失效」处理：一个解析不了的 updated_at 不能当作「刚刚
+      // 失败过」，否则坏数据会永久钉住一道护栏（fail-open，与整条护栏的默认关一致）。
+      if (!Number.isFinite(stamp) || nowMs - stamp > staleAfterMs) return 0;
+    }
+    return Number(row.streak) || 0;
+  }
+
+  /**
+   * 记一次解析失败（+1 并刷新时间戳）。返回写后的计数。
+   *
+   * 先按 staleAfterMs 读一遍再**覆写**，而不是在 SQL 里做 streak + 1——失效判断只
+   * 许有一份（就是上面那个读函数）。写成 + 1 的话，一条几周前的旧行会把「新的第一
+   * 次失败」直接加成 2，等于失效窗口在这条路径上完全不生效（本块实现的首版就是
+   * 这么写的，被回归用例抓出来）。
+   */
+  function bumpDistillParseFailureStreak(sessionId, { staleAfterMs = 0, nowMs = Date.now() } = {}) {
+    if (typeof sessionId !== "string" || sessionId.length === 0) {
+      throw new TypeError("bumpDistillParseFailureStreak: sessionId must be a non-empty string");
+    }
+    const next = getDistillParseFailureStreak(sessionId, { staleAfterMs, nowMs }) + 1;
+    db.prepare(`
+      INSERT INTO distill_parse_failures (session_id, streak, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(session_id) DO UPDATE SET
+        streak = excluded.streak,
+        updated_at = excluded.updated_at
+    `).run(sessionId, next, nowIso());
+    return next;
+  }
+
+  /** 清零（不是写 0）：没有在途失败时不该留一行，否则「有没有失败过」变得不可区分。 */
+  function clearDistillParseFailureStreak(sessionId) {
+    if (typeof sessionId !== "string" || sessionId.length === 0) return 0;
+    return db.prepare("DELETE FROM distill_parse_failures WHERE session_id = ?").run(sessionId).changes;
+  }
+
+  // #597：count() 与 countByType() 共用的 WHERE 构造——两张 HTTP 面（宿主内 /list
+  // 与 Bearer /memories）的 total 与 typeCounts 必须同口径，分布的合计才等于总数。
+  // type 刻意不在这里：count() 按调用方带，countByType() 刻意不带（它要的就是
+  // 同一份筛选下、**不带类型**的全库分布——面板分类栏被 type 筛过的页上数不出它）。
+  function pushCountFilters(opts, clauses, params) {
+    const { minImportance = null, source = null, includeForgotten = false, includeArchived = false, onlyArchived = false, depositedOnly = false, updatedFrom = null, updatedTo = null, occurredFrom = null, occurredTo = null, visibility = null, workspaceScope = null } = opts ?? {};
+    // Same filters as list() so a paged caller's total matches its rows.
+    if (minImportance != null) {
+      clauses.push("importance >= ?");
+      params.push(minImportance);
+    }
+    if (source != null) {
+      clauses.push("source = ?");
+      params.push(source);
+    }
+    // updated_at 闭区间：与 list() 共用 updatedAtBounds 归一化，非法值被忽略
+    // （不进 WHERE），total 才能和行保持同过滤。
+    const bounds = updatedAtBounds(updatedFrom, updatedTo);
+    if (bounds.from) {
+      clauses.push("updated_at >= ?");
+      params.push(bounds.from);
+    }
+    if (bounds.to) {
+      clauses.push("updated_at <= ?");
+      params.push(bounds.to);
+    }
+    // occurred_at 闭区间：与 list() 同口径（COALESCE 回退 created_at），
+    // memory_list 的 total 才能和过滤后的行保持一致。
+    const occurred = updatedAtBounds(occurredFrom, occurredTo);
+    if (occurred.from) {
+      clauses.push("COALESCE(occurred_at, created_at) >= ?");
+      params.push(occurred.from);
+    }
+    if (occurred.to) {
+      clauses.push("COALESCE(occurred_at, created_at) <= ?");
+      params.push(occurred.to);
+    }
+    // occurred_at 闭区间：与 list() 同过滤（visibility 同口径），memory_list
+    // 的 total 才能和过滤后的行保持一致。
+    if (visibility) {
+      // v0.8.1 第 3 步（issue #170 4.3）：硬过滤只认显式声明——与
+      // service.isVisibleInScope 同口径。IS NOT 是 NULL 安全比较：来源为
+      // auto/NULL（v0.8.0 存量自动标注）的行不吃硬墙，只走 A2 软加权。
+      if (visibility.agentScope != null) {
+        clauses.push("(agent_scope IS NULL OR agent_scope_source IS NOT 'explicit' OR agent_scope = ?)");
+        params.push(visibility.agentScope);
+      } else {
+        clauses.push("(agent_scope IS NULL OR agent_scope_source IS NOT 'explicit')");
+      }
+      if (visibility.workspaceScope != null) {
+        // #743 评审 Major：与 list() 同一把比较键（去末尾分隔符、不分大小写），
+        // 否则 total / typeCounts 会和行数对不上——列表放行、计数拦掉，或者
+        // 反过来。算法只写在 scope.js 的 workspaceLabelKey 里。
+        clauses.push("(workspace_scope IS NULL OR workspace_scope_source IS NOT 'explicit' OR lower(rtrim(workspace_scope, '\\/')) = ?)");
+        params.push(workspaceLabelKey(visibility.workspaceScope));
+      } else {
+        clauses.push("(workspace_scope IS NULL OR workspace_scope_source IS NOT 'explicit')");
+      }
+    }
+    // workspaceScope：选料视图的精确过滤（与 list() 同口径、同理由——它不是
+    // 可见性闸门，所以不看 source、不看 NULL）。total 必须与行数同过滤。
+    if (typeof workspaceScope === "string" && workspaceScope.trim()) {
+      clauses.push("workspace_scope = ?");
+      params.push(workspaceScope.trim());
+    }
+    if (!includeForgotten) {
+      clauses.push("forgotten = 0");
+    }
+    // 与 list() 同过滤：total 才能和归档列表的行保持一致。
+    if (onlyArchived) {
+      clauses.push("archived = 1");
+    } else if (!includeArchived) {
+      clauses.push("archived = 0");
+    }
+    // 与 list() 同过滤：deposited 视图的 total 才能和行保持一致。
+    if (depositedOnly) {
+      clauses.push(
+        "(id IN (SELECT record_id FROM receipt_chain WHERE kind IN ('merge', 'update') AND verdict = 'live') OR source = 'dream')"
+      );
+    }
+  }
+
+  function count(type, opts = {}) {
+    const clauses = [];
+    const params = [];
+    if (type !== undefined) {
+      clauses.push("type = ?");
+      params.push(type);
+    }
+    pushCountFilters(opts, clauses, params);
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    return db.prepare(`SELECT count(*) AS c FROM memories ${where}`).get(...params).c;
+  }
+
+  // #597（/list 的 typeCounts）：同一份筛选、不带 type，一次 GROUP BY 拿全库分布。
+  // 面板分类栏的数字源：被 type 筛过又分过页的已加载行上数不出真分布。GROUP BY
+  // 只回存在的类，缺类即 0；分布合计恒等于同筛选的 count(undefined)。
+  function countByType(opts = {}) {
+    const clauses = [];
+    const params = [];
+    pushCountFilters(opts, clauses, params);
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    const rows = db.prepare(`SELECT type, count(*) AS c FROM memories ${where} GROUP BY type`).all(...params);
+    return Object.fromEntries(rows.map((r) => [r.type, r.c]));
+  }
+
+  function getById(id) {
+    const row = db.prepare("SELECT * FROM memories WHERE id = ?").get(id);
+    return toRow(row);
+  }
+
+  /**
+   * 车道 C 导入的幂等读：按包内那条记忆的铸造 id 找本库的行。
+   * 走 idx_memories_share_external（部分索引，非 NULL 那一侧），等值 seek。
+   * 本地行这一格恒 NULL，因此本函数永远不会误命中本地记忆。
+   */
+  function getByShareExternalId(externalId) {
+    if (typeof externalId !== "string" || !externalId) return undefined;
+    return toRow(db.prepare("SELECT * FROM memories WHERE share_external_id = ?").get(externalId));
+  }
+
+  /**
+   * 一个包在本库落下的全部行（撤回前的清点 / 面板「外来区」列表）。
+   *
+   * 不过滤 archived / forgotten：整包退出要连归档面与遗忘面一起收走，否则撤回后库里
+   * 还剩几条「来自那个已经收起的包」的行，身份与包对不上。
+   * 读显式列清单而非 SELECT *（#430 的口径）：一个包可以有几百行，每行 9.4 MB 级别
+   * 的 embedding 拖进来没有任何消费方会读。
+   */
+  function listBySharePackId(packId) {
+    if (typeof packId !== "string" || !packId) return [];
+    return db.prepare(`SELECT ${memoryColumnList} FROM memories WHERE share_pack_id = ? ORDER BY updated_at DESC, id DESC`)
+      .all(packId).map(toRow);
+  }
+
+  // #230 写入权分离（存储层唯一铸造口，CodeRabbit 复核最终形态）：document
+  // 行只能经 saveDocument 铸造，通用 save 整类拒绝。doc_path 是任意调用方
+  // 都能捏造的字符串——「必带 doc_path」挡不住绕过注册校验（flag 闸 / 文件
+  // 存在 / 路径归一化 / evidence 可见性 / scope 匹配 / supersede 探测）的直
+  // 铸，必须整类拒绝；受控通道是独立方法而不是隐藏旗标（旗标可被载荷携带，
+  // 方法名在 DI 合同里可审计）。
+  function save(memory) {
+    if (memory?.type === "document") {
+      throw new Error("document rows are minted only via store.saveDocument (registerDocument)");
+    }
+    return insertMemoryRow(memory);
+  }
+
+  function saveDocument(memory) {
+    // 指针行结构不变量：doc_path 是 document 的存在依据（无指针 = 死行）。
+    if (!(typeof memory?.doc_path === "string" && memory.doc_path.trim())) {
+      throw new Error("document rows are pointer rows: doc_path is required");
+    }
+    return insertMemoryRow(memory);
+  }
+
+  function insertMemoryRow(memory) {
+    const id = memory.id ?? randomUUID();
+    const type = memory.type;
+    if (!TYPES.has(type)) throw new Error(`invalid memory type: ${type}`);
+    if (memory.tags !== undefined && !Array.isArray(memory.tags)) {
+      throw new Error("tags must be an array");
+    }
+    const now = nowIso();
+    const tags = JSON.stringify(memory.tags ?? []);
+    const importance = Number.isInteger(memory.importance) ? memory.importance : 3;
+    const evidence = Array.isArray(memory.evidence) ? JSON.stringify(memory.evidence) : null;
+    const docPath = typeof memory.doc_path === "string" && memory.doc_path.trim() ? memory.doc_path : null;
+    // #254 计量锚：由本行的 title/content 派生，调用方传什么都以这里算出的为准。
+    const contentHash = contentHashOf(memory);
+    const embedding = Array.isArray(memory.embedding) && memory.embedding.length
+      ? JSON.stringify(memory.embedding)
+      : null;
+    // Explicit valid status wins; otherwise infer from content/type. Falls back
+    // to 'subjective' (the column default) so legacy callers never break.
+    const epistemicStatus = EPISTEMIC_STATUSES.has(memory.epistemic_status)
+      ? memory.epistemic_status
+      : inferEpistemicStatus(memory);
+    runAtomically(() => {
+      db.prepare(
+        `INSERT INTO memories (id, type, title, content, tags, importance, forgotten, archived, archived_at, source, content_history, quality_score, embedding, epistemic_status, agent_scope, workspace_scope, agent_scope_source, workspace_scope_source, scope_decided_at, sensitivity, occurred_at, evidence, doc_path, content_hash, share_pack_id, share_external_id, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        id,
+        type,
+        memory.title,
+        memory.content,
+        tags,
+        importance,
+        memory.archived ? 1 : 0,
+        // 铸造即归档的行（store.save({archived:true})）：归档时刻就是入库时刻。
+        // 不写这一格的话，archived=1 而 archived_at=NULL 会落在「存量行」语义里，
+        // 精确口径读侧只能把它当不可追溯——明明是当下发生的归档，白丢一条记录。
+        memory.archived ? now : null,
+        memory.source ?? null,
+        JSON.stringify(memory.content_history ?? []),
+        Number.isFinite(memory.quality_score) ? memory.quality_score : null,
+        embedding,
+        epistemicStatus,
+        normalizeScopeText(memory.agent_scope),
+        normalizeScopeText(memory.workspace_scope),
+        normalizeScopeSource(memory.agent_scope_source),
+        normalizeScopeSource(memory.workspace_scope_source),
+        normalizeOccurredAt(memory.scope_decided_at),
+        normalizeScopeText(memory.sensitivity),
+        normalizeOccurredAt(memory.occurred_at),
+        evidence,
+        docPath,
+        contentHash,
+        // 车道 C：外来行身份。空串一律落 NULL——空串会占住 UNIQUE 索引的一格，第二条
+        // 空串外来行就撞响；这两格只由导入路径铸造，其余写入恒 NULL。
+        // created_at / updated_at / content_hash 仍由本函数铸造，不接受调用方传值。
+        typeof memory.share_pack_id === "string" && memory.share_pack_id.trim() ? memory.share_pack_id.trim() : null,
+        typeof memory.share_external_id === "string" && memory.share_external_id.trim() ? memory.share_external_id.trim() : null,
+        now,
+        now
+      );
+      // desired generation bumped in the same transaction as the write: once
+      // this commits, generation > applied_generation, so a crash right after
+      // (before syncMirror) is caught by recoverMirror on restart (peer
+      // blocker 1). ROLLBACK on error rolls this back with the write.
+      incrementGeneration();
+    });
+    return getById(id);
+  }
+
+  /**
+   * #254 计量：与本次写入「归一化内容哈希」相同的既有行（去重候选集）。
+   * 结构化锚先收窄成本：按哈希等值 seek（走 idx_memories_content_hash，哈希几乎唯
+   * 一，落在候选集上的行只有几条），再按 type 与 scope 三维过滤——不是全表扫、也不
+   * 逐行比哈希。scope 用 IS 比（NULL 安全）：未标注行互相匹配、与已标注行不匹配，
+   * 与 service.js 去重键（scopeKeyOf）同口径；入参先按 store 自己的 normalizeScopeText
+   * 归一，免得调用方传 " foo " 就漏配。
+   * 归档行与已遗忘行都在集内：#275 的分界是「出口止体积、不止重复」——被质量闸归档
+   * 的同一个事实必须仍能判成重复，否则同样的内容再写一次又是一条新行（#254 拍板：
+   * 归档行纳入去重候选集）。
+   * 排序即取舍：活跃行排在归档/遗忘行之前，再按 updated_at 倒序。LIMIT 先于调用方的
+   * 「活区优先」判断执行，而归档动作本身会顶 updated_at——纯按时间倒序时，同键命中一
+   * 旦超过窗口宽度，活跃行就被归档行挤出候选集，调用方只能看到归档命中，把「活跃重复」
+   * 误报成「归档重复」，恰好把这条信号要分流的两类弄反。
+   * @returns {Array<{id: string, archived: boolean, forgotten: boolean}>} 活跃行优先，其后按最近写入
+   */
+  function findContentHashMatches({ type, hash, agent_scope: agentScope, workspace_scope: workspaceScope, sensitivity, limit = 10 } = {}) {
+    if (!hash || !type) return [];
+    const lim = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 50) : 10;
+    const rows = db.prepare(
+      `SELECT id, archived, forgotten FROM memories
+       WHERE type = ? AND content_hash = ?
+         AND agent_scope IS ? AND workspace_scope IS ? AND sensitivity IS ?
+       ORDER BY archived ASC, forgotten ASC, updated_at DESC, id LIMIT ?`
+    ).all(
+      type,
+      hash,
+      normalizeScopeText(agentScope),
+      normalizeScopeText(workspaceScope),
+      normalizeScopeText(sensitivity),
+      lim
+    );
+    return rows.map((row) => ({ id: row.id, archived: row.archived === 1, forgotten: row.forgotten === 1 }));
+  }
+
+  function update(id, patch) {
+    const existing = getById(id);
+    if (!existing) throw new Error(`memory not found: ${id}`);
+    const type = patch.type ?? existing.type;
+    if (!TYPES.has(type)) throw new Error(`invalid memory type: ${type}`);
+    // #230：type 不许改入/改出 document——铸造与退役都只经 registerDocument
+    // （摘要修复走同 type 的 content/title 更新，doc_path 不在本 UPDATE 的
+    // SET 里，天然保持不变）。
+    if ((existing.type === "document") !== (type === "document")) {
+      throw new Error("memory type cannot be changed to or from 'document' (registerDocument is the only mint path)");
+    }
+    if (patch.tags !== undefined && !Array.isArray(patch.tags)) {
+      throw new Error("tags must be an array");
+    }
+    const now = nowIso();
+    const embedding = patch.embedding !== undefined
+      ? (Array.isArray(patch.embedding) && patch.embedding.length ? JSON.stringify(patch.embedding) : null)
+      : existing.embedding ?? null;
+    const epistemicStatus = resolveEpistemicStatus(existing, patch);
+    const contentHistory = Array.isArray(patch.content_history)
+      ? JSON.stringify(patch.content_history)
+      : (Array.isArray(existing.content_history) ? JSON.stringify(existing.content_history) : null);
+    const qualityScore = patch.quality_score !== undefined && Number.isFinite(patch.quality_score)
+      ? patch.quality_score
+      : (existing.quality_score ?? null);
+    // 证据链只在本 patch 显式携带时才改写（undefined=保留既有）。
+    const evidence = patch.evidence !== undefined
+      ? (Array.isArray(patch.evidence) ? JSON.stringify(patch.evidence) : null)
+      : (existing.evidence?.length ? JSON.stringify(existing.evidence) : null);
+    // v0.8.1 底座（issue #170）：scope 列只在本 patch 显式携带该键时才改写
+    // （undefined=不动；null=清空为未标注/global）。来源列只认 auto|explicit。
+    const nextAgentScope = patch.agent_scope !== undefined
+      ? normalizeScopeText(patch.agent_scope)
+      : (existing.agent_scope ?? null);
+    const nextWorkspaceScope = patch.workspace_scope !== undefined
+      ? normalizeScopeText(patch.workspace_scope)
+      : (existing.workspace_scope ?? null);
+    const nextAgentSource = patch.agent_scope_source !== undefined
+      ? normalizeScopeSource(patch.agent_scope_source)
+      : (existing.agent_scope_source ?? null);
+    const nextWorkspaceSource = patch.workspace_scope_source !== undefined
+      ? normalizeScopeSource(patch.workspace_scope_source)
+      : (existing.workspace_scope_source ?? null);
+    const nextDecidedAt = patch.scope_decided_at !== undefined
+      ? normalizeOccurredAt(patch.scope_decided_at)
+      : (existing.scope_decided_at ?? null);
+    // #254：标题或正文变了，锚跟着重算——它是当前内容的派生物，留旧值等于让「这行
+    // 现在装的什么」和标记对不上。
+    const nextTitle = patch.title ?? existing.title;
+    const nextContent = patch.content ?? existing.content;
+    const contentHash = contentHashOf({ title: nextTitle, content: nextContent });
+    runAtomically(() => {
+      db.prepare(
+        `UPDATE memories SET type=?, title=?, content=?, tags=?, importance=?, source=?, content_history=?, quality_score=?, embedding=?, epistemic_status=?, agent_scope=?, workspace_scope=?, agent_scope_source=?, workspace_scope_source=?, scope_decided_at=?, evidence=?, content_hash=?, updated_at=? WHERE id=?`
+      ).run(
+        type,
+        nextTitle,
+        nextContent,
+        JSON.stringify(patch.tags ?? existing.tags),
+        Number.isInteger(patch.importance) ? patch.importance : existing.importance,
+        patch.source !== undefined ? patch.source : (existing.source ?? null),
+        contentHistory,
+        qualityScore,
+        embedding,
+        epistemicStatus,
+        nextAgentScope,
+        nextWorkspaceScope,
+        nextAgentSource,
+        nextWorkspaceSource,
+        nextDecidedAt,
+        evidence,
+        contentHash,
+        now,
+        id
+      );
+      // Issue #202：update 可直写 embedding（patch.embedding），缓存条目失效，
+      // 下次读取按库值重解析。宁滥勿缺——即便本 patch 未含 embedding，丢一条
+      // 缓存只多一次点查重解析。
+      embeddingCache.delete(id);
+      // Desired generation bumped in the same transaction as the update (peer
+      // blocker 1: crash between write and sync must still be recoverable).
+      incrementGeneration();
+    });
+    return getById(id);
+  }
+
+  function remove(id) {
+    runAtomically(() => {
+      // #399：memory_provenance 挂着 ON DELETE CASCADE，而 node:sqlite 默认就把
+      // foreign_keys 开成 1（实测 PRAGMA foreign_keys = 1），所以级联今天确实在兜底。
+      // 这条显式 DELETE 不是冗余、也不是「FK 没开才需要」：它是不把清理挂在一份没人
+      // 钉过的驱动默认上——连接哪天以 enableForeignKeyConstraints:false 打开，悬空链接
+      // 只有这一条挡得住。记录本身（distill_records）不删——删掉一条派生记忆
+      // 不该让整个窗口的原文凭证消失。
+      db.prepare("DELETE FROM memory_provenance WHERE memory_id = ?").run(id);
+      // #512：铸造记录同理——它也只是指着记忆行的索引，行没了索引就没有指代对象。
+      db.prepare("DELETE FROM memory_mints WHERE memory_id = ?").run(id);
+      // #249 第二批：pin 行同理，理由与前两条完全一致（本表建表时也没抄
+      // REFERENCES ... ON DELETE CASCADE，清理不挂驱动默认）。注意这一条**只
+      // 防攒垃圾**，不修「回落被卡住」——注入侧判据看的是「有几条能用的」
+      // 而不是「表里有几行」，见 service.js 注入段与 pinnedStats.source 三档。
+      db.prepare("DELETE FROM pinned_memories WHERE memory_id = ?").run(id);
+      db.prepare("DELETE FROM memories WHERE id = ?").run(id);
+      // Mirror sync must reflect the deletion; bump desired generation so a
+      // crash between the delete and syncMirror leaves a recoverable debt.
+      incrementGeneration();
+    });
+  }
+
+  // 一条 DELETE ... WHERE id IN (...) 最多绑多少个 `?`。SQLite 的上限是 32766
+  // （SQLITE_MAX_VARIABLE_NUMBER），取 500 后离上限还有六十多倍余量：这条语句一行一个参数，
+  // 而包的大小按字节不按条数封顶（见 deleteBySharePackId 的分块理由），500 让单条语句的
+  // 解析成本可以忽略、又永远够不到那格上限，块数只随包条数线性增长。
+  const DELETE_ID_CHUNK = 500;
+
+  // Tag 锚点的 IN 列表分块。比 DELETE_ID_CHUNK 多一层顾虑：那条语句只有一处 IN，
+  // 这条有**三处**（attrs / relations.from / relations.to）共用同一个记忆 id 集合，
+  // 所以单块占用的参数是 3×chunk。取 500 后最坏 1500 个参数，离 32766 仍有二十倍余量。
+  const TAG_ID_CHUNK = 500;
+
+  /**
+   * 整包退出（车道 C）。删空一个不存在的包是幂等的 0，不是错误——对方点第二次「收起
+   * 这个包」与「收起一个从来没导入过的包」都该是这个答案；早退也不 bump generation：
+   * 什么都没删就别记一笔镜像债（remove() 每次必 bump，那是它的既有行为，不在这里扩大）。
+   *
+   * side table 清理口径 = remove() 的口径（#399 / #512）：显式同事务清 memory_provenance
+   * 与 memory_mints。
+   * 这条是双保险，不是「FK 没开所以必须手写」：memory_provenance 挂着 ON DELETE CASCADE，
+   * 而 node:sqlite 默认就把 foreign_keys 开成 1（实测 PRAGMA foreign_keys = 1），今天删行
+   * 确实另有级联兜底；显式清理的存在是为了不依赖这份没人钉过的驱动默认，同时跟 remove()
+   * 保持一致的口径（连接哪天以 enableForeignKeyConstraints:false 打开，悬空链接只有它挡得住）。
+   *
+   * remove() 不碰的（entity_attrs / entity_relations 的 memory_id 反查、conflict_pending、
+   * scope_changes、embedding 解析缓存）这里也不碰——批删不是新的清理语义。
+   *
+   * 向量索引这一格 C4 实测过，把 C1 留下的那句「由 C4 在 service 侧处理」改对：service
+   * 侧没有活儿要接。`vector-index.js` 是 memories.embedding 那一列的薄层，余弦检索
+   * (`searchVector`) 每次调用都从 SQL 现取「带向量的行」的 id 集合，行被物理删掉即从集合
+   * 里消失——向量跟着行一起走，一列残值都留不下；事后落到的 embed 也只是
+   * `UPDATE ... WHERE id = ?` 命中 0 行，不会把僵尸行写回来。唯一的残留是 #202 那个
+   * 进程内的解析缓存（id → 已解析向量），它与 remove() 同处置且读不出僵尸：每个调用方
+   * （searchVector / getEmbeddings / document.js / organize.js）的 id 集合都来自活行的
+   * SQL 读，未命中缓存时按 id 点查库，行没了就返回 undefined——最坏是一条等 FIFO 驱逐的
+   * 内存，不是一条搜得到的鬼行。要在这里清它等于给批删加一份 remove() 没有的新语义，
+   * 与本方法的口径声明相反，所以不动（C4 的报告记了这一格，remove() 是否要一起补是
+   * 单独一刀的事）。
+   *
+   * IN 列表分块（chunk = DELETE_ID_CHUNK）：SQLite 一条语句最多绑 32766 个参数
+   * （SQLITE_MAX_VARIABLE_NUMBER，实测第 32767 个报 "too many SQL variables"），而这条
+   * 语句原本一行一个 `?`。车道 A 的包水位按字节不按条数（MAX_PACK_BYTES = 3 MiB），所以
+   * 「正文很短、条数很多」的包理论上能逼近那一格——一条语句撞上限是整笔回滚，效果等于
+   * 「这个包永远撤不掉」，而那正是退出这条路径最不该坏的方式。
+   * 分块不是语义变化，四点逐条对齐分块前的形状：ids 是本事务开头一次读到的固定快照
+   * （slice 出来的连续段，块之间互不相交、并起来就是全集）；按主键删本就幂等；整包裹在同
+   * 一个 runAtomically 里，原子性与快照语义一字未动；generation 只在最后加一次，所以
+   * 「删了行却没记镜像债」这个 crash 窗口和分块前同样不存在。changes 逐块求和——那是
+   * 调用方答复里报出去的数，少加一块就少报一块。
+   */
+  function deleteBySharePackId(packId) {
+    if (typeof packId !== "string" || !packId) return 0;
+    return runAtomically(() => {
+      const ids = db.prepare("SELECT id FROM memories WHERE share_pack_id = ?").all(packId).map((r) => r.id);
+      if (!ids.length) return 0;
+      let deleted = 0;
+      for (let start = 0; start < ids.length; start += DELETE_ID_CHUNK) {
+        const chunk = ids.slice(start, start + DELETE_ID_CHUNK);
+        const marks = chunk.map(() => "?").join(", ");
+        db.prepare(`DELETE FROM memory_provenance WHERE memory_id IN (${marks})`).run(...chunk);
+        db.prepare(`DELETE FROM memory_mints WHERE memory_id IN (${marks})`).run(...chunk);
+        // 同 remove()：pin 行防攒垃圾（不修卡回落的那个判据问题）。
+        db.prepare(`DELETE FROM pinned_memories WHERE memory_id IN (${marks})`).run(...chunk);
+        deleted += db.prepare(`DELETE FROM memories WHERE id IN (${marks})`).run(...chunk).changes;
+      }
+      incrementGeneration();
+      return deleted;
+    });
+  }
+
+  /**
+   * Atomic compare-and-set update: applies `patch` only when the row still
+   * carries `expectedUpdatedAt` (the version token read by the caller). Returns
+   * the updated memory on success, or undefined when the row changed since the
+   * caller read it — the caller must re-read and retry. The version guard lives
+   * in the UPDATE's WHERE clause, so a concurrent read-modify-write across
+   * connections cannot silently overwrite a newer value (lost update).
+   */
+  function compareAndUpdate(id, expectedUpdatedAt, patch) {
+    const existing = getById(id);
+    if (!existing) throw new Error(`memory not found: ${id}`);
+    const type = patch.type ?? existing.type;
+    if (!TYPES.has(type)) throw new Error(`invalid memory type: ${type}`);
+    // 同 update：document 类型转换在这里同样封死（CAS 路径绕过 updateMemory
+    // 的 service 守卫，必须在存储层兜住）。
+    if ((existing.type === "document") !== (type === "document")) {
+      throw new Error("memory type cannot be changed to or from 'document' (registerDocument is the only mint path)");
+    }
+    if (patch.tags !== undefined && !Array.isArray(patch.tags)) {
+      throw new Error("tags must be an array");
+    }
+    const now = nowIso();
+    const embedding = patch.embedding !== undefined
+      ? (Array.isArray(patch.embedding) && patch.embedding.length ? JSON.stringify(patch.embedding) : null)
+      : existing.embedding ?? null;
+    const epistemicStatus = resolveEpistemicStatus(existing, patch);
+    const contentHistory = Array.isArray(patch.content_history)
+      ? JSON.stringify(patch.content_history)
+      : (Array.isArray(existing.content_history) ? JSON.stringify(existing.content_history) : null);
+    const qualityScore = patch.quality_score !== undefined && Number.isFinite(patch.quality_score)
+      ? patch.quality_score
+      : (existing.quality_score ?? null);
+    // The CAS UPDATE and the desired-generation bump must commit together (audit
+    // peer A): if the UPDATE autocommits first and the process dies before the
+    // increment, the store is mutated while generation == applied_generation and
+    // dirty == false — recoverMirror sees no debt and the mirror stays stale.
+    // Wrapping both in one transaction means a CAS miss rolls back cleanly too
+    // (no write, no generation bump).
+    // 同 update：#254 的锚随标题/正文重算（CAS 路径也改这两列）。
+    const nextTitle = patch.title ?? existing.title;
+    const nextContent = patch.content ?? existing.content;
+    const contentHash = contentHashOf({ title: nextTitle, content: nextContent });
+    let applied = false;
+    runAtomically(() => {
+      const result = db.prepare(
+        `UPDATE memories SET type=?, title=?, content=?, tags=?, importance=?, source=?, content_history=?, quality_score=?, embedding=?, epistemic_status=?, content_hash=?, updated_at=?
+         WHERE id=? AND updated_at=?`
+      ).run(
+        type,
+        nextTitle,
+        nextContent,
+        JSON.stringify(patch.tags ?? existing.tags),
+        Number.isInteger(patch.importance) ? patch.importance : existing.importance,
+        patch.source !== undefined ? patch.source : (existing.source ?? null),
+        contentHistory,
+        qualityScore,
+        embedding,
+        epistemicStatus,
+        contentHash,
+        now,
+        id,
+        expectedUpdatedAt
+      );
+      if (result.changes === 0) return; // CAS miss: a concurrent write won
+      // Issue #202：同 update——CAS 命中即可能改写 embedding，失效缓存条目。
+      embeddingCache.delete(id);
+      // Only bump desired generation on a successful CAS — a miss writes nothing.
+      incrementGeneration();
+      applied = true;
+    });
+    if (!applied) return undefined;
+    return getById(id);
+  }
+
+  function setForget(id, forgotten) {
+    runAtomically(() => {
+      db.prepare("UPDATE memories SET forgotten = ?, updated_at = ? WHERE id = ?")
+        .run(forgotten === true || forgotten === 1 ? 1 : 0, nowIso(), id);
+      incrementGeneration();
+    });
+    return getById(id);
+  }
+
+  // Issue #275 第二批：archived_at 是「从活跃面进入归档面」那一刻的精确记录。
+  // updated_at 照旧刷新（本函数自 v0.2 起的既有语义，其他读侧依赖它——面板排序、
+  // 快照哈希、CAS），两列职责分开：updated_at = 最后一次写，archived_at = 归档时刻。
+  // 幂等：已是归档态再调 archived=true，不刷新 archived_at（重复归档不是新一次
+  // 归档，否则「重复调 setArchived」又变成一次净增——那正是代理口径被推翻的原因）。
+  function setArchived(id, archived) {
+    const next = archived ? 1 : 0;
+    runAtomically(() => {
+      // nowIso 在事务内取（与改动前一致）：单调顶推的时间戳不该被一次回滚白白消耗。
+      const now = nowIso();
+      // CASE 里的 archived 是**更新前**的值（SQLite UPDATE 表达式语义）：
+      //   活跃 → 归档：落当前时刻；已归档 → 归档：保留原值（含存量 NULL，不回填）；
+      //   任意 → 取消归档：清 NULL。
+      // 幂等刻意选「重复归档不刷新时刻」：否则「对同一行重复调 setArchived(true)」
+      // 会再被算成本窗口新进——那正是本批要消灭的代理口径偏高，换个入口复活而已。
+      db.prepare(
+        `UPDATE memories SET archived = ?,
+           archived_at = CASE WHEN ? = 1 AND archived = 0 THEN ? WHEN ? = 0 THEN NULL ELSE archived_at END,
+           updated_at = ?
+         WHERE id = ?`
+      ).run(next, next, now, next, now, id);
+      incrementGeneration();
+    });
+    return getById(id);
+  }
+
+  // --- sleep-mode storage support (v0.4.0) ---------------------------------
+  // touchLastAccess stamps the read time on recall/inject paths. It deliberately
+  // does NOT bump the mirror generation: reads must not mark the mirror dirty.
+  function touchLastAccess(id, at) {
+    if (!getById(id)) return false;
+    db.prepare("UPDATE memories SET last_accessed_at = ? WHERE id = ?")
+      .run(at ?? nowIso(), id);
+    return true;
+  }
+
+  // Shrink an aged memory to `summary`, parking its full body in _full_content.
+  // Idempotent: an already-demoted memory (non-null _full_content) is left
+  // untouched. minRefTimeMs guards the fast path — if last_accessed_at moved
+  // after the caller's snapshot (>= minRefTimeMs), the memory is hot again and
+  // is skipped. Returns the updated memory, or undefined when skipped/absent.
+  function demoteToSummary(id, summary, { minRefTimeMs } = {}) {
+    let changed = false;
+    runAtomically(() => {
+      const row = db.prepare("SELECT title, last_accessed_at, content, _full_content FROM memories WHERE id = ?").get(id);
+      if (!row || row._full_content) return;
+      if (minRefTimeMs !== undefined && row.last_accessed_at) {
+        const lastMs = Date.parse(row.last_accessed_at);
+        if (lastMs >= minRefTimeMs) return; // touched after snapshot — still hot
+      }
+      db.prepare(
+        "UPDATE memories SET content = ?, _full_content = ?, content_hash = ?, updated_at = ? WHERE id = ?"
+      ).run(summary, row.content, contentHashOf({ title: row.title, content: summary }), nowIso(), id);
+      incrementGeneration();
+      changed = true;
+    });
+    return changed ? getById(id) : undefined;
+  }
+
+  // Undo demoteToSummary: pull the parked body back into content.
+  function restoreContent(id) {
+    let changed = false;
+    runAtomically(() => {
+      const row = db.prepare("SELECT title, content, _full_content FROM memories WHERE id = ?").get(id);
+      if (!row || !row._full_content) return;
+      db.prepare(
+        "UPDATE memories SET content = ?, _full_content = NULL, content_hash = ?, updated_at = ? WHERE id = ?"
+      ).run(row._full_content, contentHashOf({ title: row.title, content: row._full_content }), nowIso(), id);
+      incrementGeneration();
+      changed = true;
+    });
+    return changed ? getById(id) : undefined;
+  }
+
+  // Live memories that have not been touched since `cutMs` (never-touched ones
+  // fall back to created_at). Ordered by last access ascending — the coldest
+  // first. Used by sleep phase 2 to pick archival-demotion candidates.
+  // #230: document pointer rows are excluded — they are heat-immune by design
+  // (λ=0) and their "unread" state is normal (full text lives outside the DB),
+  // so the cold scan must never demote/archive them for lacking access.
+  function getUnrecalledSince(cutMs, { limit = 500 } = {}) {
+    const cutIso = new Date(cutMs).toISOString();
+    const rows = db.prepare(
+      `SELECT * FROM memories
+       WHERE forgotten = 0 AND archived = 0
+         AND type <> 'document'
+         AND (last_accessed_at IS NULL OR last_accessed_at < ?)
+       ORDER BY COALESCE(last_accessed_at, created_at) ASC, id
+       LIMIT ?`
+    ).all(cutIso, limit);
+    return rows.map(toRow);
+  }
+
+  function list({ type, excludeTypes = null, excludeImported = false, limit = 50, offset = 0, order = "importance", includeForgotten = false, includeArchived = false, onlyArchived = false, depositedOnly = false, minImportance = null, source = null, updatedFrom = null, updatedTo = null, occurredFrom = null, occurredTo = null, visibility = null, workspaceScope = null } = {}) {
+    const clauses = [];
+    const params = [];
+    if (type) {
+      clauses.push("type = ?");
+      params.push(type);
+    }
+    // #230：整类排除必须在 LIMIT 之前做——sleep 的模式扫描池（limit 200 +
+    // sleepPatternMinMemories 门槛）若先截断后过滤，document 行一多就会把
+    // 普通记忆挤出窗口，池子被饿空。
+    if (Array.isArray(excludeTypes) && excludeTypes.length) {
+      clauses.push(`type NOT IN (${excludeTypes.map(() => "?").join(", ")})`);
+      params.push(...excludeTypes);
+    }
+    // Optional server-side filters: importance floor and exact source match.
+    // Both stay out of the query when unset so existing callers are unaffected.
+    if (minImportance != null) {
+      clauses.push("importance >= ?");
+      params.push(minImportance);
+    }
+    if (source) {
+      clauses.push("source = ?");
+      params.push(source);
+    }
+    // excludeImported：「本库不巩固别人导入的原文」这条政策轴的查询层口径。
+    // 它必须站在 LIMIT 之前而不是跟着 .filter 走在后面——与上面 excludeTypes 那条同理由
+    // （#230）：先截断后丢弃的话，被丢掉的外来行照样吃掉窗口名额，导入过包的库里
+    // 模式扫描池会因此饿到 sleepPatternMinMemories 以下而静默跳过。
+    // `source IS NULL OR` 那一支不是防御性冗余，是必填：本方行的 source 恒为 NULL，
+    // 而 SQL 里三值逻辑让 `NULL <> IMPORTED_SOURCE` 求值为 NULL（不是 true），只写后者的
+    // 话本方行整批消失。opt-in 默认关，其余调用方的读数逐字节不变。
+    if (excludeImported) {
+      clauses.push("(source IS NULL OR source <> ?)");
+      params.push(IMPORTED_SOURCE);
+    }
+    // Optional updated_at closed range (date-only "to" is normalized to the
+    // end of that day). Same helper as count() so total matches the rows.
+    const bounds = updatedAtBounds(updatedFrom, updatedTo);
+    if (bounds.from) {
+      clauses.push("updated_at >= ?");
+      params.push(bounds.from);
+    }
+    if (bounds.to) {
+      clauses.push("updated_at <= ?");
+      params.push(bounds.to);
+    }
+    // v0.8.0 A2（issue #17）：occurred_at 闭区间过滤——按「事件发生时间」检索。
+    // 未标注 occurred_at 的行（含全部存量）回退 created_at 比较（COALESCE），
+    // 否则过滤器对旧库近乎不可用；边界归一化与 updated_at 共用 updatedAtBounds。
+    const occurred = updatedAtBounds(occurredFrom, occurredTo);
+    if (occurred.from) {
+      clauses.push("COALESCE(occurred_at, created_at) >= ?");
+      params.push(occurred.from);
+    }
+    if (occurred.to) {
+      clauses.push("COALESCE(occurred_at, created_at) <= ?");
+      params.push(occurred.to);
+    }
+    // v0.8.0 A3（issue #17）：strictScope 硬过滤（memory_list 分页路径）。
+    // SQL 与 service.isVisibleInScope 同口径：未标注(NULL)恒可见；v0.8.1 起
+    // 硬墙只认 explicit 来源（4.3），当前维度解析不到时该维度只放行未标注/
+    // 非显式行（fail-closed 收窄）。只有显式传 visibility 的用户面调用才
+    // 过滤——dream/质量过滤等内部 store.list 调用不受影响。
+    if (visibility) {
+      // v0.8.1 第 3 步（issue #170 4.3）：硬过滤只认显式声明——与
+      // service.isVisibleInScope 同口径。IS NOT 是 NULL 安全比较：来源为
+      // auto/NULL（v0.8.0 存量自动标注）的行不吃硬墙，只走 A2 软加权。
+      if (visibility.agentScope != null) {
+        clauses.push("(agent_scope IS NULL OR agent_scope_source IS NOT 'explicit' OR agent_scope = ?)");
+        params.push(visibility.agentScope);
+      } else {
+        clauses.push("(agent_scope IS NULL OR agent_scope_source IS NOT 'explicit')");
+      }
+      if (visibility.workspaceScope != null) {
+        // #743 评审 Major：工作区标签的比较口径必须与名单判定（isHardWallWorkspace）
+        // 同口径——去末尾分隔符、不分大小写。此前这里按字面比较，于是「名单命中、
+        // 章也盖了」的行会被另一个写法（C:\Work vs c:\work\）的会话判成不可见，
+        // 且不报错。比较键的算法只写在 scope.js 的 workspaceLabelKey 里，SQL 侧
+        // 用等价的 lower(rtrim(x, 分隔符))；写入侧仍存原始标签，显示不变。
+        clauses.push("(workspace_scope IS NULL OR workspace_scope_source IS NOT 'explicit' OR lower(rtrim(workspace_scope, '\\/')) = ?)");
+        params.push(workspaceLabelKey(visibility.workspaceScope));
+      } else {
+        clauses.push("(workspace_scope IS NULL OR workspace_scope_source IS NOT 'explicit')");
+      }
+    }
+    // workspaceScope（2026-11-15）：**精确列出某个工作区的行**，供面板「挑着搬」
+    // 的选料视图用。它与上面的 visibility 是两种东西，不能混：
+    //   · visibility 是可见性闸门（未标注恒可见、只拦 explicit）；
+    //   · 这个是选料清单（就要这一区、不管来源、不放进来的别的区）。
+    // 因此不看 source、不看 NULL，只做等值匹配——面板要把这一区的行一条条列给
+    // 人挑，多列一条会让人误搬别人的记忆，少列一条会让人以为这里没东西。
+    // 空值 = 不加这个过滤（老调用方逐字节不变）。
+    if (typeof workspaceScope === "string" && workspaceScope.trim()) {
+      clauses.push("workspace_scope = ?");
+      params.push(workspaceScope.trim());
+    }
+    if (!includeForgotten) {
+      clauses.push("forgotten = 0");
+    }
+    // onlyArchived：只看归档（状态页的归档列表用）；与 includeArchived（含
+    // 归档混看）互斥，同时给时归档视图优先。
+    if (onlyArchived) {
+      clauses.push("archived = 1");
+    } else if (!includeArchived) {
+      clauses.push("archived = 0");
+    }
+    // depositedOnly：只看 autoDream 巩固过的记忆——receipt_chain 的 merge /
+    // update live verdict（record_id 即保留/更新目标）∪ source="dream" 的
+    // 直写沉淀（记忆库总览）。conflict 不算沉淀：两侧只被仲裁，内容未落。
+    if (depositedOnly) {
+      clauses.push(
+        "(id IN (SELECT record_id FROM receipt_chain WHERE kind IN ('merge', 'update') AND verdict = 'live') OR source = 'dream')"
+      );
+    }
+    // limit == null = 无界（#230 注册器的精确 supersede 全量扫描用——同路径/
+    // 同标题判定不允许窗口截断）。其余调用传数字，走 sanitizePage 默认档。
+    const unbounded = limit == null;
+    const { limit: lim, offset: off } = sanitizePage(limit, offset, 50);
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    // "chrono" is pure newest-first — the stable order paged browsing (month
+    // tree, infinite scroll) needs; importance ordering would interleave
+    // months across pages.
+    // #430：chrono 的 **无界档** 不再追加 id 平局键。updated_at 上有 #202 建的
+    // 索引，而带 id 的第二项排序键用不上它——5k 行实测同一份 SQL 只差这一项：
+    // 100.6ms（带 id，EXPLAIN 多一个 USE TEMP B-TREE）对 23.4ms（纯 updated_at，
+    // 直接走 idx_memories_updated）。分页档位必须留平局键（跨页拼接要求稳定，
+    // 同刻两行在新旧页之间可能漏一条或重复一条）；无界档没有跨页拼接，今天唯一
+    // 的调用方 syncMirror 只用它算覆盖集，与顺序无关。
+    const orderBy = order === "chrono"
+      ? (unbounded ? "updated_at DESC" : "updated_at DESC, id DESC")
+      : "importance DESC, updated_at DESC, id";
+    // Issue #430：与 all() 共用同一份显式列清单（memoryColumns 由 PRAGMA 派生，
+    // 排除 embedding）。toRow 本就不输出向量，SELECT * 只是把全表最重的列拖进
+    // 内存再丢弃——无界档实测 5k 行 263ms → 117ms，窗口档 50ms → 41ms，本函数
+    // 的全部调用方（分页浏览、document 索引、sleep 池、注册器全量扫描）一起受益。
+    const projected = `SELECT ${memoryColumnList} FROM memories`;
+    const rows = unbounded
+      ? db.prepare(`${projected} ${where} ORDER BY ${orderBy}`).all(...params)
+      : db.prepare(
+          `${projected} ${where} ORDER BY ${orderBy} LIMIT ? OFFSET ?`
+        ).all(...params, lim, off);
+    return rows.map(toRow);
+  }
+
+  function all() {
+    // Issue #202：显式列清单排除 embedding——toRow 本就不输出向量，SELECT *
+    // 纯属把全表最重的列（9.4 MB TEXT/5k 行）拖进内存再丢弃。
+    const rows = db.prepare(`SELECT ${memoryColumnList} FROM memories ORDER BY updated_at DESC`).all();
+    return rows.map(toRow);
+  }
+
+  // Issue #505：写路径的去重候选必须「按同标题定向取」，不能「按 importance 取
+  // 前 N 条」。后者是「该类型最重要的 100 行」，与「找出同标题的那一行」无关：
+  // 某类型里 importance 高于待写行的行数一旦超过窗口，同标题行与待写行双双落在
+  // 窗口外，saveWithDedupe 的 find 恒不命中，于是静默走创建分支——不报错、不告
+  // 警，合并语义随库增长而失效（报告实测 1047 行类型、importance=5 有 180 行时
+  // 稳定复现）。
+  //
+  // 口径刻意与 saveWithDedupe 的比较式对齐：那边用 m.title.trim() 比
+  // String(memory.title).trim()，而 title 入库时并不 trim（见 save() 的
+  // `memory.title` 直写）⇒ 这里必须 TRIM(title)，否则存量里带首尾空白的标题
+  // 会被精确匹配漏掉，退回同一种静默降级。
+  //
+  // archived/forgotten 的过滤与 list() 默认口径一致（两者都为 0）：合并目标必须
+  // 是活跃行，否则会把内容并进一条已经归档/遗忘的记忆里。
+  // 无 LIMIT：同 (type, title) 的活跃行本就极少，加窗口等于把 #505 重新引进来。
+  function activeByTypeAndTitle(type, title) {
+    const rows = db.prepare(
+      `SELECT ${memoryColumnList} FROM memories
+        WHERE type = ? AND TRIM(title) = ?
+          AND forgotten = 0 AND archived = 0`
+    ).all(type, String(title ?? "").trim());
+    return rows.map(toRow);
+  }
+
+  // #725 收尾：升格要「复用同题行、包含已归档的那条」。activeByTypeAndTitle 只取活跃行
+  // （写路径去重用），promote→demote→promote 的循环里上一轮被归档的正是要找的那条，
+  // 所以另开一个显式带 includeArchived 的读法。TRIM(title) 与上面同一把尺、无 LIMIT
+  // ——窗口在这里同样是错的（pattern 一多就会把目标挤出窗口，那正是 #734 的 ① 号坑）。
+  function findByTypeAndTitle(type, title, { includeArchived = false } = {}) {
+    const rows = db.prepare(
+      `SELECT ${memoryColumnList} FROM memories
+        WHERE type = ? AND TRIM(title) = ?
+          AND forgotten = 0${includeArchived ? "" : " AND archived = 0"}
+     `).all(type, String(title ?? "").trim());
+    return rows.map(toRow);
+  }
+
+  // Issue #430：写路径要的「最近若干条正文」。质量过滤的近重复判定只读 content
+  // 这一列 + 前 20 行，此前写成 all().slice(0, 20) —— 全表逐行 toRow（27 字段、
+  // 三次 JSON 解析）之后只截前 20 条正文；5k 行实测 100ms 级 → 0.06ms 级。
+  // 口径与 all() 的前 N 条严格一致：不加 WHERE（archived/forgotten 仍参与近重复
+  // 判定）、updated_at DESC、同刻顺序未定义。limit 走 sanitizePage，非正整数
+  // 落回 20，调用方不必自己防 0/undefined。
+  function recentContents(limit = 20) {
+    const { limit: lim } = sanitizePage(limit, 0, 20);
+    const rows = db.prepare("SELECT content FROM memories ORDER BY updated_at DESC LIMIT ?").all(lim);
+    return rows.map((row) => row.content ?? "");
+  }
+
+  /** Set (or clear with null) the embedding vector of a memory.
+   *  `modelHash` records which model produced THIS vector (see the
+   *  embedding_model migration note). Clearing the vector clears the
+   *  provenance with it, so a NULL vector is never paired with a stale model
+   *  name; omitting modelHash leaves the column untouched (callers that
+   *  predate the column still work, their rows simply read as unknown). */
+  function setEmbedding(id, vector, modelHash) {
+    // isVectorLike 而非 Array.isArray：调用方可能递进 Float32Array（本模块缓存的
+    // 就是它）。旧守卫对 typed array 返回 false，会把「设置向量」读成「清空向量」，
+    // 静默把行改成 NULL。
+    const json = isVectorLike(vector) && vector.length ? JSON.stringify(Array.from(vector)) : null;
+    if (json) {
+      if (modelHash !== undefined) {
+        db.prepare("UPDATE memories SET embedding = ?, embedding_model = ? WHERE id = ?")
+          .run(json, modelHash === null ? null : String(modelHash), id);
+      } else {
+        db.prepare("UPDATE memories SET embedding = ? WHERE id = ?").run(json, id);
+      }
+    } else {
+      db.prepare("UPDATE memories SET embedding = NULL, embedding_model = NULL WHERE id = ?").run(id);
+    }
+    // Issue #202：单一写入口即单一失效点——重写缓存条目（向量在手上不必重解析），
+    // 清空则移除，删除过的 id 不会被下一次 searchVector 的 id 集合选中。
+    // 缓存里存 Float32Array（与 readVector 同一表示），不存 JSON.parse 出来的
+    // number[]，否则写后第一次读还要再转一次。
+    if (json) cacheEmbedding(id, new Float32Array(vector));
+    else embeddingCache.delete(id);
+  }
+
+  /** Batch fetch stored embeddings by id (v0.5.0 search-time semantic dedup).
+   *  Returns a Map(id → number[]); rows without a parseable embedding are
+   *  simply absent from the map. */
+  function getEmbeddings(ids) {
+    const out = new Map();
+    const list = (Array.isArray(ids) ? ids : []).filter(Boolean);
+    for (const id of list) {
+      // Issue #202：走同一解析缓存（语义去重的批量读也免重复 parse）。
+      const vec = getParsedEmbedding(id);
+      if (vec) out.set(id, vec);
+    }
+    return out;
+  }
+
+  function embeddedCount() {
+    // Active rows only — getStats pairs this with count() as the status card's
+    // "indexed N / M" denominator, and count() defaults exclude forgotten and
+    // archived memories. Unfiltered, archived rows inflate N past M.
+    return db.prepare(
+      "SELECT count(*) AS c FROM memories WHERE embedding IS NOT NULL AND embedding != '' AND forgotten = 0 AND archived = 0"
+    ).get().c;
+  }
+
+  /**
+   * Candidate rows still missing an embedding, for incremental re-indexing.
+   * Issue #128: active rows only — archived/forgotten rows never participate in
+   * recall or dream clustering, so backfill quota must not be eaten by them
+   * (report measured 25/50 reindex slots landing on archived rows while 88
+   * active rows stayed un-embedded). Same 口径 as embeddedCount()/count().
+   */
+  function needsEmbedding(limit = 50) {
+    return db.prepare(
+      `SELECT id, title, content FROM memories
+       WHERE (embedding IS NULL OR embedding = '')
+         AND forgotten = 0 AND archived = 0
+       ORDER BY updated_at DESC LIMIT ?`
+    ).all(limit);
+  }
+
+  /**
+   * Rows whose vector is missing OR was produced by a different model than
+   * `modelHash` — the selector the backfill should use whenever the caller
+   * knows which model the vectors are supposed to come from.
+   *
+   * Why `needsEmbedding` alone is not enough: it only matches empty vectors,
+   * so after a model switch every vector written by the previous model stays
+   * eligible for "has a vector" forever, while its similarity to the current
+   * query embedding is meaningless. Those rows keep inflating the status
+   * card's coverage while semantic recall silently degrades.
+   *
+   * `embedding_model IS NULL` counts as stale on purpose: NULL means "written
+   * before per-row provenance existed, producing model unknown", and an
+   * unknown origin cannot be proven to match. Those rows get re-embedded
+   * rather than assumed correct.
+   *
+   * When `modelHash` is falsy (embedder unconfigured / no fingerprint yet)
+   * this degrades to the plain missing-only selector instead of re-embedding
+   * the whole table against nothing.
+   */
+  function needsEmbeddingFor(modelHash, limit = 50) {
+    if (!modelHash) return needsEmbedding(limit);
+    return db.prepare(
+      `SELECT id, title, content, embedding_model FROM memories
+       WHERE ((embedding IS NULL OR embedding = '')
+              OR embedding_model IS NULL
+              OR embedding_model != ?)
+         AND forgotten = 0 AND archived = 0
+       ORDER BY updated_at DESC LIMIT ?`
+    ).all(String(modelHash), limit);
+  }
+
+  /** True when any active row would be picked by needsEmbeddingFor(). */
+  function hasStaleEmbedding(modelHash) {
+    return needsEmbeddingFor(modelHash, 1).length > 0;
+  }
+
+  /**
+   * How many rows needsEmbeddingFor() would pick in total.
+   *
+   * A re-index run is bounded by a limit, so "indexed: 0" and "indexed: 3 of
+   * 300" looked identical to the caller. Counting is cheap (no content is
+   * materialised) and is what lets the caller say how much work is left.
+   */
+  function countNeedsEmbeddingFor(modelHash) {
+    if (!modelHash) {
+      return db.prepare(
+        `SELECT count(*) AS c FROM memories
+         WHERE (embedding IS NULL OR embedding = '')
+           AND forgotten = 0 AND archived = 0`
+      ).get().c;
+    }
+    return db.prepare(
+      `SELECT count(*) AS c FROM memories
+       WHERE ((embedding IS NULL OR embedding = '')
+              OR embedding_model IS NULL
+              OR embedding_model != ?)
+         AND forgotten = 0 AND archived = 0`
+    ).get(String(modelHash)).c;
+  }
+
+  /** Per-model provenance counts over active rows ('' = unknown origin). */
+  function embeddingModelBreakdown() {
+    return db.prepare(
+      `SELECT COALESCE(embedding_model, '') AS model, count(*) AS c
+         FROM memories
+        WHERE embedding IS NOT NULL AND embedding != ''
+          AND forgotten = 0 AND archived = 0
+        GROUP BY COALESCE(embedding_model, '')`
+    ).all();
+  }
+
+  /**
+   * Per-dimension counts over active embedded rows ('' = vector that failed to
+   * parse as an array — legacy garbage rows, not a real dimension).
+   *
+   * Why per-dimension: embeddedCount() alone says "has a vector", but vectors
+   * written by a different model/dimension are not comparable with the current
+   * query embedding — searchVector skips them, so they are "present" without
+   * being "retrievable". The status card needs this split to stop reporting a
+   * coverage number that silently counts unsearchable rows.
+   */
+  function embeddingDimensionBreakdown() {
+    return db.prepare(
+      `SELECT id, embedding FROM memories
+        WHERE embedding IS NOT NULL AND embedding != ''
+          AND forgotten = 0 AND archived = 0`
+    ).all().reduce((acc, row) => {
+      let dim = "";
+      try {
+        const parsed = JSON.parse(row.embedding);
+        dim = Array.isArray(parsed) ? String(parsed.length) : "";
+      } catch { /* unparseable vector counts under "" */ }
+      acc.set(dim, (acc.get(dim) ?? 0) + 1);
+      return acc;
+    }, new Map());
+  }
+
+  /**
+   * 维度探针（#383）：**存在性判据**——库里有没有一条活跃向量的维度等于查询维度。
+   *
+   * #508 评审把判据从「读一行的维度」换成了存在性，因为 LIMIT 1 拿任意一条代表全库，
+   * 在混合维度库里两个方向都错：抽到与查询不符的那条 → 明明有可比的 3 维向量却报
+   * degraded；抽到的那条恰好解析失败 → 其余有效向量都不匹配时又漏报成 full。一行
+   * 读数回答不了「这个维度在这库里能不能比」这个问题。
+   *
+   * 行集与 searchVector **必须同源**：下面这段 WHERE 的谓词与 searchVector（本文件
+   * vector search 段）逐条相同（只是书写顺序不同，语义等价），改一处必须同步改另一处
+   * ——否则 tier 的核心断言「searchVector 会不会找到可比向量」会悄悄失真。活跃 = 未
+   * 遗忘未归档、embedding 非空；/context 只经 searchVector 触达检索，从不传
+   * includeArchived。
+   *
+   * 状态语义（后两个是 fail-closed 兜底态，不是正常读数）：
+   *   match      有维度相符的活跃向量 → 语义路通。注意「通」≠「有命中」：type /
+   *              importance / codingGate / scope 四道门（service.js 的 inject 段）
+   *              仍可能让语义档贡献为 0，这是旧探针就有的边界。
+   *   mismatch   有向量，但没有一条维度相符 → 语义召回实际不可用 → degraded
+   *   none       行集本身为空（空库 / 从未建索引）→ 没有东西可比，**不是**维度
+   *              不符 → full
+   *   unreadable 有行，但一条都读不出来（embedding 列损坏）→ 与 none 是**两种空**：
+   *              前者是还没有内容，后者是内容在那儿却读不出来。判不出来 → unknown，
+   *              绝不因为「读不到」就宣称 full。
+   *   invalid    查询维度本身不是正整数 → 同样判不出来 → unknown。当前 /context
+   *              不可达（embedQueryVector 保证返回非空数组），防御性留着：别让
+   *              「判不了」落到 full 上。
+   *
+   * 成本模型（取代原来「只读一行，O(1)」的说法——那句话对现在的实现是假的）：
+   *   · SQL 是一次**无 ORDER BY 无 LIMIT 的全 id 扫描**，每次调用都有，不免费
+   *     （只拖 id 列，约 40 KB/千行，比 SELECT * 的全表 TEXT 便宜得多）。
+   *   · 按匹配短路：全库同维度（常态）时 JS 循环第一行就 return，只解析 1 个向量。
+   *   · 一条都不匹配时才走完整个循环，而那正是要报 degraded 的情形，值得。此时每个
+   *     缓存未命中的行都要点查一次 embedding TEXT（冷缓存下 = N+1 条语句）；
+   *     getParsedEmbedding 不缓存否定结果，所以读不出来的行每次请求都会重解析一次。
+   *   · 缓存热不热是有条件的：/context 里让 embeddingCache 变热的只有 injectCandidates
+   *     内部两个 vectorIndex 分支（service.js:1696 / :1768），需要 hybridInject 与
+   *     selectiveInject 都没被关掉、行数在 4000 条 FIFO 上限内；standalone 装配不设
+   *     vectorIndex 时缓存是冷的。判档跑在 injectCandidates 之后，装配齐时缓存已热。
+   *
+   * @param {number} dimension 查询向量维度
+   * @returns {{state: "match"|"mismatch"|"none"|"unreadable"|"invalid"}}
+   */
+  function vectorDimensionState(dimension) {
+    if (!Number.isInteger(dimension) || dimension <= 0) return { state: "invalid" };
+    // 与 searchVector 的行集逐条相同（顺序不同、语义等价）——同源行集，同步改。
+    // 同样不带 `embedding != ''`：只取 id，读 embedding 列纯属白搬；空串行由
+    // readVector 返回 undefined，落到下面 sawVector 分支（不影响 unreadable 判定）。
+    const rows = db.prepare(
+      `SELECT id FROM memories
+       WHERE embedding IS NOT NULL
+         AND forgotten = 0 AND archived = 0`
+    ).all();
+    if (!rows.length) return { state: "none" };
+    let sawVector = false;
+    noteSweep(rows.length, dimension);
+    for (const row of rows) {
+      // 走同一解析缓存，不自己 JSON.parse——与 searchVector / getEmbedding(s)
+      // 同一条读路径，缓存热时零解析。
+      const v = readVector(row.id);
+      if (!v || !v.length) continue;
+      sawVector = true;
+      if (v.length === dimension) return { state: "match" };
+    }
+    // 有行却零条可解析：不是「没有向量」，是「有向量读不出来」。
+    return { state: sawVector ? "mismatch" : "unreadable" };
+  }
+
+  function search(query, { limit = 20, includeArchived = false } = {}) {
+    const q = String(query).trim();
+    if (!q) return [];
+    // Plain LIKE substring scan over title/content/tags (wildcards escaped so
+    // user input matches literally). No FTS5: CJK substring matching needs
+    // LIKE, and typical memory stores are small enough that a scan is fine.
+    const like = `%${escapeLike(q)}%`;
+    const { limit: lim } = sanitizePage(limit, 0, 20);
+    const archivedFilter = includeArchived ? "" : "archived = 0 AND ";
+    const rows = db.prepare(
+      `SELECT * FROM memories
+       WHERE ${archivedFilter}forgotten = 0 AND (title LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\' OR tags LIKE ? ESCAPE '\\')
+       ORDER BY
+         CASE WHEN title LIKE ? ESCAPE '\\' THEN 0 ELSE 1 END,
+         importance DESC,
+         updated_at DESC,
+         id
+       LIMIT ?`
+    ).all(like, like, like, like, lim);
+    return rows.map(toRow);
+  }
+
+  // --- vector search ------------------------------------------------------
+
+  function cosine(a, b) {
+    if (!isVectorLike(a) || !isVectorLike(b) || a.length !== b.length || !a.length) return 0;
+    let dot = 0;
+    let na = 0;
+    let nb = 0;
+    for (let i = 0; i < a.length; i++) {
+      dot += a[i] * b[i];
+      na += a[i] * a[i];
+      nb += b[i] * b[i];
+    }
+    if (na === 0 || nb === 0) return 0;
+    return dot / (Math.sqrt(na) * Math.sqrt(nb));
+  }
+
+  /**
+   * Brute-force cosine similarity over embedded rows. Returns rows decorated
+   * with a `score` (0..1). Only rows with a stored embedding participate.
+   */
+  function searchVector(vector, { limit = 20, includeArchived = false, threshold = 0 } = {}) {
+    if (!Array.isArray(vector) || !vector.length) return [];
+    const archivedFilter = includeArchived ? "" : "archived = 0 AND ";
+    // Issue #202：只取 id 列（~40 KB）而非 SELECT *（~11 MB）——向量从缓存取，
+    // 缓存未命中时按 id 点查 embedding 再解析回填。SQL 里保留 embedding 的
+    // IS NOT NULL 过滤，保证「有向量的行」集合始终以库为准（删除/清空即时生效）。
+    //
+    // 为什么不带 `embedding != ''`（2026-11-05 实测）：`!= ''` 要读 embedding 列
+    // 才能判定，SQLite 就得把 134MB 向量文本整个从磁盘搬一遍——而这里只 SELECT
+    // id，一条文本都不用。真库副本实测：这条 SQL 单独跑 265ms → 96ms；落到
+    // 一轮完整检索上是 138ms → 47ms（省约 90ms，其余是解析/打分开销）。
+    // 空串行（外部直接 UPDATE 造出来的，setEmbedding 写的是 NULL）由 readVector
+    // 兜住：JSON.parse('') 抛错 → 返回 undefined → 跳过，既不计分也不崩。
+    const rows = db.prepare(
+      `SELECT id FROM memories
+       WHERE ${archivedFilter}forgotten = 0 AND embedding IS NOT NULL`
+    ).all();
+    const scored = [];
+    // 自适应上限：本次要扫这么多行，先让缓存装得下，否则会边扫边驱逐自己。
+    noteSweep(rows.length, vector.length);
+    for (const row of rows) {
+      const v = readVector(row.id);
+      if (!v) continue;
+      // distill-tx-embed-gap 顺带修：维度不匹配的行按维度分流，直接跳过。旧路径
+      // 喂进 cosine 不等长就 return 0，换了模型/维度的旧向量以 0 分混进结果尾部
+      // （threshold 默认 0 时照样入选），检索方拿到的分数是跨向量空间的假值。
+      // 不等长的向量对本次查询没有可比分数，跳过是唯一诚实的处置。
+      if (v.length !== vector.length) continue;
+      const score = cosine(vector, v);
+      if (score >= threshold) scored.push({ row: { id: row.id }, score });
+    }
+    scored.sort((a, b) => b.score - a.score);
+    const { limit: lim } = sanitizePage(limit, 0, 20);
+    // Top-N 回表：只对入选行取完整字段（主键点查 ≤ lim 行），评分别拖着正文走。
+    const getFull = db.prepare("SELECT * FROM memories WHERE id = ?");
+    const out = [];
+    for (const { row, score } of scored.slice(0, lim)) {
+      const full = getFull.get(row.id);
+      if (full) out.push({ ...toRow(full), score });
+    }
+    return out;
+  }
+
+  // --- autoDream audit trail ----------------------------------------------
+
+  /**
+   * Persist one autoDream run. The audit row is machine-verifiable but never
+   * triggers write hooks (it is bookkeeping, not a memory mutation): dream
+   * records its own runs, and a notify here would loop back into the dream
+   * scheduler. Writes are idempotent on run id (replay overwrites, never
+   * duplicates) so the same logical run can be re-applied for verification.
+   */
+  function saveDreamRun(run) {
+    const id = run.id ?? randomUUID();
+    const now = nowIso();
+    const policyEpoch = Number.isInteger(run.policy_epoch) ? run.policy_epoch : 0;
+    const runType = run.run_type ?? "auto";
+    // Issue #104：degraded 轮的跳过明细（JSON）。与 decisions/outcome 同为可选
+    // 载荷，未提供时落 NULL（而不是 "[]"），审计行只记真实发生过的跳过。
+    const skipped = run.skipped !== undefined ? JSON.stringify(run.skipped) : null;
+    // Issue #89（基线半边）：只有成功刷新过基线的 run 才带这两个值。非法/缺失一律落
+    // NULL——播种端以「两列同时有值」为唯一认账条件，半个基线（只有条数没有字符数）
+    // 会让阈值按 0 字符起算，比不认还糟。
+    const baselineKnown =
+      Number.isInteger(run.store_count) && run.store_count >= 0 &&
+      Number.isInteger(run.store_chars) && run.store_chars >= 0;
+    const storeCount = baselineKnown ? run.store_count : null;
+    const storeChars = baselineKnown ? run.store_chars : null;
+    // #534：失败轮的模型原始输出（对象：kind/raw_len/raw_head/raw_tail?/parsed?）。
+    // 未提供落 NULL 而不是 "{}"——读侧靠「有没有值」区分「这轮没留」与「留了个空」。
+    const rawOutput = run.raw_output !== undefined ? JSON.stringify(run.raw_output) : null;
+    db.prepare(
+      `INSERT INTO dream_runs (id, created_at, status, error, provider, model, snapshot_hash,
+        input_count, input, decisions, outcome, applied, summary_stored, receipt, policy_epoch, run_type, skipped,
+        store_count, store_chars, raw_output)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         created_at=excluded.created_at, status=excluded.status, error=excluded.error,
+         provider=excluded.provider, model=excluded.model, snapshot_hash=excluded.snapshot_hash,
+         input_count=excluded.input_count, input=excluded.input, decisions=excluded.decisions,
+         outcome=excluded.outcome, applied=excluded.applied, summary_stored=excluded.summary_stored,
+         receipt=excluded.receipt, policy_epoch=excluded.policy_epoch, run_type=excluded.run_type,
+         skipped=excluded.skipped, store_count=excluded.store_count, store_chars=excluded.store_chars,
+         raw_output=excluded.raw_output`
+    ).run(
+      id,
+      run.created_at ?? now,
+      run.status,
+      run.error ?? null,
+      run.provider ?? null,
+      run.model ?? null,
+      run.snapshot_hash,
+      run.input_count,
+      run.input !== undefined ? JSON.stringify(run.input) : null,
+      run.decisions !== undefined ? JSON.stringify(run.decisions) : null,
+      run.outcome !== undefined ? JSON.stringify(run.outcome) : null,
+      run.applied ?? 0,
+      run.summary_stored ? 1 : 0,
+      run.receipt,
+      policyEpoch,
+      runType,
+      skipped,
+      storeCount,
+      storeChars,
+      rawOutput
+    );
+    return getDreamRun(id);
+  }
+
+  function getDreamRun(id) {
+    const row = db.prepare("SELECT * FROM dream_runs WHERE id = ?").get(id);
+    return toDreamRun(row);
+  }
+
+  // #495：excludeRunType 是可选下推条件，默认不过滤——审计面（面板的最近运行、
+  // 回放脚本、各测试的 `listDreamRuns()` 无参调用）本来就该看全量，过滤只在
+  // 「最近一次真·巩固」这种需要排除 agent 主动整理的场合由调用方显式指定。
+  // 值走白名单：这个参数会拼进 SQL 的 != 条件，不接受任意字符串。
+  function listDreamRuns({ limit = 50, offset = 0, excludeRunType = null } = {}) {
+    const { limit: lim, offset: off } = sanitizePage(limit, offset, 50);
+    const excluded = DREAM_RUN_TYPES.includes(excludeRunType) ? excludeRunType : null;
+    const rows = db.prepare(
+      "SELECT * FROM dream_runs WHERE (? IS NULL OR run_type != ?) ORDER BY created_at DESC, id LIMIT ? OFFSET ?"
+    ).all(excluded, excluded, lim, off);
+    return rows.map(toDreamRun);
+  }
+
+  // Issue #89：上次实际开跑时刻（epoch ms），从审计表恢复——调度器的 lastRunAt
+  // 只活在内存里，进程重启即归零，闸门对新实例放行 → 重启后立刻连发。审计表
+  // 本来就逐 run 落库（failed/degraded 也算 run），直接读它就是事实源，零迁移。
+  function lastDreamRunAt(runType = null) {
+    const row = runType
+      ? db.prepare(
+          "SELECT created_at FROM dream_runs WHERE run_type = ? ORDER BY created_at DESC, id LIMIT 1"
+        ).get(runType)
+      : db.prepare(
+          "SELECT created_at FROM dream_runs ORDER BY created_at DESC, id LIMIT 1"
+        ).get();
+    if (!row?.created_at) return 0;
+    const ms = Date.parse(row.created_at);
+    return Number.isFinite(ms) ? ms : 0;
+  }
+
+  // Issue #89（基线半边）：上次成功刷新后的阈值基线（活跃条数 / 正文字符数）。与
+  // lastDreamRunAt 同源——审计表就是事实源，不另开一份状态；差别只在只认「推进过
+  // 基线」的行（两列同时非 NULL = 那一轮是 ok）。按 run_type 隔离：sleep/organize
+  // 的轮次不参与 auto 的阈值判定，混用会让其余模块的库规模假扮成巩固基线。
+  // 认不出行时返回 null，调用方退回零基线（= 升级前行为），绝不假装知道基线。
+  function lastDreamBaseline(runType = null) {
+    const where = "store_count IS NOT NULL AND store_chars IS NOT NULL";
+    const row = runType
+      ? db.prepare(
+          `SELECT store_count, store_chars FROM dream_runs
+            WHERE run_type = ? AND ${where}
+            ORDER BY created_at DESC, id LIMIT 1`
+        ).get(runType)
+      : db.prepare(
+          `SELECT store_count, store_chars FROM dream_runs
+            WHERE ${where} ORDER BY created_at DESC, id LIMIT 1`
+        ).get();
+    if (!row) return null;
+    return { count: row.store_count, chars: row.store_chars };
+  }
+
+  /**
+   * Latest ruling-rule version seen on the audit trail. policy_epoch is a config
+   * value stamped onto each run by the caller; reading the newest row's epoch
+   * gives the current effective version, falling back to 0 (default) when the
+   * trail is empty. Rules upgrades leave older runs with their original epoch,
+   * so those decisions can be demoted to historical evidence.
+   */
+  function getLatestPolicyEpoch() {
+    const row = db.prepare(
+      "SELECT policy_epoch FROM dream_runs ORDER BY created_at DESC, id LIMIT 1"
+    ).get();
+    return row ? (row.policy_epoch ?? 0) : 0;
+  }
+
+  // --- per-record receipt chain --------------------------------------------
+
+  /**
+   * Persist one per-record receipt (a single merge/conflict/update verdict).
+   * The run-level dream audit trail answers "did this run happen and with what
+   * input"; the receipt chain drills down to each mutable verdict, carrying the
+   * input digest (decision basis) plus count_before → count_after idempotency
+   * checkpoints so replay drift can be located to the exact record/run. Like
+   * the dream trail this is bookkeeping: it never triggers write hooks. Writes
+   * are idempotent on receipt id (replay overwrites, never duplicates).
+   */
+  function saveReceipt(run) {
+    const id = run.receipt_id ?? randomUUID();
+    const now = nowIso();
+    const policyEpoch = Number.isInteger(run.policy_epoch) ? run.policy_epoch : 0;
+    db.prepare(
+      `INSERT INTO receipt_chain (receipt_id, run_id, record_id, kind, input_digest,
+        winner_id, loser_id, keep_source, sources, verdict, count_before, count_after,
+        policy_epoch, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(receipt_id) DO UPDATE SET
+         run_id=excluded.run_id, record_id=excluded.record_id, kind=excluded.kind,
+         input_digest=excluded.input_digest, winner_id=excluded.winner_id,
+         loser_id=excluded.loser_id, keep_source=excluded.keep_source,
+         sources=excluded.sources, verdict=excluded.verdict,
+         count_before=excluded.count_before, count_after=excluded.count_after,
+         policy_epoch=excluded.policy_epoch, created_at=excluded.created_at`
+    ).run(
+      id,
+      run.run_id,
+      run.record_id,
+      run.kind,
+      run.input_digest,
+      run.winner_id ?? null,
+      run.loser_id ?? null,
+      run.keep_source ?? null,
+      JSON.stringify(run.sources ?? []),
+      run.verdict,
+      run.count_before,
+      run.count_after,
+      policyEpoch,
+      run.created_at ?? now
+    );
+    return getReceipt(id);
+  }
+
+  function getReceipt(id) {
+    const row = db.prepare("SELECT * FROM receipt_chain WHERE receipt_id = ?").get(id);
+    return toReceipt(row);
+  }
+
+  function listReceipts({ limit = 50, offset = 0, run_id } = {}) {
+    const { limit: lim, offset: off } = sanitizePage(limit, offset, 50);
+    const clauses = [];
+    const params = [];
+    if (run_id) {
+      clauses.push("run_id = ?");
+      params.push(run_id);
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    const rows = db.prepare(
+      `SELECT * FROM receipt_chain ${where} ORDER BY created_at DESC, receipt_id LIMIT ? OFFSET ?`
+    ).all(...params, lim, off);
+    return rows.map(toReceipt);
+  }
+
+  // --- recall-layer audit trail -------------------------------------------
+
+  /**
+   * Persist one recall run (the retrieval scene: query/mode/top-k/threshold +
+   * the exact candidate list handed to the caller). Like the dream audit trail
+   * this is bookkeeping, so it never triggers write hooks — a notify here would
+   * loop back into search itself. Writes are idempotent on run id (replay
+   * overwrites, never duplicates), matching saveDreamRun.
+   */
+  function saveRecallRun(run) {
+    const id = run.id ?? randomUUID();
+    db.prepare(
+      `INSERT INTO recall_runs (id, query, mode, top_k, threshold, candidates, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         query=excluded.query, mode=excluded.mode, top_k=excluded.top_k,
+         threshold=excluded.threshold, candidates=excluded.candidates,
+         created_at=excluded.created_at`
+    ).run(
+      id,
+      run.query,
+      run.mode,
+      run.topK ?? null,
+      run.threshold ?? null,
+      JSON.stringify(run.candidates ?? []),
+      run.created_at ?? nowIso()
+    );
+    return getRecallRun(id);
+  }
+
+  function getRecallRun(id) {
+    const row = db.prepare("SELECT * FROM recall_runs WHERE id = ?").get(id);
+    return toRecallRun(row);
+  }
+
+  function listRecallRuns({ limit = 50, offset = 0, query } = {}) {
+    const { limit: lim, offset: off } = sanitizePage(limit, offset, 50);
+    const clauses = [];
+    const params = [];
+    if (query) {
+      clauses.push("query LIKE ? ESCAPE '\\'");
+      params.push(`%${escapeLike(String(query))}%`);
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    const rows = db.prepare(
+      `SELECT * FROM recall_runs ${where} ORDER BY created_at DESC, id LIMIT ? OFFSET ?`
+    ).all(...params, lim, off);
+    return rows.map(toRecallRun);
+  }
+
+  /**
+   * Window scan for the recall-stats aggregation (#217): every recall_runs row
+   * created at/after sinceIso, oldest first (rows[0].created_at = earliest
+   * coverage marker), plus the untruncated window total so the caller can flag
+   * a capped scan instead of silently undercounting. Read-only; `limit` exists
+   * so tests can exercise the cap path without a 50k-row fixture.
+   */
+  function listRecallRunsSince(sinceIso, { limit = 50000 } = {}) {
+    const total = db.prepare(
+      "SELECT count(*) AS c FROM recall_runs WHERE created_at >= ?"
+    ).get(sinceIso).c;
+    const rows = db.prepare(
+      "SELECT * FROM recall_runs WHERE created_at >= ? ORDER BY created_at ASC, id LIMIT ?"
+    ).all(sinceIso, limit).map(toRecallRun);
+    return { rows, total };
+  }
+
+  // --- recall evaluation trail (方案 B: separate from the production audit) -
+
+  /**
+   * Rolling purge of the recall_runs production audit (v0.7.0): with recordRecall
+   * defaulting ON, the table would otherwise grow unboundedly on a busy store.
+   * Drop rows older than `days` (config.recallRetentionDays, default 90).
+   * created_at is an ISO TEXT string, so the ISO bound compares lexicographically.
+   * Returns the number of rows deleted (bookkeeping — never throws on empty).
+   *
+   * 2026-10-14 找回：这一对（本函数 + index.js 的启动调用）在 dd0ed78「release:
+   * v0.7.12 + 编码记忆(codingRetrospect)蒸馏/…（合并 #73 与 #74）」里被整块弄丢。
+   * 该提交不是 merge（单亲 cb5ec63），store.js 是从一个没有这段的版本重建的，
+   * 于是函数与调用一起蒸发，而配置键 recallRetentionDays、README.md 与
+   * docs/CONFIGURATION.md 的「recall_runs 滚动清理保留天数」一直留到今天。
+   * 实测后果（2026-10-14 快照）：本机 recall_runs 18,442 行、跨度 2026-09-08 →
+   * 2026-10-13，即从那一天起只增不减。注意这张表是**活的、只增的**：同一个 10-13
+   * 当天 14:43Z 是 18,442 行、20:47Z 已是 20,029 行，几小时就差一千五——所以任何
+   * 行数只在测它的那一刻成立，引用时必须带时刻，否则日后对不上会被误读成出了错。
+   * 这份审计里现在装的是用户原话，不是无信息的空串。
+   */
+  function purgeRecallRunsOlderThan(days) {
+    const cutoff = new Date(Date.now() - days * 86400000).toISOString();
+    const result = db.prepare("DELETE FROM recall_runs WHERE created_at < ?").run(cutoff);
+    return result.changes;
+  }
+
+  /**
+   * Persist one retrieval-evaluation snapshot into recall_evals — the test/eval
+   * sibling of recall_runs, deliberately stored apart so eval snapshots never
+   * inflate the production recall audit. Like the other audit tables this is
+   * bookkeeping: it never triggers write hooks. Writes are idempotent on id
+   * (replay overwrites, never duplicates), matching saveRecallRun. recall_run_id
+   * optionally links the eval to the recall_runs row that captured the same
+   * retrieval scene (FK-referenced, null when no run was recorded).
+   */
+  function saveRecallEval(evalRow) {
+    const id = evalRow.id ?? randomUUID();
+    db.prepare(
+      `INSERT INTO recall_evals (id, recall_run_id, query, expected_ids, actual_ids, metrics, eval_type, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         recall_run_id=excluded.recall_run_id, query=excluded.query,
+         expected_ids=excluded.expected_ids, actual_ids=excluded.actual_ids,
+         metrics=excluded.metrics, eval_type=excluded.eval_type,
+         created_at=excluded.created_at`
+    ).run(
+      id,
+      evalRow.recall_run_id ?? null,
+      evalRow.query,
+      JSON.stringify(evalRow.expected_ids ?? []),
+      JSON.stringify(evalRow.actual_ids ?? []),
+      JSON.stringify(evalRow.metrics ?? {}),
+      evalRow.eval_type ?? "manual",
+      evalRow.created_at ?? nowIso()
+    );
+    return getRecallEval(id);
+  }
+
+  function getRecallEval(id) {
+    const row = db.prepare("SELECT * FROM recall_evals WHERE id = ?").get(id);
+    return toRecallEval(row);
+  }
+
+  function listRecallEvals({ limit = 50, offset = 0, query } = {}) {
+    const { limit: lim, offset: off } = sanitizePage(limit, offset, 50);
+    const clauses = [];
+    const params = [];
+    if (query) {
+      clauses.push("query LIKE ? ESCAPE '\\'");
+      params.push(`%${escapeLike(String(query))}%`);
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    const rows = db.prepare(
+      `SELECT * FROM recall_evals ${where} ORDER BY created_at DESC, id LIMIT ? OFFSET ?`
+    ).all(...params, lim, off);
+    return rows.map(toRecallEval);
+  }
+
+  // --- llm audit trail (Bug8) ---------------------------------------------
+
+  /**
+   * Persist one LLM audit row (a background call's token/time/status receipt).
+   * Bookkeeping like the other audit tables: it never triggers write hooks, so
+   * recording a call can never loop back into the scheduler that made it. The
+   * call itself is wrapped so a failure is captured (status='error') instead of
+   * blocking the feature — only a throwing saveLlmAudit is swallowed, never the
+   * LLM call.
+   */
+  function saveLlmAudit(entry) {
+    const now = nowIso();
+    const inTokens = Number.isFinite(entry.input_tokens) ? entry.input_tokens : 0;
+    const outTokens = Number.isFinite(entry.output_tokens) ? entry.output_tokens : 0;
+    const info = db.prepare(
+      `INSERT INTO llm_audit_logs (timestamp, trigger_source, operation_type, model_id,
+        input_tokens, output_tokens, total_tokens, cost_usd, duration_ms, status,
+        error_message, related_memory_ids, metadata, session_key)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      entry.timestamp ?? now,
+      entry.trigger_source,
+      entry.operation_type,
+      entry.model_id,
+      inTokens,
+      outTokens,
+      Number.isFinite(entry.total_tokens) ? entry.total_tokens : inTokens + outTokens,
+      Number.isFinite(entry.cost_usd) ? entry.cost_usd : 0,
+      Number.isFinite(entry.duration_ms) ? entry.duration_ms : 0,
+      entry.status ?? "success",
+      entry.error_message ?? null,
+      JSON.stringify(entry.related_memory_ids ?? []),
+      entry.metadata !== undefined
+        ? (typeof entry.metadata === "string" ? entry.metadata : JSON.stringify(entry.metadata))
+        : null,
+      entry.session_key ?? null
+    );
+    // #534 / CodeRabbit on #535：回读必须用**这一次插入**的 rowid，不能用
+    // `ORDER BY id DESC LIMIT 1`。库支持多进程共用（见 AGENTS.md 的
+    // busy_timeout + WAL 约定），另一个写者在这两条语句之间插入就会把这行
+    // 读成别人的调用——调用方拿它去 annotate 校验判决时，会把本轮结论写到
+    // 另一轮头上。lastInsertRowid 是连接内的事实，不受并发写影响。
+    return toLlmAudit(db.prepare("SELECT * FROM llm_audit_logs WHERE id = ?").get(info.lastInsertRowid));
+  }
+
+  /**
+   * #534 建议 3：给已落库的审计行补一层「事后才知道」的读数。
+   *
+   * 两套账的根源是时序：审计行在 LLM 调用返回的那一刻就写死了（状态、token、
+   * 耗时都是调用层事实），而决策校验发生在调用之后——一轮「调用成功、输出却被
+   * 校验整单拒绝」在审计表里永远是 success，于是聚合出来的成功率与 dream_runs
+   * 的真实成功率对不上（作者实测 95% vs 10.5%）。
+   *
+   * 只合并 metadata（表里写明是 free-form extras），绝不改 status / token /
+   * timestamp：那些是调用层的事实，改写它们等于伪造账本。metadata 是「这一轮还
+   * 有什么值得记的」的垃圾桶，把校验判决放进去既补上了分账，又不制造第二张表。
+   *
+   * patch 是浅合并：已有键保留，同名键覆盖。行不存在（被清理/删除）静默返回
+   * undefined——补注失败不该把一轮巩固变成异常。
+   */
+  function annotateLlmAudit(id, patch) {
+    if (id == null || !patch || typeof patch !== "object") return undefined;
+    const row = db.prepare("SELECT * FROM llm_audit_logs WHERE id = ?").get(id);
+    if (!row) return undefined;
+    const current = toLlmAudit(row)?.metadata;
+    const base = current && typeof current === "object" && !Array.isArray(current) ? current : {};
+    const merged = { ...base, ...patch };
+    db.prepare("UPDATE llm_audit_logs SET metadata = ? WHERE id = ?").run(JSON.stringify(merged), id);
+    return toLlmAudit(db.prepare("SELECT * FROM llm_audit_logs WHERE id = ?").get(id));
+  }
+
+  function listLlmAudits({ limit = 50, offset = 0, source, sessionKey } = {}) {
+    const { limit: lim, offset: off } = sanitizePage(limit, offset, 50);
+    const clauses = [];
+    const params = [];
+    if (source) {
+      clauses.push("trigger_source = ?");
+      params.push(source);
+    }
+    // #254 写入准入：会话内的话题回填只需要该会话的行（走 idx_llm_audit_session）。
+    if (sessionKey) {
+      clauses.push("session_key = ?");
+      params.push(sessionKey);
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    const rows = db.prepare(
+      `SELECT * FROM llm_audit_logs ${where} ORDER BY timestamp DESC, id DESC LIMIT ? OFFSET ?`
+    ).all(...params, lim, off);
+    return rows.map(toLlmAudit);
+  }
+
+  function countLlmAudits({ source, sessionKey } = {}) {
+    const clauses = [];
+    const params = [];
+    if (source) {
+      clauses.push("trigger_source = ?");
+      params.push(source);
+    }
+    if (sessionKey) {
+      clauses.push("session_key = ?");
+      params.push(sessionKey);
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    return db.prepare(`SELECT count(*) AS c FROM llm_audit_logs ${where}`).get(...params).c;
+  }
+
+  /**
+   * Aggregate LLM spend over the last `days`: total calls/tokens/duration/cost,
+   * broken down by trigger_source, by status, by operation_type and by day.
+   * Used by the API's /llm-audit/stats endpoint so the Web panel can show
+   * where budget goes.
+   *
+   * by_operation / by_day exist because by_source is too coarse for the
+   * "where did the tokens go" panel: trigger_source merges dream_consolidate
+   * and dream_summarize into one autoDream bucket, hiding the single largest
+   * cost item (37% of 7-day tokens in the 2026-10 audit). by_day feeds the
+   * 7-day trend bars. Both are additive — by_source/by_status keep their
+   * shape (two tests assert on them).
+   */
+  function getLlmAuditStats({ days = 7 } = {}) {
+    const since = new Date(Date.now() - days * 86400000).toISOString();
+    const total = db.prepare(
+      `SELECT count(*) AS c,
+              COALESCE(SUM(input_tokens), 0) AS i,
+              COALESCE(SUM(output_tokens), 0) AS o,
+              COALESCE(SUM(total_tokens), 0) AS t,
+              COALESCE(SUM(duration_ms), 0) AS d,
+              COALESCE(SUM(cost_usd), 0) AS cst
+       FROM llm_audit_logs WHERE timestamp >= ?`
+    ).get(since);
+    const bySource = db.prepare(
+      `SELECT trigger_source AS source, count(*) AS c,
+              COALESCE(SUM(total_tokens), 0) AS total_tokens
+       FROM llm_audit_logs WHERE timestamp >= ?
+       GROUP BY trigger_source ORDER BY total_tokens DESC`
+    ).all(since);
+    const byStatus = db.prepare(
+      "SELECT status, count(*) AS c FROM llm_audit_logs WHERE timestamp >= ? GROUP BY status"
+    ).all(since);
+    const byOperation = db.prepare(
+      `SELECT operation_type AS operation, count(*) AS c,
+              COALESCE(SUM(input_tokens), 0) AS input_tokens,
+              COALESCE(SUM(output_tokens), 0) AS output_tokens,
+              COALESCE(SUM(total_tokens), 0) AS total_tokens
+       FROM llm_audit_logs WHERE timestamp >= ?
+       GROUP BY operation_type ORDER BY total_tokens DESC`
+    ).all(since);
+    const byDay = db.prepare(
+      `SELECT date(timestamp) AS day, count(*) AS c,
+              COALESCE(SUM(input_tokens), 0) AS input_tokens,
+              COALESCE(SUM(output_tokens), 0) AS output_tokens,
+              COALESCE(SUM(total_tokens), 0) AS total_tokens
+       FROM llm_audit_logs WHERE timestamp >= ?
+       GROUP BY date(timestamp) ORDER BY day ASC`
+    ).all(since);
+    return {
+      days,
+      since,
+      total_calls: total.c,
+      input_tokens: total.i,
+      output_tokens: total.o,
+      total_tokens: total.t,
+      total_duration_ms: total.d,
+      total_cost_usd: Number(total.cst),
+      by_source: bySource,
+      by_status: byStatus,
+      by_operation: byOperation,
+      by_day: byDay
+    };
+  }
+
+  /**
+   * 沉淀曲线（面板「8 周沉淀」图）：按天给出「进来的」与「真沉淀的」两条序列，
+   * 用来一眼看出库到底在巩固还是在膨胀——只看新增会以为一直在长，只看总量
+   * 看不出巩固停摆（2026-10-25~10-31 那段新增照旧、合并归零，就是这张图要
+   * 暴露的形态）。
+   *
+   * added    = 当天新建记忆。排除外来导入行（本库不为别人导入的原文记账，
+   *            见 memory-source.js）；`source IS NULL OR` 那一支是必填——
+   *            SQL 三值逻辑让 `NULL <> 'imported'` 求值为 NULL 而非 true，
+   *            只写后者的版本会让本方行（source 恒为 NULL）整批消失。
+   * merged   = 当天 receipt_chain 里 kind∈(merge,update) 且 verdict='live' 的
+   *            **去重 record_id 数**，不是行数。同一条记录被多轮巩固重复记账
+   *            是常态（活库实测 2412 行只对应 1796 个记录，见 #559 期间的
+   *            核对），按行数会把「又记了一遍」算成「又沉淀了一条」。口径与
+   *            store 里「已巩固」的既有子查询同源（kind IN ('merge','update')
+   *            AND verdict='live'），不另立一套。
+   * archived = 当天进入归档面的条数（archived_at 幂等，见其注释：已归档再
+   *            归档不刷新，取消归档置 NULL），所以日聚合 = 当天新归档条数。
+   *
+   * 三列都按 UTC 日期切分，与 getLlmAuditStats 的 by_day 同一套日期口径，
+   * 前端补零/对齐逻辑因此可以复用。
+   *
+   * 只返回有数据的日期（GROUP BY 不补零），与 by_day 同形——补零是展示层的事，
+   * 后端补零会让「未知」和「已知为空」在响应里长得一样。
+   */
+  function getConsolidationStats({ days = 56 } = {}) {
+    const span = Math.max(1, Math.min(365, Math.floor(Number(days)) || 56));
+    const since = new Date(Date.now() - span * 86400000).toISOString();
+    const added = db.prepare(
+      `SELECT date(created_at) AS day, count(*) AS c
+         FROM memories
+        WHERE created_at >= ? AND (source IS NULL OR source <> ?)
+        GROUP BY date(created_at) ORDER BY day ASC`
+    ).all(since, IMPORTED_SOURCE);
+    const merged = db.prepare(
+      `SELECT day, count(*) AS c FROM (
+         SELECT date(created_at) AS day, record_id
+           FROM receipt_chain
+          WHERE created_at >= ? AND kind IN ('merge', 'update') AND verdict = 'live'
+          GROUP BY day, record_id
+       ) GROUP BY day ORDER BY day ASC`
+    ).all(since);
+    const archived = db.prepare(
+      `SELECT date(archived_at) AS day, count(*) AS c
+         FROM memories
+        WHERE archived_at IS NOT NULL AND archived_at >= ? AND (source IS NULL OR source <> ?)
+        GROUP BY date(archived_at) ORDER BY day ASC`
+    ).all(since, IMPORTED_SOURCE);
+    // 三串按天并进一张表：三条 SQL 各扫各的索引，比一次 UNION + 外层聚合好读，
+    // 也让某一段全 0 时不会因为缺行而丢掉这一天（缺的是 0，不是不存在）。
+    const byDay = new Map();
+    const bump = (rows, key) => {
+      for (const r of rows) {
+        const day = String(r.day ?? "");
+        if (!day) continue;
+        const cur = byDay.get(day) ?? { day, added: 0, merged: 0, archived: 0 };
+        cur[key] = Number(r.c) || 0;
+        byDay.set(day, cur);
+      }
+    };
+    bump(added, "added");
+    bump(merged, "merged");
+    bump(archived, "archived");
+    const list = [...byDay.values()].sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : 0));
+    const sum = list.reduce(
+      (acc, r) => ({ added: acc.added + r.added, merged: acc.merged + r.merged, archived: acc.archived + r.archived }),
+      { added: 0, merged: 0, archived: 0 }
+    );
+    return {
+      days: span,
+      since,
+      by_day: list,
+      total_added: sum.added,
+      total_merged: sum.merged,
+      total_archived: sum.archived
+    };
+  }
+
+  /** Delete audit rows older than `before` (ISO string). Returns count removed. */
+  function deleteOldLlmAudits(before) {
+    return db.prepare("DELETE FROM llm_audit_logs WHERE timestamp < ?").run(before).changes;
+  }
+
+  // --- 蒸馏原始记录与记忆级溯源（#399）-------------------------------------
+
+  /**
+   * 落盘一个蒸馏窗口的公开记录（#399）。
+   *
+   * `INSERT OR IGNORE` 而非 OR REPLACE：主键 (session_id, seq) 的冲突只可能来自
+   * **同一窗口的重跑**（max-runs 门耗尽额度、宿主重启都会重跑同一 seq 段，见
+   * summarize.js 里「max-runs 刻意不消费游标」的注释），而重跑必须幂等——同一
+   * seq 的原文没有第二次「更真」的版本，保留首次落盘时间才诚实。
+   * @param {Array<{seq:number, role:string, text:string, windowId?:string, distilledAt:string}>} records
+   * @returns {number} 实际插入行数（被忽略的冲突不计）
+   */
+  function saveDistillRecords(records) {
+    if (!Array.isArray(records) || records.length === 0) return 0;
+    const stmt = db.prepare(
+      `INSERT OR IGNORE INTO distill_records (session_id, seq, role, text, window_id, distilled_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    );
+    let inserted = 0;
+    for (const r of records) {
+      inserted += stmt.run(r.sessionId, r.seq, r.role, r.text, r.windowId ?? null, r.distilledAt).changes;
+    }
+    return inserted;
+  }
+
+  /**
+   * 到期记录统计（#275 回收报告口径，dry-run 用）。`bytes` 是列文本大小上界。
+   * @returns {{rows: number, bytes: number}}
+   */
+  function distillRecordStats(before) {
+    const row = db.prepare(
+      `SELECT count(*) AS c, COALESCE(SUM(LENGTH(text)), 0) AS b
+         FROM distill_records WHERE distilled_at < ?`
+    ).get(before);
+    return { rows: row.c, bytes: row.b };
+  }
+
+  /**
+   * 删除到期原始记录。返回实际删除行数。
+   *
+   * 只删 distill_records——memory_provenance 的链接**刻意保留**并从此指向空区间，
+   * 面板/CLI 显示「来源已过期」。级联删链接会把「这条记忆有来源、只是来源到期」
+   * 降级成「这条记忆无来源」，把可观测性削成不可观测（#399 删除语义）。
+   */
+  function clearDistillRecords(before) {
+    return db.prepare("DELETE FROM distill_records WHERE distilled_at < ?").run(before).changes;
+  }
+
+  /**
+   * 记一条记忆级溯源链接（#399）：某条记忆派生自某会话的 seq 区间。
+   *
+   * `ON CONFLICT DO NOTHING` 配合 idx_memory_provenance_link 唯一索引吸收同窗口
+   * 重跑的重复链接（否则幂等测试锁会挂）。
+   * @returns {number} 实际插入行数
+   */
+  function saveMemoryProvenance({ memoryId, sessionId, seqStart, seqEnd, createdAt, distillRunId }) {
+    // #512：distill_run_id 是「这条链接由哪一轮蒸馏写下」的可选归因。缺省落 NULL，
+    // 且**不回填**——存量链接没有第二轮真相可查，反推一个合成 id 比留空更坏。
+    return db.prepare(
+      `INSERT INTO memory_provenance (memory_id, session_id, seq_start, seq_end, created_at, distill_run_id)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT DO NOTHING`
+    ).run(memoryId, sessionId, seqStart, seqEnd, createdAt, distillRunId ?? null).changes;
+  }
+
+  /**
+   * 记一批「这条记忆的蒸馏窗口里出现过哪几张图」（v2 图像溯源）。
+   *
+   * 与 saveMemoryProvenance 同一事务、同一批 memory_id 调用——两者合成
+   * 「这条记忆 ← 这个窗口 ← 这几张图」的链路，任一半缺了整个问题就答不上。
+   *
+   * `ON CONFLICT DO NOTHING` + 复合主键 (memory_id, session_id, seq, fallback_key)
+   * 吸收同窗口重跑的重复（与 memory_provenance 的唯一索引同一思路）。
+   * @returns {number} 实际插入行数
+   */
+  function saveImageSources(rows) {
+    const list = Array.isArray(rows) ? rows.filter((row) => row && typeof row === "object") : [];
+    if (list.length === 0) return 0;
+    const stmt = db.prepare(
+      `INSERT INTO image_sources (memory_id, session_id, seq, attachment_id, fallback_key,
+         key_stability, media_type, name, width, height, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT DO NOTHING`
+    );
+    let changes = 0;
+    for (const row of list) {
+      if (typeof row.memoryId !== "string" || !row.memoryId) continue;
+      if (typeof row.sessionId !== "string" || !row.sessionId) continue;
+      if (!Number.isSafeInteger(row.seq)) continue;
+      if (typeof row.fallbackKey !== "string" || !row.fallbackKey) continue;
+      changes += stmt.run(
+        row.memoryId,
+        row.sessionId,
+        row.seq,
+        typeof row.attachmentId === "string" && row.attachmentId ? row.attachmentId : null,
+        row.fallbackKey,
+        row.keyStability === "stable" ? "stable" : "unstable",
+        row.mediaType ?? null,
+        row.name ?? null,
+        Number.isFinite(row.width) ? Math.trunc(row.width) : null,
+        Number.isFinite(row.height) ? Math.trunc(row.height) : null,
+        row.createdAt ?? nowIso()
+      ).changes;
+    }
+    return changes;
+  }
+
+  /**
+   * 一条记忆能回指的原图（v2 读出口）。按 seq、fallback_key 排，与事件顺序一致。
+   *
+   * 只回**引用**，不回字节：attachment_id 交给宿主 attachments.readImage() 才是
+   * 取图的正路，本库不托管原图（见 image_sources 建表注释）。
+   */
+  function imageSourcesFor(memoryId) {
+    if (typeof memoryId !== "string" || !memoryId) return [];
+    return db.prepare(
+      `SELECT memory_id, session_id, seq, attachment_id, fallback_key, key_stability,
+              media_type, name, width, height, created_at
+         FROM image_sources WHERE memory_id = ? ORDER BY seq, fallback_key`
+    ).all(memoryId).map((row) => ({
+      memoryId: row.memory_id,
+      sessionId: row.session_id,
+      seq: row.seq,
+      attachmentId: row.attachment_id ?? undefined,
+      fallbackKey: row.fallback_key,
+      keyStability: row.key_stability,
+      mediaType: row.media_type ?? undefined,
+      name: row.name ?? undefined,
+      width: row.width ?? undefined,
+      height: row.height ?? undefined,
+      createdAt: row.created_at
+    }));
+  }
+
+  /** 一条记忆的全部溯源链接（#399 面板/CLI 读取面；#512 起带 distill_run_id）。 */
+  function provenanceFor(memoryId) {
+    return db.prepare(
+      `SELECT memory_id, session_id, seq_start, seq_end, created_at, distill_run_id
+         FROM memory_provenance WHERE memory_id = ? ORDER BY created_at, session_id, seq_start`
+    ).all(memoryId);
+  }
+
+  /**
+   * 落盘一轮蒸馏运行（#512）。写入幂等（同 id replay 覆写、绝不重复），与
+   * saveDreamRun 同一口径，让同一逻辑轮可以重放核对。
+   *
+   * audit_id 是入参而不是在这里顺手写 audit：audit 行在 summarize.js 的 finally 里
+   * 落盘，而且**可能压根不存在**（llmAudit 关着）。run 先落、audit 后补再回填这一列，
+   * 比把两件事塞进一个事务诚实——归因不该依赖计费开关。
+   */
+  function saveDistillRun(run) {
+    const id = run.id ?? randomUUID();
+    const now = nowIso();
+    db.prepare(
+      `INSERT INTO distill_runs (id, created_at, status, error, run_type, trigger_source,
+         session_id, seq_start, seq_end, memory_count, provider, model, audit_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         created_at=excluded.created_at, status=excluded.status, error=excluded.error,
+         run_type=excluded.run_type, trigger_source=excluded.trigger_source,
+         session_id=excluded.session_id, seq_start=excluded.seq_start, seq_end=excluded.seq_end,
+         memory_count=excluded.memory_count, provider=excluded.provider, model=excluded.model,
+         audit_id=excluded.audit_id`
+    ).run(
+      id,
+      run.created_at ?? now,
+      run.status,
+      run.error ?? null,
+      run.run_type,
+      run.trigger_source,
+      run.session_id ?? null,
+      Number.isInteger(run.seq_start) ? run.seq_start : null,
+      Number.isInteger(run.seq_end) ? run.seq_end : null,
+      Number.isInteger(run.memory_count) ? run.memory_count : 0,
+      run.provider ?? null,
+      run.model ?? null,
+      Number.isInteger(run.audit_id) ? run.audit_id : null
+    );
+    return getDistillRun(id);
+  }
+
+  /** #512：事后补注某一轮的开销读数 id（audit 行在 run 之后才落盘）。 */
+  function attachDistillRunAudit(id, auditId) {
+    if (!id || !Number.isInteger(auditId)) return 0;
+    return db.prepare("UPDATE distill_runs SET audit_id = ? WHERE id = ?").run(auditId, id).changes;
+  }
+
+  function getDistillRun(id) {
+    return toDistillRun(db.prepare("SELECT * FROM distill_runs WHERE id = ?").get(id));
+  }
+
+  function listDistillRuns({ limit = 50, offset = 0 } = {}) {
+    const { limit: lim, offset: off } = sanitizePage(limit, offset, 50);
+    return db.prepare(
+      "SELECT * FROM distill_runs ORDER BY created_at DESC, id LIMIT ? OFFSET ?"
+    ).all(lim, off).map(toDistillRun);
+  }
+
+  /**
+   * 记一条「这条记忆出生自哪一轮」（#512）。只记 create：既有行的改动由
+   * receipt_chain 按 (run_id, record_id) 记，两套账不能有第二份。
+   * INSERT OR IGNORE 让重放幂等——同一 run 重放不该重复记一次铸造。
+   */
+  function saveMemoryMint({ memoryId, runId, runType, triggerSource, createdAt }) {
+    if (!memoryId || !runId || !runType || !triggerSource) return 0;
+    return db.prepare(
+      `INSERT OR IGNORE INTO memory_mints (memory_id, run_id, run_type, trigger_source, created_at)
+       VALUES (?, ?, ?, ?, ?)`
+    ).run(memoryId, runId, runType, triggerSource, createdAt ?? nowIso()).changes;
+  }
+
+  /** 一条记忆的铸造记录（#512 读侧；通常 0 或 1 条，跨轮重放才会多）。 */
+  function mintsFor(memoryId) {
+    return db.prepare(
+      `SELECT memory_id, run_id, run_type, trigger_source, created_at
+         FROM memory_mints WHERE memory_id = ? ORDER BY created_at, run_id`
+    ).all(memoryId);
+  }
+
+  /**
+   * 一个 (session, seq 区间) 的蒸馏原文行（#399 写入、#421 读出口）。
+   *
+   * 按 seq 升序——原文的先后顺序就是区间顺序，乱序会让「这句从哪来」读不出来。
+   * 到期裁剪后区间可能变空，那时返回 []：链接刻意保留并指向空区间
+   * （见 clearDistillRecords 注释），面板据此显示「原文已过期」而非「没有来源」。
+   */
+  function distillRecordsFor(sessionId, seqStart, seqEnd) {
+    return db.prepare(
+      `SELECT seq, role, text, window_id, distilled_at
+         FROM distill_records
+        WHERE session_id = ? AND seq >= ? AND seq <= ?
+        ORDER BY seq`
+    ).all(sessionId, seqStart, seqEnd);
+  }
+
+  /**
+   * 一个会话产出的蒸馏窗口（#524 方向 2 的存储侧）。
+   *
+   * #421 把溯源读出口拆成两个方向：方向 1（记忆 → 窗口）由 #509 落地，走
+   * provenanceFor；这是方向 2（会话 → 窗口）。两个方向读的是同一张表，只是索引不
+   * 同（idx_memory_provenance_session 就是为这一条建的，早已存在——所以这不是
+   * schema 变更）。
+   *
+   * **必须带 limit**：一个会话可能有几十个窗口，每个窗口接着就是整段逐字原文，
+   * 不限量等于「按会话导出全量转录」（#524 第 2 条前置）。上限的口径在协议层
+   * （provenance-http.js 的 PROVENANCE_MAX_WINDOWS），这一层只照参数取。
+   *
+   * 一行 = 一个窗口（同一 (session, seq_start, seq_end) 的多条链接 GROUP BY 成一行）
+   * ——一条蒸馏窗口通常产出多条记忆，逐链接返回会让「这个会话蒸了几次」这个唯一
+   * 有意义的计数被重复行淹没。link_count 说明该窗口派生出几条记忆，是按窗口看的
+   * 第二维；**刻意不回 memory_id 列表**：方向 1 已经是「记忆 → 窗口」，把 id 也塞进
+   * 这一侧会让两个方向不再正交（同一份映射有两条读法就得有两处维护），而真要逐条
+   * 查仍是按方向 1 走。
+   *
+   * ORDER BY seq_start：seq 是事件序号，就是会话内的先后；窗口按它排才是「这个会话
+   * 按时间蒸了哪几段」，按 created_at 排会把同一批重跑的行打散。
+   */
+  function distillWindowsFor(sessionId, limit) {
+    return db.prepare(
+      `SELECT session_id, seq_start, seq_end, MIN(created_at) AS created_at,
+              COUNT(*) AS link_count
+         FROM memory_provenance
+        WHERE session_id = ?
+        GROUP BY session_id, seq_start, seq_end
+        ORDER BY seq_start, seq_end
+        LIMIT ?`
+    ).all(sessionId, limit);
+  }
+
+  // --- 存储生命周期：无损回收（#275 第一批）--------------------------------
+  //
+  // 两项都零价值判断、零条数变化：行数不变，只把不可重建/不可达的内容丢掉。
+  // 删行不在本模块里（维护者拍板 3：裁列同意、删行不同意）——dream_runs 的骨架、
+  // LLM 决策原文与 receipt 永不删。
+
+  /**
+   * 历史 run 的输入快照统计（#275 A 项，dry-run 用）。
+   *
+   * `input` 这一列的含义**按 run_type 分叉**：auto / sleep 的 run 存的是当时的记忆库
+   * 快照（可由记忆库重建），organize 的 run 存的是 apply 的重放载荷——`organize.js`
+   * 的 apply 直接读它（`snapshot = Array.isArray(report.input) ? report.input : []`），
+   * 置空会让 apply 找不到候选、静默什么都不做却照写回执并盖上 applied_at，那份报告
+   * 从此永远重放不了。所以 organize 行不在可清范围里（同一列，两种语义，只能按 type 分）。
+   *
+   * `bytes` 是列文本大小，只作上界（真实释放看 VACUUM 前后）。
+   * @returns {{runs: number, bytes: number}}
+   */
+  function dreamRunInputStats(before) {
+    const row = db.prepare(
+      `SELECT count(*) AS c, COALESCE(SUM(LENGTH(input)), 0) AS b
+         FROM dream_runs
+        WHERE input IS NOT NULL AND created_at < ? AND run_type != 'organize'`
+    ).get(before);
+    return { runs: row.c, bytes: row.b };
+  }
+
+  /** 置空历史 run 的输入快照（organize 的重放载荷除外）。返回实际改动的行数。 */
+  function clearDreamRunInputs(before) {
+    return db.prepare(
+      `UPDATE dream_runs SET input = NULL
+        WHERE input IS NOT NULL AND created_at < ? AND run_type != 'organize'`
+    ).run(before).changes;
+  }
+
+  // #557 的裁列面：input 之外的大头是 decisions / outcome 两列 JSON（issue 评论区
+  // 实测 13.26 MB 列文本里 50.1% + 30.5%）。拍板 3 的口径是「裁列同意、删行不同意」
+  // ——行与骨架列（status / provider / receipt / policy_epoch / store_count…）永远
+  // 保留，回放能力对窗口外的轮次降级为骨架级（与 reclaim 清 input、#625 的瘦身同
+  // 一条口径）。organize 行整体豁免：input 是 apply 的重放载荷、outcome 挂着
+  // dry_run_id / applied_at 链，裁了会让 apply 静默空转（clearDreamRunInputs 的同一
+  // 条边界）。读侧已逐个核对：lastDreamRunAt / lastDreamBaseline / getLatestPolicyEpoch
+  // 读的都是骨架列，/dream-status 的 decisions.demotion 是可选链（裁掉的老轮退化成
+  // null）；reclaim 的 A 项刻意不碰 decisions/outcome——那是「随手跑的无损回收」的
+  // 边界，这里是显式配置键（dreamRunsTrimDays，opt-in 默认 0 = 关）驱动的启动期裁剪。
+  function dreamRunsTrimStats(before) {
+    const row = db.prepare(
+      `SELECT count(*) AS c,
+              COALESCE(SUM(LENGTH(input)), 0) + COALESCE(SUM(LENGTH(decisions)), 0)
+                + COALESCE(SUM(LENGTH(outcome)), 0) AS b
+         FROM dream_runs
+        WHERE created_at < ? AND run_type != 'organize'
+          AND (input IS NOT NULL OR decisions IS NOT NULL OR outcome IS NOT NULL)`
+    ).get(before);
+    return { runs: row.c, bytes: row.b };
+  }
+
+  /** 裁掉窗口外 run 的三列重载（organize 豁免）。返回实际改动的行数；重跑幂等。 */
+  function trimDreamRunPayloads(before) {
+    return db.prepare(
+      `UPDATE dream_runs
+          SET input = NULL, decisions = NULL, outcome = NULL
+        WHERE created_at < ? AND run_type != 'organize'
+          AND (input IS NOT NULL OR decisions IS NOT NULL OR outcome IS NOT NULL)`
+    ).run(before).changes;
+  }
+
+  /**
+   * 归档行仍带的向量统计（#275 B 项）。检索 SQL 恒带 `archived = 0`，所以这部分
+   * 向量按定义不可达，清掉不改变任何检索结果。
+   * @returns {{rows: number, bytes: number}}
+   */
+  function archivedEmbeddingStats() {
+    const row = db.prepare(
+      `SELECT count(*) AS c, COALESCE(SUM(LENGTH(embedding)), 0) AS b
+         FROM memories WHERE archived = 1 AND embedding IS NOT NULL`
+    ).get();
+    return { rows: row.c, bytes: row.b };
+  }
+
+  /** 清掉归档行的向量。返回实际改动行数。 */
+  function clearArchivedEmbeddings() {
+    const changed = db.prepare(
+      "UPDATE memories SET embedding = NULL WHERE archived = 1 AND embedding IS NOT NULL"
+    ).run().changes;
+    // Issue #202 的单条失效点在 setEmbedding 里，批量清走不到它——整表清缓存最省事，
+    // 代价只是活跃行下次检索多解析一次（FIFO 上限 4000，自愈）。
+    if (changed > 0) embeddingCache.clear();
+    return changed;
+  }
+
+  /**
+   * 库文件与页统计（#275 报告口径）：回收收益按 VACUUM 前后体积量，不按列字节估——
+   * 实际释放来自溢出页与索引页的回收，列文本大小只是上界。
+   *
+   * 体积是**磁盘足迹**：WAL 模式下主文件之外还有 `-wal` / `-shm`，只量主文件会把
+   * 「刚清完还没落盘」的那部分算漏（实测过：VACUUM 后主文件可能一动不动，要等一次
+   * checkpoint）。所以三份一起量；`:memory:` 库没有文件。
+   */
+  function storageStats() {
+    const pageSize = db.prepare("PRAGMA page_size").get().page_size;
+    const pageCount = db.prepare("PRAGMA page_count").get().page_count;
+    const freelistCount = db.prepare("PRAGMA freelist_count").get().freelist_count;
+    const sizeOf = (p) => {
+      try {
+        return statSync(p).size;
+      } catch {
+        return 0;
+      }
+    };
+    let fileBytes = null;
+    if (typeof path === "string" && path !== ":memory:") {
+      fileBytes = sizeOf(path) + sizeOf(`${path}-wal`) + sizeOf(`${path}-shm`);
+    }
+    return { path: typeof path === "string" ? path : null, pageSize, pageCount, freelistCount, fileBytes };
+  }
+
+  /**
+   * 容量预警的行数口径（#275 空间维度）：活跃 / 归档各一格。体积与空闲页在
+   * storageStats()，这里只补行数——两条 COUNT 的成本，挂在 /health 的按需读上，
+   * 没有周期性消费者。归档增速（净增速率）是 recall-stats 的 archive 块（第五
+   * 指标，按精确 archived_at 算），这里刻意不算速率：同一个数字长两处就会分叉。
+   */
+  function capacityStats() {
+    const active = db.prepare("SELECT COUNT(*) AS n FROM memories WHERE archived = 0").get().n;
+    const archived = db.prepare("SELECT COUNT(*) AS n FROM memories WHERE archived = 1").get().n;
+    return { active, archived };
+  }
+
+  /**
+   * 整库 VACUUM（#275 的手动步骤）：代价 O(库大小) 且需要排他写锁，所以只在显式
+   * 入口里跑，绝不挂启动路径、也不开 auto_vacuum。
+   *
+   * 收尾补一次 `wal_checkpoint(TRUNCATE)`：WAL 模式下 VACUUM 重排的是主文件里的页，
+   * 已回收的空间可能还挂在 WAL 里，不 checkpoint 就量不到体积下降——报告口径要的是
+   * 真实释放量，量不到等于没做（评审实测：VACUUM 后主文件长度不变，checkpoint 后才降）。
+   */
+  function vacuum() {
+    const started = Date.now();
+    db.exec("VACUUM");
+    db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    return { duration_ms: Date.now() - started };
+  }
+
+  // --- failure memories ----------------------------------------------------
+
+  /**
+   * Persist one failure record (user correction, failed expectation, etc.).
+   * Like the dream audit trail this is bookkeeping: it never triggers write
+   * hooks, so reflection mining of failures cannot loop back into the writer.
+   */
+  function saveFailure({ id, query, expected, actual, before, failure_type, memory_id }) {
+    const now = nowIso();
+    const beforeJson = before && typeof before === "object" ? JSON.stringify(before) : (before ?? null);
+    db.prepare(
+      `INSERT INTO failure_memories (id, query, expected, actual, before, failure_type, memory_id, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(id ?? randomUUID(), query ?? null, expected ?? null, actual ?? null, beforeJson, failure_type, memory_id ?? null, now);
+    return { id, query, expected, actual, before: before ?? null, failure_type, memory_id, created_at: now };
+  }
+
+  function listFailures({ limit = 50, offset = 0, since, memory_id, failure_type } = {}) {
+    const clauses = [];
+    const params = [];
+    if (since) { clauses.push("created_at >= ?"); params.push(since); }
+    if (memory_id) { clauses.push("memory_id = ?"); params.push(memory_id); }
+    if (failure_type) { clauses.push("failure_type = ?"); params.push(failure_type); }
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    const lim = Number.isInteger(limit) && limit > 0 ? limit : 50;
+    const off = Number.isInteger(offset) && offset > 0 ? offset : 0;
+    return db.prepare(`SELECT * FROM failure_memories ${where} ORDER BY created_at DESC, id LIMIT ? OFFSET ?`).all(...params, lim, off)
+      .map((row) => {
+        let before;
+        try { before = row.before ? JSON.parse(row.before) : null; } catch { before = null; }
+        return { ...row, before };
+      });
+  }
+
+  /** Delete failure rows older than `before` (ISO string). Returns count removed. */
+  function deleteOldFailures(before) {
+    return db.prepare("DELETE FROM failure_memories WHERE created_at < ?").run(before).changes;
+  }
+
+  // --- conflict freeze: pending manual review ------------------------------
+
+  /**
+   * Park a detected conflict for human review (conflict freeze mode). The pair
+   * order is normalized (sorted by id) so the same two memories are only ever
+   * pending once — a re-detection in a later dream run is a no-op, never a
+   * duplicate queue entry. Returns the pending row (freshly inserted, or the
+   * existing unresolved row when the pair is already pending), or undefined
+   * when the re-detection is suppressed. The returned row carries `fresh`:
+   * true only when this call actually inserted a row, false when the pair was
+   * already pending (issue #603 — callers used to read "non-null" as "parked",
+   * so a re-detection re-reported the same pair as a new freeze every run).
+   *
+   * v0.8.1（issue #170 复核项 4）：人工已裁决过的对（resolved_at 非空）不再
+   * 反复入队——除非任一侧在裁决之后又被改过（updated_at 晚于 resolved_at）。
+   * 否则跨 scope 对每轮 sleep 都原样回来，把「保留双方」的决定变成噪声。
+   * updated_at 是宽松代理（任何字段更新都会触发重新评审）——宁可多看一眼，
+   * 不静音真冲突。
+   */
+  function saveConflictPending({ run_id, memory_a, memory_b, reason, similarity }) {
+    const [a, b] = [memory_a, memory_b].sort();
+    const existing = db.prepare(
+      "SELECT * FROM conflict_pending WHERE memory_a = ? AND memory_b = ? AND resolved_at IS NULL LIMIT 1"
+    ).get(a, b);
+    if (existing) return { ...toConflictPending(existing), fresh: false };
+    const reviewed = db.prepare(
+      "SELECT * FROM conflict_pending WHERE memory_a = ? AND memory_b = ? AND resolved_at IS NOT NULL ORDER BY resolved_at DESC, rowid DESC LIMIT 1"
+    ).get(a, b);
+    if (reviewed) {
+      const touched = db.prepare(
+        "SELECT count(*) AS c FROM memories WHERE id IN (?, ?) AND updated_at > ?"
+      ).get(a, b, reviewed.resolved_at).c;
+      if (touched === 0) return undefined;
+    }
+    const id = randomUUID();
+    const now = nowIso();
+    // Issue #603 第 2 层：相似度落列。调用方拿不到（LLM 裁决路径只有理由文本）
+    // 就写 NULL，不猜——面板与排序都按「未知」处理，而不是当成 0。
+    const sim = typeof similarity === "number" && Number.isFinite(similarity)
+      && similarity >= 0 && similarity <= 1 ? similarity : null;
+    db.prepare(
+      `INSERT INTO conflict_pending (id, run_id, memory_a, memory_b, reason, similarity, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).run(id, run_id ?? null, a, b, reason ?? null, sim, now);
+    return { ...toConflictPending(db.prepare("SELECT * FROM conflict_pending WHERE id = ?").get(id)), fresh: true };
+  }
+
+  /**
+   * List pending conflicts, most-similar first. Unresolved rows only by
+   * default; pass includeResolved to include resolved ones (audit view).
+   *
+   * Issue #603 第 2 层：排序键从「created_at DESC」改成「相似度 DESC → created_at
+   * DESC」。原键在同一次 sleep 轮次里全同（实测 60 条落在 60ms 内），队列在面板
+   * 上等于随机；相似度是「该先看哪对」的唯一客观信号，现在它是一列而不是 reason
+   * 文本里的正则。
+   *
+   * NULL 排最后而不是当 0：存量行与 LLM 裁决路径没记相似度，把它们混进「低相似
+   * 度」会把「未知」伪装成「已测量」。`(similarity IS NULL)` 前缀让这条不依赖
+   * SQLite 的 NULL 排序约定，两个方向都稳。
+   */
+  function listConflictPending({ limit = 50, offset = 0, includeResolved = false } = {}) {
+    const { limit: lim, offset: off } = sanitizePage(limit, offset, 50);
+    const clauses = [];
+    const params = [];
+    if (!includeResolved) clauses.push("resolved_at IS NULL");
+    const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+    const rows = db.prepare(
+      `SELECT * FROM conflict_pending ${where}
+       ORDER BY (similarity IS NULL), similarity DESC, created_at DESC, id
+       LIMIT ? OFFSET ?`
+    ).all(...params, lim, off);
+    return rows.map(toConflictPending);
+  }
+
+  /**
+   * Mark a pending conflict as reviewed. winner (optional) records which side
+   * the human chose, keeping the resolution auditable. Returns the updated row,
+   * or undefined for an unknown id.
+   */
+  function resolveConflictPending(id, { winner } = {}) {
+    const row = db.prepare("SELECT * FROM conflict_pending WHERE id = ?").get(id);
+    if (!row) return undefined;
+    db.prepare("UPDATE conflict_pending SET resolved_at = ?, resolved_winner = ? WHERE id = ?")
+      .run(nowIso(), winner ?? null, id);
+    return toConflictPending(db.prepare("SELECT * FROM conflict_pending WHERE id = ?").get(id));
+  }
+
+  /** Number of unresolved (awaiting review) pending conflicts. */
+  function countConflictPending() {
+    return db.prepare(
+      "SELECT count(*) AS c FROM conflict_pending WHERE resolved_at IS NULL"
+    ).get().c;
+  }
+
+  // --- differentiate adjudication ledger (issue #533) ----------------------
+
+  /**
+   * Record that the pair (a, b) has already been adjudicated as "different
+   * enough to both stay" — the differentiate decision itself. Nothing is
+   * written to either memory: #533 的复现证明「把同一段注记追加到两侧」会
+   * 把两条向量越推越近（共享后缀同向拉高余弦），所以裁决只记账、不动正文。
+   *
+   * hash_a/hash_b are the content hashes captured at adjudication time; the
+   * sleep candidate builder uses them to decide whether the verdict still
+   * stands (any later edit to either side re-opens the pair). Sorting the pair
+   * keeps one row per unordered pair, same normalization as saveConflictPending.
+   */
+  function saveDifferentiatedPair({ run_id, memory_a, memory_b, hash_a, hash_b, distinctions }) {
+    const [a, b] = [memory_a, memory_b].sort();
+    // hashes travel with their side; sort the (id, hash) tuples so hash_a
+    // always belongs to memory_a after normalization.
+    const [ha, hb] = memory_a <= memory_b ? [hash_a, hash_b] : [hash_b, hash_a];
+    db.prepare(
+      `INSERT INTO differentiated_pairs (id, memory_a, memory_b, hash_a, hash_b, distinctions, run_id, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(memory_a, memory_b) DO UPDATE SET
+         hash_a = excluded.hash_a,
+         hash_b = excluded.hash_b,
+         distinctions = excluded.distinctions,
+         run_id = excluded.run_id,
+         created_at = excluded.created_at`
+    ).run(
+      randomUUID(), a, b, ha ?? null, hb ?? null,
+      // 没有 distinctions 就落 NULL 而不是 "[]"——空数组会被读成「判过、理由是空」，
+      // NULL 才是「这条账本行没记理由」的诚实写法（与 dream_runs.skipped 同口径）。
+      Array.isArray(distinctions) && distinctions.length ? JSON.stringify(distinctions) : null,
+      run_id ?? null, nowIso()
+    );
+    return findDifferentiatedPair(a, b);
+  }
+
+  /** The adjudication row for an unordered pair, or undefined. */
+  function findDifferentiatedPair(memory_a, memory_b) {
+    const [a, b] = [memory_a, memory_b].sort();
+    return toDifferentiatedPair(
+      db.prepare("SELECT * FROM differentiated_pairs WHERE memory_a = ? AND memory_b = ?").get(a, b)
+    );
+  }
+
+  /** Adjudicated pairs, newest first (audit view / tests). */
+  function listDifferentiatedPairs({ limit = 50, offset = 0 } = {}) {
+    const { limit: lim, offset: off } = sanitizePage(limit, offset, 50);
+    const rows = db.prepare(
+      "SELECT * FROM differentiated_pairs ORDER BY created_at DESC, id LIMIT ? OFFSET ?"
+    ).all(lim, off);
+    return rows.map(toDifferentiatedPair);
+  }
+
+  // --- conflict adjudication ledger (issue #529) ---------------------------
+
+  /**
+   * Record that the conflict phase adjudicated a pair, whatever the verdict was
+   * — including a bare "keep". This is the machine-side ledger that stops a
+   * no-op verdict from being re-sent forever; it is deliberately NOT
+   * conflict_pending (see the schema comment: that one is the human queue).
+   *
+   * 幂等靠主键：同一对（sort 归一化后）只留最新一次判决。多次写是常态——
+   * 一对被重判说明它确实值得重判，旧判决没有留存价值。
+   */
+  function saveConflictReviewed({ run_id, memory_a, memory_b, outcome, judged_at }) {
+    const [a, b] = [memory_a, memory_b].sort();
+    db.prepare(
+      `INSERT INTO conflict_reviewed (memory_a, memory_b, judged_at, outcome, run_id)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(memory_a, memory_b) DO UPDATE SET
+         judged_at = excluded.judged_at,
+         outcome   = excluded.outcome,
+         run_id    = excluded.run_id`
+    ).run(a, b, judged_at ?? nowIso(), outcome ?? null, run_id ?? null);
+  }
+
+  /**
+   * Load the ledger as a Map keyed by the normalized pair, for the conflict
+   * phase's pre-filter. Bounded by the number of distinct pairs ever judged,
+   * which is at most the number of pairs the phase can form — the same ceiling
+   * the candidate list itself has.
+   */
+  function loadConflictReviewed() {
+    const map = new Map();
+    for (const row of db.prepare("SELECT * FROM conflict_reviewed").all()) {
+      map.set(`${row.memory_a}\u0000${row.memory_b}`, {
+        judged_at: row.judged_at,
+        outcome: row.outcome ?? undefined,
+        run_id: row.run_id ?? undefined
+      });
+    }
+    return map;
+  }
+
+  /** Test/ops visibility: the raw ledger rows, newest first. */
+  function listConflictReviewed({ limit = 200 } = {}) {
+    return db.prepare(
+      "SELECT * FROM conflict_reviewed ORDER BY judged_at DESC, rowid DESC LIMIT ?"
+    ).all(Math.max(1, Math.min(5000, limit | 0)));
+  }
+
+  // --- conflict triage ledger（issue #641，shadow 档）-----------------------
+
+  // 四态里 open / superseded / zombied 都有写入点；differentiated（人审判为不同事、
+  // 不必再问）仍是预留位——当前没有任何代码路径会写它，留着是为了状态机与面板
+  // 筛选口径完整，别当成「已实现但没数据」。
+  //
+  // zombied 的写者是下面的 zombifyDeadLedgerPairs（#641 收尾）：账本里任一侧已经
+  // 归档 / 遗忘的对，无从消解也不该继续占着 open 被人审与注入侧当成活的真矛盾。
+  const LEDGER_STATUSES = new Set(["open", "superseded", "differentiated", "zombied"]);
+  const LEDGER_TIERS = new Set(["dup", "cross-scope-dup", "evolution", "conflict"]);
+
+  /**
+   * Record one triage observation. Upsert on the normalized pair: tier/
+   * signals/last_* refresh (the pair's classification may legitimately change
+   * after an edit), while first_seen_at/first_run_id stay put — 挂账时长与
+   * 消解路径统计都锚在首次检出，刷新它们等于重写历史。
+   */
+  function saveConflictLedgerEntry({ run_id, memory_a, memory_b, tier, similarity, signals }) {
+    const [a, b] = [memory_a, memory_b].sort();
+    if (!LEDGER_TIERS.has(tier)) {
+      throw new Error(`conflict_ledger: unknown tier ${String(tier)}`);
+    }
+    const now = nowIso();
+    db.prepare(
+      `INSERT INTO conflict_ledger (memory_a, memory_b, tier, similarity, signals, status, first_run_id, last_run_id, first_seen_at, last_seen_at)
+       VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)
+       ON CONFLICT(memory_a, memory_b) DO UPDATE SET
+         tier         = excluded.tier,
+         similarity   = excluded.similarity,
+         signals      = excluded.signals,
+         last_run_id  = excluded.last_run_id,
+         last_seen_at = excluded.last_seen_at`
+    ).run(
+      a, b, tier,
+      typeof similarity === "number" ? similarity : null,
+      // 与 differentiated_pairs.distinctions 同一条约定：没有就落 NULL，不落 "[]"。
+      signals == null ? null : JSON.stringify(signals),
+      run_id ?? null, run_id ?? null, now, now
+    );
+  }
+
+  /** Status transition for the lazy-resolution stages (enforce-phase wiring). */
+  function setConflictLedgerStatus(memory_a, memory_b, status) {
+    const [a, b] = [memory_a, memory_b].sort();
+    if (!LEDGER_STATUSES.has(status)) {
+      throw new Error(`conflict_ledger: unknown status ${String(status)}`);
+    }
+    const res = db.prepare(
+      "UPDATE conflict_ledger SET status = ? WHERE memory_a = ? AND memory_b = ?"
+    ).run(status, a, b);
+    return res.changes > 0;
+  }
+
+  /**
+   * 把「已无从消解」的账本行收进 zombied（#641 收尾，接上原本的预留位）。
+   *
+   * 为什么必须有人做这件事：账本是**测量记录**不是处置记录，每一对只要还被观察到就
+   * 一直住在里面（见上面 saveConflictLedgerEntry 的注释）。但冲突相位的候选池是
+   * `!archived && !forgotten`（sleep.js 的 phaseConflicts）——一侧归档或遗忘之后，
+   * 那一对**再也不会进 fresh**，于是账本行永远停在 open，没有任何代码路径能把它们
+   * 翻走。后果不止是数字难看：openConflictPairs 只按 `tier='conflict' AND status='open'`
+   * 取值，注入侧（service.js）会把这些「一侧已经不在库里的对」当成活的真矛盾，
+   * 给仍在的那条挂上「存在矛盾记忆」的标注。
+   *
+   * 只动 open：superseded / differentiated 已经是终点，重复改写成 zombied 会把
+   * 「这一对是怎么结束的」抹掉。两侧都退了与只退一侧同样处理——无从消解的判据是
+   * 「不可能再被同时观察到」，与退了几侧无关。
+   *
+   * 用一条 SQL 做，不逐对读改写：账本量级是几十行，但这是每轮睡眠都会跑的维护动作，
+   * 逐行 UPDATE 会让它在库大时变慢，而这条判据本来就是纯 SQL 能表达的。
+   *
+   * @returns {number} 本次改写的行数（0 = 没有需要收的死路）
+   */
+  function zombifyDeadLedgerPairs() {
+    const res = db.prepare(
+      `UPDATE conflict_ledger
+          SET status = 'zombied'
+        WHERE status = 'open'
+          AND (
+            NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = conflict_ledger.memory_a AND m.archived = 0 AND m.forgotten = 0)
+            OR NOT EXISTS (SELECT 1 FROM memories m WHERE m.id = conflict_ledger.memory_b AND m.archived = 0 AND m.forgotten = 0)
+          )`
+    ).run();
+    return res.changes ?? 0;
+  }
+
+  /**
+   * 取代链落笔（issue #641，T3 时序演进的处置）：旧行 superseded_by → 新行。
+   * 只动这两列，刻意不走 updateMemory 的完整写路径——syncMirror/notifyWrite/
+   * updated_at 都不该被一个纯元数据标注触发（正文一个字节没变，镜像无 diff
+   * 可同步；bump updated_at 反而会误导「已审过」的宽松代理判定）。已归档/
+   * 已遗忘的行不落链（它们已经退场，再标注是给幽灵记账）；重复写同一指向
+   * 是无害的幂等 no-op，换指向以最后一次为准。
+   *
+   * 幂等守卫（#650 评审）：上面那句「无害的 no-op」只对指向成立——superseded_at
+   * 每次都会刷成新的 nowIso()，返回值又按 changes > 0 判，于是同一对每轮都报
+   * 「刚处理过」：t3Chained 虚增，取代时刻被改写成最近一次巩固的时间（挂账时长
+   * 一类指标随之失真）。先读当前指向，已指向同一 winner 就直接返回 false 且不
+   * 写库，只有首次落链或换指向才真正落笔。
+   */
+  function supersedeChain(loserId, winnerId) {
+    const current = db.prepare("SELECT superseded_by FROM memories WHERE id = ?").get(loserId);
+    // 行不存在 / 已指向同一继任者：no-op，不刷时间戳、不计入变更数。
+    if (!current || current.superseded_by === winnerId) return false;
+    const res = db.prepare(
+      "UPDATE memories SET superseded_by = ?, superseded_at = ? WHERE id = ? AND archived = 0 AND forgotten = 0"
+    ).run(winnerId, nowIso(), loserId);
+    return res.changes > 0;
+  }
+
+  /**
+   * 已被取代行的 id 清单（issue #641，T3 检索侧降权用）。走部分索引，未落链
+   * 的库上是空查询。返回数组而非 Set——集合语义由调用方决定。
+   *
+   * 只认「继任者仍活着」的旧行（#650 评审）：链是一次性写下的指向，而继任者
+   * 之后仍可能被归档/遗忘/删除。若只判 superseded_by IS NOT NULL，那种情况下
+   * 旧行会被当成「已有新版本」从注入里摘掉，可它自己明明是活的、且它指向的
+   * 那条已经退场——数据在库里却永远不再出现，是一种沉默的不可逆失效。JOIN 到
+   * 继任者上要求 archived=0，继任者被归档即自动恢复旧行可见性。
+   *
+   * **遗忘是另一回事，不能一并恢复（#532）**：`memory_forget` 的语义是「我不要再
+   * 记得这个内容」，继任者退场的理由是用户主动要求，不是「这个版本不再成立」——
+   * 把被取代的旧值重新摆回注入面，等于让用户明确抛弃的旧答案趁虚回潮，正是
+   * #532 报的那个现象（更正行被忘掉，新对话答回更正前的旧值）。归档则不同：
+   * 它是整理面的退场（可恢复，且常是合并/降级的落点，旧行可能是唯一载体），
+   * 那种情形按 #650 的理由恢复。所以这里只看 archived，不看 forgotten；旧行
+   * 仍可通过显式搜索读到（fuseRecall 只降权 0.5，不摘除），不是沉默的不可逆
+   * 失效。删除（物理删）沿用 JOIN 的自然结果——继任者不存在，链随之失效。
+   */
+  function supersededIds() {
+    return db.prepare(
+      `SELECT m.id AS id
+         FROM memories m
+         JOIN memories w ON w.id = m.superseded_by
+        WHERE m.superseded_by IS NOT NULL
+          AND w.archived = 0`
+    ).all().map((r) => r.id);
+  }
+
+  /**
+   * 取代链上下文（#532）：一行被遗忘时，回执要说清连带面。
+   * 只读两个读数：这行被谁取代（superseded_by）、它取代了几条更早的行。
+   * 后者是回执里「它们保持隐藏、不算当前答案」的那句话的依据——判据与
+   * supersededIds 同源（链是否仍然生效由检索侧决定），这里不重复判断。
+   */
+  function supersedeContext(id) {
+    const row = db.prepare("SELECT id, superseded_by, archived FROM memories WHERE id = ?").get(id);
+    if (!row) return null;
+    // 回执要说的是「哪些前序**现在**真的被压住、且仍能被找到」，不是「历史上指向
+    // 过几行」（PR #681 评审）：
+    //   chainActive    与 supersededIds 同一判据——继任者被归档 ⇒ 旧行已恢复可见，
+    //                  此时再说「它们保持隐藏」就是假话（先归档再遗忘的序列）。
+    //   activePredecessors 前序里仍活跃（未归档、未遗忘）的条数。`store.search` 与
+    //                  `store.searchVector` 都要求 forgotten=0、默认排除归档行，
+    //                  所以「显式搜索仍可达」只对这部分成立。
+    const predecessors = db.prepare("SELECT count(*) AS n FROM memories WHERE superseded_by = ?").get(id).n;
+    const activePredecessors = db.prepare(
+      "SELECT count(*) AS n FROM memories WHERE superseded_by = ? AND archived = 0 AND forgotten = 0"
+    ).get(id).n;
+    return {
+      supersededBy: row.superseded_by ?? null,
+      predecessors,
+      activePredecessors,
+      chainActive: row.archived === 0,
+    };
+  }
+
+  /**
+   * 仍未消解的真矛盾对（issue #641，T4 注入侧感知用）。只取 tier=conflict 且
+   * status=open 的行——superseded/differentiated 已消解，zombied 已被 heat 兜底；
+   * shadow 档记下的观察对也在其中（注入侧标注以 enforce 档为门，见 injectCandidates）。
+   * 按最近观察排序，上限 2000：账本对的量级是个位数到几十，上限只为防御性兜底。
+   */
+  function openConflictPairs(limit = 2000) {
+    return db.prepare(
+      "SELECT memory_a, memory_b, first_seen_at AS detected FROM conflict_ledger WHERE tier = 'conflict' AND status = 'open' ORDER BY last_seen_at DESC LIMIT ?"
+    ).all(Math.max(1, Math.min(2000, limit | 0)));
+  }
+
+  /** Triage rows for the panel/analysis views, newest detection first. */
+  function listConflictLedger({ limit = 200, offset = 0, tier, status } = {}) {
+    const lim = Math.max(1, Math.min(5000, limit | 0));
+    const off = Math.max(0, offset | 0);
+    const where = [];
+    const args = [];
+    if (tier != null) { where.push("tier = ?"); args.push(String(tier)); }
+    if (status != null) { where.push("status = ?"); args.push(String(status)); }
+    const clause = where.length ? ` WHERE ${where.join(" AND ")}` : "";
+    args.push(lim, off);
+    return db.prepare(
+      `SELECT * FROM conflict_ledger${clause} ORDER BY last_seen_at DESC, rowid DESC LIMIT ? OFFSET ?`
+    ).all(...args);
+  }
+
+  function countConflictLedger({ tier, status } = {}) {
+    const where = [];
+    const args = [];
+    if (tier != null) { where.push("tier = ?"); args.push(String(tier)); }
+    if (status != null) { where.push("status = ?"); args.push(String(status)); }
+    const clause = where.length ? ` WHERE ${where.join(" AND ")}` : "";
+    return db.prepare(`SELECT COUNT(*) AS n FROM conflict_ledger${clause}`).get(...args).n;
+  }
+
+  /**
+   * v0.8.1 底座（issue #170）：scope 归属人工修正的审计行。record 描述「一次
+   * 决策后的完整状态」（prev_* 为改前、next_* 为改后，NULL=global/未标注），
+   * 由调用方（service.updateMemory）在 store.update 成功后写入；本函数不做
+   * 业务校验，只保证审计落库失败不反噬主写入（异常上抛由调用方吞掉记 warn）。
+   */
+  function saveScopeChange({ memory_id, actor, prev_agent_scope, prev_workspace_scope, next_agent_scope, next_workspace_scope, agent_scope_source, workspace_scope_source, decided_at }) {
+    const id = randomUUID();
+    db.prepare(
+      `INSERT INTO scope_changes (id, memory_id, actor, prev_agent_scope, prev_workspace_scope, next_agent_scope, next_workspace_scope, agent_scope_source, workspace_scope_source, decided_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      id,
+      memory_id,
+      actor === "panel" ? "panel" : "tool",
+      normalizeScopeText(prev_agent_scope),
+      normalizeScopeText(prev_workspace_scope),
+      normalizeScopeText(next_agent_scope),
+      normalizeScopeText(next_workspace_scope),
+      normalizeScopeSource(agent_scope_source),
+      normalizeScopeSource(workspace_scope_source),
+      normalizeOccurredAt(decided_at) ?? nowIso()
+    );
+    return toScopeChange(db.prepare("SELECT * FROM scope_changes WHERE id = ?").get(id));
+  }
+
+  /** Scope 修正审计（单条记忆，新→旧）。审计回放与候选复核用。 */
+  function listScopeChanges(memoryId, { limit = 50 } = {}) {
+    const lim = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 200) : 50;
+    // tiebreaker 用 rowid（追加写入的单调序）而非 id：decided_at 只有毫秒精度，
+    // 连续两次修正落在同一毫秒时 UUID 排序是随机的（CI windows/node24 抓到的
+    // 真实 flake）——审计回放要求「最新一条」确定。
+    const rows = db.prepare(
+      "SELECT * FROM scope_changes WHERE memory_id = ? ORDER BY decided_at DESC, rowid DESC LIMIT ?"
+    ).all(memoryId, lim);
+    return rows.map(toScopeChange);
+  }
+
+  /**
+   * 政策轴（issue #471）：按下或松开一个作用域。一行一格，靠
+   * idx_scope_state_key(dimension, scope_value) 做 UPSERT——重复按下同一状态
+   * 不刷新 decided_at（CASE WHEN），因为「第一次按下的时刻」才是回执该报的东西；
+   * 状态翻转则刷新，那是一次真的决策。
+   *
+   * note 的取舍与 decided_at 相反：非空的新 note 总是覆盖旧的，空的则原样留着。
+   * 理由是这条记录里「当前通不通」由 state 那一列承担，note 是**理由**——理由被
+   * 一次不带理由的重按抹掉是净损失（用户回看时只会看到「按下过」却不知道为什么），
+   * 而「清空理由」不是一个真实需求（要改就再按一次带上新理由）。这与本仓防御段
+   * 「宁可留着也不要静默丢」的取向一致。
+   *
+   * 归一化失败（维度/值/状态任一非法）返回 undefined，由调用方拒绝——本表只存
+   * 可解释的三种枚举，与 memories 的 scope 列不同：那里脏输入落 NULL 是正当的
+   * （「未标注」本身有语义），这里落 NULL 没有任何意思，会静默变成一行永远不
+   * 生效的状态。
+   */
+  function setScopeState({ dimension, scope_value, state, note, decided_at }) {
+    const dim = normalizeScopeStateDimension(dimension);
+    const val = normalizeScopeStateValue(scope_value);
+    const st = normalizeScopeStateState(state);
+    if (!dim || !val || !st) return undefined;
+    const at = normalizeOccurredAt(decided_at) ?? nowIso();
+    const noteText = normalizeScopeText(note);
+    db.prepare(
+      `INSERT INTO scope_state (id, dimension, scope_value, state, note, decided_at)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(dimension, scope_value) DO UPDATE SET
+         state = excluded.state,
+         note = COALESCE(excluded.note, scope_state.note),
+         decided_at = CASE WHEN scope_state.state = excluded.state THEN scope_state.decided_at ELSE excluded.decided_at END`
+    ).run(randomUUID(), dim, val, st, noteText, at);
+    return toScopeState(
+      db.prepare("SELECT * FROM scope_state WHERE dimension = ? AND scope_value = ?").get(dim, val)
+    );
+  }
+
+  /** 政策轴状态行（单格）。 */
+  function getScopeState(dimension, scope_value) {
+    const dim = normalizeScopeStateDimension(dimension);
+    const val = normalizeScopeStateValue(scope_value);
+    if (!dim || !val) return undefined;
+    return toScopeState(
+      db.prepare("SELECT * FROM scope_state WHERE dimension = ? AND scope_value = ?").get(dim, val)
+    );
+  }
+
+  /**
+   * 政策轴状态行（全量）。不提供按维度/值过滤的参数——闸门判定要的就是全量
+   * （一次现读一次索引），过滤留到 scope-state.js 的 buildPausedIndex 里做。
+   * 排 decided_at DESC + rowid DESC 同 listScopeChanges（毫秒精度同毫秒写入
+   * 时 UUID 排序随机，回执要报「最近一次决策」就得有确定的次键）。
+   */
+  function listScopeStates({ state } = {}) {
+    const rows = state
+      ? db.prepare("SELECT * FROM scope_state WHERE state = ? ORDER BY decided_at DESC, rowid DESC").all(state)
+      : db.prepare("SELECT * FROM scope_state ORDER BY decided_at DESC, rowid DESC").all();
+    return rows.map(toScopeState);
+  }
+
+  // --- pinned_memories: 显式 pin（#249 第二批） ------------------------------
+  // 四个函数只管「哪条被钉住了」这条事实，不回答「该不该注入」——注入侧的
+  // 越权/暂停作用域/遗忘判定一律留在 service（与 strictScope、scopeStateGate
+  // 同处，见 injectCandidates 的位置纪律）。存储层越薄，越不会被绕过。
+
+  /**
+   * 全部 pin 行，按 pin 先后（created_at ASC）——注入就按这个序前置，**先钉的
+   * 排在最前**。预算不够（钉的条数 > pinnedInjectBudget）时，被 eligible.slice
+   * 取走的是最早钉的那几条，最近才钉的排后面、先被挤掉。
+   *
+   * 这个方向和「稳定偏好」的理由是一致的：pin 表达的是「这条我要长期带着」，
+   * 越早做出这个承诺、越久没被撤回，就越该占住名额；若反过来让新钉的优先，
+   * pin 就退化成「最近关注」清单，和 updated_at DESC 那个错误排序键同病。
+   *
+   * 注意排序键是「什么时候钉的」，不是内容的 updated_at——一条 10 月的老记忆
+   * 今天才钉，它在 pin 序里是新的、在内容上是老的，两个轴不要混。
+   * 次键 rowid：同毫秒连钉两条时 UUID 主键排序是随机的，回执要可复现。
+   */
+  function listPinned() {
+    return db.prepare("SELECT * FROM pinned_memories ORDER BY created_at ASC, rowid ASC").all().map(toPinned);
+  }
+
+  /**
+   * 钉住一条记忆。重复 pin 同一 id 不刷新 created_at（只补 note）——pin 顺序
+   * 是「第一次钉的时间」，重钉不该把老偏好的位置往后推。调用方负责确认目标
+   * 记忆存在；这里不做外键校验（本库其余表同款：关系表不设 FK，删记忆时由
+   * unpinMemory 或下一次读的 forgotten/archived 过滤兜住）。
+   */
+  function pinMemory(memoryId, { note, created_at } = {}) {
+    if (typeof memoryId !== "string" || !memoryId.trim()) return undefined;
+    const id = memoryId.trim();
+    const at = normalizeOccurredAt(created_at) ?? nowIso();
+    db.prepare(
+      `INSERT INTO pinned_memories (memory_id, created_at, note) VALUES (?, ?, ?)
+       ON CONFLICT(memory_id) DO UPDATE SET note = COALESCE(excluded.note, pinned_memories.note)`
+    ).run(id, at, normalizeScopeText(note));
+    return toPinned(db.prepare("SELECT * FROM pinned_memories WHERE memory_id = ?").get(id));
+  }
+
+  /** 松开一条 pin。返回实际删掉的行数（0 = 本来就没钉，不是错误）。 */
+  function unpinMemory(memoryId) {
+    if (typeof memoryId !== "string" || !memoryId.trim()) return 0;
+    return db.prepare("DELETE FROM pinned_memories WHERE memory_id = ?").run(memoryId.trim()).changes;
+  }
+
+  /** pin 行数。注入侧靠它判「表是空的」——空表要回落到旧的类型口径。 */
+  function countPinned() {
+    return db.prepare("SELECT count(*) AS c FROM pinned_memories").get().c;
+  }
+
+  /**
+   * 这条记忆是否被显式钉住（单行点查，读侧）。
+   *
+   * 存在的理由是 #593 的缺口：升格吸收（document.js 的 evidence 归档）只拿得到
+   * 记忆行、拿不到 pin 表，于是它只能按**类型**猜「谁属于保真池」。显式 pin 落地
+   * 后，一条 pattern / decision 被钉住仍然是 pin，按类型猜就把它当普通行收走了。
+   * 谓词必须来自本表，不能从类型推——这正是 #593 把 pin 从类型推断改成显式存储
+   * 的同一件事，别在第二个地方又推回去。
+   */
+  function isPinned(memoryId) {
+    if (typeof memoryId !== "string" || !memoryId.trim()) return false;
+    return db.prepare("SELECT 1 AS hit FROM pinned_memories WHERE memory_id = ?").get(memoryId.trim()) !== undefined;
+  }
+
+  /**
+   * 按 id 点查注入所需的行（绕开 200 行窗口的唯一通道）。
+   *
+   * 显式列清单复用 memoryColumnList：它经 PRAGMA 派生、已排除 embedding
+   * （1024 维浮点文本 ≈ 34KB/条，5 条就白搬 170KB 而注入渲染根本不用向量）。
+   * 返回顺序不保证（IN 的求值序），调用方按自己的次序（pin created_at）重排。
+   */
+  function listByIdsForInject(ids) {
+    const wanted = Array.isArray(ids) ? ids.filter((id) => typeof id === "string" && id) : [];
+    if (wanted.length === 0) return [];
+    const placeholders = wanted.map(() => "?").join(", ");
+    return db.prepare(`SELECT ${memoryColumnList} FROM memories WHERE id IN (${placeholders})`)
+      .all(...wanted).map(toRow);
+  }
+
+  /**
+   * 取词法召回（BM25）用的整份语料：全量活跃行，只带索引真正需要的四列。
+   *
+   * 为什么单独开一个口，而不是 store.list({ limit: null })：
+   *
+   * - 不能截断。语料被截到 500 行时，排序在 500 名之外的记忆永远进不了词法召回
+   *   ——实测 8 个查询里 top10 与全量语料只有 1-4 条重合，这是静默的召回缺失，
+   *   不是慢。
+   * - 也不能走 list 的宽投影。list 按 PRAGMA 派生列清单搬全部列，无界时 9k 行
+   *   实测 340-400ms；这里只要 id / title / content / updated_at，实测 74-108ms。
+   * - updated_at 是增量维护的判据：调用方按它判断某行是否变了，只对变了的行
+   *   重新分词，而不是每次重建都重算整份语料。刻意不取 content_hash：把
+   *   content_hash 进这条查询会让耗时涨到 310ms（覆盖索引失效），比省下的分词
+   *   还贵。
+   *
+   * 排序用 updated_at DESC 走 idx_memories_updated（与 #430 无界 chrono 档同一
+   * 个索引），这里排序本身不重要，命中索引才是。
+   */
+  function listBm25Corpus() {
+    return db.prepare(
+      `SELECT id, title, content, updated_at FROM memories
+       WHERE archived = 0 AND forgotten = 0
+       ORDER BY updated_at DESC`
+    ).all().map((row) => ({
+      id: row.id,
+      title: row.title,
+      content: row.content,
+      updated_at: row.updated_at,
+    }));
+  }
+
+  /**
+   * 取注入规则池的排序键：全部活跃行，只带过滤与排序真正需要的列。
+   *
+   * 为什么单独开一个口，而不是 store.list({ limit: Math.max(200, poolSize) })：
+   * 那个窗口按 importance DESC 取（store.list 的默认 order），实测合格行 8410 条
+   * 里有 8210 条永远进不了窗——importance 4 且质量满分、本就该排在前面的记忆，
+   * 一条都到不了排序。这与 #616 的 BM25 语料是同一种病：截断不是慢，是静默的
+   * 候选缺失。
+   *
+   * 为什么不用 list({ limit: null })：list 按 PRAGMA 派生列清单搬全部列（含
+   * content），9k 行实测 340-400ms；这里只要 12 列，实测 200ms。content 只对真正
+   * 入选的那 200 条用 listByIdsForInject 点查回来（实测 7ms）。
+   *
+   * updated_at 一并取出，供排序末位平局键使用：同分组的行此前靠 Array.sort 的
+   * 稳定性继承 SQL 行序，改一行 updated_at 就能造成上千对交换。
+   */
+  function listInjectPool() {
+    return db.prepare(
+      `SELECT id, type, source, importance, quality_score, last_accessed_at,
+              created_at, updated_at, agent_scope, workspace_scope,
+              archived, forgotten
+         FROM memories
+        WHERE archived = 0 AND forgotten = 0`
+    ).all().map((row) => ({
+      id: row.id,
+      type: row.type,
+      source: row.source,
+      importance: row.importance,
+      quality_score: row.quality_score,
+      last_accessed_at: row.last_accessed_at,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+      agent_scope: row.agent_scope,
+      workspace_scope: row.workspace_scope,
+      archived: row.archived,
+      forgotten: row.forgotten,
+    }));
+  }
+
+  function getFailureStats({ since } = {}) {
+    const clause = since ? "WHERE created_at >= ?" : "";
+    const params = since ? [since] : [];
+    const rows = db.prepare(
+      `SELECT failure_type, count(*) AS c FROM failure_memories ${clause} GROUP BY failure_type`
+    ).all(...params);
+    const stats = {};
+    for (const row of rows) stats[row.failure_type] = row.c;
+    return stats;
+  }
+
+  // --- entity gene: named entities + time-boxed attrs + relations (v0.3.0) --
+
+  /**
+   * Create a named entity. A fresh mention always records first_seen = now;
+   * repeated sightings should call updateEntity (which bumps mention_count and
+   * refreshes last_seen) rather than creating duplicate rows.
+   */
+  function createEntity({ name, type }) {
+    const id = randomUUID();
+    const now = nowIso();
+    // 落库前只去掉首尾空白，保留原大小写：显示名是给人看的（"DeepSeek" 不该被写成
+    // "deepseek"），大小写折叠只发生在查找键上。存量行按 #688 口径一行不动。
+    const storedName = String(name ?? "").trim();
+    db.prepare(
+      `INSERT INTO entities (id, name, type, first_seen, last_seen, mention_count)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).run(id, storedName, type ?? null, now, now, 1);
+    return toEntity(db.prepare("SELECT * FROM entities WHERE id = ?").get(id));
+  }
+
+  /**
+   * Resolve an entity by its normalized key: lower(trim(name)), optionally
+   * narrowed to one type.
+   *
+   * #688: the pre-fix lookup was `WHERE name = ?` — byte equality. "DeepSeek" and
+   * "deepseek " were two rows forever, even though the extractor means the same
+   * object; the measured stock was 170 same-type groups collapsed by this fold.
+   *
+   * Why the type dimension is not optional in the write path: folding name alone
+   * merges 95 groups that are genuinely different objects — "DeepSeek" the
+   * technology vs "deepseek" the organization is the canonical example. Callers
+   * that resolve a *mention* must pass the type; callers that look up by a
+   * user-supplied name (panel search) may omit it and get the most recently seen
+   * row across types.
+   *
+   * Why no version-suffix stripping: "DeepSeek-V3" and "DeepSeek-V4" are distinct
+   * models; collapsing them loses which one a constraint is about.
+   *
+   * @param {string} name
+   * @param {string|null} [type] entity type; when undefined/null the lookup is
+   *   type-agnostic (panel / entity-name search path)
+   * @returns {object|undefined}
+   */
+  function findEntityByName(name, type) {
+    if (name === undefined || name === null) return undefined;
+    const hasType = type !== undefined && type !== null;
+    const sql = hasType
+      ? `SELECT * FROM entities WHERE lower(trim(name)) = lower(trim(?)) AND type IS ?
+           ORDER BY last_seen DESC LIMIT 1`
+      : `SELECT * FROM entities WHERE lower(trim(name)) = lower(trim(?))
+           ORDER BY last_seen DESC LIMIT 1`;
+    const params = hasType ? [String(name), String(type)] : [String(name)];
+    return toEntity(db.prepare(sql).get(...params));
+  }
+
+  function findEntityById(id) {
+    return toEntity(db.prepare("SELECT * FROM entities WHERE id = ?").get(id));
+  }
+
+  /**
+   * Apply a partial update to an entity, always refreshing last_seen. The
+   * mention counter increments on every sighting unless the caller overrides
+   * it explicitly via patch.mention_count (e.g. to correct a count).
+   */
+  function updateEntity(id, patch) {
+    const old = findEntityById(id);
+    if (!old) return undefined;
+    const has = (k) => Object.prototype.hasOwnProperty.call(patch, k);
+    const name = has("name") ? patch.name : old.name;
+    const type = has("type") ? patch.type : old.type;
+    const mention_count = has("mention_count")
+      ? patch.mention_count
+      : (old.mention_count ?? 1) + 1;
+    const now = nowIso();
+    db.prepare(
+      `UPDATE entities SET name = ?, type = ?, last_seen = ?, mention_count = ? WHERE id = ?`
+    ).run(name, type ?? null, now, mention_count, id);
+    return findEntityById(id);
+  }
+
+  /**
+   * Record an attribute value for an entity. The previous value for the same
+   * entity+key is invalidated (valid_until = now) before the new row is
+   * inserted, so exactly one row per entity+key is current (valid_until IS NULL).
+   */
+  function saveAttr({ entity_id, attr_key, attr_value, memory_id, confidence, source }) {
+    const now = nowIso();
+    invalidateOldAttr(entity_id, attr_key, now);
+    const id = randomUUID();
+    db.prepare(
+      `INSERT INTO entity_attrs (id, entity_id, attr_key, attr_value, memory_id, valid_from, valid_until, confidence, source)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(id, entity_id, attr_key, attr_value, memory_id ?? null, now, null, confidence ?? 1.0, source ?? null);
+    return toAttr(db.prepare("SELECT * FROM entity_attrs WHERE id = ?").get(id));
+  }
+
+  /** Mark every currently-valid attr row for entityId+attrKey as expired. Returns rows changed. */
+  function invalidateOldAttr(entityId, attrKey, now) {
+    return db.prepare(
+      `UPDATE entity_attrs SET valid_until = ? WHERE entity_id = ? AND attr_key = ? AND valid_until IS NULL`
+    ).run(now, entityId, attrKey).changes;
+  }
+
+  /** Only the live value per attr_key (valid_until IS NULL). */
+  function getCurrentAttrs(entityId) {
+    return db.prepare(
+      "SELECT * FROM entity_attrs WHERE entity_id = ? AND valid_until IS NULL"
+    ).all(entityId).map(toAttr);
+  }
+
+  /** Full history per attr_key, oldest first. */
+  function getAttrHistory(entityId) {
+    return db.prepare(
+      "SELECT * FROM entity_attrs WHERE entity_id = ? ORDER BY valid_from"
+    ).all(entityId).map(toAttr);
+  }
+
+  /**
+   * All attr rows carrying a reference to the given memory (any valid state),
+   * oldest first. Used by autoDream's update path to record what an update
+   * superseded (v0.3.0 Phase 4 / 4.3.1).
+   */
+  function getAttrsByMemory(memoryId) {
+    return db.prepare(
+      "SELECT * FROM entity_attrs WHERE memory_id = ? ORDER BY valid_from ASC"
+    ).all(memoryId).map(toAttr);
+  }
+
+  /**
+   * 一条记忆关联到的实体（记忆详情侧栏用）：entity_attrs.memory_id 反查实体，
+   * 一条 JOIN 完成。同一记忆对同一实体的多次提及（多条 attr 行）按 name 去重，
+   * 每个实体只出现一次，按提及次数降序。只取 name/type——attr 详情走
+   * entity-attrs 端点。无关联（或记忆不存在）返回空数组。
+   */
+  function entitiesForMemory(memoryId) {
+    const rows = db.prepare(
+      `SELECT e.id, e.name, e.type, e.mention_count, e.last_seen
+       FROM entity_attrs ea JOIN entities e ON e.id = ea.entity_id
+       WHERE ea.memory_id = ?
+       GROUP BY e.id
+       ORDER BY e.mention_count DESC, e.last_seen DESC, e.name ASC`
+    ).all(memoryId ?? "");
+    const seen = new Set();
+    const out = [];
+    for (const row of rows) {
+      if (seen.has(row.name)) continue;
+      seen.add(row.name);
+      out.push({ name: row.name, type: row.type ?? null });
+    }
+    return out;
+  }
+
+  /**
+   * Memories carrying a currently-valid attr matching key=value (deduped).
+   * When value is empty/undefined, the attr_value filter is dropped and every
+   * currently-valid memory for that attr_key is returned — the "attr:key"
+   * (no =value) contract, v0.3.0. Only live rows (valid_until IS NULL) with a
+   * memory reference participate, and each memory appears at most once.
+   */
+  function findMemoriesByAttr(key, value) {
+    const empty = value === undefined || value === null || value === "";
+    const sql = empty
+      ? `SELECT DISTINCT memory_id FROM entity_attrs
+         WHERE attr_key = ? AND valid_until IS NULL
+           AND memory_id IS NOT NULL AND memory_id != ''`
+      : `SELECT DISTINCT memory_id FROM entity_attrs
+         WHERE attr_key = ? AND attr_value = ? AND valid_until IS NULL
+           AND memory_id IS NOT NULL AND memory_id != ''`;
+    const params = empty ? [key] : [key, value];
+    const rows = db.prepare(sql).all(...params);
+    const memories = [];
+    const stmt = db.prepare("SELECT * FROM memories WHERE id = ?");
+    for (const { memory_id } of rows) {
+      const row = stmt.get(memory_id);
+      if (row) memories.push(toRow(row));
+    }
+    return memories;
+  }
+
+  /**
+   * Record a typed relation between two entities. metadata (optional) is a
+   * free-form JSON blob describing the relation. Relations are append-only.
+   *
+   * issue #24 块2（权重演化）：source 决定边初值——manual 1.0 / confirmed
+   * 保持 / tag 0.3 / llm 0.4；显式传入 weight 时优先于 source 映射（manual
+   * 建边可自带权重）。哲学「关系是用出来的，不是建出来的」：初值只反映来源
+   * 偏见，真正的抬升留给 bumpRelationWeight（touch 门控驱动）。
+   */
+  function saveRelation({ from_entity, to_entity, relation_type, memory_id, metadata, weight, source }) {
+    const id = randomUUID();
+    const now = nowIso();
+    const metaStr = metadata === undefined
+      ? null
+      : typeof metadata === "string"
+        ? metadata
+        : JSON.stringify(metadata);
+    const src = source ?? "manual";
+    // 只认映射表的自有键：src="constructor"/"toString" 会命中原型链上的函数，直接查表
+    // 拿到的是函数而非权重（绑进 SQL 就是整条写入抛错），必须回退默认 1.0。
+    const w = weight ?? (Object.hasOwn(RELATION_SOURCE_DEFAULTS, src) ? RELATION_SOURCE_DEFAULTS[src] : 1.0);
+    db.prepare(
+      `INSERT INTO entity_relations (id, from_entity, to_entity, relation_type, memory_id, created_at, metadata, weight, source)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(id, from_entity, to_entity, relation_type, memory_id ?? null, now, metaStr, w, src);
+    return toRelation(db.prepare("SELECT * FROM entity_relations WHERE id = ?").get(id));
+  }
+
+  /**
+   * 边权重演化（issue #24 块2）。只加不减、封顶 1.0——权重只能靠「被用」抬升、
+   * 不能靠被人为敲低，封顶防触达过频把边吹到无意义大。
+   * 下界守在这里而不是调用方：增量为负/非有限数一律拒绝（返回 false）。限幅只留
+   * 上界、把「只加不减」托付给配置范围，等于把存储接口的契约挂在调用方自觉上。
+   * 读改写合并成单条 UPDATE（MIN(1.0, weight + ?)）：memoryDir 可被多进程共用，
+   * 先 SELECT 再 UPDATE 会丢并发增量，还会拿旧值把别人已抬升的权重压回去。
+   * 幂等（缺行 changes=0 → false）；delta 默认 0.1，由调用方（touch 门控）决定
+   * 何时算一次有效触达。**作用在关系行**，与 memories 的 last_accessed_at 是两码
+   * 事：这条是针对「这条边被激活了」的演化。
+   */
+  function bumpRelationWeight(id, delta = 0.1) {
+    if (!Number.isFinite(delta) || delta < 0) return false;
+    const result = db.prepare(
+      "UPDATE entity_relations SET weight = MIN(1.0, weight + ?) WHERE id = ?"
+    ).run(delta, id);
+    return result.changes > 0;
+  }
+
+  /**
+   * 覆盖一条关系行的 metadata（#619）。关系本身仍按 saveRelation 追加，
+   * 这条只给「同一条边被后续观察补充证据」用——情感相位判重命中时要把
+   * evidence 并集与 sessionCount 写回既有边，否则边上的场合数会永远停在
+   * 第一次写入那一刻。只改 metadata，不动 weight/source/created_at：这条边的
+   * 来源与权重反映的是它第一次被建立时的事实。
+   * 幂等（缺行 changes=0 → false）。
+   */
+  function updateRelationMetadata(id, metadata) {
+    const metaStr = metadata === undefined
+      ? null
+      : typeof metadata === "string"
+        ? metadata
+        : JSON.stringify(metadata);
+    const result = db.prepare(
+      "UPDATE entity_relations SET metadata = ? WHERE id = ?"
+    ).run(metaStr, id);
+    return result.changes > 0;
+  }
+
+  /**
+   * 列出仍指着这条 trait pattern 的边（#739）：降格归档之前必须先问一句
+   * 「还有别人在用吗」，回执也要能点名是哪几条。
+   *
+   * 升格走的 `applyCreate` 按 (type, title) 去重，而标题模板只吃 person/target
+   * 与情绪**原词**（src/lang.js affectiveTrait.title）；聚合键却含归一后的
+   * `normalize_key`（src/api.js:1810）。于是「原词相同、归一键不同」的两组在
+   * 面板上是两组、在库里是同一行 pattern —— 原来的降格只清自己那组的边就把
+   * 这行归档，另一组仍指着一条已归档的 id：聚合面还说「稳定倾向」，注入面那条
+   * pattern 已经不存在。降格是「这一组」的动作，不该连带销毁别组依赖的行。
+   *
+   * 只数 `promotedToTrait === true` 的引用：降格会先清标记，所以排掉本次请求里
+   * 的边之后，剩下带标记的就是仍在使用这条 pattern 的边。
+   *
+   * `metadata` 是自由文本列（历史行有空值、也有非 JSON 的脏值），裸写
+   * `json_extract` 会抛 `malformed JSON` 把整次请求打成 500；一律用
+   * `CASE WHEN json_valid(metadata)` 包住，非法行走「不匹配」而不是报错。
+   *
+   * 返回 `{ total, ids }`：`total` 是 `COUNT(*)` 的真值，`ids` 受 `limit` 约束只用于
+   * 回执点名。别拿 `ids.length` 当总数——那正是本件要修的「静默截断」换个地方复发。
+   */
+  function relationIdsByTraitMemoryId(traitMemoryId, { excludeIds = [], limit = 50 } = {}) {
+    if (typeof traitMemoryId !== "string" || !traitMemoryId) return { total: 0, ids: [] };
+    const excluded = Array.isArray(excludeIds) ? excludeIds.filter((id) => typeof id === "string" && id) : [];
+    const placeholders = excluded.map(() => "?").join(", ");
+    const notIn = placeholders ? ` AND id NOT IN (${placeholders})` : "";
+    const scope = `WHERE CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.traitMemoryId') END = ?${notIn}
+          AND CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.promotedToTrait') END = 1`;
+    // total 走 COUNT(*)，ids 才受 limit 约束：#739 的回执要用「还有几条边在引用」
+    // 这个真值，拿被 LIMIT 截断的数组长度冒充总数，本身就是一次静默截断。
+    const total = db.prepare(`SELECT count(*) AS c FROM entity_relations ${scope}`)
+      .get(traitMemoryId, ...excluded)?.c ?? 0;
+    const rows = db.prepare(
+      `SELECT id FROM entity_relations ${scope} ORDER BY created_at ASC, id ASC LIMIT ?`
+    ).all(traitMemoryId, ...excluded, Math.max(1, Number(limit) || 50));
+    const ids = rows.map((r) => r.id);
+    return { total, ids };
+  }
+
+  /**
+   * Re-point every attr row whose memory_id is fromMemoryId to toMemoryId
+   * (autoDream merge migration, v0.3.0 Phase 4 / 4.3.2). When the keeper
+   * already carries a live attr for the same entity+key, the source row is
+   * superseded and invalidated instead (the keeper's value wins). Returns
+   * { migrated, invalidated }.
+   */
+  function migrateAttrsToMemory(fromMemoryId, toMemoryId, now) {
+    let migrated = 0;
+    let invalidated = 0;
+    const attrs = db.prepare(
+      "SELECT * FROM entity_attrs WHERE memory_id = ?"
+    ).all(fromMemoryId);
+    for (const attr of attrs) {
+      // 仅当 keeper 已有同 entity+key 的当前有效属性才视为被替代（限定 memory_id，
+      // 避免把 loser 自身的 live 行误判为 keeper 行）。
+      const keeperLive = db.prepare(
+        "SELECT id FROM entity_attrs WHERE entity_id = ? AND attr_key = ? AND valid_until IS NULL AND memory_id = ?"
+      ).get(attr.entity_id, attr.attr_key, toMemoryId);
+      if (keeperLive) {
+        db.prepare(
+          "UPDATE entity_attrs SET valid_until = ? WHERE id = ?"
+        ).run(now, attr.id);
+        invalidated++;
+      } else {
+        db.prepare(
+          "UPDATE entity_attrs SET memory_id = ? WHERE id = ?"
+        ).run(toMemoryId, attr.id);
+        migrated++;
+      }
+    }
+    return { migrated, invalidated };
+  }
+
+  /**
+   * Tag 桥接（issue #24 · 块1 三路起点里的第二路）：查询词命中某些记忆的 tag
+   * 时，那些记忆挂联的实体本身就是「这个查询正在谈的东西」——即使查询里没有
+   * 出现它们的名字。Tag 是 LLM 打的标签，比精确名松，但比向量具体，正好填在
+   * 二者之间。
+   *
+   * 匹配口径与 findEntitiesMentionedIn 对齐（JS 侧 toLowerCase，不受 SQLite
+   * 只折 ASCII 的限制）：把查询按空白与常见中英标点切词，任一词与某个 tag
+   * 全等即算命中（不做子串——tag 通常是短词，子串匹配会让「ai」命中「mail」）。
+   * 只认未归档未遗忘的行：一条已归档记忆的 tag 不该再拉出种子。
+   * 返回 {id, name}，按命中记忆数降序、名称升序（稳定）。
+   */
+  function findEntitiesByTags(text, { limit = 5 } = {}) {
+    const words = String(text ?? "")
+      .toLowerCase()
+      .split(/[\s,，、;；:：!！?？.。()（）[\]【】"'“”‘’/|]+/u)
+      .map((w) => w.trim())
+      .filter((w) => w.length >= 2);
+    if (!words.length) return [];
+    const rows = db.prepare(
+      `SELECT id, tags FROM memories WHERE archived = 0 AND forgotten = 0`
+    ).all();
+    const memHits = new Set();
+    for (const row of rows) {
+      const tags = parseTags(row.tags).map((t) => String(t).toLowerCase());
+      if (!tags.length) continue;
+      if (words.some((w) => tags.includes(w))) memHits.add(row.id);
+    }
+    if (!memHits.size) return [];
+    // 计数必须在 SQL 里做：entityIdsForMemories 返回的是 DISTINCT entity_id，
+    // 拿它反推「命中几条记忆」永远是 1，排序就静默失效了（评审抓到的正是这个）。
+    //
+    // 两个来源都要算：只读 entity_attrs 会漏掉「记忆只通过关系挂到实体上」的情况
+    // ——phaseRelations 只写 entity_relations.memory_id、不建 attr 行，于是仅由关系
+    // 关联的记忆对关系两端一个种子都生不出来。这与 getLinkedMemoryIds 的口径一致
+    // （那边 attr 与 relation 两端同样并列）。UNION 去重的是 (实体, 记忆) 对，
+    // 所以同一条记忆的多条关联记录不会把 via 抬高。
+    //
+    // 分块理由同 DELETE_ID_CHUNK：一条语句一行一个 `?`，撞上 SQLITE_MAX_VARIABLE_NUMBER
+    // （32766）会整笔抛错，而调用方 try/catch 兜底 → 静默丢掉整条 Tag 锚点。
+    // 这里每块绑 3×TAG_ID_CHUNK 个参数（三处 IN 列表），500 仍有二十倍余量。
+    const rowsByEntity = new Map();
+    const memoryIds = [...memHits];
+    for (let offset = 0; offset < memoryIds.length; offset += TAG_ID_CHUNK) {
+      const batch = memoryIds.slice(offset, offset + TAG_ID_CHUNK);
+      const marks = batch.map(() => "?").join(",");
+      const batchRows = db.prepare(
+        `SELECT hits.id AS id, e.name AS name, COUNT(DISTINCT hits.memory_id) AS via
+         FROM (
+           SELECT entity_id AS id, memory_id FROM entity_attrs
+             WHERE memory_id IN (${marks}) AND entity_id IS NOT NULL
+           UNION
+           SELECT from_entity AS id, memory_id FROM entity_relations
+             WHERE memory_id IN (${marks}) AND from_entity IS NOT NULL
+           UNION
+           SELECT to_entity AS id, memory_id FROM entity_relations
+             WHERE memory_id IN (${marks}) AND to_entity IS NOT NULL
+         ) hits JOIN entities e ON e.id = hits.id
+         GROUP BY hits.id`
+      ).all(...batch, ...batch, ...batch);
+      for (const row of batchRows) {
+        const prev = rowsByEntity.get(row.id);
+        // 各块的记忆集合互不相交，所以 via 直接相加就是全集的 DISTINCT 计数。
+        rowsByEntity.set(row.id, { id: row.id, name: row.name, via: (prev?.via ?? 0) + Number(row.via) });
+      }
+    }
+    const rows2 = [...rowsByEntity.values()];
+    if (!rows2.length) return [];
+    return rows2
+      .map((r) => ({ id: r.id, name: r.name, via: r.via }))
+      .sort((a, b) => b.via - a.via || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+      .slice(0, limit)
+      .map(({ id, name }) => ({ id, name }));
+  }
+
+  /**
+   * 按记忆批量反查实体 id（Tag 桥接用）。与 entitiesForMemory 的区别是「批量 +
+   * 带 id」：那边是面板详情页的单条展示（只要 name/type），这边要的是能直接
+   * 喂给 normalizePath 的 id 列表。同一 (记忆, 实体) 只出一次。
+   *
+   * 与 findEntitiesByTags 同口径：attr 行与关系两端并列。只读 entity_attrs 时，
+   * 一条只通过关系挂到实体上的记忆在向量路里也生不出种子（phaseRelations 不建 attr）。
+   */
+  function entityIdsForMemories(memoryIds) {
+    const ids = Array.isArray(memoryIds) ? memoryIds.filter(Boolean) : [];
+    if (!ids.length) return [];
+    const placeholders = ids.map(() => "?").join(",");
+    const rows = db.prepare(
+      `SELECT entity_id FROM entity_attrs
+         WHERE memory_id IN (${placeholders}) AND entity_id IS NOT NULL
+       UNION
+       SELECT from_entity AS entity_id FROM entity_relations
+         WHERE memory_id IN (${placeholders}) AND from_entity IS NOT NULL
+       UNION
+       SELECT to_entity AS entity_id FROM entity_relations
+         WHERE memory_id IN (${placeholders}) AND to_entity IS NOT NULL`
+    ).all(...ids, ...ids, ...ids);
+    return rows.map((r) => r.entity_id);
+  }
+
+  /**
+   * 被动确认的复核出口（issue #24 · 块4）：列出「权重已经被抬过」的边。
+   *
+   * 设计口径：被动确认本身是安静的——正常触达就 bump，不打扰人。要复核的恰恰
+   * 是「抬过的那些」，因为抬升是唯一会改变检索形状的动作。判据不看有没有被
+   * bump 过（那要额外记账），看权重是否高于该 source 的初值：RELATION_SOURCE_
+   * DEFAULTS 是建边时的起点，高出去的部分只能来自 bumpRelationWeight。
+   *
+   * 显式传过 weight 的边（manual 自带权重）会被算成「抬过」，这在语义上没错
+   * ——它确实不是初值——但它是人工意图，所以把 source 一起返回，面板自己决定
+   * 怎么标。整数比较用 gain > 0 而不是 >= 0，防浮点累加的 1e-17 噪声。
+   * 返回按 gain 降序、created_at 降序，附两侧实体名（面板不必再查一遍）。
+   */
+  function listBoostedRelations({ limit = 200, minGain = 0 } = {}) {
+    const { limit: lim } = sanitizePage(limit, 1, 200);
+    const rows = db.prepare(
+      `SELECT r.*, ef.name AS from_name, et.name AS to_name
+       FROM entity_relations r
+       LEFT JOIN entities ef ON ef.id = r.from_entity
+       LEFT JOIN entities et ON et.id = r.to_entity
+       ORDER BY r.weight DESC, r.created_at DESC`
+    ).all();
+    const out = [];
+    for (const row of rows) {
+      const src = row.source ?? "manual";
+      const base = Object.hasOwn(RELATION_SOURCE_DEFAULTS, src)
+        ? RELATION_SOURCE_DEFAULTS[src]
+        : 1.0;
+      const gain = (row.weight ?? 1.0) - base;
+      if (!(gain > minGain)) continue;
+      out.push({
+        ...toRelation(row),
+        from_name: row.from_name ?? null,
+        to_name: row.to_name ?? null,
+        base_weight: base,
+        gain
+      });
+    }
+    // 排序必须在算完 gain 之后做，不能交给 SQL 的 weight DESC：不同 source 的
+    // base 不同，weight 大不等于 gain 大（llm 边 0.95 / gain 0.55 会压过
+    // tag 边 0.90 / gain 0.60）。早先在循环里按 lim 提前 break 时，被截掉的
+    // 恰恰是 gain 更大的边——面板按 limit=100 取数，截断处正是最该看见的那几条。
+    out.sort((a, b) => b.gain - a.gain || String(b.created_at).localeCompare(String(a.created_at)));
+    return out.slice(0, lim);
+  }
+
+  /** Relations where the entity appears on either side (from or to). */
+  function getRelations(entityId) {
+    return db.prepare(
+      "SELECT * FROM entity_relations WHERE from_entity = ? OR to_entity = ?"
+    ).all(entityId, entityId).map(toRelation);
+  }
+
+  /**
+  /**
+   * 批量邻接（issue #24 · 块1 锚定层级联）：给定多条实体 id，一并取全部关系行
+   * 并归并成「每个实体 → 相邻实体 id 去重列表」的邻接表。供 anchoring.js 的
+   * cascadeDepths 使用——多实体一族只需要一次 SQL（IN 查询），比逐实体调
+   * getRelations 的 N 次往返省。邻接是无向的（from/to 双向），往返不重复。
+   * 返回 Map<entityId, Array<entityId>>；未命中的实体缺省为 absent（级联视为
+   * 无邻居，Map 里不放键同行，null 同等对待）。
+   */
+  function getEntityNeighbors(entityIds) {
+    const out = new Map();
+    const ids = Array.isArray(entityIds) ? entityIds.filter(Boolean) : [];
+    if (!ids.length) return out;
+    const placeholders = ids.map(() => "?").join(",");
+    const rows = db.prepare(
+      `SELECT from_entity, to_entity FROM entity_relations
+       WHERE from_entity IN (${placeholders}) OR to_entity IN (${placeholders})`
+    ).all(...ids, ...ids);
+    for (const r of rows) {
+      addNeighbor(out, r.from_entity, r.to_entity, ids);
+      addNeighbor(out, r.to_entity, r.from_entity, ids);
+    }
+    return out;
+  }
+
+  function addNeighbor(out, anchor, neighbor, queryIds) {
+    if (!queryIds.includes(anchor)) return; // 只以查询过的实体为锚
+    if (neighbor === anchor) return;        // 自环不构成扩散边
+    if (!out.has(anchor)) out.set(anchor, []);
+    const list = out.get(anchor);
+    if (!list.includes(neighbor)) list.push(neighbor);
+  }
+
+  /**
+   * 按记忆反查关联边（issue #24 块4 被动确认）：一条记忆被召回/注入（触达）
+   * 时，挂在同一记忆上的关系行即「这条关系被用过了」的证据——正常触达视为
+   * 被动确认，调用方据此 bumpRelationWeight。返回 toRelation 行（含 weight/
+   * source）。索引 idx_relations_memory 已建（#219）。
+   */
+  function getRelationsByMemory(memoryId) {
+    if (!memoryId) return [];
+    return db.prepare(
+      "SELECT * FROM entity_relations WHERE memory_id = ?"
+    ).all(memoryId).map(toRelation);
+  }
+
+  /**
+   * 按一批记忆 id 一次取回它们的情绪边（叠加在注入行上的「情绪记录」注释用）。
+   *
+   * 为什么不复用 getRelationsByMemory 逐条查：注入每轮都有 3-5 个候选，逐条就是一个
+   * N+1；而且注释要显示「谁对什么」，那边只回实体 id，还得再查两次名字。这里
+   * 一次 SQL 带 LEFT JOIN 把两端名字取回，按 memory_id 分组成 Map。
+   *
+   * 只读、只取 affective_context，limit 由调用方给（默认按候选数）。排序与
+   * relationsByType 一致：created_at DESC，最近记的优先——同一记忆上的多条情绪
+   * 边里，注入只挂最新那条（多挂会把注入块撑爆，也会把历史情绪误读成现状）。
+   */
+  function affectiveRelationsByMemories(memoryIds, perMemory = 1) {
+    const ids = Array.isArray(memoryIds)
+      ? memoryIds.filter((id) => typeof id === "string" && id.length > 0)
+      : [];
+    if (ids.length === 0) return new Map();
+    const cap = Number.isFinite(perMemory) ? Math.max(1, Math.trunc(perMemory)) : 1;
+    const placeholders = ids.map(() => "?").join(", ");
+    const rows = db.prepare(
+      `SELECT r.*, f.name AS from_name, f.type AS from_type,
+              t.name AS to_name, t.type AS to_type
+         FROM entity_relations r
+         LEFT JOIN entities f ON f.id = r.from_entity
+         LEFT JOIN entities t ON t.id = r.to_entity
+        WHERE r.relation_type = 'affective_context' AND r.memory_id IN (${placeholders})
+        ORDER BY r.created_at DESC`
+    ).all(...ids);
+    const out = new Map();
+    for (const row of rows) {
+      const key = row.memory_id;
+      if (!key) continue;
+      const bucket = out.get(key) ?? [];
+      if (bucket.length >= cap) continue;
+      bucket.push({
+        ...toRelation(row),
+        from_name: row.from_name ?? null,
+        from_type: row.from_type ?? null,
+        to_name: row.to_name ?? null,
+        to_type: row.to_type ?? null
+      });
+      out.set(key, bucket);
+    }
+    return out;
+  }
+
+  /**
+   * #725：按 id 取单条边（人工修正通道的寻址）。面板把一组
+   * (person, target, emotion, attribution) 当一个条目，apply 的 edgeIds 是组内
+   * 全部边；并发操作可能让其中某条已不存在，调用方逐条判空、失败进回执。
+   */
+  function relationById(id) {
+    if (typeof id !== "string" || !id) return null;
+    const row = db.prepare("SELECT * FROM entity_relations WHERE id = ?").get(id);
+    return row ? toRelation(row) : null;
+  }
+
+  /**
+   * #725：人工修正账本。审计纪律同 profile_fact_journal：只记账、不触发任何
+   * hook；自动轮不写这张表——写入方只有 apply 路由（token-write）。带 prune：
+   * 账本是审计事实不是检索面，无界增长没有读者（profile_fact_journal 同款）。
+   */
+  function recordAffectiveJournal({ at, edgeId = null, op, before = null, after = null, actor = "manual" }) {
+    db.prepare(
+      "INSERT INTO affective_journal (at, edge_id, op, before, after, actor) VALUES (?, ?, ?, ?, ?, ?)"
+    ).run(at ?? new Date().toISOString(), edgeId, op, before, after, actor);
+  }
+
+  function listAffectiveJournal(limit = 50) {
+    const cap = Number.isFinite(limit) ? Math.max(1, Math.trunc(limit)) : 50;
+    return db.prepare("SELECT * FROM affective_journal ORDER BY id DESC LIMIT ?").all(cap);
+  }
+
+  function pruneAffectiveJournal(keep = 200) {
+    return db.prepare(
+      `DELETE FROM affective_journal WHERE id NOT IN (
+         SELECT id FROM affective_journal ORDER BY id DESC LIMIT ?)`
+    ).run(keep).changes;
+  }
+
+  /**
+   * 按关系类型取全部边（#619 可见化 C）。情感边散在 23k 个实体之间，`ego` 端点
+   * 是「从某个实体往外看」，天然不适合回答「这库里一共记了哪些情绪」——那要的
+   * 是反向的、全局的一眼。所以单开一条按类型全表取，一次 SQL，不做 N 次往返。
+   *
+   * 只按类型过滤，不在 SQL 里碰 metadata：情绪/归属/场合数都由调用方从 metadata
+   * 里读，SQL 里拼 JSON 提取会把「字段名」焊进查询，下一版改字段名就得改 SQL。
+   * 按 created_at DESC 排，最近记的更靠前；limit 兜底防止面板把整表拖进内存。
+   */
+  function relationsByType(relationType, limit = 500) {
+    if (!relationType) return [];
+    const lim = Number.isFinite(limit) ? Math.max(0, Math.trunc(limit)) : 500;
+    if (lim === 0) return [];
+    // 端点名字一并取回：面板要显示「谁对谁」，让调用方拿 id 再逐条查实体
+    // 就是 N 次往返，而这个列表本来就是给「一眼看全」用的。
+    const rows = db.prepare(
+      `SELECT r.*, f.name AS from_name, f.type AS from_type,
+              t.name AS to_name, t.type AS to_type
+         FROM entity_relations r
+         LEFT JOIN entities f ON f.id = r.from_entity
+         LEFT JOIN entities t ON t.id = r.to_entity
+        WHERE r.relation_type = ?
+        ORDER BY r.created_at DESC
+        LIMIT ?`
+    ).all(relationType, lim);
+    return rows.map((row) => ({
+      ...toRelation(row),
+      from_name: row.from_name ?? null,
+      from_type: row.from_type ?? null,
+      to_name: row.to_name ?? null,
+      to_type: row.to_type ?? null
+    }));
+  }
+
+  /**
+   * #613 §4：日记素材查询。按会话 id 集合取「这个 agent 在各会话里留下的痕迹」，
+   * 卡本地日窗口。四条由 #613 实测钉死的口径，全部在这条 SQL 里兑现：
+   * - **source 两形**：`session:session-<uuid>` 与裸 `session:<uuid>` 零重叠（live 库
+   *   6492 / 1146 条），只用一形会各漏 7-8 条且不报错——所以 ids 每个都展开成两形；
+   * - **occurred_at 空值占活跃行 54.4%**：COALESCE 是必需项，漏写会让整日素材静默
+   *   掉进 null 桶（10-09 实测 365 → 7，结果仍是个正常数字）；
+   * - **-480 偏移带**：854 条外部批量写入的行 occurred_at 被写成「本地时间当 UTC」，
+   *   偏移尖峰在 -(本机时区偏移) ±10 分钟内、全为整秒精度——按偏移量认（阈值法
+   *   挡不住也不行：带外还有真跨 12h 的回忆型记忆），修法是 occurred_at 加本机偏移；
+   * - **日界按本地日**：ts 是 UTC 语义，比较时再加一次本机偏移得到本地墙钟。
+   * bandLo/bandHi/offsetMinutes 由调用方按本机时区算好传入（store 不读钟）。
+   * 返回 { rows, total }：total 是窗口内全部素材数，rows 是 LIMIT 截断后的——
+   * LIMIT 截断必须可观测（#613 验收红线：500 条只准如实说用了 400 条）。
+   */
+  function diaryMaterial({ ids, excludeIds = [], dayStart, dayEnd, excludeTypes = [], limit = 400, bandLo, bandHi, offsetMinutes }) {
+    const twoForm = (list) => list.flatMap((id) => [`session:session-${id}`, `session:${id}`]);
+    const cleanIds = Array.isArray(ids) ? ids.filter((id) => typeof id === "string" && id).slice(0, 400) : [];
+    const cleanEx = Array.isArray(excludeIds) ? excludeIds.filter((id) => typeof id === "string" && id).slice(0, 400) : [];
+    let sources = [];
+    let sourceClause = "";
+    if (cleanIds.length) {
+      // 具名 agent：素材 = 它名下已落定会话的两种 source 形状。
+      sources = twoForm(cleanIds);
+      sourceClause = ` AND source IN (${sources.map(() => "?").join(", ")})`;
+    } else if (cleanEx.length) {
+      // #613 冷行语义：_unnamed 的素材 = 全部 session 源里「没落到具名 agent 的」
+      // （冷行默认进 _unnamed；具名 agent 的两形来源被显式排除）。
+      sources = twoForm(cleanEx);
+      sourceClause = ` AND source LIKE 'session:%' AND source NOT IN (${sources.map(() => "?").join(", ")})`;
+    } else {
+      return { rows: [], total: 0 };
+    }
+    const typeFilter = Array.isArray(excludeTypes) && excludeTypes.length
+      ? ` AND type NOT IN (${excludeTypes.map(() => "?").join(", ")})`
+      : "";
+    // SQLite 的 modifier 只认「±N minutes」，$-300$ 这种「+」后跟负号会被判非法，
+    // datetime() 直接返回 NULL——窗口条件恒为假，整天的素材一条都取不到，还不报错。
+    // 偏移在 UTC 以西（美洲、太平洋）就是负数，所以符号必须显式拼。
+    const offMin = Number(offsetMinutes) || 0;
+    const offsetSql = `${offMin < 0 ? "-" : "+"}${Math.abs(offMin)} minutes`;
+    const where = `WHERE datetime(ts_utc, '${offsetSql}') >= ? AND datetime(ts_utc, '${offsetSql}') < ?`;
+    const cte = `
+      WITH src AS (
+        SELECT type, title, content, created_at, occurred_at,
+          CASE WHEN CAST(round((julianday(occurred_at) - julianday(created_at)) * 1440) AS INTEGER)
+                    BETWEEN ? AND ?
+               THEN datetime(substr(occurred_at, 1, 19), '${offsetSql}')
+               ELSE COALESCE(substr(occurred_at, 1, 19), substr(created_at, 1, 19))
+          END AS ts_utc
+        FROM memories
+        WHERE forgotten = 0 AND archived = 0${typeFilter}${sourceClause}
+      )`;
+    const baseParams = [Number(bandLo) || 0, Number(bandHi) || 0, ...(Array.isArray(excludeTypes) ? excludeTypes : []), ...sources];
+    const cap = Number.isFinite(limit) ? Math.max(1, Math.trunc(limit)) : 400;
+    const total = db.prepare(
+      `${cte} SELECT COUNT(*) AS n FROM src ${where}`
+    ).get(...baseParams, String(dayStart ?? ""), String(dayEnd ?? "")).n;
+    const rows = db.prepare(
+      `${cte} SELECT type, title, content, datetime(ts_utc, '${offsetSql}') AS local_ts
+         FROM src ${where} ORDER BY ts_utc ASC LIMIT ?`
+    ).all(...baseParams, String(dayStart ?? ""), String(dayEnd ?? ""), cap);
+    return {
+      rows: rows.map((r) => ({ type: r.type, title: r.title, content: r.content, localTs: r.local_ts })),
+      total
+    };
+  }
+
+  /** All entities (optionally name-filtered, newest first). Used by sleep phase 4
+   *  orphan detection: an entity with zero relations is a candidate for relation
+   *  completion. */
+  function listEntities({ limit = 1000, q } = {}) {
+    const needle = typeof q === "string" ? q.trim() : "";
+    if (needle === "") {
+      const rows = db.prepare(
+        "SELECT * FROM entities ORDER BY last_seen DESC, name ASC LIMIT ?"
+      ).all(limit);
+      return rows.map(toEntity);
+    }
+    // 名字过滤放在 SQL 侧：调用方若在 LIMIT 之后过滤，排在 limit 之外的实体
+    // 就永远搜不到（面板按 limit=200 取回再本地过滤，1.6 万实体时命中率约 1%）。
+    // LIKE 的 % / _ 用 ESCAPE 转义，否则用户输入一个 "%" 就会把整库匹配出来。
+    const escaped = needle.replace(/[\\%_]/g, (ch) => `\\${ch}`);
+    const rows = db.prepare(
+      "SELECT * FROM entities WHERE name LIKE ? ESCAPE '\\' ORDER BY last_seen DESC, name ASC LIMIT ?"
+    ).all(`%${escaped}%`, limit);
+    return rows.map(toEntity);
+  }
+
+  /**
+   * 实体总行数（全库，不受 limit 影响）。目录路由的 `total` 必须走这里：
+   * 它此前填的是 `entities.length`（本次切片长度），于是库里一万六千个实体
+   * 在面板上永远显示 500 —— 数字看着像"实体太少"，其实是被上限截断了。
+   * 与 listEntities 同源同表，只差一个 COUNT。
+   */
+  function countEntities() {
+    return db.prepare("SELECT COUNT(*) AS n FROM entities").get().n;
+  }
+
+  // --- 图召回轴（issue #219）-------------------------------------------------
+
+  /**
+   * 找出名称出现在文本中的实体（图召回的查询侧匹配）。大小写折叠在 JS 侧做
+   * （SQLite lower() 只折 ASCII，JS toLowerCase 覆盖全 Unicode）；名称长度
+   * 下限 2，防单字符实体把任意查询吃成万金油命中。entities 表量级小（千级），
+   * 线性扫描的查询期成本可忽略。返回按名称长度降序的 {id, name}——更具体的
+   * 长名字优先占 limit 名额。
+   */
+  function findEntitiesMentionedIn(text, { limit = 5 } = {}) {
+    const hay = String(text ?? "").toLowerCase();
+    if (!hay) return [];
+    const rows = db.prepare("SELECT id, name FROM entities WHERE length(name) >= 2").all();
+    const hits = [];
+    for (const row of rows) {
+      if (hay.includes(row.name.toLowerCase())) hits.push({ id: row.id, name: row.name });
+    }
+    hits.sort((a, b) => b.name.length - a.name.length);
+    return hits.slice(0, limit);
+  }
+
+  /**
+   * 给定实体 id 集合，反查挂联的记忆 id，带连接层级（图召回的候选侧）。
+   * tier "attr" = 当前有效属性行直接挂的记忆（与 searchByEntity 同口径，
+   * valid_until IS NULL）；tier "relation" = 实体作为 from/to 出现的关系行
+   * 所挂记忆。两层都排除空 memory_id；同一记忆两条边都有时取更强的 attr。
+   * 返回 Map<memory_id, "attr" | "relation">。
+   */
+  function getLinkedMemoryIds(entityIds) {
+    const out = new Map();
+    if (!Array.isArray(entityIds) || !entityIds.length) return out;
+    const placeholders = entityIds.map(() => "?").join(",");
+    const attrRows = db.prepare(
+      `SELECT DISTINCT memory_id FROM entity_attrs
+       WHERE valid_until IS NULL AND memory_id IS NOT NULL AND memory_id != ''
+         AND entity_id IN (${placeholders})`
+    ).all(...entityIds);
+    for (const r of attrRows) out.set(r.memory_id, "attr");
+    const relRows = db.prepare(
+      `SELECT DISTINCT memory_id FROM entity_relations
+       WHERE memory_id IS NOT NULL AND memory_id != ''
+         AND (from_entity IN (${placeholders}) OR to_entity IN (${placeholders}))`
+    ).all(...entityIds, ...entityIds);
+    for (const r of relRows) if (!out.has(r.memory_id)) out.set(r.memory_id, "relation");
+    return out;
+  }
+
+  // --- mirror sync state (F-NEW-03) -----------------------------------------
+
+  /**
+   * Upsert the single mirror_state row (id='main'). patch accepts
+   * {dirty?, last_error?, last_attempt?, success_at?, generation?,
+   * applied_generation?, type_status?} — only the keys present on the object
+   * are written, everything else is left untouched (partial upsert). type_status
+   * is stored as JSON text (objects are serialized on write), generation /
+   * applied_generation are coerced to non-negative integers. Returns the freshly
+   * read state row (default shape when absent).
+   */
+  function setMirrorState(patch) {
+    const ALLOWED = new Set([
+      "dirty",
+      "last_error",
+      "last_attempt",
+      "success_at",
+      "generation",
+      "applied_generation",
+      "type_status"
+    ]);
+    const keys = Object.keys(patch).filter(
+      (key) => ALLOWED.has(key) && Object.prototype.hasOwnProperty.call(patch, key)
+    );
+    if (keys.length === 0) {
+      db.prepare(
+        "INSERT INTO mirror_state (id) VALUES ('main') ON CONFLICT(id) DO NOTHING"
+      ).run();
+      return getMirrorState();
+    }
+    // 列同时出现在 INSERT 与 ON CONFLICT 里（excluded.*），保证首次插入也写入
+    // patch 值，而不只是默认值；未传入的列保持不变（partial upsert）。
+    const cols = [];
+    const values = [];
+    const updates = [];
+    for (const key of keys) {
+      let value = patch[key];
+      if (key === "dirty") {
+        value = value ? 1 : 0;
+      } else if (key === "generation" || key === "applied_generation") {
+        // Fail-closed integer enforcement (audit peer F): never truncate. A
+        // fractional value like 1.5 previously passed the JS gate via
+        // Math.trunc while SQLite's CHECK (>= 0) silently accepted it too, so a
+        // dirty legacy row could carry a non-integer generation that reads as a
+        // coherent applied round. Reject non-integers outright — the caller must
+        // pass a whole number, and a stale dirty value stays visible instead of
+        // being "repaired" into a misleading clean integer.
+        value = Number(value);
+        if (!Number.isInteger(value) || value < 0 || value > Number.MAX_SAFE_INTEGER) {
+          throw new RangeError(`mirror_state.${key} out of range: ${value}`);
+        }
+      } else if (key === "type_status" && value != null && typeof value !== "string") {
+        value = JSON.stringify(value);
+      }
+      cols.push(key);
+      values.push(value);
+      updates.push(`${key} = excluded.${key}`);
+    }
+    const placeholders = cols.map(() => "?").join(", ");
+    db.prepare(
+      `INSERT INTO mirror_state (id, ${cols.join(", ")}) VALUES ('main', ${placeholders})
+       ON CONFLICT(id) DO UPDATE SET ${updates.join(", ")}`
+    ).run(...values);
+    return getMirrorState();
+  }
+
+  /** Current mirror state; default {dirty:0, last_error:null, last_attempt:null, success_at:null, generation:0, applied_generation:0, type_status:{}} when absent. */
+  function getMirrorState() {
+    const row = db.prepare("SELECT * FROM mirror_state WHERE id = 'main'").get();
+    return toMirrorState(row);
+  }
+
+  /**
+   * Mark the mirror dirty after a failed sync (dirty=1 + last_error +
+   * last_attempt). v0.3.6: also bumps the desired generation so the debt is
+   * bound to a specific sync round; applied_generation is left untouched
+   * (the round was NOT applied). A stale worker that started earlier cannot
+   * clear this newer debt — only a clean fenced to a generation at least as
+   * recent as this one may.
+   */
+  function markMirrorDirty(error, now) {
+    // Bump the desired generation atomically first — the new debt must be bound
+    // to a fresh round so a stale worker cannot fence-clean it. Even if this
+    // write fails (peer blocker 2), generation still advanced, so recoverMirror
+    // sees generation > applied_generation and retries rather than false-clean.
+    incrementGeneration();
+    return setMirrorState({
+      dirty: 1,
+      last_error: error,
+      last_attempt: now ?? nowIso()
+    });
+  }
+
+  /**
+   * Fenced clean (CAS): mark the mirror clean for a specific generation.
+   * First records that generation `gen` has been applied
+   * (applied_generation = MAX(applied_generation, gen)), then clears dirty only
+   * when the current desired generation has not advanced past gen — a stale
+   * worker cleaning an older round must not wipe a newer failure's debt.
+   * Returns the resulting state (dirty stays set when the fence holds).
+   */
+  function markMirrorCleanForGeneration(gen, now) {
+    const current = getMirrorState();
+    const applied = Math.max(current.applied_generation || 0, gen);
+    const patch = { applied_generation: applied };
+    if (applied >= gen && (current.generation || 0) <= gen) {
+      patch.dirty = 0;
+      patch.last_error = null;
+      patch.success_at = now ?? nowIso();
+    }
+    return setMirrorState(patch);
+  }
+
+  /** Convenience: mark the mirror clean for the current desired generation (backward-compatible with pre-v0.3.6 callers). */
+  function markMirrorClean(now) {
+    const current = getMirrorState();
+    return markMirrorCleanForGeneration(current.generation || 0, now);
+  }
+
+  /** Convenience: clear only the dirty flag + last_error, leaving success_at untouched (manual reconcile / retry path). */
+  function clearMirrorDirty() {
+    return setMirrorState({ dirty: 0, last_error: null });
+  }
+
+  /**
+   * Record per-type mirror status (partial success bookkeeping). `status` is a
+   * patch {status: 'committed'|'failed'|'pending', applied_gen?, last_error?}
+   * replacing the entry for `type` (other types untouched). Standardizing on an
+   * explicit status gives per-type committed/failed/pending receipts — a type
+   * whose file was written while a sibling failed is recorded as such, not
+   * collapsed into a bulk "dirty" (peer blocker 4). Returns the updated state.
+   */
+  function setTypeStatus(type, status) {
+    if (!VALID_TYPE_STATUS.has(status?.status)) {
+      throw new TypeError(`setTypeStatus: status must be one of committed|failed|pending, got ${status?.status}`);
+    }
+    const current = getMirrorState();
+    const statuses = current.type_status || {};
+    statuses[type] = {
+      status: status.status,
+      ...(status.applied_gen !== undefined ? { applied_gen: status.applied_gen } : {}),
+      ...(status.last_error !== undefined ? { last_error: status.last_error } : {})
+    };
+    return setMirrorState({ type_status: JSON.stringify(statuses) });
+  }
+
+  /** Per-type mirror status map {type: {dirty, applied_gen, last_error}}, {} when unset. */
+  function getTypeStatus() {
+    const current = getMirrorState();
+    return current.type_status || {};
+  }
+
+  /** Run fn atomically: when the connection is already inside a transaction
+   *  (service.transaction's BEGIN), just run it — the outer COMMIT covers us.
+   *  Otherwise wrap in BEGIN/COMMIT so a memory write and its desired-generation
+   *  bump commit together: a crash between them can never leave a mutated store
+   *  with generation == applied (audit peer blocker 1, "crash window"). */
+  // --- #249 N3：压缩边缘的连续性提案（唯一写入口 = 压缩边缘监听器） -------------
+  /** Upsert one continuity proposal. (session_id, kind) is the形态约定「同一会话同一类
+   *  只留一条」：命中即刷新（created_at 不动、updated_at 记最近边缘），不新增行。
+   *  Queue full → drop the new one and say so (dropped: true) instead of throwing: an edge
+   *  that cannot be recorded must not break the host's step. Returns {id, created, dropped}. */
+  function saveContinuityProposal({
+    sessionId, kind, currentWork = null, nextStep = null, openQuestions = null, edgeSeq = null,
+    maxPending = MAX_CONTINUITY_PENDING
+  } = {}) {
+    if (!sessionId || !kind) throw new TypeError("continuity proposal needs sessionId and kind");
+    const now = new Date().toISOString();
+    const existing = db.prepare("SELECT id FROM continuity_proposals WHERE session_id = ? AND kind = ?").get(sessionId, kind);
+    if (!existing) {
+      const pending = db.prepare("SELECT COUNT(*) AS c FROM continuity_proposals WHERE status = 'pending'").get().c;
+      if (pending >= maxPending) return { id: null, created: false, dropped: true };
+    }
+    // 写入本身是一条 UPSERT：唯一索引 (session_id, kind) 是并发的裁决者。两个宿主共用
+    // memoryDir 时（AGENTS.md 的多进程 WAL 场景）先查后插会有一个撞 SQLITE_CONSTRAINT，
+    // 而这里只该有一条语句决定成不成功。上面的 SELECT 只用于「队列满」与 created 标记。
+    // created_at 与 status 刻意不在 SET 里：命中只刷新内容与最近边缘时刻，不把已转正的行打回 pending。
+    const id = randomUUID();
+    db.prepare(`
+      INSERT INTO continuity_proposals (id, session_id, kind, current_work, next_step, open_questions, status, edge_seq, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+      ON CONFLICT(session_id, kind) DO UPDATE SET
+        current_work = excluded.current_work,
+        next_step = excluded.next_step,
+        open_questions = excluded.open_questions,
+        edge_seq = excluded.edge_seq,
+        updated_at = excluded.updated_at
+    `).run(id, sessionId, kind, currentWork, nextStep, openQuestions, edgeSeq, now, now);
+    const row = db.prepare("SELECT id FROM continuity_proposals WHERE session_id = ? AND kind = ?").get(sessionId, kind);
+    return { id: row?.id ?? id, created: !existing, dropped: false };
+  }
+
+  /** The single proposal for (session, kind), or null. */
+  function getContinuityProposal(sessionId, kind) {
+    return db.prepare("SELECT * FROM continuity_proposals WHERE session_id = ? AND kind = ?").get(sessionId, kind) ?? null;
+  }
+
+  /** Newest-first proposals, optionally filtered by status (转正通道的读侧预置)。 */
+  function listContinuityProposals({ status, limit = 50 } = {}) {
+    const bounded = Number.isSafeInteger(limit) && limit > 0 ? limit : 50;
+    return status
+      ? db.prepare("SELECT * FROM continuity_proposals WHERE status = ? ORDER BY updated_at DESC, id LIMIT ?").all(status, bounded)
+      : db.prepare("SELECT * FROM continuity_proposals ORDER BY updated_at DESC, id LIMIT ?").all(bounded);
+  }
+
+  function countContinuityProposals({ status } = {}) {
+    return status
+      ? db.prepare("SELECT COUNT(*) AS c FROM continuity_proposals WHERE status = ?").get(status).c
+      : db.prepare("SELECT COUNT(*) AS c FROM continuity_proposals").get().c;
+  }
+
+  function runAtomically(fn) {
+    if (db.isTransaction) return fn();
+    db.exec("BEGIN");
+    try {
+      const result = fn();
+      db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      try { db.exec("ROLLBACK"); } catch { /* connection may be closed */ }
+      throw error;
+    }
+  }
+
+  /** Bump the desired generation atomically (SQLite single-statement increment,
+   *  no SELECT-then-UPSERT race: peer blocker 3 lost 10 of 91 concurrent
+   *  increments under an 8-process probe). Returns the new mirror state.
+   *  Guards the upper bound: generation must stay within MAX_SAFE_INTEGER so
+   *  reads never hit ERR_OUT_OF_RANGE (peer blocker 6). */
+  function incrementGeneration() {
+    return runAtomically(() => {
+      // Ensure the singleton row exists before incrementing (UPDATE alone would
+      // match nothing on a fresh DB).
+      db.prepare("INSERT OR IGNORE INTO mirror_state (id) VALUES ('main')").run();
+      const row = db.prepare(
+        "UPDATE mirror_state SET generation = generation + 1 WHERE id = 'main' AND generation < ? RETURNING generation"
+      ).get(Number.MAX_SAFE_INTEGER);
+      if (!row) throw new RangeError("mirror_state.generation exceeded MAX_SAFE_INTEGER");
+      return getMirrorState();
+    });
+  }
+
+  /* --------------------- chorography（仓库地志，M0 只写不读） --------------------- */
+  // 消费面（检索 / 注入）在 M1 才接，这里只落写入口。时间戳由调用方传：一次 run
+  // 的所有行共用同一个时刻（生成的页正文里也引用它），由 t0.js 的单一时钟保证，
+  // store 不自取 now()——两处时钟会把「同一 run」拆成两个版本。
+
+  function choroRepoByRoot(rootPath) {
+    return db.prepare("SELECT * FROM choro_repos WHERE root_path = ?").get(rootPath) ?? undefined;
+  }
+
+  // 位置行 upsert（#581）：同一身份同一台机器只一行，root_path 与 last_seen_at
+  // 反映最近一次登记。repo_key 为空（无 remote 且连根提交都读不到，非 git 目录）就不落——位置表
+  // 只为可移植身份服务，没有身份的行留在 choro_repos.root_path 的旧语义里。
+  function upsertChoroRepoPath(repoKey, hostId, rootPath, nowIso) {
+    if (!repoKey || !hostId) return;
+    db.prepare(
+      `INSERT INTO choro_repo_paths (repo_key, host_id, root_path, last_seen_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(repo_key, host_id) DO UPDATE SET
+         root_path = excluded.root_path,
+         last_seen_at = excluded.last_seen_at`
+    ).run(repoKey, hostId, rootPath, nowIso);
+  }
+
+  function choroRepoPathFor(repoKey, hostId) {
+    if (!repoKey || !hostId) return null;
+    return db.prepare("SELECT * FROM choro_repo_paths WHERE repo_key = ? AND host_id = ?").get(repoKey, hostId) ?? null;
+  }
+
+  // 登记或刷新仓库行。created_at 只在首次插入时落；plan_fingerprint / git_baseline
+  // 永远反映上次成功 run——失败 run 不写这两格（红线 5「失败不推进 state」，库侧
+  // 与 state.json 同一口径）。
+  //
+  // 身份（#581）：同一 portable_key 的行**优先**收敛（键的唯一性靠它保证——若
+  // 让 root_path 命中优先，升格期的跨端重复行会在各自机器上把同一个键 adoption
+  // 到两行上，键就废了）；本机路径命中只在没有同键行时兜底（无键仓库的旧口径）。
+  // 收敛到的行上 root_path 更新为「最近一次登记的位置」，读侧经 choroRepoPathFor
+  // 回退它——单机库两个值恒等、行为不变。**升级前已跨端登记出的重复行不合并**：
+  // 页面与 claims 挂在 repo_id 上，机器间合并行等于改写归属；所以 UPDATE
+  // root_path 前先查目标值是否被别的行占着（被占就保留本行原值，位置走位置表）
+  // ——否则升格期登记会撞 idx_choro_repos_root 直接抛。portable_key 缺席（无
+  // remote 且读不到根提交，非 git 目录）时退回旧的 root_path 冲突口径，存量语义不变。
+  function upsertChoroRepo(rootPath, name, planFingerprint, gitBaseline, updatedAt, portableKey = null) {
+    let existing = portableKey
+      ? (db.prepare("SELECT * FROM choro_repos WHERE portable_key = ?").get(portableKey) ?? undefined)
+      : undefined;
+    if (!existing) {
+      // 路径回退必须校验身份（PR #679 评审）：两台主机的同一条绝对路径可能各自
+      // 检出不同仓库。若该路径已属另一身份的行，拿它复用会把对方的名字、基线、
+      // 键一起改掉，随后 T0 还会用本仓库的图替换对方的模块与 claims。无键的存量
+      // 行（升格前登记）仍允许按路径认领——那时候键还不存在，路径就是唯一线索。
+      const byRoot = choroRepoByRoot(rootPath);
+      if (byRoot && portableKey && byRoot.portable_key != null && byRoot.portable_key !== portableKey) {
+        throw new Error(
+          `choro repo path conflict: ${rootPath} is already registered as ${byRoot.portable_key}; ` +
+          `refusing to re-register it as ${portableKey}`
+        );
+      }
+      existing = byRoot;
+    }
+    if (existing) {
+      const rootTaken = db.prepare("SELECT id FROM choro_repos WHERE root_path = ? AND id != ?")
+        .get(rootPath, existing.id);
+      const nextRoot = rootTaken ? existing.root_path : rootPath;
+      db.prepare(
+        `UPDATE choro_repos SET root_path = ?, name = ?, plan_fingerprint = ?, git_baseline = ?, updated_at = ?
+          WHERE id = ?`
+      ).run(nextRoot, name, planFingerprint, gitBaseline, updatedAt, existing.id);
+      if (portableKey && existing.portable_key !== portableKey) {
+        db.prepare("UPDATE choro_repos SET portable_key = ? WHERE id = ?").run(portableKey, existing.id);
+      }
+      return choroRepoByRoot(nextRoot);
+    }
+    try {
+      db.prepare(
+        `INSERT INTO choro_repos (root_path, name, plan_fingerprint, git_baseline, created_at, updated_at, portable_key)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      ).run(rootPath, name, planFingerprint, gitBaseline, updatedAt, updatedAt, portableKey);
+    } catch (err) {
+      // 并发登记（PR #679 评审）：两个进程可能都先查到「无记录」再各自插入。
+      // portable_key 的唯一索引会让后到者失败，此时重新按身份取行并走更新，
+      // 而不是把第二个写入变成用户可见的失败。
+      const message = String(err?.message ?? err);
+      if (!portableKey || !/UNIQUE constraint failed: choro_repos\.portable_key/i.test(message)) throw err;
+      const raced = db.prepare("SELECT * FROM choro_repos WHERE portable_key = ?").get(portableKey);
+      if (!raced) throw err;
+      db.prepare(
+        `UPDATE choro_repos SET root_path = ?, name = ?, plan_fingerprint = ?, git_baseline = ?, updated_at = ?
+          WHERE id = ?`
+      ).run(rootPath, name, planFingerprint, gitBaseline, updatedAt, raced.id);
+      return choroRepoByRoot(rootPath);
+    }
+    return choroRepoByRoot(rootPath);
+  }
+
+  // 整仓替换（实现计划 P7）：一次成功 run 的模块/页面/claims 全量重写。幂等语义
+  // 在这里成型：重跑同一划分 = 删了重插同样内容，行不翻倍；划分变了也不会留孤儿行
+  // （旧模块的页面与 claims 随模块一起删）。事务包住删除与插入，半截失败整体回滚，
+  // 库里保持上一次成功 run 的完整图。
+  // 父链两段式落（先全插再补 parent_id）：父模块的行号在插入前不存在，按 slug 排序
+  // 的单遍插入会遇到「父在后」的顺序问题，两段式与顺序无关。
+  function replaceChoroGraph(repoId, snapshot) {
+    return runAtomically(() => {
+      db.prepare(
+        `DELETE FROM choro_claims WHERE page_id IN (
+           SELECT p.id FROM choro_pages p JOIN choro_modules m ON p.module_id = m.id
+           WHERE m.repo_id = ?)`
+      ).run(repoId);
+      db.prepare(
+        "DELETE FROM choro_pages WHERE module_id IN (SELECT id FROM choro_modules WHERE repo_id = ?)"
+      ).run(repoId);
+      db.prepare("DELETE FROM choro_edges WHERE repo_id = ?").run(repoId);
+      db.prepare("DELETE FROM choro_modules WHERE repo_id = ?").run(repoId);
+
+      const insModule = db.prepare(
+        `INSERT INTO choro_modules (repo_id, slug, title, parent_id, file_count, fingerprint, updated_at)
+         VALUES (?, ?, ?, NULL, ?, ?, ?)`
+      );
+      const ids = new Map();
+      for (const mod of snapshot.modules) {
+        const info = insModule.run(
+          repoId, mod.slug, mod.title, mod.fileCount, mod.fingerprint, snapshot.updatedAt
+        );
+        ids.set(mod.slug, Number(info.lastInsertRowid));
+      }
+      const setParent = db.prepare("UPDATE choro_modules SET parent_id = ? WHERE id = ?");
+      for (const mod of snapshot.modules) {
+        if (mod.parentSlug == null) continue;
+        const parentId = ids.get(mod.parentSlug);
+        if (parentId != null) setParent.run(parentId, ids.get(mod.slug));
+      }
+
+      const insPage = db.prepare(
+        `INSERT INTO choro_pages
+           (module_id, rel_path, status, git_baseline, template_version, generated_at, human_block_count)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      );
+      const insClaim = db.prepare(
+        `INSERT INTO choro_claims
+           (page_id, statement, kind, source_path, start_line, end_line, confidence, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      );
+      for (const page of snapshot.pages) {
+        const moduleId = ids.get(page.moduleSlug);
+        if (moduleId == null) continue; // 划分与页面同源生成，走到这里说明调用方组装错了
+        const pageInfo = insPage.run(
+          moduleId, page.relPath, page.status, page.gitBaseline,
+          page.templateVersion, page.generatedAt, page.humanBlockCount
+        );
+        for (const claim of page.claims ?? []) {
+          insClaim.run(
+            Number(pageInfo.lastInsertRowid), claim.statement, claim.kind,
+            claim.sourcePath ?? null, claim.startLine ?? null, claim.endLine ?? null,
+            claim.confidence ?? null, snapshot.updatedAt
+          );
+        }
+      }
+      // 跨模块边（P8）：from/to 都是模块 slug，只存 from≠to 的；同向多条文件级
+      // 边聚合为一条带 weight 的模块级边。
+      const insEdge = db.prepare(
+        "INSERT INTO choro_edges (repo_id, from_slug, to_slug, weight) VALUES (?, ?, ?, ?)"
+      );
+      let edgeCount = 0;
+      for (const edge of snapshot.edges ?? []) {
+        if (edge.fromSlug === edge.toSlug) continue;
+        insEdge.run(repoId, edge.fromSlug, edge.toSlug, edge.weight ?? 1);
+        edgeCount++;
+      }
+      return { modules: snapshot.modules.length, pages: snapshot.pages.length, edges: edgeCount };
+    });
+  }
+
+  // T1 的页级读写（实现计划 P16–P18）：与 replaceChoroGraph 的整仓替换并存——
+  // T1 是逐模块的（一轮只动一页），整仓替换会把其他页的富化状态抹掉。
+  function choroPageBySlug(repoId, slug) {
+    return db.prepare(
+      `SELECT p.id, p.module_id, p.rel_path, p.status, p.git_baseline, p.template_version,
+              p.generated_at, p.human_block_count, p.fail_count,
+              p.verified_baseline, p.verified_at, m.slug
+         FROM choro_pages p JOIN choro_modules m ON p.module_id = m.id
+        WHERE m.repo_id = ? AND m.slug = ?`
+    ).get(repoId, String(slug));
+  }
+
+  // 单页失败记账（spec 步 12「失败两次即记 failed」）：首次失败只计数、状态不动
+  // （骨架仍是当前有效产物），第二次到阈值才把 status 推成 failed。generatedAt
+  // 不动——失败不推进 state（红线 5）的页级口径。
+  function recordChoroPageFailure(pageId, failThreshold = 2) {
+    db.prepare("UPDATE choro_pages SET fail_count = fail_count + 1 WHERE id = ?").run(pageId);
+    const row = db.prepare("SELECT fail_count, status FROM choro_pages WHERE id = ?").get(pageId);
+    if (row.fail_count >= failThreshold) {
+      db.prepare("UPDATE choro_pages SET status = 'failed' WHERE id = ?").run(pageId);
+      row.status = "failed";
+    }
+    return row;
+  }
+
+  // 富化成功：skeleton → enriched，generatedAt 推进、失败计数清零（成功重置的是
+  // 「连续失败」的连续性，不是历史）。
+  //
+  // verifiedBaseline 是 T1 那一刻的 HEAD：claims 的行号取自那个提交的代码，之后判失效
+  // 只能从它起算（传 null 表示拿不到 HEAD——那时 diff 判不了，面板要说「不知道」，
+  // 而不是退回全仓 git_baseline 假装知道）。
+  function markChoroPageEnriched(pageId, generatedAt, verifiedBaseline = null, verifiedDirtyFiles = null) {
+    // 脏文件清单单独一列（#648）：基线记的是提交，清单记的是「提交之外还有哪些文件
+    // 在那一刻参与了 claim 抽取」。null（不知道/读不出）与 []（当时确实干净）严格分开，
+    // 面板据此才能说清这一页是用哪棵树验证的。
+    const dirtyJson = Array.isArray(verifiedDirtyFiles) ? JSON.stringify(verifiedDirtyFiles) : null;
+    db.prepare(
+      `UPDATE choro_pages
+          SET status = 'enriched', generated_at = ?, fail_count = 0,
+              verified_baseline = ?, verified_at = ?, verified_dirty_files = ?
+        WHERE id = ?`
+    ).run(generatedAt, verifiedBaseline, generatedAt, dirtyJson, pageId);
+  }
+
+  // 单页 claims 整页替换（P20 的表侧）：T1 一轮产出的 claims 删旧插新；evidence/
+  // JSON 由 t1.js 同步写盘（两处同源同写）。
+  function saveChoroPageClaims(pageId, claims) {
+    return runAtomically(() => {
+      db.prepare("DELETE FROM choro_claims WHERE page_id = ?").run(pageId);
+      const ins = db.prepare(
+        `INSERT INTO choro_claims
+           (page_id, statement, kind, source_path, start_line, end_line, confidence, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      );
+      for (const claim of claims) {
+        ins.run(
+          pageId, claim.statement, claim.kind,
+          claim.sourcePath ?? null, claim.startLine ?? null, claim.endLine ?? null,
+          claim.confidence ?? null, claim.createdAt
+        );
+      }
+      return claims.length;
+    });
+  }
+
+  // --- chorography 向量（收尾档 P36–P38）---------------------------------
+  // 一页一行（saveChoroPageVector 先删后插）；dim 失配由检索侧判（查询向量
+  // 的 dim ≠ 行 dim → 该行按 stale 处理，惰性全量重嵌）。
+  function getChoroPageVectors(repoId) {
+    return db.prepare(
+      `SELECT v.owner_id, v.dim, v.model, v.vector, v.source_generated_at,
+              m.slug, m.title, p.generated_at AS page_generated_at
+         FROM choro_vectors v
+         JOIN choro_pages p ON v.owner_id = p.id
+         JOIN choro_modules m ON p.module_id = m.id
+        WHERE m.repo_id = ?`
+    ).all(repoId);
+  }
+
+  function saveChoroPageVector(pageId, { vector, dim, model, sourceGeneratedAt, createdAt }) {
+    return runAtomically(() => {
+      db.prepare("DELETE FROM choro_vectors WHERE owner_id = ?").run(pageId);
+      db.prepare(
+        `INSERT INTO choro_vectors (owner_id, dim, model, vector, source_generated_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      ).run(pageId, dim, model, JSON.stringify(vector), sourceGeneratedAt, createdAt);
+      return { owner_id: pageId, dim };
+    });
+  }
+
+  // --- 「Agent 眼中的你」自动事实（2026-11-06，profile-facts 域）---
+  // 三张表只服务本域，写路径全部走 runAtomically：facts 与记忆主表零交叉，不需要
+  // service.transaction 的 pendingEmbed/pendingEntity 截断语义（那层是给写记忆行用的）。
+
+  function parseFactIds(text) {
+    if (!text) return [];
+    try {
+      const v = JSON.parse(text);
+      return Array.isArray(v) ? v.map((x) => String(x)) : [];
+    } catch { return []; }
+  }
+
+  function listProfileFacts(agentKey, { includeArchived = false } = {}) {
+    const rows = db.prepare(
+      `SELECT * FROM profile_facts WHERE agent_key = ? ${includeArchived ? "" : "AND status = 'active'"} ORDER BY updated_at DESC, id DESC`
+    ).all(agentKey);
+    return rows.map((r) => ({ ...r, source_memory_ids: parseFactIds(r.source_memory_ids) }));
+  }
+
+  /** 全库活跃事实按卡分组（注入 provider 的读口，见 src/profile-facts.js）。 */
+  function listActiveFactsGrouped() {
+    const rows = db.prepare(
+      "SELECT agent_key, content FROM profile_facts WHERE status = 'active' ORDER BY updated_at DESC"
+    ).all();
+    const grouped = { default: [], byAgent: {} };
+    for (const r of rows) {
+      if (r.agent_key === "") grouped.default.push(r.content);
+      else (grouped.byAgent[r.agent_key] ??= []).push(r.content);
+    }
+    return grouped;
+  }
+
+  function getProfileFact(id) {
+    const r = db.prepare("SELECT * FROM profile_facts WHERE id = ?").get(id);
+    return r ? { ...r, source_memory_ids: parseFactIds(r.source_memory_ids) } : undefined;
+  }
+
+  function insertProfileFact({ id, agentKey, content, sourceMemoryIds = [], at }) {
+    db.prepare(
+      "INSERT INTO profile_facts (id, agent_key, content, status, source_memory_ids, created_at, updated_at) VALUES (?, ?, ?, 'active', ?, ?, ?)"
+    ).run(id, agentKey, String(content), JSON.stringify(sourceMemoryIds ?? []), at, at);
+  }
+
+  /** 返回更新后的行；id 不存在返回 undefined，由调用方记入 failures。 */
+  function updateProfileFact(id, { content, status, sourceMemoryIds, at }) {
+    const cur = getProfileFact(id);
+    if (!cur) return undefined;
+    const next = {
+      content: content ?? cur.content,
+      status: status ?? cur.status,
+      source_memory_ids: sourceMemoryIds ?? cur.source_memory_ids,
+      updated_at: at
+    };
+    db.prepare("UPDATE profile_facts SET content = ?, status = ?, source_memory_ids = ?, updated_at = ? WHERE id = ?")
+      .run(next.content, next.status, JSON.stringify(next.source_memory_ids), next.updated_at, id);
+    return { ...cur, ...next };
+  }
+
+  function insertProfileFactJournal({ at, agentKey, runId = null, factId = null, op, before = null, after = null, actor = "auto" }) {
+    db.prepare(
+      "INSERT INTO profile_fact_journal (at, agent_key, run_id, fact_id, op, before, after, actor) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+    ).run(at, agentKey, runId, factId, op, before, after, actor);
+  }
+
+  function listProfileFactJournal(agentKey, { limit = 20 } = {}) {
+    return db.prepare("SELECT * FROM profile_fact_journal WHERE agent_key = ? ORDER BY id DESC LIMIT ?")
+      .all(agentKey, limit);
+  }
+
+  /** 每卡只留最近 keep 条：账本是审计事实不是检索面，无界增长没有读者。 */
+  function pruneProfileFactJournal(agentKey, keep = 200) {
+    return db.prepare(
+      `DELETE FROM profile_fact_journal WHERE agent_key = ? AND id NOT IN (
+         SELECT id FROM profile_fact_journal WHERE agent_key = ? ORDER BY id DESC LIMIT ?)`
+    ).run(agentKey, agentKey, keep).changes;
+  }
+
+  function insertProfileFactRun({ id, agentKey, triggerSource, status, cursor = null, inputCount = 0, opsApplied = 0, detail = null, startedAt, finishedAt }) {
+    db.prepare(
+      `INSERT INTO profile_fact_runs (id, agent_key, trigger_source, status, cursor, input_count, ops_applied, detail, started_at, finished_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(id, agentKey, triggerSource, status, cursor, inputCount, opsApplied, detail, startedAt, finishedAt);
+  }
+
+  function listProfileFactRuns(agentKey, { limit = 10 } = {}) {
+    return db.prepare("SELECT * FROM profile_fact_runs WHERE agent_key = ? ORDER BY started_at DESC, id DESC LIMIT ?")
+      .all(agentKey, limit);
+  }
+
+  /** 该卡最近一次 ok 轮的游标。failed 轮不消费——下次重跑同一窗口（蒸馏游标同款纪律）。 */
+  function profileFactsCursor(agentKey) {
+    const row = db.prepare(
+      "SELECT cursor FROM profile_fact_runs WHERE agent_key = ? AND status = 'ok' ORDER BY started_at DESC, id DESC LIMIT 1"
+    ).get(agentKey);
+    return row ? row.cursor : null;
+  }
+
+  /**
+   * 增量输入行：活跃（未归档未遗忘）+ 排除外来行（source IS NULL OR 那一支是三值
+   * 逻辑必填，与 list() 的 excludeImported 同一个坑）+ 严格 scope 分区——agent 卡
+   * 只吃 agent_scope=自己 的行，default 卡只吃 agent_scope IS NULL 的行。
+   * updated_at 是 ISO 串，字典序即时间序，`>` 即「游标之后」（单调时间戳纪律）。
+   */
+  function listFactInputRows(agentKey, { since = null, limit = 120 } = {}) {
+    const scopeClause = agentKey ? "agent_scope = ?" : "agent_scope IS NULL";
+    const params = [IMPORTED_SOURCE, ...(agentKey ? [agentKey] : [])];
+    if (since) params.push(since);
+    params.push(limit);
+    return db.prepare(
+      `SELECT id, type, title, content, importance, updated_at FROM memories
+       WHERE forgotten = 0 AND archived = 0 AND (source IS NULL OR source <> ?)
+         AND ${scopeClause}
+         ${since ? "AND updated_at > ?" : ""}
+       ORDER BY updated_at DESC LIMIT ?`
+    ).all(...params);
+  }
+
+  function countFactInputRows(agentKey, { since = null } = {}) {
+    const scopeClause = agentKey ? "agent_scope = ?" : "agent_scope IS NULL";
+    const params = [IMPORTED_SOURCE, ...(agentKey ? [agentKey] : [])];
+    if (since) params.push(since);
+    return db.prepare(
+      `SELECT COUNT(*) AS n FROM memories
+       WHERE forgotten = 0 AND archived = 0 AND (source IS NULL OR source <> ?)
+         AND ${scopeClause}
+         ${since ? "AND updated_at > ?" : ""}`
+    ).get(...params).n;
+  }
+
+  /**
+   * 自动轮要维护的卡：有 scope 行的记忆身份 ∪ 存量卡片。存量卡即使输入行被清空
+   * 也保留在名单里（手动轮还可能对它做人工修正后的再维护）；'' 由调用方固定追加。
+   */
+  function listFactCardKeys() {
+    return db.prepare(
+      `SELECT DISTINCT agent_scope AS k FROM memories WHERE agent_scope IS NOT NULL
+       UNION
+       SELECT DISTINCT agent_key FROM profile_facts WHERE agent_key <> ''`
+    ).all().map((r) => r.k);
+  }
+
+  /* --------------------- knowledge base（知识库第二层，§3.3） --------------------- */
+  // 与 choro 那组表同一套纪律：本域只读写 kb_* 三张表，绝不进 memories /
+  // saveWithDedupe / dream / 质量过滤的任何池子。时间戳由调用方传（一次 ingest
+  // 的所有行共用一个时刻），store 不自取 now()——两处时钟会把「同一次入库」拆成
+  // 两个版本，sha256 幂等判据也会跟着抖。
+
+  function kbCollectionByKey(key) {
+    return db.prepare("SELECT * FROM kb_collections WHERE key = ?").get(String(key)) ?? undefined;
+  }
+
+  /** 集合列表带计数：面板左栏要的不是空壳 key 列表，docs/chunks 是它的主信息。 */
+  function listKbCollections() {
+    return db.prepare(
+      `SELECT c.*,
+              (SELECT COUNT(*) FROM kb_docs d WHERE d.collection_id = c.id) AS doc_count,
+              (SELECT COUNT(*) FROM kb_chunks k JOIN kb_docs d2 ON k.doc_id = d2.id
+                 WHERE d2.collection_id = c.id) AS chunk_count
+         FROM kb_collections c ORDER BY c.key`
+    ).all();
+  }
+
+  // key 是外部键（面板/工具用它寻址），title 是展示名。ON CONFLICT 不动 created_at：
+  // 「这个集合哪天建的」是事实，重命名不该改写它。
+  function upsertKbCollection({ key, title, description = null, at }) {
+    db.prepare(
+      `INSERT INTO kb_collections (key, title, description, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET
+         title = excluded.title,
+         description = excluded.description,
+         updated_at = excluded.updated_at`
+    ).run(String(key), String(title), description ?? null, at, at);
+    return kbCollectionByKey(key);
+  }
+
+  /** 删集合连带删它的文档与分块（三张表是一个整体，留孤儿行等于悄悄占空间）。 */
+  function deleteKbCollection(key) {
+    const row = kbCollectionByKey(key);
+    if (!row) return false;
+    return runAtomically(() => {
+      db.prepare(
+        "DELETE FROM kb_chunks WHERE doc_id IN (SELECT id FROM kb_docs WHERE collection_id = ?)"
+      ).run(row.id);
+      db.prepare("DELETE FROM kb_docs WHERE collection_id = ?").run(row.id);
+      db.prepare("DELETE FROM kb_collections WHERE id = ?").run(row.id);
+      return true;
+    });
+  }
+
+  function listKbDocs(collectionId) {
+    return db.prepare(
+      "SELECT * FROM kb_docs WHERE collection_id = ? ORDER BY rel_key"
+    ).all(collectionId);
+  }
+
+  function kbDocByRelKey(collectionId, relKey) {
+    return db.prepare(
+      "SELECT * FROM kb_docs WHERE collection_id = ? AND rel_key = ?"
+    ).get(collectionId, String(relKey)) ?? undefined;
+  }
+
+  function kbChunksByDoc(docId) {
+    return db.prepare(
+      "SELECT * FROM kb_chunks WHERE doc_id = ? ORDER BY ordinal"
+    ).all(docId);
+  }
+
+  /**
+   * 入库落库的唯一写口。幂等判据是 **正文 sha256**（不是文件 stat）：同 rel_key +
+   * 同 sha256 = 整件事 no-op，回执 skipped 且不动 chunks——否则编辑器保存一次
+   * （mtime 变、内容没变）就要全量重切块，库和索引一起白忙。
+   *
+   * 变了才替换：删旧 chunks 再插新的，事务包住，半截失败整体回滚，库里保持上一版
+   * 完整文档。上一版 status=error 的行不算命中（它没有可分块的正文，重来必须真跑）。
+   */
+  function replaceKbDoc({ collectionId, relKey, kind, sourcePath = null, title, bytes = 0, sha256 = null, at, chunks = [] }) {
+    return runAtomically(() => {
+      const prev = kbDocByRelKey(collectionId, relKey);
+      if (prev && prev.status === "ok" && sha256 && prev.sha256 === sha256) {
+        return { docId: prev.id, chunks: kbChunksByDoc(prev.id).length, skipped: true };
+      }
+      db.prepare("DELETE FROM kb_chunks WHERE doc_id IN (SELECT id FROM kb_docs WHERE collection_id = ? AND rel_key = ?)")
+        .run(collectionId, String(relKey));
+      let docId;
+      if (prev) {
+        db.prepare(
+          `UPDATE kb_docs SET kind = ?, source_path = ?, title = ?, bytes = ?, sha256 = ?,
+                  indexed_at = ?, status = 'ok', error = NULL WHERE id = ?`
+        ).run(kind, sourcePath, String(title), bytes, sha256, at, prev.id);
+        docId = prev.id;
+      } else {
+        const info = db.prepare(
+          `INSERT INTO kb_docs (collection_id, rel_key, kind, source_path, title, bytes, sha256, indexed_at, status, error)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ok', NULL)`
+        ).run(collectionId, String(relKey), kind, sourcePath, String(title), bytes, sha256, at);
+        docId = Number(info.lastInsertRowid);
+      }
+      const ins = db.prepare(
+        "INSERT INTO kb_chunks (doc_id, ordinal, heading, text, created_at) VALUES (?, ?, ?, ?, ?)"
+      );
+      for (const c of chunks) ins.run(docId, c.ordinal, c.heading ?? "", c.text ?? "", at);
+      return { docId, chunks: chunks.length, skipped: false };
+    });
+  }
+
+  /** 入库失败也要留痕：面板要能显示「这份文档上次为什么没进来」，静默丢来源等于假成功。 */
+  function markKbDocError({ collectionId, relKey, kind, sourcePath = null, title, error, at }) {
+    const prev = kbDocByRelKey(collectionId, relKey);
+    if (prev) {
+      db.prepare(
+        "UPDATE kb_docs SET status = 'error', error = ?, indexed_at = ?, source_path = ?, kind = ?, title = ? WHERE id = ?"
+      ).run(String(error ?? ""), at, sourcePath, kind, String(title ?? prev.title), prev.id);
+      return prev.id;
+    }
+    const info = db.prepare(
+      `INSERT INTO kb_docs (collection_id, rel_key, kind, source_path, title, bytes, sha256, indexed_at, status, error)
+       VALUES (?, ?, ?, ?, ?, 0, NULL, ?, 'error', ?)`
+    ).run(collectionId, String(relKey), kind, sourcePath, String(title ?? relKey), at, String(error ?? ""));
+    return Number(info.lastInsertRowid);
+  }
+
+  /** 检索候选集：跨集合或单集合，一次取全（BM25 需要全语料算 df，不能分页取）。 */
+  function kbChunksForSearch(collectionId = null) {
+    return db.prepare(
+      `SELECT k.id, k.doc_id, k.ordinal, k.heading, k.text,
+              d.rel_key, d.title, d.kind, c.key AS collection_key
+         FROM kb_chunks k
+         JOIN kb_docs d ON k.doc_id = d.id
+         JOIN kb_collections c ON d.collection_id = c.id
+        WHERE d.status = 'ok' AND (? IS NULL OR d.collection_id = ?)`
+    ).all(collectionId, collectionId);
+  }
+
+  return {
+    db,
+    count,
+    countByType,
+    getById,
+    // 车道 C：外来行身份的两个读口（幂等键 / 整包清点）。
+    getByShareExternalId,
+    listBySharePackId,
+    save,
+    // document 唯一铸造口（#230 写入权分离）：registerDocument 专用，通用
+    // save/update/CAS 均拒绝 document 创建或类型转换。
+    saveDocument,
+    update,
+    compareAndUpdate,
+    // #254：写入准入的内容哈希候选集（只读）。
+    findContentHashMatches,
+    remove,
+    // 车道 C：整包退出（幂等批删，side table 口径同 remove()）。
+    deleteBySharePackId,
+    // 只管 SQLite 回滚的存储层原语（本文件每个写方法都在用它，这里只是对外露一层：
+    // 外层已开着事务时它直接执行回调，db.isTransaction 早退，嵌套不会二次 BEGIN）。
+    // **它不是导入口**：车道 C 的导入走 service.transaction()——那层除回滚外还会随
+    // ROLLBACK 截断 pendingEmbed / pendingEntity，用这个裸原语导入会让队列和库分叉。
+    // 露出的用途是存储级批写与用例：C1 的 UNIQUE 撞库用例（test/share-store.test.js）
+    // 就靠它把「撞一条、整批不落」这条 ROLLBACK 路径直接命中。
+    runAtomically,
+    setForget,
+    setArchived,
+    touchLastAccess,
+    demoteToSummary,
+    restoreContent,
+    getUnrecalledSince,
+    list,
+    all,
+    // Issue #505：写路径去重的定向候选（按 type + TRIM(title) 精确取活跃行），
+    // 替代「importance 前 N 条」那个会随库增长失效的窗口。
+    activeByTypeAndTitle,
+    // #725 收尾：升格复用同题行要能看见已归档那条（见函数注释）。
+    findByTypeAndTitle,
+    // #430：有界单列读，写路径（质量过滤）用。
+    recentContents,
+    search,
+    setEmbedding,
+    getEmbeddings,
+    getParsedEmbedding,
+    embeddingCacheStats,
+    embeddedCount,
+    needsEmbedding,
+    needsEmbeddingFor,
+    countNeedsEmbeddingFor,
+    hasStaleEmbedding,
+    embeddingModelBreakdown,
+    embeddingDimensionBreakdown,
+    vectorDimensionState,
+    searchVector,
+    saveDreamRun,
+    lastDreamRunAt,
+    lastDreamBaseline,
+    getDreamRun,
+    listDreamRuns,
+    getLatestPolicyEpoch,
+    saveReceipt,
+    getReceipt,
+    listReceipts,
+    saveRecallRun,
+    getRecallRun,
+    listRecallRuns,
+    listRecallRunsSince,
+    purgeRecallRunsOlderThan,
+    saveRecallEval,
+    getRecallEval,
+    listRecallEvals,
+    saveLlmAudit,
+    annotateLlmAudit,
+    getDistillCursor,
+    setDistillCursor,
+    // #493 补充 §②：解析失败计数跨进程持久化（读侧带失效窗口）。单独成表，
+    // 不并进 distill_cursors——那句 UPSERT 是单调的，归零语义会打架。
+    getDistillParseFailureStreak,
+    bumpDistillParseFailureStreak,
+    clearDistillParseFailureStreak,
+    listLlmAudits,
+    countLlmAudits,
+    getLlmAuditStats,
+    getConsolidationStats,
+    deleteOldLlmAudits,
+    // 蒸馏原始记录与记忆级溯源（#399）：窗口凭证的写入/统计/裁剪，链接的读写。
+    saveDistillRecords,
+    distillRecordStats,
+    clearDistillRecords,
+    saveMemoryProvenance,
+    saveImageSources,
+    imageSourcesFor,
+    provenanceFor,
+    distillRecordsFor,
+    distillWindowsFor,
+    // #512 蒸馏运行与铸造归因：run 是归因主体，audit 行只是它的开销读数。
+    // 写入幂等（replay 覆写），读侧只读——两处都不触发 write hooks（bookkeeping）。
+    saveDistillRun,
+    attachDistillRunAudit,
+    getDistillRun,
+    listDistillRuns,
+    saveMemoryMint,
+    mintsFor,
+    // 存储生命周期（#275 第一批）：无损回收的统计、清理与体积口径。
+    dreamRunInputStats,
+    clearDreamRunInputs,
+    dreamRunsTrimStats,
+    trimDreamRunPayloads,
+    archivedEmbeddingStats,
+    clearArchivedEmbeddings,
+    storageStats,
+    capacityStats,
+    vacuum,
+    saveFailure,
+    listFailures,
+    getFailureStats,
+    deleteOldFailures,
+    saveConflictPending,
+    listConflictPending,
+    resolveConflictPending,
+    countConflictPending,
+    saveDifferentiatedPair,
+    findDifferentiatedPair,
+    listDifferentiatedPairs,
+    // #529：机器侧裁决台账（与上面四条人工队列的函数刻意分开，见 schema 注释）。
+    saveConflictReviewed,
+    loadConflictReviewed,
+    listConflictReviewed,
+    saveConflictLedgerEntry,
+    setConflictLedgerStatus,
+    zombifyDeadLedgerPairs,
+    supersedeChain,
+    supersededIds,
+    supersedeContext,
+    openConflictPairs,
+    listConflictLedger,
+    countConflictLedger,
+    saveScopeChange,
+    listScopeChanges,
+    // 政策轴（issue #471）：按下/松开一个作用域。纯 bookkeeping，不调
+    // incrementGeneration()——它不动任何记忆行，动它只会让所有缓存无谓失效。
+    setScopeState,
+    getScopeState,
+    listScopeStates,
+    // #249 第二批：显式 pin（独立表，绕开候选池的通道）。注入侧只读这里，
+    // 不再拿 PINNED_MEMORY_TYPES 当 pin 标记（那个常量在 write-admission 里
+    // 另有写入配额豁免的语义，两件事不再叠在同一个名字上）。
+    listPinned,
+    pinMemory,
+    unpinMemory,
+    countPinned,
+    isPinned,
+    listByIdsForInject,
+    listInjectPool,
+    listBm25Corpus,
+    createEntity,
+    findEntityByName,
+    findEntityById,
+    listEntities,
+    countEntities,
+    updateEntity,
+    saveAttr,
+    invalidateOldAttr,
+    getCurrentAttrs,
+    getAttrHistory,
+    getAttrsByMemory,
+    entitiesForMemory,
+    findMemoriesByAttr,
+    findEntitiesMentionedIn,
+    // #24 块1 第二路（Tag 桥接）与块4 复核出口。
+    findEntitiesByTags,
+    entityIdsForMemories,
+    listBoostedRelations,
+    getLinkedMemoryIds,
+    saveRelation,
+    updateRelationMetadata,
+    relationIdsByTraitMemoryId,
+    bumpRelationWeight,
+    migrateAttrsToMemory,
+    getRelations,
+    relationsByType,
+    diaryMaterial,
+    getEntityNeighbors,
+    getRelationsByMemory,
+    affectiveRelationsByMemories,
+    relationById,
+    recordAffectiveJournal,
+    listAffectiveJournal,
+    pruneAffectiveJournal,
+    setMirrorState,
+    getMirrorState,
+    markMirrorDirty,
+    markMirrorClean,
+    markMirrorCleanForGeneration,
+    clearMirrorDirty,
+    setTypeStatus,
+    getTypeStatus,
+    incrementGeneration,
+    // #249 N3：压缩边缘的连续性提案（落提案、转正才进 memories）。
+    saveContinuityProposal,
+    getContinuityProposal,
+    listContinuityProposals,
+    countContinuityProposals,
+    // knowledge base（知识库第二层，§3.3）：三张 kb_* 表，与记忆行物理隔离。
+    kbCollectionByKey,
+    listKbCollections,
+    upsertKbCollection,
+    deleteKbCollection,
+    listKbDocs,
+    kbDocByRelKey,
+    kbChunksByDoc,
+    replaceKbDoc,
+    markKbDocError,
+    kbChunksForSearch,
+    // chorography（仓库地志）：M0 只写不读，消费面 M1 接（见上面注释块）。
+    choroRepoByRoot,
+    upsertChoroRepo,
+    upsertChoroRepoPath,
+    choroRepoPathFor,
+    replaceChoroGraph,
+    choroPageBySlug,
+    recordChoroPageFailure,
+    markChoroPageEnriched,
+    saveChoroPageClaims,
+    getChoroPageVectors,
+    saveChoroPageVector,
+    // 「Agent 眼中的你」自动事实（2026-11-06）：读口与写口都只给 domain 层
+    // （src/profile-facts.js）和 API 层用，记忆主表路径不经此。
+    listProfileFacts,
+    listActiveFactsGrouped,
+    getProfileFact,
+    insertProfileFact,
+    updateProfileFact,
+    insertProfileFactJournal,
+    listProfileFactJournal,
+    pruneProfileFactJournal,
+    insertProfileFactRun,
+    listProfileFactRuns,
+    profileFactsCursor,
+    listFactInputRows,
+    countFactInputRows,
+    listFactCardKeys,
+    close() {
+      db.close();
+    }
+  };
+}

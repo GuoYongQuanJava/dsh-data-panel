@@ -1,0 +1,230 @@
+// dsh-mneme/src/user-settings.js
+// 「用户设置」注入块（人格 / 画像 / 自动画像事实 / 规则）的唯一渲染处。
+//
+// 为什么要单独成模块：面板「Agent 眼中的画像」那张卡原本自己在前端拼了一份 profile +
+// rules 的列表，注释写着「注入生效文本」——但它没有表头、没有「- 用户画像：」前缀，
+// 也完全没有人格三行。两处渲染代码各写各的，就一定会漂；而漂了没人报错，因为两边都
+// 「看着像」。现在注入器与预览路由调同一个函数，前端只显示后端给的文本。
+//
+// 顺序是设计口径（人格设计稿⑥）：特化指令（人格）先出，画像与规则后出、后写覆盖占
+// 上风，rules 恒最硬。改这个顺序等于改提示词权重，别顺手调。自动画像事实（2026-11-06，
+// src/profile-facts.js）插在画像之后、规则之前——它是「画像的 agent 侧补充」，与
+// 手填画像物理分离（模型对 user_settings.profile 永远只有读权）。
+
+import { STR, langOf } from "./lang.js";
+
+// 事实段的注入预算（本块此前无任何截断机制——它是「身份文本」，从不轮换）。
+// 不设上限的话，一次失控的维护轮能把每帧 systemPrompt 撑爆；行数与总字符双帽，
+// 截断不静默（尾注如实说还剩几条，与 #164① 同一纪律）。
+const PROFILE_FACTS_MAX_LINES = 40;
+const PROFILE_FACTS_MAX_CHARS = 1200;
+
+/**
+ * 提示词变量转义：宿主模板插值对 `{{`/`}}` 会按变量名解析并在缺失时抛错，整轮崩掉。
+ * 所以把 2 个以上连续花括号逐字符插 `\`，让任何 `{{`/`}}` 子串都不残留；转换幂等，
+ * 单花括号原样通过。`config.escapePromptVariables === false` 时退回原文。
+ *
+ * 住在这里是刻意的：预览必须与注入共用同一个转义，否则「同源」又是假的。
+ * `src/inject.js` 的同名闭包函数只是薄薄一层委托，其余调用点不动。
+ */
+export function escapePromptVars(config, text) {
+  if (config?.escapePromptVariables === false) return String(text);
+  return String(text).replace(/[{}]{2,}/g, (run) => run.split("").join("\\"));
+}
+
+/**
+ * 按会话身份取人格卡。返回 `{ card, source }`，`source` 是给面板解释「用的哪张卡」的
+ * 读数，不参与判定。
+ *
+ * 寻址维度（#606 起两维，子 agent 继承再加一维共三维）：`sessionId`（绑会话卡，
+ * 最具体）优先于 `parentSessionId`（子 agent 继承父会话卡），最后是 `agentId`（按预设建卡）。
+ * 理由是具体性——会话比预设更具体，而 DS Bot 这类宿主里 `agentPreset` 恒为
+ * `"standard"`（`ds-bot/src/host/roster.js:72-80` 强制写入，实测 50 个会话里 43 个是
+ * 它），若让 byAgent 优先，则谁给 `standard` 建一张卡就会盖掉所有按会话建的卡。
+ * 父会话卡排在 byAgent 之前：子 agent 自己没卡时，它属于哪段对话比它属于哪个预设
+ * 更能说明「该用谁的人格」。
+ *
+ * `strict`（config.personaStrictAddressing，默认关）决定「有身份、没这张身份的卡」
+ * 与「这张卡被显式关掉」这两种情况：
+ * - 关（现状）：落 default 卡。default 于是变成「所有没建卡的 agent 都能拿到它」，
+ *   包括宿主里跑的外部 bot——它自带身份与设定，两处「你是谁」撞在同一帧里。
+ * - 开：不注入人格（`source: "none"`）。default 退回它的本意：只兜「这一帧解析不到
+ *   身份」的会话（无名会话本来就是 default 卡的受众）。
+ * 默认关是有意的：这是一次口径变更，不能让老用户的注入文本在升级后静默变化。
+ *
+ * 严格模式有一格例外（#587）：两维**都没建过卡**时仍回落 default。两种处境必须
+ * 分开——「建了卡、只是没这一张的卡」是真该按 none 处理（否则关掉一张卡等于没关），
+ * 而「一张卡都没建」时 default 是用户手里唯一的一张卡，按 none 处理等于把它永久
+ * 废掉，且面板不报错。判据看两维合起来的键数（#606 起）：只建了 bySession 卡时，
+ * 一个按 byAgent 寻址的会话同样不该被 default 兜底——用户已经做过分区了。
+ */
+export function resolvePersonaCard(
+  settings,
+  agentId,
+  { strict = false, sessionId = null, parentSessionId = null } = {}
+) {
+  const store = settings.getPersona();
+  const id = typeof agentId === "string" && agentId.trim() ? agentId.trim() : "";
+  const sid = typeof sessionId === "string" && sessionId.trim() ? sessionId.trim() : "";
+  const pid =
+    typeof parentSessionId === "string" && parentSessionId.trim() ? parentSessionId.trim() : "";
+  // 第一维：绑会话卡（最具体）
+  const sessionCard = sid ? store.bySession?.[sid] : null;
+  if (sessionCard && sessionCard.enabled === true) return { card: sessionCard, source: "bySession" };
+  // 第二维（子 agent 继承）：自己没卡就取父会话的卡。
+  // 为什么必须有这一维：子 agent 是新会话，用户不可能给每个派生会话都建一张卡；而
+  // strict 一旦生效，「有身份、没这张身份的卡」= 不注入人格，子 agent 会从「自称父
+  // 会话的人格」变成「不知道自己是谁」——比串味更糟。继承父会话卡才是用户能预期的
+  // 语义：同一个 agent 派生出去的手脚，仍是同一个 agent。
+  // 注意与 `src/session-gate.js` 的口径区别：那里**刻意不**用 parentSession 判「是不是
+  // 子代理」（宿主 fork 出来的主会话同样带 parentSession，用它判会把主会话误关）。
+  // 这里要问的不是「你是不是子代理」而是「你自己有没有卡」，所以 fork 出的分支继承
+  // 父卡也是正确的（它就是同一段对话的副本）。父 id 与自身 id 相同（脏数据）时跳过，
+  // 免得一次寻址查两遍同一个键。
+  const parentCard = pid && pid !== sid ? store.bySession?.[pid] : null;
+  if (parentCard && parentCard.enabled === true) return { card: parentCard, source: "parentSession" };
+  // 第三维：按预设/身份建的卡
+  const card = id ? store.byAgent[id] : null;
+  if (card && card.enabled === true) return { card, source: "byAgent" };
+  // 严格模式只在「确实建过卡」时才拒绝兜底：两维都空时兜底是唯一的出路。
+  const anyCard = Object.keys(store.byAgent ?? {}).length > 0 || Object.keys(store.bySession ?? {}).length > 0;
+  // 身份判定要把父会话 id 算进来：子 agent 只有父会话 id、没有自己的卡时，也是
+  // 「确实有身份」，不许被 default 兜底。
+  if ((id || sid || pid) && strict && anyCard) return { card: {}, source: "none" };
+  return { card: store.default, source: "default" };
+}
+
+/**
+ * 按会话身份取自动事实卡（resolvePersonaCard 的镜像，形状不同：facts 没有
+ * enabled 位，「卡存在」就是非空数组）。strict 语义与人格一致：有身份但没这张
+ * 身份的卡时不落 default——两个 bot 对用户的认知不互串是 store 层分区（输入行）
+ * 与本层寻址（输出注入）共同守住的边界。与人格同一条例外（#587）：`byAgent` 整体
+ * 为空时仍落 default，「一张都没建」不等于「这一张没建」。
+ */
+export function resolveFactsCard(factsStore, agentId, { strict = false } = {}) {
+  const id = typeof agentId === "string" && agentId.trim() ? agentId.trim() : "";
+  const byAgent = factsStore?.byAgent ?? {};
+  const card = id ? (byAgent[id] ?? null) : null;
+  if (card && card.length) return { facts: card, source: "byAgent" };
+  if (id && strict && Object.keys(byAgent).length > 0) return { facts: [], source: "none" };
+  return { facts: factsStore?.default ?? [], source: "default" };
+}
+
+/**
+ * 渲染整块「用户设置」。`agentId` 是会话身份（解析不到传 null → 走 default 兜底），
+ * `sessionId` 是绑会话卡的键（#606；解析不到传 null）。
+ * `factsProvider` 是 profile-facts 域的读口（返回 `{ default: [...], byAgent: {...} }`），
+ * 可选；**开关与 provider 双闸**——profileFactsEnabled 关着时连 provider 都不调，
+ * 「关」必须是零读数而不是「读了不渲染」。返回 `{ text, source, agent, session, configGate }`：
+ * `text` 为最终注入文本（全空时 ""），`configGate` 是 personaEnabled 的现值——面板
+ * 要靠它解释「卡开着为什么没生效」。
+ */
+export function renderUserSettingsBlock({
+  settings,
+  config,
+  agentId = null,
+  sessionId = null,
+  parentSessionId = null,
+  factsProvider = null
+}) {
+  const language = langOf(config);
+  const profile = settings.getProfile().trim();
+  const rules = settings.getRules();
+  const enabled = config?.personaEnabled === true;
+  const strict = config?.personaStrictAddressing === true;
+  const resolved = enabled
+    ? resolvePersonaCard(settings, agentId, { strict, sessionId, parentSessionId })
+    : { card: {}, source: "default" };
+  const persona = resolved.card;
+  // 段（#600）：每一行都带上它的 kind 与写回所需的定位信息，供面板按段读、按段改。
+  // 段文本是**未转义**的原样行；整串 `text` 仍走原来的「先 join 再统一转义」，
+  // 所以注入字节不变（转义只动连续花括号，换行不参与，逐段转义与整串转义等价）。
+  //
+  // `text` 是**带模板前缀的整行**（如 `- 用户画像：xxx`），不能拿去当新值回写，
+  // 否则每写一次叠一层前缀。可回写的段另带 `value`＝原始值（无前缀、未转义）；
+  // 没有原始值的段（表头、事实表头、截断尾注）不带 `value` 键。
+  const personaLines = [];
+  if (persona?.enabled === true) {
+    if (typeof persona.name === "string" && persona.name.trim()) {
+      const value = persona.name.trim();
+      personaLines.push({ kind: "personaName", field: "name", value, text: STR.personaNameLine[language](value) });
+    }
+    if (typeof persona.personality === "string" && persona.personality.trim()) {
+      const value = persona.personality.trim();
+      personaLines.push({ kind: "personaPersonality", field: "personality", value, text: STR.personaPersonalityLine[language](value) });
+    }
+    if (typeof persona.replyStyle === "string" && persona.replyStyle.trim()) {
+      const value = persona.replyStyle.trim();
+      personaLines.push({ kind: "personaReplyStyle", field: "replyStyle", value, text: STR.personaReplyStyleLine[language](value) });
+    }
+    // scenario / mesExample（#606）：只有设置了才输出，未设置时本块逐字节不变。
+    if (typeof persona.scenario === "string" && persona.scenario.trim()) {
+      const value = persona.scenario.trim();
+      personaLines.push({ kind: "personaScenario", field: "scenario", value, text: STR.personaScenarioLine[language](value) });
+    }
+    if (typeof persona.mesExample === "string" && persona.mesExample.trim()) {
+      const value = persona.mesExample.trim();
+      personaLines.push({ kind: "personaMesExample", field: "mesExample", value, text: STR.personaMesExampleLine[language](value) });
+    }
+  }
+  // 事实段：开关关 / 无 provider / 该卡没事实三种情况都不渲染，注入文本与
+  // 未启用事实时逐字节一致（老用户零变化）。
+  const factsResolved = config?.profileFactsEnabled === true && typeof factsProvider === "function"
+    ? resolveFactsCard(factsProvider(), agentId, { strict })
+    : { facts: [], source: "none" };
+  const factLines = [];
+  if (factsResolved.facts.length) {
+    let chars = 0;
+    let shown = 0;
+    for (const fact of factsResolved.facts) {
+      const value = String(fact);
+      const line = STR.profileFactLine[language](value);
+      if (shown >= PROFILE_FACTS_MAX_LINES || chars + line.length > PROFILE_FACTS_MAX_CHARS) break;
+      factLines.push({ kind: "fact", index: shown, value, text: line });
+      chars += line.length;
+      shown += 1;
+    }
+    const remaining = factsResolved.facts.length - shown;
+    if (remaining > 0) factLines.push({ kind: "factsTruncated", remaining, text: STR.profileFactsTruncated[language](remaining) });
+    if (factLines.length) {
+      // 表头的 n 是**总条数**（含没注入的），与「另有 N 条未注入」互补，别改成 shown。
+      factLines.unshift({
+        kind: "factsHeader",
+        shown,
+        total: factsResolved.facts.length,
+        text: STR.profileFactsHeader[language](factsResolved.facts.length)
+      });
+    }
+  }
+  const id = typeof agentId === "string" && agentId.trim() ? agentId.trim() : null;
+  const sid = typeof sessionId === "string" && sessionId.trim() ? sessionId.trim() : null;
+  const pid =
+    typeof parentSessionId === "string" && parentSessionId.trim() ? parentSessionId.trim() : null;
+  if (!profile && !rules.length && !personaLines.length && !factLines.length) {
+    // `parent` 是读数（面板要能说清「这张卡是从父会话继承来的」），不参与判定。
+    return {
+      text: "",
+      segments: [],
+      source: resolved.source,
+      agent: id,
+      session: sid,
+      parent: pid,
+      configGate: enabled
+    };
+  }
+  const segments = [{ kind: "header", text: STR.userSettingsHeader[language] }];
+  segments.push(...personaLines);
+  if (profile) segments.push({ kind: "profile", value: profile, text: STR.profileLine[language](profile) });
+  segments.push(...factLines);
+  for (const rule of rules) segments.push({ kind: "rule", value: rule, text: STR.ruleLine[language](rule) });
+  const lines = segments.map((s) => s.text);
+  return {
+    text: escapePromptVars(config, lines.join("\n")),
+    segments,
+    source: resolved.source,
+    agent: id,
+    session: sid,
+    parent: pid,
+    configGate: enabled
+  };
+}

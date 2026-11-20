@@ -1,0 +1,3479 @@
+import { createHash, randomUUID } from "node:crypto";
+import { TYPE_FILE, MIRROR_READONLY_TYPES } from "./mirror.js";
+import { updatedAtBounds } from "./store.js";
+import { normalizeExplicitScope, scopeKeyOf, workspaceLabelKey } from "./scope.js";
+import { createScopeStateGate } from "./scope-state.js";
+import { STR, langOf } from "./lang.js";
+import { computeHeat } from "./heat.js";
+import { recallStats } from "./recall-stats.js";
+import { evaluateMemoryQuality } from "./quality-filter.js";
+import { CAPACITY_WARNING_DEFAULTS, injectChildEnabled } from "./config.js";
+// 外来行（source='imported'，导入路径落的来源）的身份判定只许有一个定义处——本文件的
+// 两处汇流口与巩固/降级那些读侧行池都调这同一个谓词，避免各处自己写字符串比较然后各自漂移。
+import { isImportedRow } from "./memory-source.js";
+import { applyDecisions, EPISTEMIC_PRIORITY } from "./dream/decisions.js";
+import { createDocumentRegistrar } from "./document.js";
+import { createOrganizer } from "./organize.js";
+import { createShareImport } from "./share-import.js";
+import { createCorpusIndex } from "./search/bm25.js";
+import { adaptiveThreshold } from "./search/adaptive.js";
+import { resolveConflictMode } from "./conflict-mode.js";
+import { anchorSeeds, normalizePath, cascadeDepths, HOP_QUOTA } from "./graph/anchoring.js";
+
+// Issue #369：蒸馏白名单（src/summarize.js 的 VALID）产得出 history，注入白名单
+// 原先不收——本机活跃库实测 378/1820（20.8%）因此永不可自动注入，而它们在同一库
+// 的 recall_runs `auto` 模式里被按需检索过 328 次：不是垃圾数据，只是进不了注入池。
+// 收编后候选池 1362 → 1713（+25.8%），按 top_k=5 粗算约多占 1 席；重要度闸门对
+// history 一视同仁（见 injectCandidates 的 importance >= threshold），低于闸门照旧出局。
+// pattern 一并收编：它一度被当成「只由手工写入（实测 40 条全 source=manual）」——那个
+// 判据是错的。机器一直在 mint：2026-10-14 按 dream_runs 的 patterns.applied 逐轮求和，
+// 得 144，与表内 pattern 行数 144 相等（72 轮 sleep 里 48 轮 ok，auto 轮 0），来源是
+// src/dream/sleep.js 的 phasePatterns；当时的 source=manual 只是 saveWithDedupe 没拿到
+// source 时的兜底值，不是「人写的」的意思（现在 mint 会带 source=sleep/dream）。
+// 但它确实已被 dreamMergeGuard 列为长保留受保护类型（docs/CONFIGURATION.md）——巩固层
+// 当资产护住、注入面一次不给看，是同一条口径的两头不一致。这一点与作者是谁无关，
+// 收编的结论不变，错的只是当初用来支持它的那句前提。
+const INJECT_TYPES = new Set(["preference", "project", "decision", "summary", "rejected_solution", "pitfall", "constraint", "history", "pattern"]);
+
+// document 摘要行（#230）：仅 documentMemoryEnabled 开启时进注入候选。独立
+// 集合而非常改共享 Set——INJECT_TYPES 本身是「类型可注入」的静态事实，flag
+// 是运行时状态，两者不能搅在一起。
+const INJECT_TYPES_WITH_DOCUMENT = new Set([...INJECT_TYPES, "document"]);
+
+// #619 补链（注入侧）：情绪注释的长度上限。注释拼在记忆行内容之后、按整行扣注入
+// 块预算（src/inject.js 的 MAX_BLOCK），所以它必须有一个硬上限——否则一条啰嗦的
+// 情绪记录就能把同批后面的候选全挤成标题行。160 字够写完「谁·什么心情·哪件事·
+// 几次·为什么」，超过的多半是模型在复述理由，边际价值低于它挤掉的记忆。
+const AFFECTIVE_NOTE_MAX = 160;
+
+// 编码记忆类型（codingRetrospect）：rejected_solution / pitfall / constraint
+// 只在编码任务时注入（防噪声污染其他业务），且编码场景下按 codingBoostFactor
+// 加权排序提前。
+const CODING_MEMORY_TYPES = new Set(["rejected_solution", "pitfall", "constraint"]);
+
+// pin 池类型（#249 第一批）：约束与偏好是「对谁都成立的边界」，需要逐字保真
+// 而不是相关性排序——它们与情景日志同池同速率摘要会被静默降级（立项依据）。
+// 注意 constraint 同时属于 CODING_MEMORY_TYPES，非编码任务里已被 codingGate
+// 滤掉，pin 池同样拿不到它；是否豁免该门控是待维护者拍板的口径问题，本批次
+// 不动既有门控（不放大行为面）。
+// 导出给写入准入（#254 的穿透口）与注入侧共用一份定义：两处各写一份 list 迟早
+// 漂移成「pin 池豁免了、预算没豁免」这类两套口径。
+export const PINNED_MEMORY_TYPES = new Set(["constraint", "preference"]);
+
+/**
+ * 判断一段文本是否编码类任务（关键词匹配，codingRetrospect 读取侧门控）。
+ * 纯函数，无副作用，便于单测。
+ */
+export function isCodingTask(text, keywords = []) {
+  const t = String(text ?? "").toLowerCase();
+  return keywords.some((kw) => t.includes(String(kw).toLowerCase()));
+}
+
+// Epistemic trust weights (v0.4.5): when config.trustEpistemicWeighting is on,
+// each recall candidate's existing score is multiplied by the weight of its
+// epistemic_status before ranking — measured facts outrank guesses. Missing /
+// unknown statuses are unscaled (×1). Off by default, so nothing changes.
+const EPISTEMIC_WEIGHTS = { observation: 1.0, inferred: 0.85, subjective: 0.7 };
+
+// Bug5: content version history cap (FIFO — the newest 20 versions are kept,
+// older ones dropped). Entries are {content, source, updated_at}; source marks
+// how the version was superseded (auto_merge | human_override | overwrite).
+const CONTENT_HISTORY_MAX = 20;
+
+// Issue #135 附属发现 2：质量过滤器写下的系统信号标签（「为什么被降权/归档」的
+// 唯一审计线索）。更新路径整组替换 tags 会把它们抹掉——更新时按此清单并集保留。
+// 清单必须与 quality-filter.js 的写入端对齐（6 个，含 type 自指的 self_referential）；
+// evidence_degraded 是 #230 注册端的求交标记（quality-filter 不写它，但同样
+// 不许被更新抹掉）。
+const SIGNAL_TAGS = ["low_quality", "duplicate", "meta", "repetitive", "short_content", "self_referential", "evidence_degraded"];
+
+// scopeKeyOf 已上提到 ./scope.js（v0.8.1，issue #170 第 2 步）：与 sleep 的跨
+// scope 配对共用同一把比较钥匙，避免两处定义漂移。
+
+// v0.8.0 A2（issue #17）scope 检索加权系数：两维都无法确立 foreign 的候选
+// （命中行、未标注行、当前侧维度解析不到的行）→ 加成；只有确立了 foreign
+// （记忆带标注 + 当前维度可解析 + 值不等）→ 降权但保留可见（硬过滤是 A3
+// strictScope）。即未标注行与命中行同列、不吃惩罚，但注意它们吃的是 BOOST
+// 而非 ×1 中性。系数是模块常量而非配置项：A2 只定性行为，数值要等线上检索
+// 质量反馈再调（加配置面=提前优化）。
+const SCOPE_MATCH_BOOST = 1.25;
+const SCOPE_FOREIGN_PENALTY = 0.5;
+
+/**
+ * 单条候选的 scope 乘数。匹配语义与去重键一致（scopeKeyOf）：记忆侧未标注视同
+ * 该维度命中（全局记忆对谁都可见）；当前会话侧某维度解析不到则该维度不参与
+ * 比较（无法比较 ≠ 不匹配）。
+ */
+function scopeMultiplier(m, current) {
+  const agentForeign = scopeKeyOf(m.agent_scope) !== null
+    && current.agent_scope !== null
+    && scopeKeyOf(m.agent_scope) !== current.agent_scope;
+  // #743 评审：工作区维与硬墙判定、SQL 过滤共用 workspaceLabelKey，
+  // 否则同一条记忆在「硬墙放不放行」与「软加权算不算外来」上会给出两套答案。
+  const wsKey = workspaceLabelKey(m.workspace_scope);
+  const curWsKey = workspaceLabelKey(current.workspace_scope);
+  const workspaceForeign = wsKey !== null
+    && curWsKey !== null
+    && wsKey !== curWsKey;
+  return (agentForeign || workspaceForeign) ? SCOPE_FOREIGN_PENALTY : SCOPE_MATCH_BOOST;
+}
+
+/**
+ * v0.8.0 A2：occurred_at 后置过滤谓词（搜索融合池用）。行侧取
+ * COALESCE(occurred_at, created_at)——与 store.list 的 SQL 过滤同口径，未标注
+ * 行回退创建时间；时间戳损坏的行保留（宁可放宽也不误杀，同 summarize inWindow）。
+ */
+function inOccurredBounds(m, bounds) {
+  const t = Date.parse(String(m.occurred_at ?? m.created_at ?? ""));
+  if (!Number.isFinite(t)) return true;
+  if (bounds.from && t < Date.parse(bounds.from)) return false;
+  if (bounds.to && t > Date.parse(bounds.to)) return false;
+  return true;
+}
+
+/**
+ * v0.8.0 A3（issue #17）strictScope 可见性谓词：issue 的四象限可见性公式
+ * （agent 不对称可见性）——记忆对当前会话可见 ⇔ (agent 维：未标注 或 命中当前
+ * agent) AND (workspace 维：未标注 或 命中当前 workspace)。NULL=未标注=全局；
+ * 当前会话某维度解析不到时，该维度带标注的记忆一律不可见（fail-closed：身份
+ * 不明的会话只见全局，不冒认）。sensitivity 是标签不参与可见性判定（其语义
+ * 留给后续批次）。store.list 的 SQL 过滤与此谓词同口径（见 store.js visibility）。
+ */
+function isVisibleInScope(m, current) {
+  // v0.8.1 第 3 步（issue #170 4.3，作者已确认）：硬过滤只认显式声明。某维
+  // 仅当「该维有标注且来源为 explicit」才构成硬墙；auto（含 v0.8.0 存量的
+  // NULL 来源行）只吃 A2 软加权（foreign ×0.5 保留可见），不进硬过滤。
+  // 显式全局（值 NULL + source explicit）与未标注同形，天然恒可见。
+  if (m.agent_scope_source === "explicit") {
+    const agent = scopeKeyOf(m.agent_scope);
+    if (agent !== null && (current.agent_scope === null || agent !== current.agent_scope)) return false;
+  }
+  if (m.workspace_scope_source === "explicit") {
+    // #743 评审：工作区维的比较键必须与硬墙名单判定、store 的 SQL 过滤同一把
+    // 钥匙（去末尾分隔符、不分大小写）。此前这里字面比较，名单命中、章也盖了
+    // 的行会被另一种写法（C:\Work vs c:\work\）的会话判成不可见。
+    const ws = workspaceLabelKey(m.workspace_scope);
+    const cur = workspaceLabelKey(current.workspace_scope);
+    if (ws !== null && (cur === null || ws !== cur)) return false;
+  }
+  return true;
+}
+
+/** Prepend the previous content to a memory's content_history (FIFO capped). */
+function pushContentHistory(existing, source) {
+  const history = Array.isArray(existing?.content_history) ? existing.content_history : [];
+  return [
+    { content: existing?.content ?? "", source, updated_at: new Date().toISOString() },
+    ...history
+  ].slice(0, CONTENT_HISTORY_MAX);
+}
+
+/** Bug5: same-title merge appends the new content under a timestamped `---`
+ *  separator instead of overwriting, so a re-noted memory never loses history.
+ *  The `---` line is compatible with the mirror's readHumanEdits (which strips
+ *  only the LAST structural `---` when parsing the human-editable file). */
+function appendContent(oldContent, newContent) {
+  const ts = new Date().toISOString();
+  return `${oldContent}\n\n---\n[${ts}] ${newContent}`;
+}
+
+/**
+ * Standard retrieval-quality metrics over the ordered candidate ids actually
+ * returned vs the ids the evaluator marked relevant (方案 B). Pure + total, so
+ * callers (and tests) get deterministic numbers without touching a store:
+ *   precision = |relevant ∩ retrieved| / |retrieved|
+ *   recall    = |relevant ∩ retrieved| / |expected|
+ *   mrr       = 1 / rank of the first relevant doc (0 when none retrieved)
+ * hit_count is the raw intersection size. Values are rounded to 4 decimals so
+ * repeated divisions (e.g. 1/3) never surface binary-float noise.
+ */
+export function computeRetrievalMetrics(actualIds, expectedIds) {
+  const expected = new Set(Array.isArray(expectedIds) ? expectedIds : []);
+  const actual = Array.isArray(actualIds) ? actualIds : [];
+  const relevant = actual.filter((id) => expected.has(id)).length;
+  const round4 = (x) => Math.round(x * 10000) / 10000;
+  let mrr = 0;
+  for (let i = 0; i < actual.length; i++) {
+    if (expected.has(actual[i])) { mrr = 1 / (i + 1); break; }
+  }
+  return {
+    precision: round4(actual.length ? relevant / actual.length : 0),
+    recall: round4(expected.size ? relevant / expected.size : 0),
+    mrr: round4(mrr),
+    hit_count: relevant
+  };
+}
+
+export function createService({ store, mirror, config, onWrite, logger, documentIndex, writeAdmission }) {
+  const language = langOf(config);
+
+  // issue #471 政策轴：作用域级可逆闸门。判定实现住 src/scope-state.js（与存储解耦，
+  // test 可以直接构造暂停集合、不必开库）；这里只把 store 的读写函数接上去。
+  // 每次调用现读一次状态表，不做缓存：表恒小（行数 = 被人按过的作用域个数），
+  // 而缓存要配一套失效协议才能让面板/另一进程的改动立刻可见（见 scope-state.js）。
+  const scopeStateGate = createScopeStateGate({
+    listStates: () => store.listScopeStates(),
+    saveAudit: (entry) => store.saveLlmAudit(entry),
+    config,
+    logger
+  });
+  // Optional dream scheduler hook, installed via setDreamHook after creation
+  // (the scheduler holds a reference back to the service, so it cannot be
+  // passed in the constructor). Fired on the same write events as onWrite.
+  let dreamHook = null;
+
+  // Optional sleep scheduler hook (v0.4.0), installed via setSleepHook after
+  // creation. Fired on the same write events as onWrite: it tells the sleep
+  // scheduler the store just changed so the idle-detection clock resets.
+  let sleepHook = null;
+
+  // Optional vector embedder, installed via setEmbedder after creation. After
+  // any content write it fire-and-forgets a re-embed of the row so vector
+  // search stays in sync; failures are swallowed inside the embedder.
+  let embedder = null;
+
+  // Optional entity extractor, installed via setEntityExtractor after creation
+  // (index.js injects it so the service never depends on the LLM directly).
+  // After a new memory is saved it fire-and-forgets an extraction pass for the
+  // entity gene (v0.3.0); failures are swallowed so a broken extraction never
+  // surfaces as a write failure. Extraction only runs when
+  // config.entityExtractionEnabled is true.
+  let entityExtractor = null;
+  let vectorIndex = null;
+  let reranker = null;
+
+  // Optional recall recorder, installed via setRecallRecorder after creation.
+  // When searchMemories is called with recordRecall=true it receives the
+  // actual merged recall scene (candidates + scores + source + threshold) so
+  // the retrieval layer can be audited/replayed — the sibling of the dream
+  // judgment-layer audit trail (dream_runs).
+  let recallRecorder = null;
+
+  // Bug4: semantic recall cache for the injection path. The system-prompt
+  // interpolator renders context synchronously, so injectCandidates cannot
+  // fire a fresh async embed. The most recent searchMemories recall is cached
+  // here (query + ordered candidates) and reused when the injection query
+  // matches, giving semantic-first injection without breaking the sync render.
+  let lastSemanticRecall = null;
+
+  // Transaction nesting depth. Inside service.transaction the per-mutation side
+  // effects (mirror render, write notify, re-embed) are deferred so a ROLLBACK
+  // never leaves the mirror file diverged from the database; transaction()
+  // replays them exactly once against the committed state.
+  let txDepth = 0;
+
+  // Serial task queue (sleep v0.4.0). Long-running background passes — dream
+  // consolidation, sleep cycles — must never overlap: two sleep runs racing
+  // would double-demote or double-mint patterns. enqueue chains the task onto
+  // a promise tail so N callers can queue work that runs strictly one at a
+  // time. A task that rejects doesn't poison the queue (the tail swallows the
+  // rejection) but the rejection still propagates to that caller.
+  let queueTail = Promise.resolve();
+  function enqueue(fn) {
+    const next = queueTail.then(fn, fn);
+    queueTail = next.catch(() => {});
+    return next;
+  }
+
+  // issue #6 (part 2): startup race defense. A local embedder (LocalEmbedder /
+  // Ollama) exposes an async init(), so between `setEmbedder` and init()
+  // resolving there is a window where embedSingle would throw "not initialized"
+  // and the re-embed would be silently dropped. When the embedder carries a
+  // `ready` flag we queue writes in embedPending until init sets ready=true,
+  // then flush them through the embedder's real interface. Embedders without a
+  // `ready` flag (legacy OpenAI, instantly usable) keep their old behavior.
+  let embedPending = [];
+  let embedReadyTimer = null;
+  const EMBED_PENDING_MAX = 100; // bound the queue; drop oldest beyond this
+  const EMBED_READY_POLL_MS = 100;
+  const EMBED_READY_POLL_LIMIT = 30; // ~3s ceiling; never poll forever
+
+  /** Flush the queued re-embeds once the embedder is ready. Fail-safe. */
+  function flushEmbedPending() {
+    if (!embedder || embedPending.length === 0) return;
+    const batch = embedPending.splice(0, embedPending.length);
+    for (const memory of batch) {
+      try {
+        if (!memory?.id) continue;
+        if (typeof embedder.schedule === "function") {
+          embedder.schedule(memory);
+        } else if (typeof embedder.embedSingle === "function") {
+          const text = [memory.title, memory.content].filter(Boolean).join("\n");
+          if (!text) continue;
+          embedder
+            .embedSingle(text)
+            .then((vec) => {
+              if (Array.isArray(vec) && vec.length) {
+                store.setEmbedding(memory.id, vec);
+              }
+            })
+            .catch((err) => {
+              logger?.warn?.("flushEmbedPending embedSingle failed:", err);
+            });
+        }
+      } catch (err) {
+        logger?.warn?.("flushEmbedPending failed:", err);
+      }
+    }
+  }
+
+  function stopEmbedReadyPolling() {
+    if (embedReadyTimer) {
+      clearInterval(embedReadyTimer);
+      embedReadyTimer = null;
+    }
+  }
+
+  function scheduleEmbed(memory) {
+    try {
+      // distill-tx-embed-gap: 入队而不是丢弃，transaction() 提交后补跑（#372 同款）。
+      if (txDepth > 0) {
+        pendingEmbed.push(memory);
+        return;
+      }
+      if (!embedder || !memory?.id) return;
+
+      // Readiness gate: embedder exposes `ready` (async init) and is not ready
+      // yet — queue instead of firing embedSingle into a half-built extractor.
+      const hasReady = "ready" in embedder;
+      if (hasReady && embedder.ready !== true) {
+        if (embedPending.length >= EMBED_PENDING_MAX) embedPending.shift();
+        embedPending.push(memory);
+        return;
+      }
+
+      if (typeof embedder.schedule === "function") {
+        embedder.schedule(memory);
+        return;
+      }
+
+      if (typeof embedder.embedSingle === "function") {
+        const text = [memory.title, memory.content].filter(Boolean).join("\n");
+        if (!text) return;
+
+        embedder
+          .embedSingle(text)
+          .then((vec) => {
+            if (Array.isArray(vec) && vec.length) {
+              store.setEmbedding(memory.id, vec);
+            }
+          })
+          .catch((err) => {
+            logger?.warn?.("scheduleEmbed embedSingle failed:", err);
+          });
+      }
+    } catch (err) {
+      logger?.warn?.("scheduleEmbed failed:", err);
+    }
+  }
+
+  /**
+   * Fire-and-forget entity extraction for a freshly saved memory (entity gene
+   * v0.3.0). Opt-in via config.entityExtractionEnabled; the extractor is
+   * injected as a hook so the service never needs a direct LLM reference.
+   * The hook itself is expected to resolve to { ok:boolean } and never throw;
+   * a thrown rejection is swallowed here as a final fail-safe.
+   */
+  // #372: 事务内的抽取曾经被这里直接丢弃（注释写 deferred，实际 transaction()
+  // 从不补跑）——自动蒸馏的所有写入都裹在 service.transaction() 里，session:* 来源
+  // 的记忆因此 100% 抽不到实体。改为入队，事务提交后由 transaction() 的 drain 补跑。
+  // 队列不设上限：元素只是对已落库行的引用（内存成本≈0），而 cap 丢最旧等于把
+  // 「抽取被静默丢弃」这个本修复要消灭的 bug 换个量级带回来；上限实际由事务内
+  // 写入批量决定。回滚时由 transaction() 截断到事务前的基线（见 ROLLBACK 路径）。
+  const pendingEntity = [];
+
+  // distill-tx-embed-gap：scheduleEmbed 在事务内曾被首行 `if (txDepth > 0) return;`
+  // 直接丢弃（注释写 deferred，transaction() 从不补跑）——与 #372 的实体抽取是
+  // 同一个 bug 模板，只是受害者换成了嵌入：自动蒸馏的 session:* 行因此 100%
+  // 拿不到向量。照 #372 先例入队，事务提交后补跑；回滚时截断回本层基线，
+  // 绝不给已回滚的行嵌向量。队列同样不设上限：元素只是对已落库行的引用，
+  // cap 丢最旧等于把「向量被静默丢弃」换个量级带回来。
+  const pendingEmbed = [];
+
+  function scheduleEntityExtraction(memory) {
+    if (txDepth > 0) {
+      pendingEntity.push(memory);
+      return;
+    }
+    if (!config.entityExtractionEnabled || !entityExtractor) return;
+    try {
+      entityExtractor(memory).catch((err) => {
+        logger?.warn?.("entity extraction failed:", err);
+      });
+    } catch (err) {
+      logger?.warn?.("entity extraction failed:", err);
+    }
+  }
+
+  /**
+   * Cross-encoder rerank over a candidate list (best effort). Reranker
+   * failures degrade to the original candidate order — reranking is an
+   * accuracy upgrade, never a correctness gate.
+   */
+  async function rerankCandidates(query, candidates, topK) {
+    if (!reranker || !candidates.length) return candidates.slice(0, topK);
+    try {
+      const scored = await reranker.rerank(query, candidates.map((c) => ({ id: c.id, title: c.title, content: c.content })));
+      if (!Array.isArray(scored)) return candidates.slice(0, topK);
+      const byId = new Map(candidates.map((c) => [c.id, c]));
+      const out = [];
+      for (const s of scored) {
+        const c = byId.get(s.id);
+        if (c) { out.push({ ...c, score: s.score, source: "rerank" }); if (out.length >= topK) break; }
+      }
+      return out.length ? out : candidates.slice(0, topK);
+    } catch {
+      return candidates.slice(0, topK);
+    }
+  }
+
+  /**
+   * v0.8.0 A3（issue #17）strictScope 硬过滤的**唯一实现**。三处共用：融合池、
+   * `entity:` 与 `attr:` 两条前缀路。
+   *
+   * 抽成单一实现是为了让「过滤点写在哪」不再漂移——那两条前缀路在 searchMemories
+   * 的入口就 return（见那里的路由块），早于融合池那道过滤，曾经整条绕过硬墙；三处
+   * 各写一份判断，只会让下一个新增通路再漏一次（同 #349 把阈值口径收进
+   * activeStoreSize 的理由：两处各写一份过滤条件，漂移只在某条路径上显形）。
+   *
+   * strictScope 关（默认）或 scope 解析不到时原样返回：行为与改动前逐字节一致。
+   *
+   * issue #471 政策轴接在这里：判定收在 scope-state.js（同一个「过滤点不许漂移」
+   * 的理由），本函数只按顺序挂上去。政策轴排在事实轴**前面**——它更便宜（一次小
+   * 表读，无逐行字段比较），且语义上「这一路现在通不通」先于「你看不看得见」。
+   *
+   * 注意政策轴的短路条件与事实轴不同：它不看 `scope`。事实轴要有 scope 才知道
+   * 「以谁的眼睛看」，而政策轴问的是「这条路还开着吗」，与调用方是谁无关——会话
+   * 身份解析失败不该让闸门整条失效（故政策轴在 scope 为 null 时照样生效）。
+   *
+   * **覆盖面只到「喂给模型的那几条路」**：融合池 + `entity:`/`attr:` 前缀路 +
+   * 注入候选池，以及 dream/sleep 的整理读入口。`memory_list` / `memory_get` /
+   * 面板列表**刻意不过这道闸**（它们走 `strictVisibility` 与 store.list 的
+   * `visibility` 参数，与 `gateByScope` 平行的另一条链）。理由：按下之后人还要能
+   * 查「我到底按下了什么、里面有什么」，那是检视面不是供料面；把检视面也关掉，
+   * 人就没有任何入口找回被暂停的行、也没法确认该不该松开。这也是为什么按下的是
+   * 政策而不是事实：行还在，只是不再喂给模型。
+   */
+  function gateByScope(rows, scope) {
+    const gated = scopeStateGate.filter(rows);
+    if (config?.strictScope !== true || !scope) return gated;
+    return gated.filter((m) => isVisibleInScope(m, scope));
+  }
+
+  /**
+   * Search for memories attached to a named entity (v0.3.0 Phase 3).
+   * 合并优先级：entity_attrs.memory_id 精确关联 = 1.0 > 关键词提及 = 0.7；
+   * attr 命中不覆盖，keyword 只补充召回，最后按 _score 降序取 topK。
+   * @param {string} entityName
+   * @param {object} [options]
+   * @param {number} [options.topK=20]
+   * @param {object|null} [options.scope] 当前会话 scope，供 strictScope 闸门使用
+   * @returns {any[]}
+   */
+  function searchByEntity(entityName, { topK = 20, scope = null } = {}) {
+    const entity = store.findEntityByName(entityName);
+    if (!entity) return [];
+    const attrs = store.getCurrentAttrs(entity.id);
+    const memoryIds = [...new Set(attrs.map((a) => a.memory_id).filter(Boolean))];
+    const attrHits = memoryIds.map((id) => store.getById(id)).filter(Boolean);
+    // 关键词这一路的窗口取两倍：闸门在截断之前生效，出局的候选会让位，窗口按最终条数
+    // 取就会不够（与融合路给向量检索取 lim * 2 同一个理由）。没有候选被闸掉时结果与
+    // 取 topK 逐字节一致——多出来的是排在后面的低分候选，进不了 topK。
+    const keywordHits = store.search(entityName, { limit: topK * 2 });
+    const merged = new Map();
+    for (const mem of attrHits) merged.set(mem.id, { ...mem, _source: "entity_attr", _score: 1.0 });
+    for (const mem of keywordHits) {
+      if (!merged.has(mem.id)) merged.set(mem.id, { ...mem, _source: "keyword", _score: 0.7 });
+    }
+    // 先过闸、再截 topK：反过来做的话，出局的候选会占掉名额、可见的补不进来——topK=1
+    // 而首位出局时直接返回空数组。排序本身不动，只是把闸门插在截断之前，与融合池那条
+    // 路同序（那边也是先 filter 后 slice）。
+    const ranked = Array.from(merged.values()).sort((a, b) => b._score - a._score);
+    const visible = gateByScope(ranked, scope).slice(0, topK);
+    // 闸门还必须在 touchRecalled **之前**：放在后面的话，一次越权检索照样会给出局的
+    // 行刷回温时钟，并在被动确认开启时 bump 它们的关联边——命中反馈落到了调用方
+    // 本不该看见的行上。
+    touchRecalled(visible);
+    return visible;
+  }
+
+  /**
+   * Search for memories by attribute key/value (v0.3.0 Phase 3).
+   * value 为空时由 store.findMemoriesByAttr 返回该 key 的全部有效记忆。
+   * @param {string} key
+   * @param {string | undefined} value
+   * @param {object} [options]
+   * @param {number} [options.topK=20]
+   * @param {object|null} [options.scope] 当前会话 scope，供 strictScope 闸门使用
+   * @returns {any[]}
+   */
+  function searchByAttr(key, value, { topK = 20, scope = null } = {}) {
+    if (!key) return [];
+    // value 可能为 undefined（attr:key 无 = 值）：归一为空串后交给
+    // store.findMemoriesByAttr —— 空 value 契约 = 返回该 attr_key 的全部
+    // 当前有效记忆（v0.3.0，store.js 已实现）。
+    const rows = store.findMemoriesByAttr(key, value ?? "");
+    // 同 searchByEntity：先过闸再截 topK，且闸门在 touchRecalled 之前。
+    const visible = gateByScope(rows, scope).slice(0, topK);
+    touchRecalled(visible);
+    return visible;
+  }
+
+  /**
+   * Semantic-aware memory search: keyword recall (store.search) plus optional
+   * vector recall + rerank. mode:
+   *   auto    (default) keyword first, vector fills remaining slots (legacy)
+   *   hybrid  vector first, keyword fills remaining slots
+   *   vector  vector only, falls back to keyword when unavailable
+   *   keyword text only, never touches the embedder
+   * useRerank runs the cross-encoder over the merged list when a reranker is
+   * installed; results carry an extra `score` when reranked.
+   */
+  // Weighted blend factor for hybrid search; exposed so callers can tune it.
+  const DEFAULT_HYBRID_WEIGHTS = { vector: 0.6, keyword: 0.4 };
+
+  // Cosine over two numeric vectors (shared by the search-time semantic dedup).
+  // Accepts typed arrays too — the store's cache holds Float32Array, and
+  // `Array.isArray` is false for typed arrays (would score everything 0).
+  function cosineVec(a, b) {
+    const isVec = (v) => Array.isArray(v) || (ArrayBuffer.isView(v) && !(v instanceof DataView));
+    if (!isVec(a) || !isVec(b) || a.length !== b.length || !a.length) return 0;
+    let dot = 0, na = 0, nb = 0;
+    for (let i = 0; i < a.length; i++) {
+      dot += a[i] * b[i];
+      na += a[i] * a[i];
+      nb += b[i] * b[i];
+    }
+    if (na === 0 || nb === 0) return 0;
+    return dot / (Math.sqrt(na) * Math.sqrt(nb));
+  }
+
+  // BM25 语料索引缓存（#617 审计 O2）。此前每次渲染都 store.list 500 行 + 重新
+  // tokenize 全语料，实测 4.318ms/次、每个 step 一次；其中 store.list 占 4.318ms
+  // 里的绝大部分，而语料在两次写入之间根本没变。
+  //
+  // 失效键用 mirror_state.generation，不另建计数器：改正文/可见性的写入（insert /
+  // update / remove / setArchived / setForgotten / setContent …）都已经 bump 它，
+  // 而 last_accessed_at 与 embedding 这两类写入**刻意不 bump**（store.js 里写明
+  // reads must not mark the mirror dirty）——这两类恰好也不改 title+content 语料，
+  // 正是我们要的失效粒度，不用额外判断。
+  //
+  // 水位每次从库里现读，不在进程内记本地计数：多宿主共用一个 memoryDir 是支持形态
+  // （busy_timeout + WAL），另一个进程写完 bump 的是库里的 generation，本地计数
+  // 永远看不见，只有现读才收得到。
+  //
+  // 只缓存索引、不缓存查询结果：search() 返回的是 {...row, score} 副本，索引里
+  // 留着的原始行不会被调用方改到；缓存结果则会跨 step 串味（同一 query 在不同
+  // 池子状态下该给不同答案）。
+  //
+  // #616（语料截断）：索引本身换成增量形态（createCorpusIndex），语料也换成全量。
+  // 此前语料固定 store.list({ limit: 500 })，排在 500 名之外的记忆永远进不了词法
+  // 召回——实测 8 个查询里 top10 与全量语料只有 1-4 条重合。截断不是慢，是静默的
+  // 召回缺失，所以这里必须全量；全量的代价靠增量维护摊掉：整份语料只在索引不存在
+  // 或需要对齐时取一次，之后每轮只对变过的行重新分词。
+  let bm25IndexCache = null; // { generation, index, seen } | null
+
+  /**
+   * BM25 third recall path (v0.5.0 1.1). Scores the query tokens against the
+   * live non-archived rows and returns the top `limit` hits with scores
+   * normalized to [0,1]. Failures degrade to [] — BM25 is a recall booster,
+   * never a correctness gate.
+   */
+  function bm25Recall(q, limit) {
+    if (config?.bm25SearchEnabled === false) return [];
+    try {
+      const index = bm25CorpusIndex();
+      if (!index) return [];
+      const hits = index.search(q, { limit });
+      if (!hits.length) return [];
+      // 索引只留 id + 频次（省掉整行常驻内存），命中后按 id 回表补全：融合层与
+      // 注入渲染都要完整字段（fuseRecall 直接把行塞进结果集）。
+      const byId = new Map();
+      for (const row of store.listByIdsForInject(hits.map((h) => h.id))) byId.set(row.id, row);
+      const out = [];
+      for (const hit of hits) {
+        const row = byId.get(hit.id);
+        // 索引与回表之间可能有并发写入（另一个宿主进程归档/遗忘该行），
+        // 取不到或已不可见的命中直接丢弃，不拿它冒充结果。
+        if (!row || row.archived || row.forgotten) continue;
+        out.push({ ...row, score: hit.score });
+      }
+      return out;
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * 取（必要时重建）BM25 语料索引。水位读不到时退化成每次重建而不是报错：这条
+   * 通路是 recall booster，读不到 mirror_state 只该慢一点，不该让词法召回整批消失。
+   */
+  function bm25CorpusIndex() {
+    let generation = null;
+    try {
+      generation = store.getMirrorState().generation;
+    } catch { /* 水位不可读：本次退回重建，且不写缓存 */ }
+    if (bm25IndexCache && generation !== null && bm25IndexCache.generation === generation) {
+      return bm25IndexCache.index;
+    }
+    const docs = store.listBm25Corpus();
+    if (!docs.length) {
+      bm25IndexCache = null;
+      return null;
+    }
+    const index = bm25IndexCache ? bm25IndexCache.index : createCorpusIndex();
+    const seen = bm25IndexCache ? bm25IndexCache.seen : new Map();
+    // 增量维护：只对 updated_at 变过（或新出现）的行重新分词，语料里已经不存在的
+    // id 从索引移除。删除不会在行上留痕（行都没了），所以判据是「本轮全量 id 集合」
+    // 减去「索引里还留着的 id」——这也是必须每轮取一次全量语料的原因，省钱的空间
+    // 在分词与建索引，不在取数。
+    const alive = new Set();
+    for (const doc of docs) {
+      alive.add(doc.id);
+      if (seen.get(doc.id) === doc.updated_at) continue;
+      index.upsert(doc);
+      seen.set(doc.id, doc.updated_at);
+    }
+    for (const id of [...seen.keys()]) {
+      if (alive.has(id)) continue;
+      index.remove(id);
+      seen.delete(id);
+    }
+    // 水位读不到时**不碰缓存**，保留上一份「已知有效 generation」的条目：读失败
+    // 若只是偶发（库锁、迁移窗口）而期间没有写入，恢复后水位与条目一致，直接命中；
+    // 期间真有写入，水位已经变了，下一轮自然重建。反过来把 null 当键存进去则是纯
+    // 噪声——那样的条目永远命不中，还把有效的那份挤掉了。
+    if (generation !== null) bm25IndexCache = { generation, index, seen };
+    return index;
+  }
+
+  // #619（规则池截断）：注入候选池的排序键缓存。与 bm25IndexCache 同一套纪律——
+  // 失效键用 mirror_state.generation（读到就用，读不到就现扫一次且不写缓存），
+  // 只缓存「行 + 排序键」、不缓存过滤与排序结果：injectTypes、threshold、
+  // codingKeywords 都是每次调用现读的配置，缓存结果会串味。
+  //
+  // heat 是这套缓存唯一的例外：heatOf 读 last_accessed_at，而 touchLastAccess
+  // 刻意不 bump generation（#617 同一纪律），于是缓存会让热度停在上一轮。所以
+  // 那两个开关同时开时绕开缓存，宁可每轮多扫一次 200ms，也不让热度失真。
+  let injectPoolCache = null; // { generation, rows } | null
+
+  function injectPoolRows() {
+    const heatSensitive = config?.heatEnabled === true && config?.injectHeatEnabled === true;
+    let generation = null;
+    if (!heatSensitive) {
+      try {
+        generation = store.getMirrorState().generation;
+      } catch {
+        generation = null;
+      }
+      if (injectPoolCache && generation !== null && injectPoolCache.generation === generation) {
+        return injectPoolCache.rows;
+      }
+    }
+    const rows = store.listInjectPool();
+    // 水位读不到时不碰缓存，理由同 bm25CorpusIndex：那样的条目永远命不中，还会
+    // 把有效的那份挤掉。
+    if (generation !== null) injectPoolCache = { generation, rows };
+    return rows;
+  }
+
+  /**
+   * Graph fourth recall path (issue #219 → #24 块1 锚定层). When the query text
+   * mentions a known entity name, memories linked to that entity (attrs +
+   * relations) join the fusion pool as a confirm/backfill signal — same standing
+   * as BM25, never dominating the semantic ranking. Tier scores: attr-linked
+   * 1.0 (direct evidence, same source searchByEntity trusts) > relation edge
+   * 0.9. Archived/forgotten rows never participate. Failures degrade to [] —
+   * a recall booster, never a correctness gate (same contract as bm25Recall).
+   *
+   * #24 升级（graphAnchoringEnabled）：命中实体作为锚定种子，沿 entity_relations
+   * 级联扩散邻居（默认深度 2），邻居挂联的记忆以 hop 配额权重参与——把「关系是
+   * 用出来的」延伸成检索信号：查询命中的不只有直接挂联，还有跳跃可达的活跃子图。
+   * 邻居权重 = HOP_QUOTA[hop] × linked tier（attr 1.0 / relation 0.9），仍低于
+   * 直达种子的满权，绝不喧宾夺主。
+   *
+   * #24 块1 补充（三路起点接线）：前半段只喂了 exact 一路，Tag 桥接与向量两路
+   * 能力在 anchoring.js 里却从未被调用。现补齐——
+   *   · exact：查询里出现实体名（布尔 1.0）；
+   *   · tag  ：查询词命中某条记忆的 tag，该记忆挂联的实体即种子（计数级别 0.4）;
+   *   · vector：查询向量近邻的记忆挂联的实体（cos 走 min-max，连续通路）。
+   * 三路在累加前各按自己的尺度归一化（离散级别 vs min-max），混加不会让高频
+   * Tag 淹没强向量命中。两路都是弱信号入口：任一路为空就少一路，全空则
+   * anchorSeeds 返回空、整个图轴让位（与加这两路之前的行为一致）。
+   * 三者共用 graphAnchoringEnabled 一个闸：默认关时仍是逐字节的 #219 单跳轴。
+   */
+  function entityRecall(q, limit, { queryVector = null } = {}) {
+    if (config?.entityRecallEnabled !== true) return [];
+    try {
+      const entities = store.findEntitiesMentionedIn(q);
+      // Tag 桥接与向量两路只服务锚定层：关锚定时不查（少两次库读，也守住
+      // 「关档行为逐字节不变」的承诺——见下方 if 分支）。
+      const anchoring = config?.graphAnchoringEnabled === true;
+      const tagEntities = anchoring && typeof store.findEntitiesByTags === "function"
+        ? (() => { try { return store.findEntitiesByTags(q); } catch { return []; } })()
+        : [];
+      // 早退只在**三路全无来源**时才成立。向量路的存在感恰恰在查询里没有实体名
+      // 的时候最大（「数据库迁移」说不出任何实体），若仍以「名字没命中」早退，
+      // 第二、三路就永远等不到自己被调用——接上了也等于没接。
+      const canVector = anchoring && Array.isArray(queryVector) && queryVector.length > 0 && !!vectorIndex;
+      if (!entities.length && !tagEntities.length && !canVector) return [];
+      // 关闭锚定级联=逐字节复用 #219 单跳轴：种子裁剪/重排/截断全是 #24 新增的
+      // 行为，默认关时一条都不许漏进旧路径（graphSeedCap 也只在开启后生效——
+      // 无论 cap 调多小，关档时命中实体仍全量挂联）。
+      if (!anchoring) {
+        const linked = store.getLinkedMemoryIds(entities.map((e) => e.id));
+        if (!linked.size) return [];
+        const hits = [];
+        for (const [id, tier] of linked) {
+          const row = store.getById(id);
+          if (!row || row.archived || row.forgotten) continue;
+          hits.push({ ...row, score: tier === "attr" ? 1.0 : 0.9, source: "entity" });
+          if (hits.length >= limit * 2) break;
+        }
+        return hits;
+      }
+      // 三路激活信号，各自先归一化再累加（尺度不同，混加会让高频通路淹没强相关）。
+      const paths = [];
+      // 第一路：精确名（布尔通路——命名实体逻辑上是离散匹配，不参与 min-max）。
+      if (entities.length) {
+        paths.push(normalizePath(entities.map((e) => e.id), { path: "exact" }));
+      }
+      // 第二路：Tag 桥接（tag 共现，离散级别 0.4——比精确名弱、比子串强）。
+      if (tagEntities.length) {
+        paths.push(normalizePath(tagEntities.map((e) => e.id), { path: "tag" }));
+      }
+      // 第三路：向量（连续通路，cos 相似度走 min-max）。记忆 → 挂联实体反查，
+      // 同一实体被多条近邻记忆挂联时取最高分（一条更近的记忆就够证明相关）。
+      if (Array.isArray(queryVector) && queryVector.length && vectorIndex) {
+        try {
+          const near = vectorIndex.search(queryVector, { limit: limit * 2, threshold: 0 });
+          const bestOf = new Map();
+          for (const m of near) {
+            const score = m?.score ?? 0;
+            if (!(score > 0)) continue;
+            for (const eid of store.entityIdsForMemories([m.id])) {
+              if (!(bestOf.get(eid) >= score)) bestOf.set(eid, score);
+            }
+          }
+          if (bestOf.size) {
+            paths.push(normalizePath(
+              [...bestOf.entries()].map(([id, score]) => ({ id, score })),
+              { path: "vector", continuous: true }
+            ));
+          }
+        } catch { /* 向量路失败只是少一路，不拖垮整条图轴 */ }
+      }
+      if (!paths.length) return [];
+      // 激活分为 0 的种子不算种子：min-max 会把**连续通路里最弱的那条**压成 0，
+      // 可下游给种子挂联记忆的是固定满权 tier（1.0/0.9），不看种子自己的分数。
+      // 留着 0 分种子，等于让「这一路里最不像的那条」以最强的方式把记忆拉进池。
+      // 零分项在 anchorSeeds 里排最后，所以先取 cap 再滤掉不会浪费名额。
+      const seeds = anchorSeeds({ paths, cap: config?.graphSeedCap ?? 12 }).filter((s) => s.score > 0);
+      if (!seeds.length) return [];
+      // 0-hop 直达：挂联记忆按 tier 定分（attr 1.0 / relation 0.9）——与 #219
+      // 单跳轴同分。MAX 语义：同一条记忆被多实体挂联时保留最高分。
+      const scored = new Map();
+      const push = (memId, score) => {
+        if (scored.has(memId) && scored.get(memId) >= score) return;
+        const row = store.getById(memId);
+        if (!row || row.archived || row.forgotten) return;
+        scored.set(memId, score);
+      };
+      const seedLinked = store.getLinkedMemoryIds(seeds.map((s) => s.id));
+      for (const [memId, tier] of seedLinked) {
+        push(memId, tier === "attr" ? 1.0 : 0.9);
+      }
+      // 级联：沿 entity_relations 走 BFS，邻居挂联的记忆以 hop 配额权重补位——
+      // 不覆盖种子直达分（MAX 语义保证），只填「种子里没有但邻居可达」的槽。
+      const seedIds = seeds.map((s) => s.id);
+      const adjacency = store.getEntityNeighbors(seedIds);
+      const depths = cascadeDepths({
+        seeds,
+        // 逐节点懒取邻居：初次查询只带种子那一层的邻接，BFS 走到 1-hop 节点时
+        // 必须按需再拉一层，否则 >1 跳永远拿到空邻居、graphCascadeDepth≥2 形同
+        // 虚设。节点数随图度数增长，热路径上以 graphCascadeDepth≤3 为天然上界，
+        // 真遇到大图再考虑查询配额。
+        adjacencyOf: (id) => {
+          if (!adjacency.has(id)) adjacency.set(id, store.getEntityNeighbors([id]).get(id) ?? []);
+          return adjacency.get(id);
+        },
+        maxDepth: config?.graphCascadeDepth ?? 2
+      });
+      let neighborsSeen = 0;
+      const neighborCap = (config?.graphSeedCap ?? 12) * HOP_QUOTA[1]; // 1-hop 配额即为邻居总量上界
+      for (const [nid, hop] of depths) {
+        if (hop < 1) continue;
+        if (neighborsSeen >= Math.max(1, Math.floor(neighborCap))) break;
+        neighborsSeen++;
+        const neighborLinked = store.getLinkedMemoryIds([nid]);
+        for (const [memId, tier] of neighborLinked) {
+          const tierW = tier === "attr" ? 1.0 : 0.9;
+          push(memId, HOP_QUOTA[Math.min(hop, 3)] * tierW);
+        }
+      }
+      const hits = [...scored.entries()]
+        .map(([id, score]) => {
+          const row = store.getById(id);
+          return { ...row, score, source: "entity" };
+        })
+        .sort((a, b) => b.score - a.score || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+      return hits.slice(0, limit * 2);
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Search-time semantic dedup (v0.5.0 2.3): greedy pass dropping candidates
+   * whose embedding similarity to an already-kept row exceeds the threshold.
+   * Rows without a stored embedding are always kept (no signal = no drop).
+   */
+  function semanticDeduplicate(candidates) {
+    // Opt-in aggressive mode (default off): collapsing near-duplicates can
+    // drop legitimately distinct rows on small embedding models, so it ships
+    // behind searchSemanticDedup=true.
+    if (config?.searchSemanticDedup !== true || candidates.length < 2) return candidates;
+    const threshold = config?.searchSemanticDedupThreshold ?? 0.95;
+    try {
+      const vecs = store.getEmbeddings(candidates.map((c) => c.id));
+      if (vecs.size < 2) return candidates;
+      const kept = [];
+      for (const c of candidates) {
+        const v = vecs.get(c.id);
+        if (!v) { kept.push(c); continue; }
+        const dup = kept.some((k) => {
+          const kv = vecs.get(k.id);
+          return kv && cosineVec(v, kv) > threshold;
+        });
+        if (!dup) kept.push(c);
+      }
+      return kept;
+    } catch {
+      return candidates;
+    }
+  }
+
+  /**
+   * Give a keyword-hit row a relevance score in [0,1]: title hits score
+   * higher than content hits, then scaled by importance (1-5). This lets
+   * keyword results participate in weighted hybrid blends.
+   */
+  function scoreKeyword(row, q) {
+    const ql = q.toLowerCase();
+    const title = (row.title ?? "").toLowerCase();
+    const content = (row.content ?? "").toLowerCase();
+    const titleHit = title.includes(ql);
+    const base = titleHit ? 1 : content.includes(ql) ? 0.6 : 0.3;
+    return base * (0.5 + (row.importance ?? 3) / 10);
+  }
+
+  /**
+   * Recall touch (v0.4.0 sleep; v0.7.0 heat gating): any memory surfaced by
+   * recall or auto-injection gets its last_accessed_at bumped, so the "unrecalled
+   * N days → demote/archive" tiering counts real access — and the heat clock
+   * resets (heat ref = last_accessed_at). Best-effort and gated on
+   * config.heatEnabled — when heat is off this is a complete no-op (no writes
+   * on the hot recall path). A touch failure must never break search/inject.
+   */
+  function touchRecalled(memories) {
+    if (!Array.isArray(memories) || memories.length === 0) return;
+    // heatEnabled=false 只关 touchLastAccess 的热度消费（既有语义），但 #24
+    // 块4 被动确认独立于 heat——graphPassiveConfirm 开时照常 bump 关联边。
+    // graphWeightEnabled 是块2 立的演化总闸：它关着时任何触达都不该改边权，被动
+    // 确认只是它底下的一个通道（后续块还会接别的确认通道），两键同开才 bump，
+    // 否则单开通道键就等于绕过「演化默认关」的承诺。
+    // 两条路径都 best-effort，失败绝不阻断检索/注入。
+    const heatOn = config?.heatEnabled !== false;
+    const passive = config?.graphPassiveConfirm === true && config?.graphWeightEnabled === true;
+    const delta = config?.graphWeightDelta ?? 0.1;
+    for (const m of memories) {
+      if (!m?.id) continue;
+      try {
+        if (heatOn) store.touchLastAccess(m.id);
+        if (passive) {
+          // 正常触达=对该记忆挂联关系边的被动确认；bump 只加不减封顶 1.0，
+          // 自激回路由封顶天然遏制。「仅异常路径暴露给用户复核」的确认记录
+          // 侧在此落地，复核 UI 留后续块。
+          for (const rel of store.getRelationsByMemory(m.id)) {
+            store.bumpRelationWeight(rel.id, delta);
+          }
+        }
+      } catch { /* touch is best effort */ }
+    }
+  }
+
+  /**
+   * Recall fusion (plan #1). Turns the three ranked signal lists (keyword,
+   * vector, BM25) into a single merged list. Three recipes, selected by
+   * config.recallFusion:
+   *  - blend (default): legacy behavior — weighted sum for vector/hybrid, union
+   *    backfill for auto. Byte-identical to pre-fusion code, so enabling the
+   *    config never regresses anybody.
+   *  - rrf: Reciprocal Rank Fusion — Σ 1/(k + rank + 1) over each list a row
+   *    appears in. Rank-based, so the unit mismatch (raw cosine vs keyword
+   *    score vs normalized IDF) is irrelevant.
+   *  - minmax: min-max normalize each source list's scores to [0,1] then take
+   *    the weighted sum — a scale-aware version of `blend`.
+   * Returns { merged, signals }, where signals is Map<id, {keyword, vector,
+   * bm25}> so searchMemories can decorate rows when signalTransparency is on.
+   */
+  function fuseRecall({ keyword, vector, bm25, entity, lim, mode, wv, wk, wb, we, supersededIds = null }) {
+    const recipe = config?.recallFusion ?? "blend";
+
+    // Per-source scores are recorded for every recipe so signalTransparency
+    // works regardless of how the ranking was produced.
+    const signals = new Map();
+    const addSig = (id, field, sc) => {
+      const cur = signals.get(id) ?? {};
+      cur[field] = sc;
+      signals.set(id, cur);
+    };
+    for (const m of keyword) addSig(m.id, "keyword", m.score ?? 0);
+    for (const m of vector) addSig(m.id, "vector", m.score ?? 0);
+    for (const m of bm25) addSig(m.id, "bm25", m.score ?? 0);
+    for (const m of entity) addSig(m.id, "entity", m.score ?? 0);
+
+    const vectorIds = new Set(vector.map((m) => m.id));
+    const keywordIds = new Set(keyword.map((m) => m.id));
+
+    // Mode contract (aligns rrf/minmax with blend): keyword-only searches must
+    // stay keyword-only regardless of recipe, so enabling an opt-in recipe can
+    // never pull vector/BM25 rows into a mode="keyword" request. This mirrors
+    // the blend branch's `mode === "keyword"` short-circuit (byte-for-byte).
+    if (mode === "keyword") {
+      return { merged: keyword.slice(0, lim), signals };
+    }
+
+    let merged;
+    if (recipe === "rrf") {
+      // Rank-based: only the position of a row inside each surviving source
+      // list matters, so no cross-signal scale calibration is needed.
+      const k = 60; // standard RRF constant (plan #1 documents k=60)
+      const rows = new Map();
+      const addList = (list) => list.forEach((m, idx) => {
+        const s = 1 / (k + idx + 1);
+        const cur = rows.get(m.id);
+        if (cur) cur.score += s;
+        else rows.set(m.id, { ...m, score: s });
+      });
+      addList(keyword);
+      addList(vector);
+      addList(bm25);
+      addList(entity);
+      merged = [...rows.values()].sort((a, b) => (b.score ?? 0) - (a.score ?? 0)).slice(0, lim);
+    } else if (recipe === "minmax") {
+      // Scale-aware weighted sum: each source list is min-max normalized to
+      // [0,1] before blending, so raw cosine and keyword score live on the
+      // same footing.
+      const norm = (list) => {
+        if (!list.length) return new Map();
+        let min = Infinity, max = -Infinity;
+        for (const m of list) { const s = m.score ?? 0; if (s < min) min = s; if (s > max) max = s; }
+        const range = max - min;
+        const out = new Map();
+        for (const m of list) out.set(m.id, range > 0 ? ((m.score ?? 0) - min) / range : 0.5);
+        return out;
+      };
+      const kw = norm(keyword), ve = norm(vector), bm = norm(bm25), en = norm(entity);
+      const rows = new Map();
+      const seed = (m) => { if (!rows.has(m.id)) rows.set(m.id, { ...m, score: 0 }); };
+      for (const m of keyword) seed(m);
+      for (const m of vector) seed(m);
+      for (const m of bm25) seed(m);
+      for (const m of entity) seed(m);
+      for (const [id, row] of rows) {
+        const k = kw.get(id) ?? 0;
+        const v = ve.get(id) ?? 0;
+        const b = bm.get(id) ?? 0;
+        const e = en.get(id) ?? 0;
+        row.score = v * wv + k * wk + b * wb + e * we;
+      }
+      merged = [...rows.values()].sort((a, b) => (b.score ?? 0) - (a.score ?? 0)).slice(0, lim);
+    } else {
+      // blend — the pre-existing per-mode behavior, extracted verbatim.
+      if (mode === "keyword") {
+        merged = keyword;
+      } else if (mode === "vector" || mode === "hybrid") {
+        const byId = new Map();
+        for (const m of vector) {
+          const rec = byId.get(m.id);
+          byId.set(m.id, rec ? { ...rec, score: Math.max(rec.score ?? 0, m.score ?? 0) } : m);
+        }
+        for (const m of keyword) {
+          const rec = byId.get(m.id);
+          if (rec) {
+            byId.set(m.id, { ...rec, score: (rec.score ?? 0) * wv + (m.score ?? 0) * wk });
+          } else {
+            byId.set(m.id, m);
+          }
+        }
+        for (const m of bm25) {
+          const rec = byId.get(m.id);
+          if (rec) {
+            if (keywordIds.has(m.id)) continue;
+            byId.set(m.id, { ...rec, score: (rec.score ?? 0) + wb * (m.score ?? 0) });
+          } else {
+            byId.set(m.id, { ...m, score: wb * (m.score ?? 0) });
+          }
+        }
+        // Entity axis (#219): same confirm/backfill contract as BM25 —
+        // seen rows get a weighted bonus, unseen ids backfill at we·score.
+        for (const m of entity) {
+          const rec = byId.get(m.id);
+          if (rec) {
+            byId.set(m.id, { ...rec, score: (rec.score ?? 0) + we * (m.score ?? 0) });
+          } else {
+            byId.set(m.id, { ...m, score: we * (m.score ?? 0) });
+          }
+        }
+        const ranked = [...byId.values()].sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+        merged = ranked.slice(0, lim);
+        if (merged.length < lim && !merged.length) {
+          merged = keyword.slice(0, lim);
+        }
+      } else {
+        // auto: keyword leads, vector + BM25 + entity fill remaining slots.
+        merged = keyword.slice(0, lim);
+        const seen = new Set(merged.map((m) => m.id));
+        for (const m of vector) {
+          if (merged.length >= lim) break;
+          if (!seen.has(m.id)) { seen.add(m.id); merged.push(m); }
+        }
+        for (const m of bm25) {
+          if (merged.length >= lim) break;
+          if (!seen.has(m.id)) { seen.add(m.id); merged.push(m); }
+        }
+        for (const m of entity) {
+          if (merged.length >= lim) break;
+          if (!seen.has(m.id)) { seen.add(m.id); merged.push(m); }
+        }
+      }
+    }
+
+    // #617 第 3 条：这里原本还有一段「recipe !== "blend" 且 mode === "auto" 时用
+    // keyword.slice(0,lim) 覆盖 merged」的收尾，注释自称是「保留 blend 的 auto
+    // 契约」。但 rrf/minmax 的全部意义就是跨源排序——把它们算出来的序整个换成
+    // 「关键词命中先上」，等于配置了 rrf 却在 auto 下拿到 keyword 的顺序，配方
+    // 白选。auto 的「关键词领位」语义只属于 blend（它在 :906-922 里自己实现了，
+    // 且带 seen 去重与容量控制），不该由收尾段替别的配方代劳。删掉后 rrf/minmax
+    // 的 auto 排序就是它们各自算出来的排序。
+
+    // #641（T3 取代链的检索侧，beta 第三阶段）：已被取代的行整体降权后重排——
+    // 它仍是「曾经为真」的可追溯历史，显式搜索照样能找到，但不该与取代它的
+    // 那行竞争注入名次。乘 0.5 的语义是「同卷必排继任者之后」，不是隐藏；
+    // 取代链只会在 enforce 档下落笔，链没落过时本段与从前逐字节一致。
+    // keyword 短路在前面已 return——那是人的显式检索动作，保留完整可见性与
+    // 原始排序。已知边界：各分支已按 lim 截断，这里只重排不再回填——极端
+    // 情况下一个刚挤进末位的被取代行会占住名额，但它被压到继任者之后，按
+    // 名次消费的注入实际效果等价；把降权挪进各分支截断前是显式重构，等
+    // 召回基准跑过一轮再决定值不值。行形状随来源不一（向量源可能是瘦行），
+    // 所以按 id 集合判定而不是读行上的 superseded_by。
+    if (supersededIds?.size) {
+      merged = merged
+        .map((m) => (supersededIds.has(m.id) ? { ...m, score: (m.score ?? 0) * 0.5 } : m))
+        .sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+    }
+
+    return { merged, signals };
+  }
+
+  /**
+   * Search memories for a query. Merges up to four recall sources (keyword,
+   * vector, BM25, and — when config.entityRecallEnabled is on — entity-linked
+   * memories whose entity names the query mentions; see fuseRecall) according
+   * to config.recallFusion (blend/rrf/minmax — see
+   * fuseRecall), then optionally decorates rows with per-source signals
+   * (config.signalTransparency), applies semantic dedup (non-keyword modes),
+   * reranking, and epistemic trust re-weighting, and finally hands the merged
+   * list to the recall-layer recorder.
+   *
+   * options:
+   *   mode          — 'auto' (default) | 'keyword' | 'vector' | 'hybrid'
+   *   topK          — max rows (default 20)
+   *   threshold     — explicit vector score floor (overrides adaptive)
+   *   useRerank     — apply the reranker if available (default true)
+   *   recordRecall  — write a recall_runs audit row (default from config)
+   *
+   * Returns an array of memory rows { id, title, content, score, source, ... },
+   * with `signals` added when config.signalTransparency is on. Never throws:
+   * a vector/rerank failure degrades to keyword results.
+   */
+  async function searchMemories(query, options = {}) {
+    const {
+      mode = "auto",
+      topK = 20,
+      threshold,
+      useRerank = true,
+      // v0.8.0 A2（issue #17）：当前会话 scope（工具层从 exec 解析后传入）与
+      // occurred_at 时间窗。两者都只在显式传入时生效，既有调用方（注入/梦/评测）
+      // 不传 → 行为与 A2 前一致。
+      scope = null,
+      occurredFrom = null,
+      occurredTo = null,
+      recordRecall = options.recordRecall ?? (config?.recallRecordDefault ?? true)
+    } = options;
+    const q = String(query ?? "").trim();
+    if (!q) return [];
+
+    // entity:/attr: 前缀路由（v0.3.0 Phase 3）。entitySearchEnabled 关闭时走原逻辑。
+    if (config?.entitySearchEnabled) {
+      if (q.startsWith("entity:")) {
+        return searchByEntity(q.slice(7).trim(), options);
+      }
+      if (q.startsWith("attr:")) {
+        const [key, value] = q.slice(5).split("=");
+        return searchByAttr(key, value, options);
+      }
+    }
+
+    const lim = topK > 0 ? topK : 20;
+
+    // Keyword results, decorated with a score so they can be weight-blended
+    // with vector results and reported uniformly. source tracks where each
+    // candidate came from for the recall layer receipt.
+    const rawKeyword = store.search(q, { limit: lim });
+    const keyword = rawKeyword.map((m) => ({ ...m, score: scoreKeyword(m, q), source: "keyword" }));
+    const wantVector = mode === "vector" || mode === "hybrid" || (mode === "auto" && !!embedder);
+    let vector = [];
+    // #24 块1：查询向量在这里算出来，图轴的向量起点要用同一份——再嵌一次既
+    // 多一次模型调用，也可能拿到不同的向量（本地模型带随机性时）。
+    let vectorQuery = null;
+    if (wantVector && embedder) {
+      try {
+        // Legacy embedders expose embed(query); local ones expose embedSingle.
+        const embedSingle = typeof embedder.embedSingle === "function"
+          ? embedder.embedSingle.bind(embedder)
+          : embedder.embed.bind(embedder);
+        const qv = await embedSingle(q);
+        if (qv?.length) {
+          vectorQuery = qv;
+          // Adaptive threshold (v0.5.0 1.2): the fetch runs at the loosest
+          // branch floor so the head-gap rule can still re-admit the tail;
+          // the final cutoff is computed against the fetched score
+          // distribution.
+          //
+          // #713: an explicit `threshold` (including an explicit 0 = no
+          // cutoff) always wins; adaptive off with no explicit threshold falls
+          // back to the configured fixed cutoff, never to 0. Falling back to 0
+          // made "turn adaptive off" mean "drop the relevance floor", which
+          // contradicted both docs and vectorSearchThreshold — the key then had
+          // no consumer at all, so setting it did nothing. The internal
+          // full-scan paths (hot refresh, backfill) pass 0 explicitly and keep
+          // their no-cutoff behavior.
+          const adaptive = config?.adaptiveThresholdEnabled !== false;
+          const explicitThreshold = threshold === undefined ? null : threshold;
+          const fixedThreshold = explicitThreshold ?? (config?.vectorSearchThreshold ?? 0.65);
+          const fetchThreshold = adaptive && explicitThreshold === null
+            ? Math.min(0.5, adaptiveThreshold(q))
+            : fixedThreshold;
+          const search = vectorIndex
+            ? vectorIndex.search(qv, { limit: lim * 2, threshold: fetchThreshold })
+            : store.searchVector(qv, { limit: lim * 2, threshold: fetchThreshold });
+          const finalThreshold = adaptive && explicitThreshold === null
+            ? adaptiveThreshold(q, search)
+            : fixedThreshold;
+          vector = search
+            .filter((m) => (m.score ?? 1) >= finalThreshold)
+            .map((m) => ({ ...m, vector: true, source: "vector" }));
+        }
+      } catch { /* vector unavailable: keep keyword results */ }
+    }
+
+    // BM25 third path (v0.5.0 1.1): IDF-weighted token overlap recalls rows
+    // whose query terms are scattered — the gap LIKE substring matching
+    // cannot close. Scores are already normalized to [0,1].
+    const bm25 = bm25Recall(q, lim).map((m) => ({ ...m, source: "bm25" }));
+    // Loose blend weight: BM25 confirms and backfills, never dominates the
+    // semantic signal. Same-memory overlap boosts, unseen ids backfill.
+    const wb = 0.3;
+
+    // Graph fourth path (issue #219, opt-in entityRecallEnabled): query-
+    // mentioned entities pull their linked memories into the pool. Keyword
+    // mode stays text-only per the mode contract, so the axis is skipped
+    // there even when enabled.
+    const entity = mode === "keyword" ? [] : entityRecall(q, lim, { queryVector: vectorQuery });
+    // Entity axis shares BM25's backfill weight (we = wb) until #217 recall
+    // data justifies a distinct entity weight.
+
+    // Hybrid blending weights from config when provided.
+    const wv = config?.hybridSearchVectorWeight ?? DEFAULT_HYBRID_WEIGHTS.vector;
+    const wk = config?.hybridSearchKeywordWeight ?? DEFAULT_HYBRID_WEIGHTS.keyword;
+
+    // T3 降权的判定集：一次部分索引查询拿全部已取代行 id（通常为空或个位数）。
+    const supersededIds = new Set(store.supersededIds());
+    const { merged: fusedMerged, signals } = fuseRecall({ keyword, vector, bm25, entity, lim, mode, wv, wk, wb, we: wb, supersededIds });
+    let merged = fusedMerged;
+    // v0.8.0 A3（issue #17）：strictScope 硬过滤——他 scope 的候选直接出局
+    // （区别于 A2 的降权保留可见）；未标注行与命中行保留。strict 与 A2 加权
+    // 叠加：过滤后剩下的命中行仍吃加成。scope 未传（flag 关）或完全解析不到
+    // 时跳过——identity 为空的对象（{null,null}）按 fail-closed 过滤。
+    merged = gateByScope(merged, scope);
+    // v0.8.0 A2：occurred_at 时间过滤——在融合池上先滤再 dedup/slice，rerank
+    // 只看窗内候选，topK 槽位不被窗外行占用。
+    const occurredBounds = updatedAtBounds(occurredFrom, occurredTo);
+    if (occurredBounds.from || occurredBounds.to) {
+      merged = merged.filter((m) => inOccurredBounds(m, occurredBounds));
+    }
+    // Signal transparency (#2): decorate each returned row with its per-source
+    // scores and the final fused score. Purely additive — never changes rank.
+    if (config?.signalTransparency === true) {
+      merged = merged.map((m) => ({ ...m, signals: { ...(signals.get(m.id) ?? {}), final: m.score ?? 0 } }));
+    }
+
+    // Search-time semantic dedup (v0.5.0 2.3): near-duplicate rows are
+    // dropped before the reranker sees them, so topK slots carry distinct
+    // information instead of the same memory twice. Keyword mode is exempt —
+    // it is the documented text-only path and must not be altered by
+    // embedding state.
+    merged = mode === "keyword" ? merged : semanticDeduplicate(merged);
+    merged = merged.slice(0, lim);
+    let result = useRerank && reranker && merged.length
+      ? await rerankCandidates(q, merged, lim)
+      : merged;
+    // Epistemic trust (v0.4.5): opt-in re-weighting of the final candidate
+    // scores by source credibility. When off (default) `result` is returned
+    // untouched — exactly the legacy behavior.
+    if (config.trustEpistemicWeighting === true) {
+      result = result
+        .map((m) => ({
+          ...m,
+          score: (m.score ?? 0) * (EPISTEMIC_WEIGHTS[m.epistemic_status] ?? 1)
+        }))
+        .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
+        .slice(0, lim);
+    }
+
+    // v0.8.0 A2（issue #17）：scope 检索加权——两维都无法确立 foreign 的候选
+    // （命中/未标注/当前侧解析不到）加成，确立 foreign 的候选降权但保留可见
+    // （硬过滤是 A3 strictScope）；未标注行与命中行同列吃 BOOST、不被压制。
+    // flag 关或调用方未传 scope 时不动分，排序与 A2 前逐字节一致。与
+    // epistemic 加权同款收尾：乘分 → 降序 → 截 topK。
+    if (config.scopeEnabled === true && scope && (scope.agent_scope || scope.workspace_scope)) {
+      result = result
+        .map((m) => ({ ...m, score: (m.score ?? 0) * scopeMultiplier(m, scope) }))
+        .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
+        .slice(0, lim);
+    }
+
+    // Recall layer receipt: with recordRecall on, hand the actual merged
+    // candidate list (id/title/content/score/source) to the injected recorder
+    // before returning, making the retrieval scene replayable — the sibling of
+    // the dream judgment-layer audit trail. Recorder failures must never break
+    // the search itself.
+    if (recordRecall && recallRecorder) {
+      try {
+        recallRecorder({
+          query: q,
+          mode,
+          topK: lim,
+          threshold: threshold ?? null,
+          // Per-source 信号随回执落盘（fuseRecall 本就无条件计算，此前只服务
+          // signalTransparency 展示）：复用侧查询画像（query 型 → 各路权重的
+          // 离线聚合，AssoMem arXiv 2510.10397 消融所示收益大头）需要这份原料。
+          // 纯加字段——recall_runs 无 schema 变更，旧行 candidates 缺该键照常读。
+          candidates: result.map((m) => ({
+            id: m.id,
+            title: m.title,
+            content: m.content,
+            score: m.score ?? null,
+            source: m.source ?? "keyword",
+            signals: signals.get(m.id) ?? {}
+          })),
+          createdAt: new Date().toISOString()
+        });
+      } catch { /* recall receipt is best effort */ }
+    }
+    // #713（续）：`_score` 报的是**真正参与 finalThreshold 比较的那一个余弦**
+    // ——这个分值来自 fuseRecall 无条件记下的 per-source 信号，不是 fetch
+    // 阶段的阈值常量，也不是融合后的混合分（RRF 的 0.25 与余弦的 0.5 是两把
+    // 尺子，混着报会让调阈值的人看错数）。纯新增字段：向量路没参与的行
+    // （keyword / bm25 回填）没有余弦可比，就不带这个键，旧调用方形状不变。
+    // 放在全部排序变换之后，绝不影响名次。
+    result = result.map((m) => {
+      const s = signals.get(m.id)?.vector;
+      return typeof s === "number" && Number.isFinite(s) ? { ...m, _score: s } : m;
+    });
+
+    // Bug4: cache the latest semantic recall so the sync injection path can
+    // reuse it when the injection query matches (no async embed available).
+    lastSemanticRecall = { query: q, items: result };
+    touchRecalled(result);
+    return result;
+  }
+
+  /**
+   * Retrieval evaluation (方案 B): run one search for `query`, compare the ids
+   * it actually returned against `expectedIds`, and return the computed
+   * metrics. When persistence is on (config.evalPersistTestResults, or an
+   * explicit `persist` override per call) the snapshot is written to the
+   * recall_evals table — a SEPARATE store from the recall_runs production audit,
+   * so test/eval data never inflates the production trail.
+   *
+   * options:
+   *   mode/topK/threshold/useRerank — passed through to searchMemories
+   *   evalType                      — label for the snapshot (default 'manual')
+   *   recordRecall                  — also write a recall_runs audit row for the
+   *                                   same scene and link it via recall_run_id
+   *                                   (default false: eval stays unlinked)
+   *   recallRunId                   — explicit link to an existing recall_runs id
+   *   persist                       — override the config gate for this call
+   *
+   * Returns { metrics, actualIds, expectedIds, recallRunId, persisted }.
+   * Never throws on persistence failures: a broken eval write must not break
+   * the retrieval quality measurement.
+   */
+  async function evaluateRetrieval(query, expectedIds, options = {}) {
+    const q = String(query ?? "").trim();
+    const expected = Array.isArray(expectedIds) ? expectedIds : [];
+    const {
+      mode = "auto",
+      topK = 20,
+      threshold,
+      useRerank = true,
+      evalType = "manual",
+      recordRecall = false,
+      recallRunId = null,
+      persist = config.evalPersistTestResults === true
+    } = options;
+    if (!q) {
+      const empty = computeRetrievalMetrics([], expected);
+      return { metrics: empty, actualIds: [], expectedIds: expected, recallRunId: null, persisted: false };
+    }
+
+    const rows = await searchMemories(q, { mode, topK, threshold, useRerank, recordRecall: false });
+    const actualIds = rows.map((m) => m.id);
+    const metrics = computeRetrievalMetrics(actualIds, expected);
+
+    // Optional recall_runs audit for the same scene; the eval row then links to
+    // it. Kept separate from the production recorder (which fires only on
+    // recordRecall=true inside searchMemories) — eval never double-records.
+    // An explicit recallRunId wins; recordRecall only mints a NEW audit run when
+    // the caller did not already link one (never clobber an existing link).
+    let runId = recallRunId ?? null;
+    if (recordRecall && runId === null) {
+      try {
+        const run = store.saveRecallRun({
+          query: q,
+          mode,
+          topK,
+          threshold: threshold ?? null,
+          candidates: rows.map((m) => ({
+            id: m.id,
+            title: m.title,
+            content: m.content,
+            score: m.score ?? null,
+            source: m.source ?? "keyword"
+          })),
+          created_at: new Date().toISOString()
+        });
+        runId = run.id;
+      } catch { /* non-fatal: the eval itself still succeeds */ }
+    }
+
+    let persisted = false;
+    if (persist) {
+      try {
+        store.saveRecallEval({
+          recall_run_id: runId,
+          query: q,
+          expected_ids: expected,
+          actual_ids: actualIds,
+          metrics,
+          eval_type: evalType,
+          created_at: new Date().toISOString()
+        });
+        persisted = true;
+      } catch { /* non-fatal: measurement survives a failed eval write */ }
+    }
+    return { metrics, actualIds, expectedIds: expected, recallRunId: runId, persisted };
+  }
+
+  /**
+   * Fire-and-forget write notification; errors are swallowed to keep write
+   * paths clean. The store mutation has already committed, so a throwing
+   * subscriber must not surface as a write failure. Archive/forget flags are
+   * state toggles, not content writes, so they never notify.
+   */
+  function notifyWrite() {
+    if (txDepth > 0) return; // deferred to the transaction's commit
+    if (onWrite) {
+      try { onWrite(); } catch { /* ignore */ }
+    }
+    if (dreamHook) {
+      try { dreamHook(); } catch { /* ignore */ }
+    }
+    if (sleepHook) {
+      try { sleepHook(); } catch { /* ignore */ }
+    }
+  }
+
+  /**
+   * Run several store mutations atomically (SQLite BEGIN/COMMIT/ROLLBACK) and
+   * fire the deferred side effects once against the committed state. A throwing
+   * body rolls the whole batch back — no partial writes, no diverged mirror.
+   * Errors propagate to the caller. NOTE: the commit path re-renders the mirror
+   * and notifies subscribers, but re-embedding is left to the caller (the dream
+   * flow re-embeds through maintainIndexAfterDream).
+   */
+  function transaction(fn) {
+    store.db.exec("BEGIN");
+    txDepth++;
+    // #372: 记住本层事务开始时的队列深度——回滚时截断回这里。本层（及更深的
+    // 嵌套层）入队的抽取随回滚一并丢弃，外层已提交未 drain 的条目不受牵连。
+    const baseline = pendingEntity.length;
+    // distill-tx-embed-gap: 嵌入队列用同一套基线机制，与实体抽取保持一致。
+    const embedBaseline = pendingEmbed.length;
+    let committed = false;
+    try {
+      const result = fn();
+      store.db.exec("COMMIT");
+      committed = true;
+      return result;
+    } catch (error) {
+      try { store.db.exec("ROLLBACK"); } catch { /* store may be closed */ }
+      // 回滚：丢弃本层入队的抽取请求，绝不对已回滚的行抽实体（CodeRabbit
+      // 复审抓出：仅靠 committed 门挡 drain 时，回滚条目会滞留队列、被下一个
+      // 成功事务误抽）。外层未提交的条目在 baseline 之前，原样保留。
+      pendingEntity.length = baseline;
+      // distill-tx-embed-gap: 同理，绝不给已回滚的行嵌向量。
+      pendingEmbed.length = embedBaseline;
+      throw error;
+    } finally {
+      txDepth--;
+      // Sync failures are surfaced, not swallowed (peer blocker 2): the mirror
+      // debt was already recorded by markMirrorDirty inside syncMirror, so a
+      // restart recovers — but the operator must see it now, not after restart.
+      const syncResult = syncMirror();
+      if (!syncResult?.success && !syncResult?.deferred) {
+        logger?.warn?.("mirror sync failed after transaction:", syncResult?.error);
+      }
+      notifyWrite();
+      // #372: 补跑事务内排队的实体抽取——只在 COMMIT 成功后（此时 txDepth 已归零，
+      // scheduleEntityExtraction 走正常触发路径）。嵌套事务的内层提交不 drain
+      // （txDepth 仍 >0 时 schedule 会重新入队，与 drain 形成自旋）——条目等最外层
+      // COMMIT 后统一补跑。
+      if (committed && txDepth === 0) drainPendingEntityExtraction();
+      // distill-tx-embed-gap: 补跑事务内排队的嵌入——同一套嵌套规则：内层提交
+      // 不 drain（txDepth 仍 >0 时 scheduleEmbed 会重新入队），等最外层 COMMIT
+      // 后统一补跑。放在 drainPendingEntityExtraction 之后无依赖，仅保持顺序。
+      if (committed && txDepth === 0) drainPendingEmbeds();
+    }
+  }
+
+  function drainPendingEntityExtraction() {
+    while (pendingEntity.length) {
+      scheduleEntityExtraction(pendingEntity.shift());
+    }
+  }
+
+  // distill-tx-embed-gap: drain 与 pendingEntity 同构。补跑走 scheduleEmbed 本体，
+  // 因此 embedder 未 ready / 无 schedule 接口等既有分流逻辑全部复用，不另写一路。
+  function drainPendingEmbeds() {
+    while (pendingEmbed.length) {
+      scheduleEmbed(pendingEmbed.shift());
+    }
+  }
+
+  /**
+   * Embed an arbitrary query text and return its vector (null on failure / no
+   * embedder). Used by the injector to prefetch the semantic-first recall
+   * vector for the current user message — the system-prompt render is
+   * synchronous, so the vector must be cached in advance (Bug4).
+   */
+  async function embedQuery(query) {
+    const q = String(query ?? "").trim();
+    if (!q || !embedder) return null;
+    try {
+      const embedSingle = typeof embedder.embedSingle === "function"
+        ? embedder.embedSingle.bind(embedder)
+        : embedder.embed.bind(embedder);
+      const vector = await embedSingle(q);
+      return Array.isArray(vector) && vector.length ? vector : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * 写入端同会话语义去重（Issue #127，opt-in，默认 off）：落库前把新条目与
+   * 「同会话 + 时间窗」内已落库的记忆比对，命中即并入既有条目，不再新造一行。
+   *
+   * 分层：title 档走零成本的标题归一化；vector 档复用已有 embedding 列做近邻，
+   * 新条目的向量由 embedder 现算（embedQuery），全程无 LLM 调用。embedder 不可用
+   * 或向量缺失一律返回 undefined 回落正常写入——去重是增强，绝不能成为写入依赖。
+   *
+   * 作用域刻意限定「同会话」：跨会话的同类事实仍交给 autoDream / sleep 的批量裁决。
+   * 比对逻辑与并入动作分别复用 cosineVec 与 saveWithDedupe 的 _mergeInto 分支。
+   *
+   * @returns {{action: "merged", memory: object, sim: number}|undefined} 命中则返回
+   *          并入目标与相似度；未命中（含任何异常）返回 undefined。
+   */
+  async function findSessionDuplicate(memory, { mode = "off", minSim = 0.92, windowHours = 24, source } = {}) {
+    if (mode === "off" || !source || !memory?.title) return undefined;
+    try {
+      const sinceMs = windowHours > 0 ? Date.now() - windowHours * 3600000 : 0;
+      const inWindow = (m) => {
+        if (sinceMs <= 0) return true;
+        const t = Date.parse(m.created_at ?? "");
+        return !Number.isFinite(t) || t >= sinceMs; // 时间戳损坏时不误杀
+      };
+      const candidates = store
+        .list({ type: memory.type, source, limit: 200 })
+        .filter((m) => !m.archived && inWindow(m));
+      if (!candidates.length) return undefined;
+
+      if (mode === "title") {
+        const norm = (s) => String(s ?? "").toLowerCase().replace(/[\s\p{P}]+/gu, "");
+        const key = norm(memory.title);
+        if (!key) return undefined;
+        const hit = candidates.find((m) => norm(m.title) === key);
+        return hit ? { action: "merged", memory: hit, sim: 1 } : undefined;
+      }
+      if (mode !== "vector") return undefined;
+
+      const vecs = store.getEmbeddings(candidates.map((m) => m.id));
+      if (!vecs.size) return undefined;
+      const probe = await embedQuery([memory.title, memory.content].filter(Boolean).join("\n"));
+      if (!probe) return undefined;
+      let best;
+      for (const m of candidates) {
+        const v = vecs.get(m.id);
+        if (!v) continue; // 无向量的既有行不参与比对（无信号 = 不判定）
+        const sim = cosineVec(probe, v);
+        if (sim >= minSim && (!best || sim > best.sim)) best = { action: "merged", memory: m, sim };
+      }
+      return best;
+    } catch {
+      return undefined; // 去重失败绝不阻塞写入
+    }
+  }
+
+  /**
+   * Save a memory, merging into an existing one when title matches within the same type.
+   *
+   * Bug5: a same-title merge no longer overwrites — the new content is appended
+   * under a timestamped `---` separator (`旧内容\n\n---\n[时间戳] 新内容`) and the
+   * previous content is archived into content_history (source: auto_merge, FIFO
+   * capped at 20). importance takes the max of both (capped at 5). Callers that
+   * truly replace a row (dream summary regeneration) pass `_overwrite: true` to
+   * overwrite directly while still archiving the old version (source: overwrite).
+   * mergeHumanEdits entry points pass `_humanEdited: true` — same direct
+   * overwrite semantics, source: human_override.
+   *
+   * Bug7 (memory quality filter): when config.memoryQualityFilter.enabled, the
+   * memory is scored after dedupe, before write:
+   *   score >= degradeThreshold        → stored normally (score persisted)
+   *   archiveThreshold <= score < 60   → persisted + ranked degraded
+   *   score < archiveThreshold         → archived + tagged low_quality (still
+   *                                      explicitly searchable via includeArchived)
+   * @returns {{action: "created"|"merged", memory: object}}
+   */
+  function saveWithDedupe(memory) {
+    // #230 写入权分离：document 行只能经 registerDocument 铸造（注册校验 +
+    // doc_path + evidence 三样俱全）。通用保存路径（memory_save 工具 / MCP /
+    // standalone API / bootstrap）一律拒绝——防止绕过注册校验造出无指针无
+    // 回链的伪 document 行。与 updateMemory 的同款守卫构成双保险。
+    if (memory?.type === "document") {
+      throw new Error("type 'document' is minted only via registerDocument (summary + doc_path + evidence)");
+    }
+    // Bug7: score quality once (after dedupe lookup, before write). Failures
+    // inside the evaluator are impossible (pure function), but the write that
+    // records the score must never fail the save — wrap defensively.
+    const qf = config.memoryQualityFilter;
+    let quality = null;
+    // #692: 这个开关的默认值是开（config.js 的 schema 与宿主装配都会填 true），
+    // 所以读法必须是 `!== false`。写成 `=== true` 时，绕过 Config 的裸配置调用方
+    // （测试、第三方直接 import createService）会静默拿到「关」，与文档口径相反。
+    if (qf?.enabled !== false) {
+      try {
+        // #430：近重复判定只要最近 20 条正文，别再为了 slice(0,20) 先物化整库
+        // （all() + 逐行 toRow，5k 行实测 100ms 级；本查询 0.06ms 级）。口径与
+        // all().slice(0, 20) 一致：不加 WHERE、updated_at DESC、同刻顺序未定义。
+        const recentContents = store.recentContents(20);
+        quality = evaluateMemoryQuality(memory, {
+          // #692: 默认开之后 qf 自身可能缺席（裸配置调用方），阈值读取必须可选链。
+          minContentLength: qf?.minContentLength ?? 10,
+          recentContents
+        });
+      } catch { /* quality scoring is best-effort */ }
+    }
+    // dream 总览按 source 身份去重，而非本地化标题：memory.language 切换后
+    // 标题变化，若仍按 (type, title) 匹配会出现两个活跃的 summary 同时注入。
+    // 其余类型维持 (type, title) 匹配不变。
+    //
+    // Issue #505：候选集此前是 store.list({ type, limit: 100 }) —— 那是「该类型
+    // 最重要的 100 行」（order 默认 importance），与「找出同标题的那一行」无关。
+    // 某类型里 importance 高于待写行的行数一旦超过 100，同标题行与待写行双双落在
+    // 窗口外，下面的 find 恒不命中，于是静默走创建分支：不报错、不告警，合并语义
+    // 随库增长而失效（实测 1047 行类型、importance=5 有 180 行时稳定复现）。
+    // 改为按同标题定向取（store.activeByTypeAndTitle，无窗口）。
+    //
+    // spec §5 决策 2：本机巩固不许改写别人的原文。这里不是防呆——蒸馏路径的每一次
+    // 同题命中都会 appendContent 覆盖外来行的正文与 updated_at，别人的记忆从此变成
+    // 我们两家的混杂物。把外来行剔出候选集后只会落回既有的「新建一行」分支。
+    // 谓词挂在**两个**候选集上：sourceScopedCandidates 在 dream/narrative 那两条分支
+    // 里就是候选集本身，只挂 candidates 等于给外来行留一条后门。这一处过滤留在 JS 侧
+    // 而不是下推 SQL（同 #515 的反面）：那里下推是因为外来行会吃掉 LIMIT 窗口名额，
+    // 这里 limit: null 本就无界，没有窗口可饿，而下推会多出第二份外来行判据。
+    const candidates = store.activeByTypeAndTitle(memory.type, memory.title).filter((m) => !isImportedRow(m));
+    // dream/narrative 两条分支按 source（及 tags[0]）匹配，而不是按标题：它们的
+    // 去重键本来就不含标题（语言切换后标题会变）。定向取同标题会把这两条路径
+    // 打回「永远不命中」——所以这两类仍走「该类型活跃行」的候选集，只是窗口换成
+    // 了无界且不带 importance 排序。类型内行数由 summary 的生产方（autoDream /
+    // generateNarratives）决定，量级远小于普通记忆，且这两条分支本来就要求扫全
+    // 类型才能找到同 source 的那一行——原来的 100 行窗口对它们同样是错的。
+    const sourceScopedCandidates = (memory.type === "summary" && (memory.source === "dream" || memory.source === "narrative"))
+      ? store.list({ type: memory.type, limit: null }).filter((m) => !isImportedRow(m))
+      : candidates;
+    // v0.8.0 A1（issue #17）：去重键由 (type, title) 扩展为
+    // (type, title, agent_scope, workspace_scope, sensitivity)——不同作用域的同
+    // 标题记忆绝不互相物理合并（旧逻辑跨 agent/workspace 并行，事后无法拆分）。
+    // NULL 归一为「未标注」：未标注行之间互相匹配（含存量行），与已标注行不
+    // 匹配。
+    // v0.8.1（issue #170 复核项 1）：比较不再受 scopeEnabled 门控——显式声明
+    // flag 关也生效（工具层明写「读了自动标注也生效」，去重必须同口径），否则
+    // 关自动标注后同标题不同 scope 的行会物理合并进第一行的归属。存量全 NULL
+    // 行互相匹配，A1 前行为不变。
+    const scopeMatches = (m) =>
+      scopeKeyOf(m.agent_scope) === scopeKeyOf(memory.agent_scope) &&
+      scopeKeyOf(m.workspace_scope) === scopeKeyOf(memory.workspace_scope) &&
+      scopeKeyOf(m.sensitivity) === scopeKeyOf(memory.sensitivity);
+    // Issue #127：写入端语义去重命中时，调用方用 _mergeInto 指定并入目标——复用
+    // 下面这段并入逻辑（appendContent + content_history + 质量处置），不另写第二份
+    // 实现。目标已被并发删除时回落到常规匹配。显式目标同样过 scope 门：跨作用域
+    // 的语义相似不并入（防泄漏），回落为独立新行。
+    // 显式目标还过外来门（spec §5 决策 2）：调用方指到别人导入的原文时，这个目标
+    // 按「未命中」处理，同样落回新建一行——两条路都只有 merged/created 两种结局。
+    const explicitCandidate = memory._mergeInto ? store.getById(memory._mergeInto) : undefined;
+    const explicitTarget = explicitCandidate && !isImportedRow(explicitCandidate) ? explicitCandidate : undefined;
+    const existing = explicitTarget
+      ? (scopeMatches(explicitTarget) ? explicitTarget : undefined)
+      : (memory.type === "summary" && memory.source === "dream")
+        ? (sourceScopedCandidates.find((m) => m.source === "dream" && scopeMatches(m))
+          ?? candidates.find((m) => scopeMatches(m) && m.title.trim() === String(memory.title).trim()))
+        : (memory.type === "summary" && memory.source === "narrative")
+          // 叙述条（#164）按主题键去重而非本地化标题：标题随语言变
+          // （叙述：X / Narrative: X），title 匹配在语言切换后会残留同 tag 双行。
+          // tag 存于 tags[0]（generateNarratives 落库），跨语言稳定 → 原地刷新。
+          ? (sourceScopedCandidates.find((m) => m.source === "narrative" && m.tags?.[0] === memory.tags?.[0] && scopeMatches(m))
+            ?? candidates.find((m) => scopeMatches(m) && m.title.trim() === String(memory.title).trim()))
+        : candidates.find((m) => scopeMatches(m) && m.title.trim() === String(memory.title).trim());
+    if (existing) {
+      const newContent = String(memory.content ?? "");
+      if (!newContent.trim()) {
+        // Nothing to merge: the row stays untouched.
+        return { action: "merged", memory: existing };
+      }
+      const direct = memory._overwrite === true || memory._humanEdited === true;
+      const content = direct
+        ? newContent
+        : appendContent(existing.content, newContent);
+      const importance = Math.min(5, Math.max(existing.importance, memory.importance ?? existing.importance));
+      // v0.8.1 底座（issue #170）：去重命中=scope 值完全同键，此时显式写入把
+      // 被并入行的同维来源升级为 explicit（用户刚刚显式声明了同一归属），
+      // 并刷新 scope_decided_at。仅升级来源、不改值——值改变会走新行。
+      const scopeUpgrade = {};
+      if (memory.agent_scope_source === "explicit" && existing.agent_scope_source !== "explicit") {
+        scopeUpgrade.agent_scope_source = "explicit";
+      }
+      if (memory.workspace_scope_source === "explicit" && existing.workspace_scope_source !== "explicit") {
+        scopeUpgrade.workspace_scope_source = "explicit";
+      }
+      if (Object.keys(scopeUpgrade).length) scopeUpgrade.scope_decided_at = new Date().toISOString();
+      const merged = store.update(existing.id, {
+        content,
+        importance,
+        tags: memory.tags ?? existing.tags,
+        title: memory.title ?? existing.title,
+        ...(memory.evidence !== undefined ? { evidence: memory.evidence } : {}),
+        content_history: pushContentHistory(existing, direct
+          ? (memory._humanEdited === true ? "human_override" : "overwrite")
+          : "auto_merge"),
+        ...scopeUpgrade,
+        ...(quality ? { quality_score: quality.score } : {})
+      });
+      // v0.8.1（issue #170 review 3）：来源升级也是归属性质改变——与
+      // updateMemory 的显式修正同等待遇，落一行 scope_changes（actor=tool：
+      // 只有 memory_save 的显式参数会带 explicit 来源走到这里）。审计失败只
+      // warn 不反噬合并。升级只在来源首次变化时触发，不会每次并入都写。
+      if (Object.keys(scopeUpgrade).length) {
+        try {
+          store.saveScopeChange({
+            memory_id: existing.id,
+            actor: "tool",
+            prev_agent_scope: existing.agent_scope ?? null,
+            prev_workspace_scope: existing.workspace_scope ?? null,
+            next_agent_scope: merged.agent_scope ?? null,
+            next_workspace_scope: merged.workspace_scope ?? null,
+            agent_scope_source: merged.agent_scope_source ?? null,
+            workspace_scope_source: merged.workspace_scope_source ?? null,
+            decided_at: scopeUpgrade.scope_decided_at
+          });
+        } catch (e) {
+          try { logger?.warn?.(`[dsh-mneme] scope upgrade audit failed: ${String(e)}`); } catch { /* 不反噬 */ }
+        }
+      }
+      // Bug7: a degraded/archived result is applied on top of the merged row.
+      const result = applyQualityDisposition(merged, quality, qf);
+      afterSync("write");
+      notifyWrite();
+      scheduleEmbed(result);
+      // #372: 合并分支此前不触发抽取——并入的新内容永远不进实体面，目标行若当初
+      // 也是事务内创建的就彻底没有实体。saveAttr 按 (entity_id, attr_key) 先失活旧值
+      // 再插入，重抽幂等（重抽同键只会刷新值，不堆重复行）。
+      scheduleEntityExtraction(result);
+      return { action: "merged", memory: result };
+    }
+    // #254 写入准入：决策形状由 write-admission.js 一次定死（阶段一定死、之后只加
+    // 分支），这里只做两件事——先问决策，再在 enforce 命中时**在 store.save 之前**
+    // 返回。放在 store.save 之前是这条闸门的意义所在：写进去再删等于没拦，而且中间
+    // 那一瞬的注入/检索面已经暴露了。
+    // 计量是旁路，拒绝不是：evaluate 抛异常按「不判定」处理（宁可漏拦也不能让判据
+    // 故障把写入变成不可用），record 抛异常同样只 warn（审计失败不能反噬写入）。
+    let admission = null;
+    if (writeAdmission) {
+      try {
+        admission = writeAdmission.evaluate({ memory, sessionKey: memory._sessionKey });
+      } catch (e) {
+        try { logger?.warn?.(`[dsh-mneme] write admission evaluate failed: ${String(e)}`); } catch { /* 不反噬 */ }
+      }
+    }
+    // 第 1 级硬拒（enforce 打开且判据命中）：这次写入不落库、不通知、不排嵌入、
+    // 不抽实体。审计行仍然要落——拒绝面是这条闸门唯一可解释性的来源（验收第 2 条
+    // 「被拒写入有审计与明确原因、可解释不静默丢弃」）。memoryId 传 null：这次写入
+    // 没有产生任何行，related_memory_ids 必须空着，挂一个不存在的 id 就是造虚账。
+    // reason 随返回值透出，工具层据此给模型一句可行动的拒绝理由。
+    if (admission?.decision === "deny") {
+      try {
+        writeAdmission.record({
+          sessionKey: memory._sessionKey,
+          verdict: admission,
+          memoryId: null
+        });
+      } catch (e) {
+        try { logger?.warn?.(`[dsh-mneme] write admission record failed: ${String(e)}`); } catch { /* 不反噬 */ }
+      }
+      return { action: "denied", reason: admission.deny?.reason ?? "denied", deny: admission.deny ?? null, memory: null };
+    }
+    const created = store.save({
+      type: memory.type,
+      title: memory.title,
+      content: memory.content,
+      tags: memory.tags ?? [],
+      importance: memory.importance ?? 3,
+      source: memory.source ?? "manual",
+      // epistemic_status 必须显式透传：省略时 store 会回退到内容标记推断
+      // （中文正则），英文/无标记内容一律落 subjective——E2 四臂实验当场抓到
+      // （trustEpistemicWeighting 的重排对 saveWithDedupe 写入的记忆整体空转，
+      // R+ 臂与 A 臂注入序逐条相同）。undefined 保持推断行为，显式值优先。
+      epistemic_status: memory.epistemic_status,
+      ...(memory.evidence !== undefined ? { evidence: memory.evidence } : {}),
+      // v0.8.0 A1：scope 标注透传（store 端归一化，未标注落 NULL）。
+      // v0.8.1 底座：来源（auto/explicit）与决策时间随行透传。
+      agent_scope: memory.agent_scope,
+      workspace_scope: memory.workspace_scope,
+      agent_scope_source: memory.agent_scope_source,
+      workspace_scope_source: memory.workspace_scope_source,
+      scope_decided_at: memory.scope_decided_at,
+      sensitivity: memory.sensitivity,
+      occurred_at: memory.occurred_at,
+      ...(quality ? { quality_score: quality.score } : {})
+    });
+    const result = applyQualityDisposition(created, quality, qf);
+    if (admission) {
+      try {
+        writeAdmission.record({
+          sessionKey: memory._sessionKey,
+          verdict: admission,
+          memoryId: created.id
+        });
+      } catch (e) {
+        try { logger?.warn?.(`[dsh-mneme] write admission record failed: ${String(e)}`); } catch { /* 不反噬 */ }
+      }
+    }
+    afterSync("write");
+    notifyWrite();
+    scheduleEmbed(result);
+    scheduleEntityExtraction(result);
+    return { action: "created", memory: result };
+  }
+
+  /**
+   * Bug7: apply the quality verdict to a freshly written row. Below the archive
+   * threshold the memory is archived + tagged low_quality (still searchable
+   * explicitly via includeArchived); between archive and degrade thresholds the
+   * score is already persisted and only the injection ranking is affected
+   * (importance × score/100). Best-effort: a disposition write failure must
+   * never fail the save. Returns the (possibly refreshed) memory row so callers
+   * see the archived/tagged state, not the pre-disposition snapshot.
+   *
+   * Issue #135 附属发现 1：importance ≥ memoryQualityFilter.exemptImportance
+   * （默认 4）的记忆不参与静默自动归档——评分与信号标签照常写入（可观测），
+   * 注入排序照常按 importance × score/100 降权，但 setArchived 跳过。报告实测
+   * 150 条低分归档里 128 条 importance ≥ 4（51 条 = 5）：一条被显式标为重要的
+   * 记忆不该被规则分静默归档、无感知无豁免。
+   */
+  function applyQualityDisposition(memory, quality, qf) {
+    // 与 saveWithDedupe 同一个读法（#692）：默认开，只有显式 false 才跳过。
+    if (!quality || qf?.enabled === false) return memory;
+    const archiveThreshold = qf?.archiveThreshold ?? 30;
+    // Signal tags (meta / repetitive / duplicate / short_content / low_quality)
+    // are merged onto the stored row in every assessed band so the verdict is
+    // observable, not just the numeric score. Below the archive threshold the
+    // memory is additionally archived (still explicitly searchable) — unless
+    // its importance reaches the exemption floor (kept active, demoted only).
+    const tags = [...new Set([...(memory.tags ?? []), ...(quality.tags ?? [])])];
+    const exemptImportance = qf?.exemptImportance ?? 4;
+    const importanceExempt = Number.isInteger(memory.importance) && memory.importance >= exemptImportance;
+    if (tags.length === (memory.tags?.length ?? 0) && (quality.score >= archiveThreshold || importanceExempt)) {
+      return memory; // no tag drift and not archived → nothing extra to write
+    }
+    try {
+      store.update(memory.id, { tags, quality_score: quality.score });
+      if (quality.score < archiveThreshold && !importanceExempt) {
+        store.setArchived(memory.id, true);
+      } else if (quality.score < archiveThreshold) {
+        logger?.info?.(`[dsh-mneme] quality filter: memory ${memory.id} scored ${quality.score} < ${archiveThreshold} but importance ${memory.importance} >= exemptImportance ${exemptImportance}; demoted, not archived`);
+      }
+      return store.getById(memory.id);
+    } catch {
+      return memory;
+    }
+  }
+
+  /**
+   * Candidate memories for automatic context injection:
+   * summaries first, then all preferences, then non-forgotten items with
+   * importance >= threshold. History is never auto-injected. Archived entries
+   * are excluded (store.list already filters them by default; the extra
+   * !m.archived check is kept as double insurance).
+   *
+   * Bug4 (hybridInject): when a non-empty `query` is available and a matching
+   * semantic recall was cached by the last searchMemories, the vector hits
+   * lead the selection (up to maxItems*2 candidates) and the rule-based pick
+   * fills + dedupes the remaining slots. Empty query / no cached recall /
+   * hybridInject off → pure legacy rule-based selection.
+   *
+   * #249 第一批（B1 pin 池）：`pinnedInjectBudget` > 0 时，约束/偏好类先按相关性
+   * 取满独立预算、再从候选里摘除（于是轮换重排碰不到它们），由调用方前置到块
+   * 头。`pinnedStats` 是可选出参：回报实际 pin 条数与超预算未展示条数，不改变
+   * 本函数「返回数组」的既有契约。预算为 0 时整段不执行，行为逐字节不变。
+   *
+   * Issue #380（preInjectGate）：可选的 `gate` 在这里消费——判定与滤除必须发生在
+   * `touchRecalled` **之前**（与 strictScope 同纪律，见 :419-422 的注释：闸门放
+   * 在记账之后，出局的条目照样吃了曝光）。`gateStats` 是可选出参，回报本帧的闸门
+   * 状态给调用方做面板快照；`gate` 缺席（检索侧/独立服务调用）时逐字节等于改前。
+   */
+  function injectCandidates({ query = "", maxItems = 5, threshold = 3, queryVector, scope = null, rotate = null, rotateWindow = 0, pinnedStats = null, gate = null, gateStats = null } = {}) {
+    const q = String(query ?? "").trim();
+    // codingRetrospect 读取侧门控：编码记忆（rejected_solution / pitfall /
+    // constraint）只在编码任务时注入，防噪声污染其他业务；编码任务时按
+    // codingBoostFactor 加权，让编码记忆在编码场景更靠前。
+    const isCoding = isCodingTask(q, config.codingKeywords ?? []);
+    const codingGate = (m) => isCoding || !CODING_MEMORY_TYPES.has(m.type);
+    // Bug7: quality-weighted importance in the rule-based tier. Unassessed rows
+    // (quality_score null) count as 100 (weight 1), so legacy stores keep their
+    // exact summary>preference>importance ordering.
+    const qualityWeight = (m) => (m.quality_score != null ? m.quality_score / 100 : 1);
+    // Issue #205 补测：候选池必须比轮换窗口大——窗口 N 需要 maxItems×(N+1) 张
+    // 不同的牌，池子只有 maxItems×2 时窗口一开就被吃光、只剩回填（重复率的
+    // 结构性下限由池子大小决定）。无轮换时保持既有 maxItems×2 不变；规则路
+    // 的 200 条上限同样给轮换让路（上限翻倍也只是多读一次 SQL LIMIT）。
+    const rotateWindowN = Number.isInteger(rotateWindow) && rotateWindow > 0 ? rotateWindow : 0;
+    const poolSize = rotateWindowN > 0
+      ? Math.max(maxItems * 2, maxItems * (rotateWindowN + 1))
+      : maxItems * 2;
+    // #230 拍板：注入档位合并设计（叙述条次优先档 + document 摘要行预算）。
+    // ①叙述条（source=narrative）从纯按需解禁进注入候选，落次优先档——但受
+    // 生成总闸 dreamNarrativeEnabled 约束（flag 关 = 该类行不再注入，存量行
+    // 仍可检索）；②document 摘要行同落次优先档，另有独立预算（见下方选取）。
+    const injectTypes = config?.documentMemoryEnabled === true ? INJECT_TYPES_WITH_DOCUMENT : INJECT_TYPES;
+    // #230 拍板：叙述条解禁进注入受生成总闸约束——门必须对全部候选路径一致
+    // （规则/向量/缓存/BM25），只锁规则路的话语义路仍会漏进 narrative 行。
+    const allowNarrative = config?.dreamNarrativeEnabled === true;
+    // #619：规则池不再从 200 行窗口里筛。此前这里是 store.list({ limit: 200 })，
+    // 窗口按 importance DESC 取（合格行 8410 条里 8210 条永远进不了窗）。
+    // listInjectPool 取全部活跃行的排序键，过滤与排序都在 JS 侧做；正文只对真正
+    // 入选的那一批回表补全（见下方排序段）。
+    const filtered = injectPoolRows()
+      .filter((m) => !m.archived && injectTypes.has(m.type) && !m.forgotten &&
+        // 叙述条：#228 落地为纯按需检索；#230 合并拍板解禁为次优先档注入
+        // （per-topic 叙述常驻位仍只留给 dream 总览 source=dream）。
+        (m.source !== "narrative" || allowNarrative) &&
+        codingGate(m) &&
+        (m.type === "summary" || m.type === "preference" || m.importance >= threshold));
+    // #218 v1: heat 乘数——heatEnabled 时在优先级层内给 importance×quality 乘
+    // heat（同级内的乘数；priority 分层、store 的 order=chrono 分页序与召回融
+    // 合序都不动）。heat 关闭时不建表、不算 heat，权重恒 1，排序与改动前一致。
+    // selectiveInject 相似度重排（下方）开启且向量可用时相似度优先——heat 只
+    // 生效于规则路排序与语义路回填序。
+    // issue #218 / E5 效用考卷：heat 乘进注入排序在真实年龄混合下饿死老约束
+    // （现行量级 ≡ 拟合参数，importance-only 遵从 +12.7pp），故注入侧 heat 拆出
+    // 独立开关 injectHeatEnabled（默认关）：不开时权重恒 1，排序与 heat 关闭
+    // 逐字节一致；召回侧时钟（touchLastAccess）与 sleep 降级联判不受影响。
+    const heatMap = config?.heatEnabled === true && config?.injectHeatEnabled === true
+      ? new Map(filtered.map((m) => [m.id, computeHeat(m, Date.now(), config)]))
+      : null;
+    const heatOf = (m) => (heatMap ? heatMap.get(m.id) ?? 1 : 1);
+    // v0.8.x（issue #339 / E7 实测）：A2 软加权补齐到注入通道。此前 ×0.5/×1.25
+    // 只作用于 searchMemories——E7 考卷里「explicit 标注 + 软档」的注入集与无标注
+    // 逐条相同（80/80），主泄露面上软档形同虚设。门控与检索侧同款：scopeEnabled
+    // 且当前会话至少一维可解析；strictScope 硬过滤在下方先行，硬墙开启时被滤行
+    // 不会到这里被二次降权。未激活时乘 1，排序与改动前逐字节一致。
+    const softScopeActive = config?.scopeEnabled === true && scope != null &&
+      Boolean(scope.agent_scope || scope.workspace_scope);
+    const scopeMultOf = (m) => (softScopeActive ? scopeMultiplier(m, scope) : 1);
+    // #619：排序键逐条算一次，而不是在 comparator 里现算（8k 行要算十几万次
+    // priority/effImportance）；末位补 updated_at DESC + id 两个平局键，让同分组
+    // 内的次序可复现——此前靠 Array.sort 的稳定性继承 SQL 行序，改一行 updated_at
+    // 就能造成上千对交换，同分组的行谁进注入位实际上是随机的。
+    const priority = (m) => {
+      // #230：叙述条与 document 摘要行同为次优先档——蒸馏摘要（0）仍最
+      // 先，指针型聚合产物（1）先于普通 project/decision（2）。叙述条是
+      // type=summary，判 source 必须在判 type 之前。
+      if (m.source === "narrative") return 1;
+      if (m.type === "summary") return 0;
+      if (m.type === "preference") return 1;
+      if (m.type === "document") return 1;
+      if (isCoding && CODING_MEMORY_TYPES.has(m.type)) return 1;
+      return 2;
+    };
+    // 编码记忆在编码任务时优先于普通 decision（与 preference 同级），
+    // importance 乘 codingBoostFactor 加权（封顶 5，保持 importance 语义）。
+    const effImportance = (m) =>
+      (isCoding && CODING_MEMORY_TYPES.has(m.type))
+        ? Math.min(5, m.importance * (config.codingBoostFactor ?? 2))
+        : m.importance;
+    const windowSize = Math.max(200, poolSize);
+    const rankedOrder = filtered
+      .map((m) => ({
+        m,
+        p: priority(m),
+        // 软加权乘在层内数值积上（priority 档位不动）：foreign ×0.5 后压不过
+        // 同档自己行——E7 的同 importance 档设计正是这个场景。
+        s: effImportance(m) * qualityWeight(m) * heatOf(m) * scopeMultOf(m),
+      }))
+      .sort((a, b) =>
+        a.p - b.p ||
+        b.s - a.s ||
+        (a.m.updated_at === b.m.updated_at ? 0 : (a.m.updated_at ?? "") < (b.m.updated_at ?? "") ? 1 : -1) ||
+        (a.m.id < b.m.id ? -1 : a.m.id > b.m.id ? 1 : 0))
+      .slice(0, windowSize)
+      .map((row) => row.m.id);
+    // 排序键那版没有 title/content，而注入渲染要全文；只回表这一批（实测 200 条
+    // 约 7ms），且保持排序后的次序。回表时行可能已被归档/遗忘/删除——丢弃，
+    // 不为它占位。
+    const fullById = new Map();
+    if (rankedOrder.length) {
+      for (const row of store.listByIdsForInject(rankedOrder)) fullById.set(row.id, row);
+    }
+    const items = rankedOrder
+      .map((id) => fullById.get(id))
+      .filter((m) => m && !m.archived && !m.forgotten);
+
+    let candidates = items;
+    // #617 第 2 条（前半）：向量路与 BM25 路此前是**互斥**的——`if (!semanticItems.length)`
+    // 包住 BM25，于是「有向量」等于「词法命中整批消失」。可两条路测的不是同一件事：
+    // 向量管「意思像」，BM25 管「词面撞上」，专有名词、issue 编号、函数名这类查询
+    // 恰恰是向量最容易糊、词法最准的地方。现在两路都跑，用 RRF（k=60）融合排名：
+    // 某一路的第 1 名恒得 1/(60+1)，两路都靠前的行自然走高，不再由「谁先跑」决定。
+    // 另外先按 fetchLimit 多取再过滤——旧代码先按 poolSize 截断再筛门控，筛掉的
+    // 名额永远补不回来（缩水），池子越脏越明显。
+    let fusedRrf = null; // id -> RRF 原始分；selectiveInject 复用它做二次重排
+    if (config.hybridInject !== false && q) {
+      const fetchLimit = Math.max(poolSize * 4, 40);
+      const passesGate = (m) => Boolean(m) && !m.archived && injectTypes.has(m.type) && !m.forgotten &&
+        (m.source !== "narrative" || allowNarrative) &&
+        codingGate(m) &&
+        (m.type === "summary" || m.type === "preference" || m.importance >= threshold);
+      const vectorHits = [];
+      if (Array.isArray(queryVector) && queryVector.length && vectorIndex) {
+        try {
+          for (const m of vectorIndex.search(queryVector, { limit: fetchLimit, threshold: 0 })) {
+            if (passesGate(m)) vectorHits.push(m);
+          }
+        } catch { /* vector unavailable: fall through to the recall cache */ }
+      }
+      if (!vectorHits.length && lastSemanticRecall?.query === q && lastSemanticRecall.items?.length) {
+        // CodeRabbit on #404：这条回填分支此前独漏重要度门槛——向量路与 BM25 路
+        // 都带着它。#369 收编 history 后缺口会被放大：库里低于闸门的行（实测
+        // history 378 条中有 27 条 i<=2）走一次检索进缓存就能绕开门槛占注入位。
+        for (const m of lastSemanticRecall.items) if (passesGate(m)) vectorHits.push(m);
+      }
+      // Issue #198：BM25 词法路。首轮（无向量、无缓存召回）这是唯一的同步相关性
+      // 信号；有向量时它补上向量糊掉的那一类命中。#617 之后它不再被向量挤掉。
+      const bm25Hits = [];
+      for (const hit of bm25Recall(q, fetchLimit)) if (passesGate(hit)) bm25Hits.push(hit);
+      if (vectorHits.length || bm25Hits.length) {
+        const RRF_K = 60;
+        const rrf = new Map();
+        const rowById = new Map();
+        const addList = (list) => {
+          list.forEach((m, idx) => {
+            rowById.set(m.id, m);
+            rrf.set(m.id, (rrf.get(m.id) ?? 0) + 1 / (RRF_K + idx + 1));
+          });
+        };
+        addList(vectorHits);
+        addList(bm25Hits);
+        fusedRrf = rrf;
+        // 软加权（issue #339 / CodeRabbit on #350）作用在融合分上：foreign 行不再
+        // 靠一路的原始 score 绕过降权，也不需要像旧代码那样单独给 BM25 排一次序。
+        const ranked = [...rrf.entries()]
+          .map(([id, score]) => {
+            const m = rowById.get(id);
+            return { m, score: score * scopeMultOf(m) };
+          })
+          .sort((a, b) => b.score - a.score)
+          .map((row) => row.m);
+        const seen = new Set();
+        const merged = [];
+        const push = (m) => {
+          if (seen.has(m.id)) return;
+          seen.add(m.id);
+          merged.push(m);
+        };
+        for (const m of ranked) {
+          push(m);
+          if (merged.length >= poolSize) break;
+        }
+        for (const m of items) {
+          if (merged.length >= poolSize) break;
+          push(m);
+        }
+        candidates = merged;
+      }
+    }
+    // pin 池取数修复（#249 第一批）：pin 类行被混合合并的封顶挡在候选池外面。
+    // `merged.length >= poolSize` 在 pin 筛选**之前**就封顶（生产 maxItems=5 →
+    // poolSize=10，向量路一次正好返回 10 条即 break），规则窗口里那些
+    // constraint/preference 于是一条都进不了 candidates，pin 池只能从那 10 条里
+    // 碰运气选——而本文件注释（:1919）与 issue #249 验收都写着「pin 不占
+    // maxItems 名额」。实测真库 maxItems=5 时 pin shown 只有 2/5，补回后恒 5/5；
+    // maxItems=10（poolSize=20）时前后都是 5/5——所以这不是多给名额，只是把被
+    // 向量路吃掉的那部分补回来。
+    // 两条纪律：①只在 pin 预算 > 0 时补，预算关时 candidates 与改前逐字节一致；
+    // ②只补到候选池尾部，后面的 strictScope（:1923）与 scopeState（:1930）两道
+    // 闸门照旧作用其上，「pin 池 eligible 取自过滤之后的候选」这条位置纪律不变。
+    //
+    // #249 第二批（显式 pin）：判据从「类型」换成「用户亲手钉的 id」。两种口径
+    // 由 pinned_memories 表**里能用的行**回答，而不是由「表里有几行」回答：
+    // - 有可用行 → explicit：按 id 点查（store.listByIdsForInject）取回行，于是
+    //   **200 行规则窗口之外的记忆也能进**（这是第二层存在的理由本身）；不再按
+    //   type 认 pin（写得最全的那版往往是 pattern，限类型就只能拿残缺版）。
+    // - 一条可用行都没有 → 回落旧的类型口径，升级即等价；她钉第一条才切换。
+    //
+    // ⚠ 判据为什么必须看「能用的」而不是 countPinned()>0：pin 行会在 memories
+    // 那边被归档、遗忘、硬删，而 pinned_memories 对这三种一无所知。用 count(*)
+    // 当判据，只要表里剩一行（哪怕是归档行），pinMode 就永远钉在 explicit，而
+    // eligible 恒为空 → pin 全灭且**永不回落**，无日志无报错——正是这批改动要
+    // 治的那类静默失败。删除路径补 DELETE 只堵「硬删」这一种，归档/遗忘比硬删
+    // 常见得多，所以根因在判据，不在清理。
+    // 只要还有一条能用就留在 explicit、只注入能用的那几条：若因为「有 3 条归档」
+    // 就整段回落到类型口径，会突然冒出一批她没钉过的条目，那比少注入更糟。
+    // 补位仍在这段：早于 topic 重排（:1930）、strictScope（:1972）、scopeState
+    // （:1979），所以越权行与暂停作用域行照样过两道闸——pin 不是绕过闸门的通道。
+    // 预算 0 时整段不执行：不读表、不改 candidates，逐字节等于改前。
+    const pinnedBudget = Math.max(0, Math.min(5, Math.floor(config?.pinnedInjectBudget ?? 0)));
+    // null | "explicit" | "type-fallback" | "fallback-none-usable"
+    let pinMode = null;
+    let pinRows = [];              // explicit：按 pin 先后（created_at ASC）排好、已滤遗忘/归档
+    let pinOutsideWindow = 0;      // explicit：点查取回、原本不在候选池的行数（观测点）
+    if (pinnedBudget > 0) {
+      let pinRecords = [];
+      try {
+        // 先读表（本表行数以个位计）；能用的行下一步按 id 点查回来再判。
+        pinRecords = store.countPinned() > 0 ? store.listPinned() : [];
+      } catch { pinRecords = []; }
+      if (pinRecords.length > 0) {
+        try {
+          // 点查带列裁剪（listByIdsForInject 复用 memoryColumnList，已排除 embedding）。
+          // 遗忘/归档行在这里就滤掉：pin 不是复活通道（验收第 7 条）。
+          const byId = new Map(store.listByIdsForInject(pinRecords.map((p) => p.memory_id))
+            .map((m) => [m.id, m]));
+          pinRows = pinRecords.map((p) => byId.get(p.memory_id)).filter((m) => m && !m.forgotten && !m.archived);
+        } catch { pinRows = []; }
+      }
+      if (pinRows.length > 0) {
+        pinMode = "explicit";
+        const knownIds = new Set(candidates.map((m) => m.id));
+        const additions = pinRows.filter((m) => !knownIds.has(m.id));
+        pinOutsideWindow = additions.length;
+        if (additions.length) candidates = [...candidates, ...additions];
+      } else {
+        // 表空，或表里有行但一条都用不了（归档/遗忘/被删）。两种都回落类型口径，
+        // 但 source 分开记：后者是一次**静默降级**，必须留痕，否则读的人只会看到
+        // 「pin 一条都没注入」而不知道为什么。
+        pinMode = pinRecords.length > 0 ? "fallback-none-usable" : "type-fallback";
+        if (candidates !== items) {
+          const knownIds = new Set(candidates.map((m) => m.id));
+          const spilledPins = items.filter(
+            (m) => PINNED_MEMORY_TYPES.has(m.type) && m.graphHint !== true && !knownIds.has(m.id)
+          );
+          if (spilledPins.length) candidates = [...candidates, ...spilledPins];
+        }
+      }
+    }
+    // Topic-ranked selection (v0.5.0 2.2): when the current query's vector is
+    // available the whole candidate list is re-ordered by similarity to that
+    // vector, so the injected slots go to memories on the current topic
+    // rather than to the rule-based order. Rows the index did not return
+    // keep their relative order after the scored ones.
+    //
+    // #617 第 2 条（后半）：这段此前是**纯余弦**全量 sort，于是上游用 RRF 顶上来的
+    // BM25 命中（词面精确、余弦却低）会被重新压到 maxItems 之后，再被 general 槽
+    // 的 `general.length >= maxItems` 丢掉——融合白做。现在余弦只占一半权重，另一半
+    // 给 RRF 分（同一轮融合算出来的那份）：纯余弦命中仍是主体，但词法精确命中
+    // 不会因为「意思不够像」被挤出去。
+    // RRF 归一化：单路第 1 名原始分 1/(60+1)，乘 (60+1)/2 得 0.5，双路都在第 1 名
+    // 得 1.0 —— 与余弦同量纲，且天然落在 [0,1]。
+    if (config?.selectiveInjectEnabled !== false && Array.isArray(queryVector) && queryVector.length && vectorIndex) {
+      try {
+        const hits = vectorIndex.search(queryVector, { limit: 200, threshold: 0 });
+        const sim = new Map(hits.map((m) => [m.id, m.score ?? 0]));
+        if (sim.size) {
+          const RRF_NORM = (60 + 1) / 2;
+          // 软加权乘在融合分上（不是乘在某一路的原始分上）；两路都没有的规则
+          // 候选保持 -1 沉底（缺失项乘乘数会让 foreign 缺失项反而排到自己的缺失
+          // 项之上，故不乘）。
+          const scopedSim = (m) => {
+            const s = sim.get(m.id);
+            const rrf = fusedRrf?.get(m.id);
+            if (s === undefined && rrf === undefined) return -1;
+            // #683 第 2 条：余弦缺失时用 0.5 中性基线，不再判 0 分。老行大量没有
+            // embedding（索引建立前入库的），而 0 会把「词法精确命中但没向量」的
+            // 行系统性压到「意思像但只有向量」的行之下——两路融合的本来目的就是
+            // 让这两类各守一段，缺失一项不该等于这一项判了负分。
+            const fused = 0.5 * (s ?? 0.5) + 0.5 * (rrf ?? 0) * RRF_NORM;
+            return fused * scopeMultOf(m);
+          };
+          candidates = [...candidates].sort((a, b) => scopedSim(b) - scopedSim(a));
+        }
+      } catch { /* topic re-rank unavailable: keep rule-based order */ }
+    }
+    // #24 块3：图召回候选打标。entityRecall 只在 entityRecallEnabled 开启时
+    // 有产出，这里为命中者贴 graphHint 标签——注入侧据此（a）graphInjectHint
+    // 开=标成 [检索线索] 前缀的线索行（独立预算），（b）关=线索行只参与排序
+    // 不改变注入块（保守档）。与检索侧共用同一图闸：块1 #341 把 entityRecall
+    // 升级成级联后，注入侧自动吃到同样的扩散信号，无需再改。只在语义/规则候选
+    // 为空时兜底检索，避免注入路径双倍候选成本。
+    if (config?.entityRecallEnabled === true && q) {
+      try {
+        const graphHits = entityRecall(q, maxItems * 2, { queryVector });
+        if (graphHits.length) {
+          const graphIds = new Set(graphHits.map((m) => m.id));
+          candidates = [
+            ...candidates.map((m) => graphIds.has(m.id) ? { ...m, graphHint: true } : m),
+            ...graphHits
+              .filter((m) => !candidates.some((c) => c.id === m.id))
+              .map((m) => ({ ...m, graphHint: true }))
+          ];
+        }
+      } catch { /* graph hint is best-effort */ }
+    }
+    // v0.8.0 A3（issue #17）：strictScope 硬过滤同样作用于自动注入——scoped 记忆
+    // 泄进无关注入上下文是最典型的越权通道，检索侧过滤挡不住这里。
+    // 位置纪律：必须在**图召回合并之后**、pin 池之前——entityRecall 不做 scope
+    // 门控，过滤放在它前面时，出局行会被图召回重新打上 graphHint 带回候选池
+    // （graphInjectHint 开时作为线索行进注入块；CodeRabbit on #371 的可达性分析，
+    // /context 与宿主注入同受影响）。pin 池 eligible 取自本过滤之后的候选，
+    // 顺带保证越权行进不了 pin。
+    if (config?.strictScope === true && scope) {
+      candidates = candidates.filter((m) => isVisibleInScope(m, scope));
+    }
+    // issue #471 政策轴：挂在事实轴之后、pin 池之前。位置与上面同一条纪律——必须在
+    // 图召回合并之后，否则出局行会被 entityRecall 打上 graphHint 带回候选池。
+    // 观察档（enabled 开、enforce 关）在这里留一条审计行说清「本应被拦下几条」，
+    // 但不改 candidates；拦截档才真的摘掉。审计写失败只 warn，注入照常完成。
+    candidates = scopeStateGate.gateInjection(candidates).rows;
+    // #249 第一批：B1 pin 池。取在相关性排序之后、轮换之前——取谁按此刻的候选
+    // 次序（即相关性次序），取到后从候选中摘除，于是下面的轮换重排碰不到它们
+    // （验收：pin 不参与跨轮轮换）。独立预算的两层意义：pin 既不占 maxItems
+    // 名额、也不被 document 预算截断，因此不会把当前任务需要的情景候选挤出去；
+    // 超预算的条数回报给调用方，在块内如实标注（绝不静默省略）。
+    // （pinnedBudget 与口径在候选池那段已算好——见 :1876 起的 #249 第二批注释。）
+    // eligible 留到块外：未展示条数要等 general 槽选完才算得准（见 selected 之后）。
+    // graphHint 行不进 pin 池：pin 是「每轮必进的约束/偏好」，而线索行按定义是
+    // 「链路信息、非事实断言」，且 pin 长在候选池遍历之前——不排除的话，保守档
+    // （graphInjectHint 关）也能从 pin 侧把它放回注入块，线索开关就被绕过去了。
+    //
+    // 两种口径（#249 第二批）：explicit 时 eligible 就是「钉过、点查取回、且过了
+    // 两道闸（仍在 candidates 里）」的行，次序按 pin 先后（created_at ASC）——
+    // 稳定偏好按「什么时候被钉」排，而不是按「最近改过」，正是第二层要修的
+    // 那个排序维度；type-fallback 时保持旧口径（候选里按类型筛），升级即等价。
+    const eligible = pinnedBudget > 0
+      ? (pinMode === "explicit"
+        ? (() => {
+            const live = new Set(candidates.map((m) => m.id));
+            return pinRows.filter((m) => live.has(m.id) && m.graphHint !== true);
+          })()
+        : candidates.filter((m) => PINNED_MEMORY_TYPES.has(m.type) && m.graphHint !== true))
+      : [];
+    let pinned = [];
+    if (pinnedBudget > 0 && eligible.length > 0) {
+      pinned = eligible.slice(0, pinnedBudget);
+      const pinnedIds = new Set(pinned.map((m) => m.id));
+      candidates = candidates.filter((m) => !pinnedIds.has(m.id));
+    }
+    // Issue #205：注入位跨轮轮换。rotate = 最近 N 轮注入过的 id 集合（由注入层
+    // 按会话维护并传入）：这些条目本轮不再优先——新鲜者前置（各自内部相对次序
+    // 保持），不足时按原序回填，槽位数与 touchRecall 语义均不变。rotate 为空时
+    // 行为与既有排序完全一致。
+    if (rotate && rotate.size > 0 && candidates.length > 0) {
+      const fresh = candidates.filter((m) => !rotate.has(m.id));
+      if (fresh.length > 0) candidates = [...fresh, ...candidates.filter((m) => rotate.has(m.id))];
+    }
+    // #230 拍板：document 摘要行预算——次优先档内最多 documentInjectBudget
+    // 条，超预算的 document 行跳过、由后续候选补位（不占槽）。预算只约束
+    // 注入不约束检索：指针行价值在「按需读全文」，常驻注入若不设界就会把
+    // 注入块变成文档目录（#164 失败判据：批量把历史塞进上下文）。
+    const documentBudget = config?.documentInjectBudget ?? 2;
+    let documentSeen = 0;
+    // #24 块3：图线索行（graphHint）按独立预算 graphInjectBudget 进块；所谓
+    // 独立=既不受 document 预算约束、也不挤占 maxItems 槽位。graphInjectHint
+    // 关（默认保守档）时线索行**不进注入块**——它们只参与候选池排序（对融合无
+    // 影响，因为候选池生成的唯一用途就是注入），桥接信号不污染常驻文本；开时
+    // 才作为 [检索线索] 前缀行进入。与 document/pin 同构：预算只约束注入。
+    const hintOpen = config?.graphInjectHint === true;
+    let graphSeen = 0;
+    const graphBudget = hintOpen ? Math.max(0, Math.floor(config?.graphInjectBudget ?? 1)) : 0;
+    const general = [];
+    for (const m of candidates) {
+      if (m.graphHint === true) {
+        if (!hintOpen) continue;      // 保守档：线索只排序不进块
+        if (graphSeen >= graphBudget) continue; // 独立预算内放行
+        graphSeen++;
+      } else if (general.length >= maxItems) {
+        break; // 普通候选受 maxItems 槽位上界
+      }
+      if (m.type === "document") {
+        if (documentSeen >= documentBudget) continue;
+        documentSeen++;
+      }
+      general.push(m);
+    }
+    // #249 第一批：pin 前置到块内相关性排序之前（验收项），且不占 maxItems 名额。
+    // pinned 为空时 selected 就是 general 本身——关闭态与改动前逐字节一致。
+    let selected = pinned.length > 0 ? [...pinned, ...general] : general;
+    // Issue #641（T3/T4 注入侧，beta 第三阶段）：取代链行不进注入——继任者携带
+    // 现状，旧值注入只会浪费名额、冒着被采用的风险（supersedeChain 只由 enforce
+    // 落笔，shadow/关闭态下集合恒空，本过滤与从前逐字节一致）。矛盾对（tier=
+    // conflict 且仍 open）同批时按「可信度 → 新者」排位并互相标注：#537 的教训
+    // 是标注必须把区分信息带进注入文本，否则重演「记账了但没用上」；标注再显式
+    // 门控在 enforce 档——shadow 只记账零处置。
+    const supersededIdSet = new Set(store.supersededIds());
+    if (supersededIdSet.size) {
+      selected = selected.filter((m) => !supersededIdSet.has(m.id));
+    }
+    // 两个键的解析走 resolveConflictMode（src/conflict-mode.js），与 dream / sleep
+    // 同源。此前这里只判 `config.conflictLedgerMode === "enforce"`、完全不看
+    // freeze：处置侧已经被 freeze 压停，注入侧却照旧给矛盾对挂标注——同一份配置
+    // 在三处算出三种答案，注入文本因此比处置更「乐观」。
+    if (resolveConflictMode(config).ledgerMode === "enforce" && selected.length > 1) {
+      const language = langOf(config);
+      const byId = new Map(selected.map((m) => [m.id, m]));
+      for (const p of store.openConflictPairs()) {
+        const ma = byId.get(p.memory_a);
+        const mb = byId.get(p.memory_b);
+        if (!ma || !mb) continue;
+        // 确定性排位：可信度（observation > inferred > subjective，与
+        // applyConflict 的换位同序）优先，平手退回服务器时钟新者。多对并存时
+        // 逐一交换以相对次序为准——矛盾对是稀有事件，交换足够且可预测。
+        const rank = (m) => EPISTEMIC_PRIORITY[m.epistemic_status] ?? 0;
+        let preferred = ma;
+        let other = mb;
+        const ra = rank(ma);
+        const rb = rank(mb);
+        if (ra !== rb) {
+          if (rb > ra) { preferred = mb; other = ma; }
+        } else if ((mb.created_at ?? "") > (ma.created_at ?? "")) {
+          preferred = mb;
+          other = ma;
+        }
+        const detected = String(p.detected ?? "").slice(0, 10);
+        preferred.conflictNote = STR.conflictPairPreferred[language](String(other.title ?? "").slice(0, 24), detected);
+        other.conflictNote = STR.conflictPairSecondary[language](String(preferred.title ?? "").slice(0, 24), detected);
+        const pi = selected.indexOf(preferred);
+        const oi = selected.indexOf(other);
+        if (pi > oi) {
+          selected.splice(pi, 1);
+          selected.splice(oi, 0, preferred);
+        }
+      }
+    }
+    // #619 补链（注入侧）：单次场合的情绪边挂成注释行。到这里为止，#641 已把
+    // 矛盾标注写进注入文本本体；情绪走同一条通道（m.affectiveNote，由 inject.js
+    // 拼在该行内容之后），不新开注入块、不动 schema。
+    //
+    // 只挂 occasion：trait 档已被 sleep 铸成 type=pattern 的记忆，本来就自己进
+    // 注入（见 INJECT_TYPES 里 pattern 的收编说明），再挂一遍是同一件事说两次。
+    // 开关默认关；关着时这一段整段不执行，注入结果与加它之前逐字节一致。
+    if (injectChildEnabled(config, "affectiveInjectEnabled") && selected.length) {
+      const language = langOf(config);
+      const byMemory = store.affectiveRelationsByMemories(selected.map((m) => m.id), 1);
+      if (byMemory.size) {
+        for (const m of selected) {
+          const edge = byMemory.get(m.id)?.[0];
+          if (!edge?.metadata || typeof edge.metadata !== "object") continue;
+          // #724：已归档的边（过期巡检或人工归档）不再进注入——「这条情绪已经
+          // 过时了」是归档的含义，注入里继续挂它等于把归档当没发生。
+          if (edge.metadata.archivedAt) continue;
+          if (edge.metadata.attribution === "trait" || edge.metadata.promotedToTrait === true) continue;
+          const emotion = String(edge.metadata.emotion ?? "").trim();
+          if (!emotion) continue;
+          // 谁、对什么：端点名字取自这次 SQL 的 LEFT JOIN；实体被删了（名字为
+          // null）就宁可不挂——「某个已删实体不高兴」是噪声不是信息。
+          const person = String(edge.from_name ?? "").trim();
+          const target = String(edge.to_name ?? "").trim();
+          if (!person || !target) continue;
+          const occasions = Number.isFinite(edge.metadata.sessionCount)
+            ? Math.max(1, Math.trunc(edge.metadata.sessionCount))
+            : 1;
+          const why = typeof edge.metadata.why === "string" ? edge.metadata.why.trim().slice(0, 60) : "";
+          // 长度闸：注释会吃注入块预算（MAX_BLOCK − 块头），一条长注释能把后面
+          // 的候选挤成标题行。情绪记录的边际价值不值这个价，超了就不挂。
+          const note = STR.affectiveNote[language](person, emotion, target, occasions, why);
+          if (note.length > AFFECTIVE_NOTE_MAX) continue;
+          m.affectiveNote = note;
+        }
+      }
+    }
+    if (pinnedStats) {
+      // 「未展示」只数**真的没进块**的 pin 类条目：被 pin 预算挤下来的条目会回到
+      // 候选池，仍可能被 general 槽选中——那就是展示了。按 eligible - pinned 直接
+      // 相减会把它们也算成未展示，块头那一行于是虚报（评审实测：pref#2 已在块内，
+      // 仍报「另有 2 条未展示」）。所以统一按「有没有进 selected」判。
+      const shownIds = new Set(selected.map((m) => m.id));
+      pinnedStats.shown = pinned.length;
+      pinnedStats.suppressed = eligible.filter((m) => !shownIds.has(m.id)).length;
+      // #249 第二批：口径来源与「绕开窗口」的观测点。source 四档（预算 0 时整个
+      // 键不出现）：
+      //   "explicit"              用户钉的行里有能用的，按 pin 先后注入
+      //   "type-fallback"         表里从没钉过（含升级后还没钉），走旧类型口径
+      //   "fallback-none-usable"  钉过，但那些行全被归档/遗忘/删了 —— 这次是一次
+      //                           静默降级，留这一档就是为了让它不再静默
+      // 前两档的行为差异在「窗口外也能进」：只有 explicit 享受点查补位，
+      // outsideWindow 也只数这批（cognee 那条「别让它进候选池」的等价做法）；
+      // 两个 fallback 档恒 0（它们只能从窗口里取）。
+      pinnedStats.source = pinMode ?? undefined;
+      pinnedStats.outsideWindow = pinOutsideWindow;
+    }
+    // Issue #380：注入前判定（preInjectGate）在这里消费——**必须在 touchRecalled
+    // 之前**，与 strictScope 同纪律（见本文件 :419-422 的注释：闸门放在记账之后，
+    // 出局的条目照样吃了曝光）。滤除若留给调用方（inject.js）做，被标记的记忆仍会
+    // 刷温时钟（heat + injectHeat 时进排序权重）并落 mode='inject' 曝光账，反馈环
+    // 会把闸门想压下的意见记忆重新顶上来。判定与过滤只作用于一般记忆槽：pin 池
+    // （#249 逐字保真）与 graphHint 线索行豁免（豁免在下面 judgedPart 的切片里）。
+    // 帧状态经 gateStats 出参回给调用方做面板快照（同 pinnedStats 口径，不动
+    // 「返回数组」契约）；gate 缺席（检索侧/独立服务调用）= 逐字节等于改前。
+    let injected = selected;
+    if (gate) {
+      const judgedPart = selected.filter((m, i) => i >= pinned.length && m.graphHint !== true);
+      const gateFrame = gate.forFrame(query, judgedPart);
+      if (gateFrame?.state === "filtered" && gateFrame.flaggedIds) {
+        injected = selected.filter((m) => !gateFrame.flaggedIds.has(m.id));
+      }
+      if (gateStats) gateStats.frame = { ...gateFrame, judged: judgedPart.length };
+    }
+    touchRecalled(injected);
+    // #217 口径（2026-09-19 拍板）：注入是曝光型访问事件，与检索命中同表分账
+    // （mode='inject'，candidates 存实际注入集）。跟随 recallRecordDefault——
+    // 与检索侧同门，不设新配置键；heat 关闭时照写，留痕与消费解耦（两 issue
+    // 独立验收）。空选不记（没有访问发生）；记账失败不影响注入本身。**实际注入集**
+    // = 闸门滤除之后的集合（#380 评审：被滤掉的记忆没有曝光，不能记成已注入）。
+    if ((config?.recallRecordDefault ?? true) && recallRecorder && injected.length > 0) {
+      try {
+        recallRecorder({
+          // recall_runs.query 是 NOT NULL（store.js 的 recall_runs 建表语句，
+          // 2026-10-14 在 :75）—— 注入是主动曝光，
+          // 没有查询词时用空串而非 null——SQLite 改列约束需重建表，不值得。
+          // v0.9.0：调用方（inject.js 的 lastUserQuery，2026-10-14 在 :343）本来就带着本轮的
+          // 用户原话传进来，这里丢掉等于把「当时想干什么」从审计里抹掉
+          // （2026-10-13 快照：18,231/18,231 注入行 query 全空，全空比例
+          // 100%——这个比率才是要记的，绝对行数随表长，引用要带时刻）。
+          // 有就记，真没有才空串。
+          query: q,
+          mode: "inject",
+          topK: maxItems,
+          threshold: null,
+          candidates: injected.map((m) => ({
+            id: m.id,
+            title: m.title,
+            content: m.content,
+            score: m.score ?? null,
+            source: m.source ?? "keyword"
+          })),
+          createdAt: new Date().toISOString()
+        });
+      } catch { /* recall receipt is best effort */ }
+    }
+    return injected;
+  }
+
+  /**
+   * Merge human edits parsed from a mirror file back into the store.
+   * Only content/title are taken; structure fields stay machine-owned.
+   */
+  function mergeHumanEdits(type, edits) {
+    // #296：只读 type 的结构性守卫。调用点（启动合并 / reconcileHumanEdits）都已
+    // 跳过它们，但这条不变量属于「人改回填」本身——将来多一个调用点不该重开这个口
+    // （指针行文本被当正文写回 document 行会污染摘要）。
+    if (MIRROR_READONLY_TYPES.has(type)) return 0;
+    let applied = 0;
+    for (const edit of edits) {
+      if (!edit.id) continue; // corrupt/malformed edit: skip it, keep merging the rest
+      const existing = store.getById(edit.id);
+      if (!existing || existing.type !== type) continue;
+      const patch = {};
+      if (typeof edit.title === "string" && edit.title.trim()) patch.title = edit.title.trim();
+      if (typeof edit.content === "string" && edit.content.trim()) patch.content = edit.content.trim();
+      if (Object.keys(patch).length) {
+        // 启动回灌（F-NEW-01）：digest 存在且匹配 = 文件自渲染后无人触碰（旧机器
+        // 镜像），机器 wins，DB 的 New 必须保留，静默改回 Old 是 bug。
+        const digestMatches = typeof edit.digest === "string"
+          && typeof edit.title === "string"
+          && typeof edit.content === "string"
+          && createHash("sha256").update(`${edit.title}\x00${edit.content}`).digest("hex") === edit.digest;
+        if (digestMatches) continue;
+        // 文件 == store（无实际变化）时不覆盖，也不计入 applied。
+        const hasDiff = (patch.title !== undefined && existing.title !== patch.title)
+          || (patch.content !== undefined && existing.content !== patch.content);
+        if (!hasDiff) continue;
+        // 人工编辑回灌后触发 re-embed（issue #3 残留修复）：向量必须与
+        // 新 title/content 一致。scheduleEmbed 为 fire-and-forget，
+        // 内部 try/catch 吞错，失败不影响主流程。
+        // Bug5: human edits overwrite directly, but the machine version is
+        // archived into content_history (source: human_override) before being
+        // replaced, so a manual correction never silently destroys the old value.
+        const merged = store.update(edit.id, {
+          ...patch,
+          content_history: patch.content !== undefined && existing.content !== patch.content
+            ? pushContentHistory(existing, "human_override")
+            : existing.content_history
+        });
+        applied++;
+        scheduleEmbed(merged);
+      }
+    }
+    if (applied) {
+      afterSync("write");
+      notifyWrite();
+    }
+    return applied;
+  }
+
+  /**
+   * v0.8.0 冲突集中处理（issue 反馈：冻结冲突没有人工出口——store 的
+   * resolveConflictPending 此前无任何 API/UI 调用）。人工确认一条待审冲突：
+   * 盖章 resolved_at/resolved_winner（审计），可选按 dream 非冻结 conflict
+   * 路径**同款**处置落地——复用 applyDecisions 的 conflict 分支，CAS 快照 +
+   * 事务 + 胜者追加已否决注记 + 败者归档 + 幂等全部同源，不另写第二份裁决。
+   *
+   * @param {string} id conflict_pending 行 id
+   * @param {{winner?: "a"|"b"|null, apply?: boolean}} opts
+   *   winner: 选哪一方保留（a = memory_a，冻结时 LLM 的建议胜者；b = memory_b）；
+   *   null = 仅盖章标记已读、不落地处置。人工选择是权威裁决：传入
+   *   applyDecisions 的 config 关掉 trustEpistemicWeighting——可信度自动换位
+   *   只应作用于 LLM 提议对，不能推翻人工选择。
+   * @returns {object|undefined} 盖章后的冲突行 + disposition 摘要；未知 id 返回 undefined
+   */
+  function resolveConflictPending(id, { winner = null, apply = true } = {}) {
+    const rows = store.listConflictPending({ includeResolved: true, limit: 500 });
+    const row = rows.find((r) => r.id === id);
+    if (!row) return undefined;
+    const winnerId = winner === "a" ? row.memory_a : winner === "b" ? row.memory_b : null;
+    const loserId = winner === "a" ? row.memory_b : winner === "b" ? row.memory_a : null;
+    let disposition = null;
+    if (apply && winnerId && loserId) {
+      const snapshot = new Map();
+      for (const m of [store.getById(row.memory_a), store.getById(row.memory_b)]) {
+        if (m) snapshot.set(m.id, { updated_at: m.updated_at, content: m.content, title: m.title });
+      }
+      // applyDecisions 需要一个 service 形状的参数（getById/update/setArchived/
+      // transaction）——委托给闭包内的同名实现，mirror/通知/嵌入与主写路径同源。
+      const applyService = {
+        getById: (mid) => store.getById(mid),
+        update: (mid, patch) => updateMemory(mid, patch),
+        setArchived: (mid, v) => archiveMemory(mid, v),
+        transaction: (fn) => transaction(fn)
+      };
+      // 不传 mintSource——本路径由人在面板上点确认，即便日后有人在这里加
+      // create，落 saveWithDedupe 的 manual 兜底恰好就是对的语义（人触发的写入）。
+      // 这是刻意的，不是漏传。
+      const { committed, failures } = applyDecisions(
+        [{ action: "conflict", winner: winnerId, loser: loserId, reason: row.reason ?? "" }],
+        applyService,
+        logger,
+        snapshot,
+        { ...config, trustEpistemicWeighting: false }
+      );
+      // Review 发现：处置必须**先于**盖章。原实现先 resolveConflictPending 盖章、
+      // 再 applyDecisions——若 CAS 拒掉（确认前双方被并发更新），行已 resolved 从
+      // 队列消失、前端仍显示成功，审计却记了"已确认"且无法重试。现在失败时不盖章
+      // 直接返回：行留在队列待重试，审计不被污染。
+      if (failures.length) {
+        return { ...row, disposition: { ok: false, failures } };
+      }
+      disposition = { ok: true, committed };
+    }
+    // 处置成功（或纯标记）后才盖章。幂等重放（败者已归档 → skipped）也走这里：
+    // 处置本就存在，标记已审即可。
+    const stamped = store.resolveConflictPending(id, { winner: winnerId });
+    if (!stamped) return undefined;
+    return { ...stamped, disposition };
+  }
+
+  /**
+   * v0.8.0 冲突队列视图数据源：未解决冲突行，联表带出双方的当前状态（标题/
+   * 内容/类型/重要性/归档标记），面板一处即可集中审阅，不必按徽章逐条找。
+   * 参与记忆被删除/失联时该侧返回 {missing: true}（队列不因此丢行）。
+   */
+  function listConflictQueue({ limit = 50, offset = 0 } = {}) {
+    const rows = store.listConflictPending({ limit, offset, includeResolved: false });
+    const side = (id) => {
+      const m = store.getById(id);
+      if (!m) return { id, missing: true };
+      return {
+        id,
+        title: m.title,
+        type: m.type,
+        importance: m.importance,
+        content: m.content,
+        // 裁决依据：两侧的新旧与重要度是「该留哪条」的客观信号。此前 side() 不带
+        // 时间戳，面板只能显示 A 方/B 方两个标签，用户没有依据就整对删掉或乱选
+        // （#400）。
+        created_at: m.created_at ?? null,
+        updated_at: m.updated_at ?? null,
+        archived: m.archived === true,
+        forgotten: m.forgotten === true
+      };
+    };
+    return rows.map((r) => ({
+      id: r.id,
+      run_id: r.run_id ?? null,
+      reason: r.reason ?? null,
+      // Issue #603 第 2 层：入队时记下的相似度（0–1）。存量行与 LLM 裁决路径
+      // 没记 → null。面板据此排序与画条，不再从 reason 文本里正则回收；
+      // null 与 0 必须区分开（「没测过」不是「不相似」）。
+      similarity: typeof r.similarity === "number" ? r.similarity : null,
+      created_at: r.created_at,
+      memory_a: side(r.memory_a),
+      memory_b: side(r.memory_b)
+    }));
+  }
+
+  function toApiList(rows) {
+    return rows.map((m) => ({
+      id: m.id,
+      type: m.type,
+      title: m.title,
+      content: m.content,
+      tags: m.tags,
+      importance: m.importance,
+      source: m.source,
+      created_at: m.created_at,
+      updated_at: m.updated_at,
+      // v0.8.0 A2：scope 标注与事件发生时间透出——条件展开（未标注行不带键，
+      // DTO 与 A2 前逐字节同形；带 undefined 键会被 in-process schema 校验
+      // 判违规，JSON 序列化虽会丢弃但形状不稳定）。
+      // v0.8.1 底座：scope 来源与决策时间随行透出（同样条件展开）。
+      ...(m.agent_scope !== undefined ? { agent_scope: m.agent_scope } : {}),
+      ...(m.workspace_scope !== undefined ? { workspace_scope: m.workspace_scope } : {}),
+      ...(m.agent_scope_source !== undefined ? { agent_scope_source: m.agent_scope_source } : {}),
+      ...(m.workspace_scope_source !== undefined ? { workspace_scope_source: m.workspace_scope_source } : {}),
+      ...(m.scope_decided_at !== undefined ? { scope_decided_at: m.scope_decided_at } : {}),
+      ...(m.sensitivity !== undefined ? { sensitivity: m.sensitivity } : {}),
+      ...(m.occurred_at !== undefined ? { occurred_at: m.occurred_at } : {}),
+      // #230：document 指针行的文件定位随行透出——「全文按需读」的入口就是
+      // 这个路径；普通行恒不带键，DTO 与 #230 前逐字节同形。
+      ...(m.doc_path !== undefined && m.doc_path !== null ? { doc_path: m.doc_path } : {}),
+      // #713（续）：检索结果的相关度余弦随行透出（0…1，与 vectorSearchThreshold
+      // 同一把尺子）。只有向量路出过分的行才带；列表/读取/注入等非检索路径
+      // 恒不带键，DTO 与 #713 前逐字节同形。
+      ...(typeof m._score === "number" ? { _score: m._score } : {})
+    }));
+  }
+
+  /**
+   * Three-way merge of in-flight human mirror edits before a re-render.
+   * Runs on every syncMirror, so a human edit made between two store writes is
+   * never silently overwritten by the next sync (human priority is not limited
+   * to startup). Per edited entry:
+   *   - file changed only → human wins; the edit is merged back into the store.
+   *   - file AND store changed → real three-way conflict: keep the human edit
+   *     and append a marker preserving the store's concurrent version, so no
+   *     side is dropped.
+   *   - store changed only → store wins (the file is simply re-rendered).
+   * Only title/content are taken (structure fields stay machine-owned, matching
+   * mergeHumanEdits). Returns the memory list to render.
+   */
+  function reconcileHumanEdits(memories) {
+    if (!mirror) return memories;
+    const byType = new Map();
+    for (const m of memories) {
+      if (!byType.has(m.type)) byType.set(m.type, []);
+      byType.get(m.type).push(m);
+    }
+    const result = [];
+    for (const type of Object.keys(TYPE_FILE)) {
+      const list = byType.get(type) ?? [];
+      if (list.length === 0) continue;
+      const editsById = new Map(mirror.readHumanEdits(type).map((e) => [e.id, e]));
+      for (const m of list) {
+        const edit = editsById.get(m.id);
+        if (!edit) { result.push(m); continue; }
+        const humanChanged = (typeof edit.title === "string" && edit.title !== m.title)
+          || (typeof edit.content === "string" && edit.content !== m.content);
+        if (!humanChanged) { result.push(m); continue; }
+        // 判断文件是否被人工动过：digest 存在且匹配则无人触碰，否则视为人工动过。
+        // digest 是渲染时对 sha256(title \x00 content) 的记录；机器 store 更新后
+        // 镜像还没重渲染时读到旧内容，digest 仍匹配 → 机器 wins，不会误判为
+        // 并发人工编辑导致机器写丢失 + 伪冲突标记。
+        const digestMatches = typeof edit.digest === "string"
+          && typeof edit.title === "string"
+          && typeof edit.content === "string"
+          && createHash("sha256").update(`${edit.title}\x00${edit.content}`).digest("hex") === edit.digest;
+        if (digestMatches) {
+          // 无人触碰，机器 wins，走原样
+          result.push(m);
+          continue;
+        }
+        // 人工动过（digest 不存在=老文件/手工文件保守视为人工动过），走三方合并
+        // （保留现有 storeChanged 逻辑）
+        const storeChanged = edit.updated_at !== undefined && m.updated_at !== edit.updated_at;
+        if (storeChanged) {
+          // 三方合并保留双方时的冲突批注：随实例语言，写进记忆正文。
+          const marker = STR.serviceConflictMarker[language](m.updated_at, m.content);
+          store.update(m.id, { title: edit.title, content: `${edit.content}${marker}` });
+        } else {
+          store.update(m.id, { title: edit.title, content: edit.content });
+        }
+        const merged = store.getById(m.id);
+        scheduleEmbed(merged);
+        result.push(merged);
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Re-render the human-editable mirror after any store mutation, merging any
+   * in-flight human edits first (never silently overwriting them). Only
+   * non-forgotten memories are mirrored: forgotten entries must not reach the
+   * human-editable file (a human "edit" could otherwise resurrect them).
+   */
+  // #296 第二批：documentDir/index.md 的写后语。与注册入口共用同一个
+  // documentMemoryEnabled 闸（默认关）：闸开时只列活跃指针行（正文永远不进这个
+  // 文件），闸关时把索引删掉——document 子系统整体退出，留一份陈旧索引会列出已
+  // 归档的行，正是镜像侧 documents.md 在闸关时被删掉要避免的那种「看着还在、其实
+  // 已关」的视图。两步都只 warn：索引是机器产物，不能让触发它的业务写失败。
+  function syncDocumentIndex() {
+    if (!documentIndex) return;
+    if (config?.documentMemoryEnabled !== true) {
+      const removed = documentIndex.remove();
+      if (!removed?.ok) logger?.warn?.("document index remove failed:", removed?.error);
+      return;
+    }
+    try {
+      const result = documentIndex.sync(store.list({ type: "document", limit: null }));
+      if (!result?.ok) logger?.warn?.("document index sync failed:", result?.error);
+    } catch (error) {
+      logger?.warn?.("document index sync failed:", error);
+    }
+  }
+
+  // syncMirror: 同步 mirror，并在失败/成功时持久记录 dirty 状态；保证自身不抛出。
+  // v0.3.6（audit peer 4 阻断）：
+  //   - 开始时 incrementGeneration 绑定本次期望轮次 gen；成功用
+  //     markMirrorCleanForGeneration(gen, now) CAS/fence 清 dirty——旧 worker
+  //     （gen 已过期）不会误清另一 worker 未恢复的故障债务；
+  //   - 失败写 markMirrorDirty（递增 desired 绑定新债务），下次 recover 恢复；
+  //   - 逐 type 用 setTypeStatus 记录部分成功/失败（type_status JSON）；
+  //   - 所有 store 状态写入各自 try/catch，失败只 warn，绝不向外抛（F-NEW-03）。
+  function syncMirror() {
+    if (txDepth > 0) return { success: true, deferred: true }; // deferred to the transaction's commit
+    // #296 第二批：documentDir/index.md 走同一条写后语——它与镜像一样是「从库渲染
+    // 的机器产物」，同样只在内容变化时落盘、同样自己吞掉失败。放在 !mirror 短路
+    // 之前：索引在不在，不该取决于镜像是否装配（无镜像的宿主与测试同样要有它）。
+    syncDocumentIndex();
+    if (!mirror) return { success: true, deferred: true };
+    const now = new Date().toISOString();
+    let gen;
+    try {
+      // desired generation 已在业务写事务中原子递增（peer blocker 1）；这里
+      // 直接读当前值作为本次同步的目标轮次，不再自行 incrementGeneration。
+      const state = store.getMirrorState();
+      gen = state?.generation ?? 0;
+    } catch (stateError) {
+      logger?.warn?.("syncMirror: getMirrorState failed:", stateError);
+      return { success: false, error: stateError?.message ?? String(stateError) };
+    }
+    // coveredTypes 提到 try 外初始化：即使 store.list 先抛错，catch 分支也有
+    // 合法的空 Set 可迭代，保证 syncMirror 自身绝不抛（fail-safe）。
+    const coveredTypes = new Set();
+    try {
+      // 预先取本次要覆盖的全部活跃行（只读一次）。这里曾经是
+      // store.list({ limit: 500 })——活跃集超过 500 时镜像会静默少掉尾部记忆，
+      // 而文件本身没有任何提示（#278 第一批）。在这里退回任何截断都不行——
+      // 「宣称覆盖活跃集」与静默截断不能共存（这一条不变）。
+      // #430：改成 list 的无界档（limit: null）+ SQL 侧过滤，替掉 all() + 逐行
+      // filter——list 的默认 includeForgotten:false / includeArchived:false 与旧
+      // filter 的 !forgotten && !archived 完全同口径（store.js 里就是这两条
+      // clause），document 闸改由 excludeTypes 在 LIMIT 之前排除。旧写法先物化
+      // 整库（embedding 列 + 逐行 27 字段 toRow）再逐行丢弃：被丢掉的行连带它们
+      // 的物化一起省下了。要再压一层得换按 type 分页取，属另一批的事。
+      const list = store.list({
+        limit: null,
+        order: "chrono",
+        // #296 第二批：镜像里的 documents.md 与 index.md 共用 documentMemoryEnabled
+        // 闸。关掉时把 document 行也从渲染集里去掉——sync 对「空 type」的既有处理
+        // 会把陈旧的 documents.md 删掉，不留一个「看着还在、其实已关」的视图。
+        excludeTypes: config?.documentMemoryEnabled === true ? null : ["document"]
+      });
+      for (const memory of list) {
+        if (memory?.type && TYPE_FILE[memory.type]) {
+          coveredTypes.add(memory.type);
+        }
+      }
+
+      // Per-type physical outcome (audit peer D): mirror.sync writes each type
+      // file independently and reports per-type success/failure. A type whose
+      // file was physically committed must be marked committed even when a
+      // sibling type errors — the old code batch-failed every type on any error,
+      // leaving committed files mislabeled as failed and masking partial state.
+      // Absent entries (a type with no memories) count as success: sync prunes
+      // the stale file, which is itself a completed physical state.
+      let allOk = true;
+      const results = mirror.sync(reconcileHumanEdits(list)) ?? {};
+      for (const type of Object.keys(TYPE_FILE)) {
+        const r = results[type];
+        const ok = !r || r.ok === true;
+        if (!ok) allOk = false;
+        try {
+          if (ok) {
+            store.setTypeStatus(type, { status: "committed", applied_gen: gen, last_error: null });
+          } else {
+            store.setTypeStatus(type, { status: "failed", last_error: r.error ?? "mirror sync failed" });
+          }
+        } catch (stateError) {
+          logger?.warn?.(`syncMirror: setTypeStatus(${type}) failed:`, stateError);
+        }
+      }
+
+      // 全部 type 物理收敛：CAS/fence 绑定到本地 gen，旧 worker（gen 已过期）会被
+      // 拦截。此步失败说明核心 clean 状态没写成功，向上层报失败（不再静默）。
+      if (allOk) {
+        try {
+          store.markMirrorCleanForGeneration(gen, now);
+        } catch (stateError) {
+          logger?.warn?.("syncMirror: markMirrorCleanForGeneration failed:", stateError);
+          return { success: false, error: stateError?.message ?? String(stateError) };
+        }
+        return { success: true };
+      }
+
+      // 部分 type 失败：持久 dirty（债务绑定到新轮次），下次 recover 只补未收敛
+      // 的 type。committed 的 type 已应用本轮 gen，不因兄弟失败被回滚。
+      const failedTypes = Object.entries(results)
+        .filter(([, r]) => r && r.ok === false)
+        .map(([t]) => t);
+      try {
+        store.markMirrorDirty(`mirror sync failed for: ${failedTypes.join(", ")}`, now);
+      } catch (stateError) {
+        logger?.warn?.("syncMirror: markMirrorDirty failed:", stateError);
+      }
+      return { success: false, error: `mirror sync failed for: ${failedTypes.join(", ")}` };
+    } catch (error) {
+      const errMsg = error?.message ?? String(error);
+      logger?.warn?.("syncMirror failed:", error);
+      try {
+        // 债务绑定到新的一轮（desired generation 原子递增；即便 dirty 写失败，
+        // generation 已推进，recoverMirror 仍能捕获，不产生 false-clean）。
+        store.markMirrorDirty(errMsg, now);
+      } catch (stateError) {
+        logger?.warn?.("syncMirror: markMirrorDirty failed:", stateError);
+      }
+      // 逐 type 标记为 failed（applied_gen 不动）
+      for (const type of coveredTypes) {
+        try {
+          store.setTypeStatus(type, { status: "failed", last_error: errMsg });
+        } catch (stateError) {
+          logger?.warn?.(`syncMirror: setTypeStatus(${type}) failed:`, stateError);
+        }
+      }
+      return { success: false, error: errMsg };
+    }
+  }
+
+  // afterSync: run syncMirror and surface a failure to the operator instead of
+  // swallowing it (peer blocker 2 + audit peer B). The mirror debt has already
+  // been persisted by markMirrorDirty inside syncMirror, so a restart recovers —
+  // but the calling write path must not report clean while the mirror is
+  // known-stale. Returns the sync result so the caller can attach an explicit
+  // degraded/pending receipt to its return value instead of faking success.
+  function afterSync(label) {
+    const r = syncMirror();
+    if (!r?.success && !r?.deferred) {
+      logger?.warn?.(`${label}: mirror sync failed (will recover on restart):`, r?.error);
+    }
+    return r;
+  }
+
+  // recoverMirror: 启动/手动 reconcile 时根据持久 dirty 状态决定是否恢复同步
+  // （F-NEW-03 + v0.3.6）。触发条件不只是 dirty——还检查
+  // generation > applied_generation（有未应用的债务），这样 COMMIT→dirty 崩溃
+  // 窗口（DB 提交后、markMirrorDirty/clean 前进程退出 → dirty=false 但
+  // generation 不一致）也能被捕获。有界重试（最多 3 次）重跑 syncMirror 收敛；
+  // 某次成功后 dirty=false 且无更新债务（generation <= applied_generation）
+  // 立即停止。返回 { recovered, error } 供 index.js 启动 / api.js health 判断。
+  // 一切 fail-safe，绝不向外抛。
+  function recoverMirror() {
+    const MAX_ATTEMPTS = 3;
+    let lastError = null;
+    let recovered = false;
+
+    try {
+      const state = store.getMirrorState();
+      // 崩溃窗口检测：dirty 或 generation > applied_generation（COMMIT→dirty 窗口）
+      if (!state?.dirty && !(state.generation > state.applied_generation)) {
+        // 本来就干净：无需恢复，视为成功
+        return { recovered: true, error: null };
+      }
+
+      // 有 dirty 或有未应用债务：最多尝试 3 次 sync
+      for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+        try {
+          syncMirror(); // syncMirror 内部已 catch，不会向外抛
+          const currentState = store.getMirrorState();
+          // 成功条件：dirty 为 false 且没有更新一轮的债务
+          // （generation <= applied_generation，恢复后由 syncMirror 里
+          //   markMirrorCleanForGeneration 自动把 applied 跟上）
+          if (!currentState?.dirty && currentState.generation <= currentState.applied_generation) {
+            recovered = true;
+            lastError = null;
+            break;
+          }
+          // 仍 dirty 或仍有更新债务：记录最后一次错误供重试耗尽后上报。
+          // 注意：若别的 worker 又失败产生新债务（dirty 仍 true），这是"新债务"
+          // 不是本次失败，继续重试直到耗尽次数。
+          lastError = currentState.last_error || `Sync attempt ${attempt + 1} left mirror dirty or has pending debt`;
+        } catch (syncError) {
+          // syncMirror 理论不抛，fail-safe 兜底
+          const errMsg = syncError?.message ?? String(syncError);
+          logger?.warn?.("recoverMirror: sync attempt failed:", errMsg);
+          lastError = errMsg;
+        }
+      }
+
+      if (!recovered) {
+        logger?.warn?.("dsh-mneme mirror: recover failed after", MAX_ATTEMPTS, "attempts");
+      } else {
+        logger?.warn?.("dsh-mneme mirror: recovered from dirty/pending state");
+      }
+    } catch (error) {
+      // fail-safe：任何意外异常不向外抛
+      lastError = error?.message ?? String(error);
+      logger?.warn?.("dsh-mneme mirror: recover failed with unexpected error:", error);
+    }
+
+    return { recovered, error: recovered ? null : lastError };
+  }
+
+  // getMirrorHealth: 暴露 mirror 同步健康状态，供 api.js /health 使用
+  // （F-NEW-03）。把 DB 的 dirty 0/1 转成 boolean；fail-safe，绝不向外抛。
+  function getMirrorHealth() {
+    try {
+      const state = store.getMirrorState();
+      if (!state) {
+        // 无状态行：返回安全默认值
+        return {
+          dirty: false,
+          last_error: null,
+          last_attempt: null,
+          success_at: null
+        };
+      }
+      return {
+        dirty: Boolean(state.dirty),
+        last_error: state.last_error ?? null,
+        last_attempt: state.last_attempt ?? null,
+        success_at: state.success_at ?? null
+      };
+    } catch (error) {
+      // fail-safe：状态读取失败也不向外抛，但必须显式表达"未知"而非伪装成
+      // 干净（peer blocker 5：真实读取失败要显式 unknown，不得归一为 dirty:false）。
+      logger?.warn?.("getMirrorHealth failed:", error);
+      return {
+        dirty: null,
+        last_error: error?.message ?? String(error),
+        last_attempt: null,
+        success_at: null
+      };
+    }
+  }
+
+  // getCapacityHealth：容量预警（#275 空间维度）——库体积 / 归档区规模是否过线。
+  // 与 getMirrorHealth 同款 fail-safe：读失败显式 unknown，绝不伪装成 ok，也绝不
+  // 向外抛（/health 还有镜像那半张答复，容量不能把整张健康面拖塌）。
+  // 阈值读 config.capacityWarning；config 缺席（直连调用方 / 测试传裸对象）时退回
+  // config.js 的同一份常量，不另立一套数字。答复里只有数字，**绝不带 storageStats
+  // 的 path**——那是本机文件系统布局，/health 是半张对外面。
+  function getCapacityHealth() {
+    const unknown = () => ({
+      status: "unknown",
+      file_bytes: null,
+      freelist_bytes: null,
+      active_rows: null,
+      archived_rows: null,
+      archived_ratio: null,
+      checks: []
+    });
+    try {
+      const cfg = { ...CAPACITY_WARNING_DEFAULTS, ...(config?.capacityWarning ?? {}) };
+      const stats = store.storageStats();
+      const counts = store.capacityStats();
+      const total = counts.active + counts.archived;
+      const ratio = total > 0 ? counts.archived / total : null;
+      const checks = [];
+      // 每条检查：阈值 > 0 才启用（0 = 显式关掉这一条），过线判 >= ——「到阈值」
+      // 即报警（#275 口径）。没法评的检查直接缺席而不是伪装 ok：file_bytes 为
+      // null（:memory: 库）时体积检查进不了列表，total 为 0 时占比检查同理。
+      if (cfg.dbSizeWarnMb > 0 && stats.fileBytes !== null) {
+        checks.push({
+          key: "db_size",
+          status: stats.fileBytes >= cfg.dbSizeWarnMb * 1048576 ? "warn" : "ok",
+          value_bytes: stats.fileBytes,
+          threshold_bytes: cfg.dbSizeWarnMb * 1048576
+        });
+      }
+      if (cfg.archivedRowsWarn > 0) {
+        checks.push({
+          key: "archived_rows",
+          status: counts.archived >= cfg.archivedRowsWarn ? "warn" : "ok",
+          value: counts.archived,
+          threshold: cfg.archivedRowsWarn
+        });
+      }
+      if (cfg.archivedRatioWarn > 0 && ratio !== null) {
+        checks.push({
+          key: "archived_ratio",
+          status: ratio >= cfg.archivedRatioWarn ? "warn" : "ok",
+          value: Math.round(ratio * 1000) / 1000,
+          threshold: cfg.archivedRatioWarn
+        });
+      }
+      return {
+        status: checks.some((c) => c.status === "warn") ? "warn" : "ok",
+        file_bytes: stats.fileBytes,
+        freelist_bytes: stats.freelistCount * stats.pageSize,
+        active_rows: counts.active,
+        archived_rows: counts.archived,
+        archived_ratio: ratio === null ? null : Math.round(ratio * 1000) / 1000,
+        checks
+      };
+    } catch (error) {
+      logger?.warn?.("getCapacityHealth failed:", error);
+      return unknown();
+    }
+  }
+
+  // 返回字面量与内部裁决器（resolveConflictPending → applyDecisions 的 conflict
+  // 处置）共用的写路径：mirror 同步、写通知、嵌入调度全部同源，不能各写一份。
+  function updateMemory(id, p, ctx = {}) {
+    const old = store.getById(id);
+    // #230 写入权分离（与 saveWithDedupe 同款守卫）：document 行只能经
+    // registerDocument 铸造。既有 document 行的摘要修复（memory_update 改
+    // content/title——设计定案的更新通道）照常放行，type 不许改入 document。
+    if (p?.type === "document" && old?.type !== "document") {
+      throw new Error("type 'document' is minted only via registerDocument (summary + doc_path + evidence)");
+    }
+    // Issue #135 附属发现 2：质量过滤器把「为什么被降权/归档」写在系统信号标签
+    // 上（SIGNAL_TAGS，applyQualityDisposition 以并集写入），而这里整组替换
+    // tags——任何带 tags 的更新都会抹掉这条唯一的审计线索（报告实测 150 条低分
+    // 记忆里恰好缺的 2 条就是被 update 过的，并因此误判过归档来源）。把 existing
+    // 的系统信号标签并集保留；用户自传的标签照常生效。
+    let patch = (p && Array.isArray(p.tags) && old && Array.isArray(old.tags))
+      ? { ...p, tags: [...new Set([...p.tags, ...old.tags.filter((t) => SIGNAL_TAGS.includes(t))])] }
+      : p;
+    // v0.8.1 底座（issue #170）：显式 scope 修正。patch 携带 agent_scope /
+    // workspace_scope 键（undefined=该维不动）时归一化并盖 explicit 章 +
+    // scope_decided_at，随后写 scope_changes 审计行（actor：tool=模型侧 /
+    // panel=人工侧）。审计失败只 warn，不反噬主写入。
+    const nextAgentScope = p && p.agent_scope !== undefined ? normalizeExplicitScope(p.agent_scope) : undefined;
+    const nextWorkspaceScope = p && p.workspace_scope !== undefined ? normalizeExplicitScope(p.workspace_scope) : undefined;
+    const scopeChanged = nextAgentScope !== undefined || nextWorkspaceScope !== undefined;
+    if (scopeChanged) {
+      const decidedAt = new Date().toISOString();
+      patch = { ...patch };
+      if (nextAgentScope !== undefined) {
+        patch.agent_scope = nextAgentScope;
+        patch.agent_scope_source = "explicit";
+      }
+      if (nextWorkspaceScope !== undefined) {
+        patch.workspace_scope = nextWorkspaceScope;
+        patch.workspace_scope_source = "explicit";
+      }
+      patch.scope_decided_at = decidedAt;
+    }
+    const updated = store.update(id, patch);
+    if (scopeChanged && old && updated) {
+      try {
+        store.saveScopeChange({
+          memory_id: id,
+          actor: ctx.actor === "panel" ? "panel" : "tool",
+          prev_agent_scope: old.agent_scope ?? null,
+          prev_workspace_scope: old.workspace_scope ?? null,
+          next_agent_scope: updated.agent_scope ?? null,
+          next_workspace_scope: updated.workspace_scope ?? null,
+          agent_scope_source: updated.agent_scope_source ?? null,
+          workspace_scope_source: updated.workspace_scope_source ?? null,
+          decided_at: patch.scope_decided_at
+        });
+      } catch (e) {
+        try { ctx.logger?.warn?.(`[dsh-mneme] scope change audit failed: ${String(e)}`); } catch { /* 同样不反噬 */ }
+      }
+    }
+    // Record a user correction when any meaningful field changed and the
+    // reflection failure tracker is enabled. expected = what it became,
+    // actual = what it was before; query (when provided) captures the
+    // user's original intent so later reflection can reason about recall.
+    const hasMeaningfulChange = old && updated && (
+      old.content !== updated.content ||
+      old.title !== updated.title ||
+      old.importance !== updated.importance
+    );
+    if (hasMeaningfulChange && config.reflectionFailureTracking) {
+      store.saveFailure({
+        id: randomUUID(),
+        query: ctx.query ?? null,
+        expected: updated.content,
+        actual: old.content,
+        before: { title: old.title, content: old.content, importance: old.importance },
+        failure_type: "user_correction",
+        memory_id: id
+      });
+    }
+    const sync = afterSync("write");
+    notifyWrite();
+    scheduleEmbed(updated);
+    // Audit peer B: when the mirror sync failed, the store write landed but
+    // the mirror did not converge — return an explicit degraded receipt rather
+    // than a plain success. Non-enumerable so existing deepEqual assertions on
+    // the memory shape keep passing.
+    if (!sync?.success && !sync?.deferred) {
+      Object.defineProperty(updated, "_mirror", {
+        value: { status: "degraded", error: sync?.error ?? "mirror sync failed" },
+        enumerable: false,
+        configurable: true
+      });
+    }
+    return updated;
+  }
+
+  function archiveMemory(id, f) {
+    const updated = store.setArchived(id, f);
+    afterSync("write");
+    // #275 B 项：归档行的向量会被手动回收清掉（检索恒带 archived = 0，按定义不可达），
+    // 还原回活跃面时补一次嵌入——否则那行只剩关键词可检索，回收就成了单程票。
+    // 判据用真值（`!f`）而不是 `f === false`：store.setArchived 自己就是按真值归一
+    // （`archived ? 1 : 0`），API/工具传 0 或空串同样会把行放回活跃面，口径必须同一把尺。
+    // 排队语义与写入路径同一处（txDepth / 未就绪由 scheduleEmbed 自己挡）。
+    if (!f) scheduleEmbed(updated);
+    return updated;
+  }
+
+  // document 型记忆注册（#230）：内聚块在 src/document.js（AGENTS.md 尺寸
+  // 约定，同 recallStats 先例），这里只做依赖注入 + barrel 出口，调用方零改动。
+  // 写后语只做重嵌入：镜像同步与写通知由 transaction 的 commit 路径统一执行
+  // （notifyWrite 在 txDepth>0 时 deferred 到 finally），这里再调就是双份。
+  const registerDocument = createDocumentRegistrar({
+    store,
+    config,
+    embedQuery,
+    pushContentHistory,
+    transaction,
+    // #275 拍板 5：升格吸收的 evidence 行随之归档，但 pinned 池（#249）永不自动归档
+    // ——注册器不 import 这个集合，方向反了会成环，所以在这里注入。
+    pinnedTypes: PINNED_MEMORY_TYPES,
+    finalize: (rows) => {
+      for (const row of rows) scheduleEmbed(row);
+    }
+  });
+
+  // agent 主动整理接口（#231）：dryRun 比对报告 → agent 判断 → apply 落库，筛除项
+  // 进归档不删，全程复用 dream_runs 的 receipt 语义（不新建审计面）。走
+  // saveWithDedupe 落库 = 复用常规写路径的镜像/通知语；重嵌入由 finalize 在事务
+  // 提交后补（事务里的 scheduleEmbed 被 txDepth 挡掉）——document 同款先例。
+  const { organize } = createOrganizer({
+    store,
+    embedQuery,
+    saveWithDedupe,
+    transaction,
+    finalize: (rows) => {
+      for (const row of rows) scheduleEmbed(row);
+    }
+  });
+
+  // 车道 C 收侧的入库与整包退出（spec §5）：内聚块在 src/share-import.js，这里只做依赖
+  // 注入 + barrel 出口。注入的是本文件的 transaction 而不是 store.runAtomically——嵌入
+  // 队列由 transaction 的最外层 COMMIT 排空，换那个助手等于静默不嵌入（#372 修过两次）；
+  // 退出那侧用它则是为了 finally 里的 syncMirror + notifyWrite（删完得让其余读侧知道）。
+  const shareImport = createShareImport({ store, transaction, scheduleEmbed });
+
+  return {
+    saveWithDedupe,
+    registerDocument,
+    // agent 主动整理接口（#231）：内聚块在 src/organize.js，这里只做依赖注入 +
+    // barrel 出口。本体不带配置键（第一批口径），暴露闸住在工具层（#231 第二批的
+    // `organizeEnabled` → `tools.js` 的 `memory_organize`）：service 侧不认识开关，
+    // 所以直连 service 的调用方（测试、内部管线）不受面板那格影响。
+    organize,
+    recoverMirror,
+    getMirrorHealth,
+    getCapacityHealth,
+    getMirrorState: () => store.getMirrorState(),
+    injectCandidates,
+    mergeHumanEdits,
+    // 车道 C 收侧：两张皮（面板路由 / standalone 数据面）各自的壳只认这一份实现——
+    // createApi 手里没有 store，「api 层不直接摸 store」这条纪律（见下面 embeddedCount
+    // 那组 passthrough 的注释）要求导入从 service 进，否则两皮各摸一遍 store、幂等
+    // 口径随之变成两份。
+    importSharePack: shareImport.importSharePack,
+    // 整包退出（C4）与导入同住 src/share-import.js：收侧的「进与出」共用同一份 store
+    // 注入与同一个事务口径，键名照计划里的契约留在 service 的返回表上，两张皮（C5/C6）
+    // 只认 service 这一个入口——api 层不直接摸 store 那条纪律对退出同样成立。
+    deleteSharePack: shareImport.deleteSharePack,
+    toApiList,
+    isVisibleInScope,
+    // issue #471 政策轴：按下/松开与读取照 store 那三条件透传（纯 bookkeeping，
+    // 不挂 write hook——它们不动任何记忆行，同 saveConflictPending 那批）。
+    setScopeState: (r) => store.setScopeState(r),
+    getScopeState: (d, v) => store.getScopeState(d, v),
+    listScopeStates: (o) => store.listScopeStates(o),
+    // #249 第二批：pin 的读写口。这四个都是纯 bookkeeping——它们不动任何记忆行，
+    // 只动 pinned_memories 这张关系表，所以照 setScopeState 那一批的纪律**不挂
+    // write hook**（不 afterSync、不 notifyWrite）：pin 一条不该让 mirror 重渲染，
+    // 也不该把那行记忆的 heat/embedding 重新排队。注入侧只经 store 读本表
+    // （listPinned / listByIdsForInject），写侧只经这里，两处都绕开 memories 主表。
+    pinMemory: (id, opts) => store.pinMemory(id, opts),
+    unpinMemory: (id) => store.unpinMemory(id),
+    listPinned: () => store.listPinned(),
+    countPinned: () => store.countPinned(),
+    // 巩固（dream.js）侧的过滤出口。暴露出来而不是让 dream 自己读状态表，是因为
+    // 判定只能有一份实现（gateByScope 注释里那条「过滤点漂移」的教训）；dream 侧
+    // 的三个读入口各自的附加条件不同（有的排 forgotten、有的不排），但「被按下的
+    // 作用域不参与巩固」这一层对三处是一样的。enforce 关时本函数原样返回入参。
+    filterPaused: (rows) => scopeStateGate.filter(rows),
+    transaction,
+    getDistillCursor: (sessionId) => store.getDistillCursor(sessionId),
+    setDistillCursor: (sessionId, lastSeq) => store.setDistillCursor(sessionId, lastSeq),
+    // #493 补充 §②：解析失败计数是**跨进程**的事实（护栏默认关，但开着时重启一次
+    // 就清零等于让护栏可被重启绕过）。整条是 bookkeeping，不挂 write hook。
+    getDistillParseFailureStreak: (sessionId, opts) => store.getDistillParseFailureStreak(sessionId, opts),
+    bumpDistillParseFailureStreak: (sessionId, opts) => store.bumpDistillParseFailureStreak(sessionId, opts),
+    clearDistillParseFailureStreak: (sessionId) => store.clearDistillParseFailureStreak(sessionId),
+    // #399 蒸馏原始记录与溯源：与上面两条游标一样是纯 passthrough——它们不是
+    // 记忆写入，不该触发 syncMirror / notifyWrite / 实体抽取（那些钩子挂在
+    // saveWithDedupe 上）。distill_records 的落盘由 summarize.js 在蒸馏窗口内
+    // 一次性批写，读回只给面板/CLI 的溯源视图用。
+    saveDistillRecords: (records) => store.saveDistillRecords(records),
+    saveMemoryProvenance: (link) => store.saveMemoryProvenance(link),
+    provenanceFor: (memoryId) => store.provenanceFor(memoryId),
+    // 图像溯源（v2）：与 saveMemoryProvenance 同一组 passthrough——写侧在蒸馏窗口
+    // 事务里一并落，读侧给面板/CLI 回答「这条记忆能回指哪张图」。不碰 syncMirror：
+    // 引用行不是记忆内容，改它不该把记忆文件标脏。
+    saveImageSources: (rows) => store.saveImageSources(rows),
+    imageSourcesFor: (memoryId) => store.imageSourcesFor(memoryId),
+    // #421 读出口：按 (session, seq 区间) 取蒸馏原文。与 provenanceFor 成对——
+    // 一个给区间、一个给区间里的原文，合起来才是「这条记忆从哪几句蒸出来的」。
+    distillRecordsFor: (sessionId, seqStart, seqEnd) => store.distillRecordsFor(sessionId, seqStart, seqEnd),
+    // #524 方向 2：按会话列出它的蒸馏窗口。与 provenanceFor 同一张表、另一条索引
+    // （idx_memory_provenance_session），所以也是纯 passthrough——读的是 #399 早就
+    // 落好的事实，不产生任何写入。
+    distillWindowsFor: (sessionId, limit) => store.distillWindowsFor(sessionId, limit),
+    // #512 蒸馏运行与铸造归因：同样是 bookkeeping passthrough（与 saveDreamRun
+    // 那一组同语义）——run 是审计主体，notifyWrite 会绕回它自己的调度器。
+    saveDistillRun: (run) => store.saveDistillRun(run),
+    attachDistillRunAudit: (id, auditId) => store.attachDistillRunAudit(id, auditId),
+    getDistillRun: (id) => store.getDistillRun(id),
+    listDistillRuns: (opts) => store.listDistillRuns(opts),
+    saveMemoryMint: (mint) => store.saveMemoryMint(mint),
+    mintsFor: (memoryId) => store.mintsFor(memoryId),
+    enqueue,
+    setDreamHook(fn) { dreamHook = fn; },
+    setSleepHook(fn) { sleepHook = fn; },
+    setEmbedder(emb) {
+      embedder = emb;
+      if (!emb) {
+        // embedder removed (init failed in index.js): stop polling and drop
+        // queued re-embeds — search just degrades to keyword.
+        stopEmbedReadyPolling();
+        embedPending = [];
+        return;
+      }
+      if (emb.ready === true) {
+        flushEmbedPending();
+        return;
+      }
+      // Async-initializing embedder: poll `ready` until it flips, then flush.
+      if ("ready" in emb && embedReadyTimer === null) {
+        let attempts = 0;
+        let readyReadFailed = false;
+        // 读 `ready` 必须先兜住异常再算天花板，否则天花板形同不存在：`ready` 是
+        // getter（embedding.js 的 OpenAI embedder 直接读库），getter 一抛错，整条
+        // `||` 的求值当场中断，右侧的 `attempts >= EMBED_READY_POLL_LIMIT` 永远轮
+        // 不到 —— stopEmbedReadyPolling() 不执行，定时器就活过 3s 上限，并以未捕获
+        // 异常的形式每 100ms 抛一次。实测（2026-10-14）：卸载路径 store.close() 之后
+        // 每次读 ready 都抛 "database is not open"，5s 内读 46 次，天花板 31 被直接
+        // 打穿，宿主事件循环因此永不排空。读不出来按「没就绪」处理，但上限照算。
+        const readReady = () => {
+          try {
+            return emb.ready === true;
+          } catch (err) {
+            if (!readyReadFailed) {
+              readyReadFailed = true; // 只报一次，别让 3s 上限变成 30 条刷屏
+              logger?.warn?.("embedder ready probe failed, treating it as not-ready:", err);
+            }
+            return false;
+          }
+        };
+        embedReadyTimer = setInterval(() => {
+          attempts++;
+          const ready = readReady();
+          if (ready || attempts >= EMBED_READY_POLL_LIMIT) {
+            stopEmbedReadyPolling();
+            if (ready) flushEmbedPending();
+            else embedPending = []; // init never landed: drop the queue
+          }
+        }, EMBED_READY_POLL_MS);
+      }
+    },
+    setEntityExtractor(fn) { entityExtractor = fn; },
+    setVectorIndex(vi) { vectorIndex = vi; },
+    setReranker(rn) { reranker = rn; },
+    setRecallRecorder(fn) { recallRecorder = fn; },
+    searchMemories,
+    // recallStats（#217）实现在 src/recall-stats.js：service.js 过 2000 行参考线，
+    // 新内聚块独立成模块（AGENTS.md 尺寸约定）；这里只留 barrel 出口，调用方
+    // （api 层）零改动。纯读聚合，见模块注释的口径说明。
+    recallStats: (options) => recallStats(store, options),
+    embedQuery,
+    findSessionDuplicate,
+    evaluateRetrieval,
+    computeRetrievalMetrics,
+    // passthroughs used by tools and api layers; mutations keep the mirror in sync
+    search: (q, o) => store.search(q, o),
+    searchVector: (v, o) => store.searchVector(v, o),
+    embeddedCount: () => store.embeddedCount(),
+    // 向量出身的两个分组读数：状态端点 /semantic 用它们区分「有向量」和
+    // 「可检索」（byModel 按行级 embedding_model，byDimension 按向量维数）。
+    // passthrough 形状与 embeddedCount 同款，api 层不直接摸 store。
+    countNeedsEmbeddingFor: (modelHash) => store.countNeedsEmbeddingFor(modelHash),
+    embeddingModelBreakdown: () => store.embeddingModelBreakdown(),
+    embeddingDimensionBreakdown: () => store.embeddingDimensionBreakdown(),
+    // #383：维度探针，供 /context 判「库里有没有一条活跃向量与查询同维」。注意
+    // 它**不再是**「读一行的维度」（那个判据在混合维度库里两个方向都错，见 store.js
+    // vectorDimensionState 的注释）：换成存在性判据后成本是「一次全 id 扫描 + 按匹配
+    // 短路的解析」，同维度健康库只解析 1 个向量，只有要报 degraded 时才走完全表。
+    // 与上面那个全表扫的 breakdown 仍是两件事：一个是状态页的完整分布，一个是每请求
+    // 用得起的判据。透传而非让 api 层摸 store，与同组其他条目一致；api 侧负责把探针
+    // 异常隔离成 unknown，不在这里吞。
+    vectorDimensionState: (dimension) => store.vectorDimensionState(dimension),
+    // 整包透传：store.list 的每个口径（excludeTypes / excludeImported / includeArchived…）
+    // 都从这里过去，service 侧不再枚举一遍——枚举就是第二份口径表，加一个键就要改两处，
+    // 漏改的那处静默失效。政策轴一律走这里的查询参数，不许退回调用方的 .filter：
+    // LIMIT 先生效的话，被丢掉的行照样吃掉窗口名额。前例是同文件 syncMirror 的那条注释
+    // （src/service.js:2247，document 轴改由 excludeTypes 在 LIMIT 之前排除），
+    // 同一取舍的另两次是 #230 与 #471。
+    list: (o) => store.list(o),
+    all: () => store.all(),
+    count: (type, opts) => store.count(type, opts),
+    // #597：/list 的 typeCounts——同一份筛选、不带 type 的全库分布（面板分类栏数字源）。
+    countByType: (opts) => store.countByType(opts),
+    getById: (id) => store.getById(id),
+    remove: (id) => {
+      store.remove(id);
+      afterSync("write");
+      notifyWrite();
+    },
+    // #725 收尾：升格/降格要按同题行找 pattern（含已归档），走 store 的定向读。
+    // 不用 list()：那个是「该类型最重要的 N 行」，pattern 一多就把目标挤出窗口。
+    findByTypeAndTitle: (type, title, opts) => store.findByTypeAndTitle(type, title, opts),
+    activeByTypeAndTitle: (type, title) => store.activeByTypeAndTitle(type, title),
+    update: updateMemory,
+    // v0.8.1 底座：scope 归属修正审计（单条记忆，新→旧）。
+    listScopeChanges: (memoryId, opts) => store.listScopeChanges(memoryId, opts),
+    // Compare-and-set update: applies the patch only when the row still carries
+    // `expectedUpdatedAt`. Returns undefined on a miss (no write) so the caller
+    // can re-read and retry — the primitive that prevents lost updates across
+    // concurrent read-modify-write (see scripts/stress-dsh.js axis 3).
+    compareAndUpdate: (id, expectedUpdatedAt, patch, ctx = {}) => {
+      const old = store.getById(id);
+      const updated = store.compareAndUpdate(id, expectedUpdatedAt, patch);
+      if (updated === undefined) return undefined; // CAS miss: no write, no side effects
+      const hasMeaningfulChange = old && updated && (
+        old.content !== updated.content ||
+        old.title !== updated.title ||
+        old.importance !== updated.importance
+      );
+      if (hasMeaningfulChange && config.reflectionFailureTracking) {
+        store.saveFailure({
+          id: randomUUID(),
+          query: ctx.query ?? null,
+          expected: updated.content,
+          actual: old.content,
+          before: { title: old.title, content: old.content, importance: old.importance },
+          failure_type: "user_correction",
+          memory_id: id
+        });
+      }
+      const sync = afterSync("write");
+      notifyWrite();
+      scheduleEmbed(updated);
+      // Audit peer B: mirror sync failure on a CAS write must surface too.
+      if (!sync?.success && !sync?.deferred) {
+        Object.defineProperty(updated, "_mirror", {
+          value: { status: "degraded", error: sync?.error ?? "mirror sync failed" },
+          enumerable: false,
+          configurable: true
+        });
+      }
+      return updated;
+    },
+    setForget: (id, f) => {
+      const updated = store.setForget(id, f);
+      afterSync("write");
+      return updated;
+    },
+    // 取代链上下文（#532）：memory_forget 的回执要说清「这次抑制连带谁」。
+    // 只读，不走 afterSync——回执冒烟不该触发镜像重渲染。旧装配（测试替身）
+    // 没有这个方法时返回 null，工具侧按「无链信息」降级，不抛。
+    supersedeContext: (id) => (typeof store.supersedeContext === "function" ? store.supersedeContext(id) : null),
+    setArchived: archiveMemory,
+    // sleep-mode storage (v0.4.0). demoteToSummary / restoreContent mutate
+    // content so they ride the normal write-hook path (mirror re-renders).
+    // touchLastAccess is a read-stamp — deliberately NO write hook (a recall
+    // must not dirty the mirror). getUnrecalledSince is a pure read.
+    demoteToSummary: (id, summary, opts) => {
+      const updated = store.demoteToSummary(id, summary, opts);
+      afterSync("write");
+      return updated;
+    },
+    restoreContent: (id) => {
+      const updated = store.restoreContent(id);
+      afterSync("write");
+      return updated;
+    },
+    touchLastAccess: (id, at) => store.touchLastAccess(id, at),
+    getUnrecalledSince: (cutMs, opts) => store.getUnrecalledSince(cutMs, opts),
+    // autoDream audit trail: passthroughs deliberately bypass write hooks —
+    // an audit write is bookkeeping, and notifyWrite would loop back into the
+    // dream scheduler that just recorded the run.
+    saveDreamRun: (run) => store.saveDreamRun(run),
+    getDreamRun: (id) => store.getDreamRun(id),
+    listDreamRuns: (opts) => store.listDreamRuns(opts),
+    // Per-record receipt chain (same bookkeeping semantics as saveDreamRun: an
+    // audit write, never a write-hook-triggering memory mutation).
+    saveReceipt: (r) => store.saveReceipt(r),
+    getReceipt: (id) => store.getReceipt(id),
+    listReceipts: (opts) => store.listReceipts(opts),
+    // Conflict freeze bookkeeping (same semantics as the audit passthroughs
+    // above: an audit write, never a write-hook-triggering memory mutation).
+    saveConflictPending: (r) => store.saveConflictPending(r),
+    listConflictPending: (opts) => store.listConflictPending(opts),
+    listConflictQueue,
+    resolveConflictPending,
+    countConflictPending: () => store.countConflictPending(),
+    // Issue #533：differentiate 的裁决账本。同样只做记账、绝不改正文——正文
+    // 一旦互相追加同一段注记，两条向量会被同向拉近（复现见 store 侧建表注释）。
+    saveDifferentiatedPair: (r) => store.saveDifferentiatedPair(r),
+    findDifferentiatedPair: (a, b) => store.findDifferentiatedPair(a, b),
+    listDifferentiatedPairs: (opts) => store.listDifferentiatedPairs(opts),
+    // #529：机器侧冲突裁决台账。同样只有 bookkeeping 语义——一行台账既不是记忆
+    // 内容也不是人工裁决，写它不该触发 syncMirror / notifyWrite / 实体抽取，否则
+    // 记账本身会反过来把睡眠调度器叫醒（与上面 saveDreamRun 同一个理由）。
+    saveConflictReviewed: (r) => store.saveConflictReviewed(r),
+    loadConflictReviewed: () => store.loadConflictReviewed(),
+    listConflictReviewed: (opts) => store.listConflictReviewed(opts),
+    // #641：冲突分诊账本。与上面 conflict_reviewed 同一条 bookkeeping 纪律——纯
+    // 测量记录，写它绝不触发 write hooks，否则 shadow 档的每轮记账都会把睡眠
+    // 调度器叫醒。
+    saveConflictLedgerEntry: (r) => store.saveConflictLedgerEntry(r),
+    setConflictLedgerStatus: (a, b, s) => store.setConflictLedgerStatus(a, b, s),
+    // #641 收尾：把任一侧已归档 / 遗忘的 open 账本行收进 zombied。与上面同一条
+    // bookkeeping 纪律——只改账本状态，不碰 memories 任何一列。
+    zombifyDeadLedgerPairs: () => store.zombifyDeadLedgerPairs(),
+    listConflictLedger: (opts) => store.listConflictLedger(opts),
+    countConflictLedger: (opts) => store.countConflictLedger(opts),
+    // #641 T3 取代链：与上面 ledger 同一条 bookkeeping 纪律——纯元数据标注绝不
+    // 触发 write hooks（正文零变化，镜像无 diff；bump updated_at 会污染
+    // 「这一对刚判过」的宽松代理判定）。
+    supersedeChain: (loserId, winnerId) => store.supersedeChain(loserId, winnerId),
+    // Recall evaluation trail (方案 B): audit-bookkeeping semantics like the
+    // dream/recall passthroughs above — a recall_evals write is a snapshot, not
+    // a memory mutation, so it never triggers write hooks.
+    saveRecallEval: (r) => store.saveRecallEval(r),
+    getRecallEval: (id) => store.getRecallEval(id),
+    listRecallEvals: (opts) => store.listRecallEvals(opts),
+    // LLM audit trail (Bug8): bookkeeping semantics like the recall/dream
+    // passthroughs — a saveLlmAudit write never triggers write hooks.
+    saveLlmAudit: (entry) => store.saveLlmAudit(entry),
+    // #534：校验层的判决要补回到调用层已经写死的审计行上（两套账分账，见 store 侧注释）。
+    annotateLlmAudit: (id, patch) => store.annotateLlmAudit(id, patch),
+    listLlmAudits: (opts) => store.listLlmAudits(opts),
+    countLlmAudits: (opts) => store.countLlmAudits(opts),
+    getLlmAuditStats: (opts) => store.getLlmAuditStats(opts),
+    // 面板「8 周沉淀」图（只读聚合）：进来的 / 真沉淀的 / 归档的按天三条线。
+    getConsolidationStats: (opts) => store.getConsolidationStats(opts),
+    deleteOldLlmAudits: (before) => store.deleteOldLlmAudits(before),
+    // Entity gene (v0.3.0) passthroughs for the autoDream apply path
+    // (applyDecisions): records supersedes relations after an update and
+    // migrates entity_attrs on merge. Bookkeeping writes like the audit
+    // passthroughs above — never write-hook-triggering memory mutations.
+    saveRelation: (r) => store.saveRelation(r),
+    // #619：同一条边被后续观察补充证据时回写 metadata（情感相位判重命中）。
+    updateRelationMetadata: (id, metadata) => store.updateRelationMetadata(id, metadata),
+    // #725：人工修正通道——按 id 寻址 + 账本读写。只记账不触发 hook（审计纪律
+    // 同 profile_fact_journal）；写入方只有 apply 路由（token-write）。
+    relationById: (id) => store.relationById(id),
+    // #739：降格归档前先问「还有几条边指着这行 pattern」——跨组共用的行不能
+    // 因为一组降格就被归档，否则另一组仍指着一条已归档的 id。
+    relationIdsByTraitMemoryId: (traitMemoryId, opts) => store.relationIdsByTraitMemoryId(traitMemoryId, opts),
+    recordAffectiveJournal: (entry) => store.recordAffectiveJournal(entry),
+    listAffectiveJournal: (limit) => store.listAffectiveJournal(limit),
+    pruneAffectiveJournal: (keep) => store.pruneAffectiveJournal(keep),
+    listEntities: (o) => store.listEntities(o),
+    countEntities: () => store.countEntities(),
+    getRelations: (id) => store.getRelations(id),
+    relationsByType: (type, limit) => store.relationsByType(type, limit),
+    // #613 §4：日记素材查询（store 内 SQL，service 只透传）。纯读，无 hook。
+    diaryMaterial: (params) => store.diaryMaterial(params),
+    // #24 块4 被动确认的复核出口：列出权重被 bump 抬过的边（gain = 现权 −
+    // 该 source 的初值）。纯读，不动权重——「看哪些边被用出来过」是人的动作。
+    listBoostedRelations: (o) => store.listBoostedRelations(o),
+    // v0.7.0 实体热投影：实体热 = 关联记忆 heat 聚合（取 max）。无关联记忆
+    // 或 heatEnabled=false 时返回 null；前端据此决定图谱节点大小/明暗。
+    entityHeat: (entityId) => {
+      if (config.heatEnabled === false) return null;
+      const rels = store.getRelations(entityId) ?? [];
+      let max = -Infinity;
+      for (const rel of rels) {
+        if (!rel.memory_id) continue;
+        const mem = store.getById(rel.memory_id);
+        if (!mem) continue;
+        const h = computeHeat(mem, Date.now(), config);
+        if (h > max) max = h;
+      }
+      return max === -Infinity ? null : max;
+    },
+    saveAttr: (r) => store.saveAttr(r),
+    createEntity: (r) => store.createEntity(r),
+    findEntityByName: (n, t) => store.findEntityByName(n, t),
+    findEntityById: (id) => store.findEntityById(id),
+    getAttrsByMemory: (id) => store.getAttrsByMemory(id),
+    // 记忆详情侧栏：一条记忆关联到的实体（entity_attrs.memory_id 反查，纯读）。
+    entitiesForMemory: (id) => store.entitiesForMemory(id),
+    getCurrentAttrs: (id) => store.getCurrentAttrs(id),
+    migrateAttrsToMemory: (fromId, toId, now) => store.migrateAttrsToMemory(fromId, toId, now)
+  };
+}
