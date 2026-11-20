@@ -22,6 +22,7 @@ import json
 import os
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from docx import Document
@@ -125,7 +126,10 @@ CASE_TABLE_WIDTHS = [900, 900, 2100, 1600, 2806]
 DISTRIBUTION_WIDTHS = [500, 1150, 1900, 760, 570, 570, 570, 570, 570, 570, 576]
 
 # 表2 测试结果记录单（6 列）
-RECORD_TABLE_WIDTHS = [560, 1100, 1500, 2300, 2200, 646]
+#
+# 列宽按用户要求：序号列从 389 加宽到 520（用户反馈「序号列有点窄」），
+# 差额从「详细需求追踪条目」里扣，其余不动。
+RECORD_TABLE_WIDTHS = [520, 1271, 1584, 2085, 2200, 646]
 
 # 表0 软件信息表（9 列）
 INFO_TABLE_WIDTHS = [1000, 800, 800, 1100, 900, 1000, 1100, 700, 906]
@@ -672,10 +676,11 @@ def fill_case_table(
     # 测试方法：黑盒测试（固定值，与测试类型是两回事）
     set_cell_text(table.rows[1].cells[4], "黑盒测试")
 
-    # 测试需求追踪：功能项编号 + 需求条目
+    # 测试需求追踪：只写功能项名称（+ 需求条目），**不带功能项编号 F-001**。
+    # 用户明确要求去掉「F-001 · 」这个前缀 —— 编号对读者没有信息量，
+    # 报告里也不靠它做引用（引用用的是章节号）。
     trace = " · ".join(
         part for part in [
-            feature.get("code", ""),
             feature.get("name", ""),
             case.get("requirement", ""),
         ] if part
@@ -809,22 +814,17 @@ def fill_distribution_table(table: Table, features: list, stage_name: str = "") 
         tr.getparent().remove(tr)
 
     # 计划出所有行的类型，方便一次建够
+    #
+    # ★ 用户明确要求：**不出阶段小计**，只在表尾出一组「用例汇总 / 占总测试用例百分比%」，
+    #   而且这两行要并入**最后一个阶段**的合并块（与时序号列、阶段列一起竖到底）。
     plan = []                      # [(kind, stage, name, total, counts)]
-    stage_blocks = []              # [(阶段名, 数据行起始下标, 数据行结束下标, 小计行下标)]
+    stage_blocks = []              # [(阶段名, 数据行起始下标, 数据行结束下标)]
     for stage, items in groups:
         start = len(plan)
         for name, total, counts in items:
             plan.append(("data", stage, name, total, counts))
         end = len(plan) - 1
-        # 阶段小计：用例数 = 该阶段内功能项用例数之和；7 类分别累加
-        sub_totals = {key: 0 for key, _ in TYPE_COLUMNS}
-        grand_of_stage = 0
-        for _, total, counts in items:
-            grand_of_stage += total
-            for key in sub_totals:
-                sub_totals[key] += counts[key]
-        plan.append(("subtotal", stage, "本阶段用例汇总", grand_of_stage, sub_totals))
-        stage_blocks.append((stage, start, end, len(plan) - 1))
+        stage_blocks.append((stage, start, end))
 
     # 全项目总计
     overall_totals = {key: 0 for key, _ in TYPE_COLUMNS}
@@ -862,17 +862,10 @@ def fill_distribution_table(table: Table, features: list, stage_name: str = "") 
             continue
 
         if kind == "subtotal":
-            # 小计行：「序号」格写「小计」，「测试阶段」格留空 —— 它已经在阶段名的合并块里，
-            # merge_cells_down() 会把后续格清空，所以这里写什么都会被清，只是先写个语义值。
-            set_cell_text(row.cells[0], "小计")
-            set_cell_text(row.cells[1], "")
-            set_cell_text(row.cells[2], name)
-            set_cell_text(row.cells[3], str(total))
-            for col, (key, _) in enumerate(TYPE_COLUMNS, start=4):
-                set_cell_text(row.cells[col], str(counts[key]))
+            # 不再产生小计行（用户要求去掉），这里仅保留兼容分支，正常不会走到。
             continue
 
-        # total / percent 两行是表尾总计：序号留空，测试阶段写「合计」
+        # total / percent 两行是表尾总计：序号列留空、阶段列写「合计」
         set_cell_text(row.cells[0], "")
         set_cell_text(row.cells[1], "合计")
         set_cell_text(row.cells[2], name)
@@ -885,22 +878,38 @@ def fill_distribution_table(table: Table, features: list, stage_name: str = "") 
             for col, (key, _) in enumerate(TYPE_COLUMNS, start=4):
                 set_cell_text(row.cells[col], "%.1f%%" % counts[key])
 
-    # ── 纵向合并：每个阶段内「序号」与「测试阶段」两列各合成一格 ──
+    # ── 纵向合并 ──
     # 用户原话：「测试阶段都是第一阶段，测试阶段这一列属于第一阶段的就要合并单元格，
     #           包括序号也是，就说明这一个阶段有这么多的功能项」。
-    # 所以：
-    #   · 序号列合并块 = 该阶段的**功能项行**，首格写功能项数（= 这阶段有几个功能项）；
-    #   · 测试阶段列合并块 = 功能项行 + 本阶段小计行，首格写阶段名。
-    #     小计行也算这一阶段的，让阶段名一直竖到底，不会出现「小计行那格空着」。
-    # 两列合并范围不同是允许的，Word 按每格自己的 vMerge 走。
-    for stage, start, end, subtotal_row in stage_blocks:
-        feature_block = list(range(1 + start, 1 + end + 1))
-        if len(feature_block) >= 2:
-            merge_cells_down(table, 0, feature_block)
-            # 合并后首格写「本阶段功能项数」——比重复流水号更有信息量
-            set_cell_text(table.rows[1 + start].cells[0], str(len(feature_block)))
+    #
+    # 合并范围：
+    #   · 中间各阶段：序号列、阶段列都只覆盖**该阶段的功能项行**
+    #   · 最后一个阶段：还要把表尾的「用例汇总 / 百分比」两行一起并进去，
+    #     让最后一格的阶段名一直竖到底（用户手改版就是这样）。
+    #
+    # ★ 注意：plan 的下标是「数据行序号」，表格里的实际行号 = 1 + 下标（第 0 行是表头）。
+    #   踩过两个坑：
+    #     ① 直接把 plan 下标当表格行号用 → IndexError；
+    #     ② 先合并功能项行、再合并「功能项行+表尾行」，两次 merge_cells_down 会对
+    #        已合并的格子重复操作 → "no tr above topmost tr"。
+    #   所以这里**每个合并块只算一次范围、只调一次 merge**。
+    total_rows = len(plan)                                          # plan 行数（含表尾两行）
+    tail_rows = [1 + (total_rows - 2), 1 + (total_rows - 1)]        # 表尾两行的表格行号
 
-        stage_block = feature_block + [1 + subtotal_row]
+    for idx, (stage, start, end) in enumerate(stage_blocks):
+        feature_rows = [1 + start + k for k in range(end - start + 1)]
+        is_last = idx == len(stage_blocks) - 1
+
+        # 序号列：中间阶段只合并功能项行；最后一个阶段把表尾两行也并进去
+        seq_block = feature_rows + (tail_rows if is_last else [])
+        if len(seq_block) >= 2:
+            merge_cells_down(table, 0, seq_block)
+        # 合并后首格就是「这个阶段的序号」，**填 1、2、3**，不是功能项数量。
+        # 踩过：我原来填 len(feature_rows)（4/6/5），用户直接指出「不应该是 123 吗」。
+        set_cell_text(table.rows[feature_rows[0]].cells[0], str(idx + 1))
+
+        # 阶段列：同上范围，首格是阶段名
+        stage_block = feature_rows + (tail_rows if is_last else [])
         if len(stage_block) >= 2:
             merge_cells_down(table, 1, stage_block)
 
@@ -1049,13 +1058,17 @@ def build_overall_evaluation(doc, stages: list, meta: dict) -> None:
         stage_start = stage.get("startDate") or start_date
         stage_end = stage.get("endDate") or end_date
 
-        text = ""
-        if index == 0:
-            text = (
-                "测试组依据软件需求，共设计了测试用例 {total} 个，共执行测试用例 {total} 个，"
-                "其中 {passed} 个测试用例执行通过，{failed} 个测试用例执行未通过，"
-                "测试共发现程序问题 {issues} 个，问题详见附录 A。"
-            ).format(total=total_all, passed=passed_all, failed=failed_all, issues=issues_all)
+        # 每一段都**完整写出总量句**（用户明确要求：按模板制式段原样复制，
+        # 有几个阶段就有几段，每段都以「测试组依据软件需求…」开头）。
+        #
+        # 我上一轮为了避免「共设计 74 个」重复三遍，改成只有第一段带总量句 ——
+        # 那是错误的发挥：模板的制式段本来就是每段独立成篇，读者从任意一段读起
+        # 都要能看懂全项目规模。已按用户手改版改回。
+        text = (
+            "测试组依据软件需求，共设计了测试用例 {total} 个，共执行测试用例 {total} 个，"
+            "其中 {passed} 个测试用例执行通过，{failed} 个测试用例执行未通过，"
+            "测试共发现程序问题 {issues} 个，问题详见附录 A。"
+        ).format(total=total_all, passed=passed_all, failed=failed_all, issues=issues_all)
 
         stage_text = ""
         # 日期缺失时**不写这一句**，而不是写「—到—」这种明显是没填的占位
@@ -1107,6 +1120,84 @@ def build_overall_evaluation(doc, stages: list, meta: dict) -> None:
     set_para_text(Paragraph(ep, doc), tail)
 
 
+def renumber_table_captions(doc, all_issues: list) -> None:
+    """把 3.1 与附录里残留的 `表x` 换成真实编号。
+
+    ★ 用户反复提过的刺眼问题：生成版里留着「表x 软件信息表」这种模板占位。
+      原因是我只处理了 4.x 用例表的表题，3.1 的几张汇总表标题是从模板原样继承的。
+
+    编号规则（全套文档连续，与 4.x 用例表共用一条自增线）：
+        表1 软件信息表                       ← 1.2 系统概述
+        表2 需求功能项测试用例和测试类型的分布情况统计   ← 3.1
+        表3 软件问题分类统计                  ← 3.1
+        表x 测试结果记录单                    ← 留 x（用户手改版也没改这处）
+        表4… 表N  <用例标识>                  ← 4.x.1 各用例表（build_full 里分配）
+        表N+1… 软件问题报告单 <问题编号>        ← 附录 A
+        表N'… 软件问题处理单 <问题编号>         ← 附录 B
+
+    注意「表x 测试结果记录单」**刻意保留 x**：用户手改版也是这么留的，
+    说明这张表的编号另有安排（记录单在正文里排在用例表之前，编号不该抢占 4.x 序列）。
+    """
+    items = body_items(doc)
+
+    # ① 1.2 软件信息表 → 表1
+    for kind, obj in items:
+        if kind != "p":
+            continue
+        raw = obj.text or ""
+        if "软件信息表" in raw and "表x" in raw:
+            set_para_text(obj, raw.replace("表x", "表1"))
+            break
+
+    # ② 3.1 分布统计表 → 表2；问题分类统计 → 表3；测试结果记录单 → 表4
+    for kind, obj in items:
+        if kind != "p":
+            continue
+        raw = obj.text or ""
+        if "表x" not in raw:
+            continue
+        if "需求功能项测试用例和测试类型的分布情况统计" in raw:
+            set_para_text(obj, raw.replace("表x", "表2"))
+        elif "软件问题分类统计" in raw:
+            set_para_text(obj, raw.replace("表x", "表3"))
+        elif "测试结果记录单" in raw:
+            # 用户明确要求：记录单也是正文里的一张表，编号要接上（表4），
+            # 用例表再从 表5 开始。
+            set_para_text(obj, raw.replace("表x", "表4"))
+        elif "见表" in raw or "见下表" in raw:
+            # 「问题等级问题类型分布见下表x」→ 指向表3
+            set_para_text(obj, raw.replace("下表x", "下表3").replace("见表x", "见表3"))
+
+    # ②' 清掉 1.范围 / 1.1标识 下面的模板占位「定死的先不写」
+    #     用户明确要求：这两处**什么都不要写**，直接删掉正文。
+    for kind, obj in items:
+        if kind != "p":
+            continue
+        if (obj.text or "").strip() == "定死的先不写":
+            el = obj._p
+            if el.getparent() is not None:
+                el.getparent().remove(el)
+
+    # ②'' 清掉 4.7 回归测试里「本次测试无未通过用例重跑」那句
+    #      用户明确要求删掉 —— 没有回归就留一个「无」字即可。
+    for kind, obj in items:
+        if kind != "p":
+            continue
+        raw = (obj.text or "").strip()
+        if raw == "无（本次测试无未通过用例重跑）。":
+            set_para_text(obj, "无")
+
+    # ③ 附录 A / B 的表题：紧跟在「附录A软件问题报告单」/「附录B软件问题处理单」之后，
+    #    已经由 build_full 按序生成（表1、表2…），这里不再重复编号。
+    #    这条分支只兜底：万一模板残留「表x软件问题报告单」这种，也换掉。
+    for kind, obj in items:
+        if kind != "p":
+            continue
+        raw = obj.text or ""
+        if "表x" in raw and ("软件问题报告单" in raw or "软件问题处理单" in raw):
+            set_para_text(obj, raw.replace("表x", "表1"))
+
+
 def build_sufficiency_section(doc, stages: list, meta: dict) -> None:
     """3.2 配置项测试充分性分析：把模板里的 xxx 换成真数据。
 
@@ -1140,11 +1231,13 @@ def build_sufficiency_section(doc, stages: list, meta: dict) -> None:
                 covered_features += 1
 
     rate = (covered_features * 100.0 / total_features) if total_features else 0.0
+    # ★ 用户明确要求：删掉末尾那句「（用例与单一需求条目的逐条映射覆盖率未单独统计…）」。
+    #   报告是给验收方看的，正文里写「我们没统计某一项」会显得像自我免责；
+    #   覆盖口径按功能项说清楚就够了。
     text = (
         "本次配置项测试共涉及测试用例 {total} 个。本次设计的测试用例，覆盖了 {software} "
         "软件需求规格说明中的需求功能项 {covered}/{features} 个，功能项覆盖率达到 {rate:.1f}%；"
         "测试结果充分准确，能够满足对软件所实现的功能、性能等指标的验证。"
-        "（用例与单一需求条目的逐条映射覆盖率未单独统计，以功能项覆盖为准。）"
     ).format(
         total=total_cases, software=software,
         covered=covered_features, features=total_features,
@@ -1156,22 +1249,142 @@ def build_sufficiency_section(doc, stages: list, meta: dict) -> None:
 def build_environment_section(doc, meta: dict) -> None:
     """3.3 测试环境的影响：模板占位是「有则写，无则写无」。
 
-    用户第 4 点的同类问题 —— 模板预留文字要换成真数据。
-    按 meta 里的 envImpact 填；没有就按 runEnv 写具体环境，明确「无不良影响」。
+    ★ 用户明确要求：**没有影响就只写「无」**，不要自作主张补一段环境说明。
+
+    我上一轮在这里写成了「无。本次测试在以下环境执行：…，测试环境对测试结果未产生
+    不良影响。」—— 那是发挥。模板原文只要求「有则写，无则写无」，环境信息另有
+    1.2 软件信息表的「运行环境」列承载，正文不必重复。
+
+    只有数据里真给了 envImpact（确实存在环境造成的影响）才写内容。
     """
     items = body_items(doc)
     idx = find_index(items, "有则写，无则写无")
     if idx < 0:
         return
     impact = meta.get("envImpact")
-    if impact:
-        text = str(impact)
-    else:
-        run_env = meta.get("runEnv") or ""
-        text = "无。"
-        if run_env:
-            text = "无。本次测试在以下环境执行：%s，测试环境对测试结果未产生不良影响。" % run_env
+    text = str(impact) if impact else "无"
     set_para_text(Paragraph(items[idx][1]._p, doc), text)
+
+
+def apply_heading_style(paragraph, level: int) -> None:
+    """把段落设成第 level 级标题（1/2/3），格式按用户 2026-11-20 定的规则。
+
+    格式（三级**完全一样**，用户暂定）：
+        · 宋体，小四（12pt）
+        · 不加粗
+        · 段前 0 / 段后 0
+        · 1.5 倍行距
+
+    为什么不用 Word 内置的「标题 1/2/3」样式：
+        模板里所有段落都是 Normal 样式，而且正文/表格段落也是 Normal。
+        套内置标题样式会把它们也牵连进来（还会带出自动编号 —— 模板的
+        numbering.xml 有 numId=3，一挂上标题样式章节号就会变成 1.、1.1、1.1.1
+        的双重编号）。所以这里**直接改段落自身的格式**，不换样式、不碰自动编号。
+
+    @param paragraph: 目标段落
+    @param level: 1 / 2 / 3（目前只用于语义标注，格式三者相同）
+    """
+    p_pr = paragraph._p.get_or_add_pPr()
+
+    # ── ① 段落间距：段前 0 / 段后 0 / 1.5 倍行距 ──
+    spacing = p_pr.find(qn("w:spacing"))
+    if spacing is None:
+        spacing = p_pr.makeelement(qn("w:spacing"), {})
+        p_pr.append(spacing)
+    spacing.set(qn("w:before"), "0")
+    spacing.set(qn("w:beforeLines"), "0")
+    spacing.set(qn("w:after"), "0")
+    spacing.set(qn("w:afterLines"), "0")
+    # 1.5 倍行距：line = 240 * 1.5 = 360，lineRule = auto
+    spacing.set(qn("w:line"), "360")
+    spacing.set(qn("w:lineRule"), "auto")
+
+    # ── ② 大纲级别：让 Word 导航窗格/目录能识别这是几级标题 ──
+    #     outlineLvl 是 0 基：1 级 → 0，2 级 → 1，3 级 → 2
+    lvl = max(0, min(8, int(level) - 1))
+    outline = p_pr.find(qn("w:outlineLvl"))
+    if outline is None:
+        outline = p_pr.makeelement(qn("w:outlineLvl"), {})
+        p_pr.append(outline)
+    outline.set(qn("w:val"), str(lvl))
+
+    # ── ③ 字体：宋体 + 小四（12pt / 24 半磅）+ 不加粗 ──
+    #     Word 里「中文字体」和「西文字体」是两个属性（rFonts 的 eastAsia / ascii），
+    #     只设 ascii 的话中文仍会走默认字体，所以三个都写。
+    for run in paragraph.runs:
+        r_pr = run._r.get_or_add_rPr()
+        r_fonts = r_pr.find(qn("w:rFonts"))
+        if r_fonts is None:
+            r_fonts = r_pr.makeelement(qn("w:rFonts"), {})
+            r_pr.insert(0, r_fonts)
+        for attr in ("w:ascii", "w:hAnsi", "w:eastAsia", "w:cs"):
+            r_fonts.set(qn(attr), "宋体")
+        r_fonts.set(qn("w:hint"), "eastAsia")
+
+        # 小四 = 12pt = 24 半磅
+        for tag, val in (("w:sz", "24"), ("w:szCs", "24")):
+            node = r_pr.find(qn(tag))
+            if node is None:
+                node = r_pr.makeelement(qn(tag), {})
+                r_pr.append(node)
+            node.set(qn("w:val"), val)
+
+        # 不加粗：attr 写法 <w:b w:val="0"/> 比删掉更稳（删掉会继承样式里的粗体）
+        for tag in ("w:b", "w:bCs"):
+            node = r_pr.find(qn(tag))
+            if node is None:
+                node = r_pr.makeelement(qn(tag), {})
+                r_pr.append(node)
+            node.set(qn("w:val"), "0")
+
+
+def center_paragraph(paragraph) -> None:
+    """把段落设成居中（用于附录 A/B 的表题）。
+
+    用户明确要求：附录里的「表1 软件问题报告单 JYSG-JT-WT-001」这类表题要居中。
+    只改 jc，不动字号/字体。
+    """
+    p_pr = paragraph._p.get_or_add_pPr()
+    jc = p_pr.find(qn("w:jc"))
+    if jc is None:
+        jc = p_pr.makeelement(qn("w:jc"), {})
+        p_pr.append(jc)
+    jc.set(qn("w:val"), "center")
+
+
+def style_headings(doc) -> None:
+    """给全文的 1/2/3 级标题套格式。
+
+    识别规则（只看文字形态，不依赖样式 —— 模板全是 Normal）：
+        一级标题：`1.范围` `2.引用文档` `3.测试结果概述` `4.用户与账号详细测试结果` `5.…` `6.…`
+                  `注释` `附录A软件问题报告单` `附录B软件问题处理单`
+        二级标题：`1.1标识` `3.1对被测试软件的总体评估` `4.1用户注册与登录` `4.7回归测试`
+        三级标题：`4.1.1测试结果总结`
+
+    判据用正则，避免误伤：
+        · 一级：`^\\d+\\.` 后面**不再有** `\\d+\\.`（即 `4.xxx详细测试结果` 这种）
+        · 二级：`^\\d+\\.\\d+` 后面不再有 `\\d+\\.`
+        · 三级：`^\\d+\\.\\d+\\.\\d+`
+    """
+    LEVEL1_RE = re.compile(r"^\d+\.[^\d]")              # 1.范围 / 4.xxx详细测试结果
+    LEVEL2_RE = re.compile(r"^\d+\.\d+[^\d.]")          # 1.1标识 / 4.1用户注册与登录
+    LEVEL3_RE = re.compile(r"^\d+\.\d+\.\d+")           # 4.1.1测试结果总结
+    L1_EXTRA = ("注释", "附录A软件问题报告单", "附录B软件问题处理单")
+
+    for paragraph in doc.paragraphs:
+        text = (paragraph.text or "").strip()
+        if text == "":
+            continue
+        # 表题不参与标题（「表1 软件信息表」这种）
+        if text.startswith("表"):
+            continue
+
+        if LEVEL3_RE.match(text):
+            apply_heading_style(paragraph, 3)
+        elif LEVEL2_RE.match(text):
+            apply_heading_style(paragraph, 2)
+        elif LEVEL1_RE.match(text) or text in L1_EXTRA:
+            apply_heading_style(paragraph, 1)
 
 
 def build_full(template: Path, data: dict, out_path: Path) -> Path:
@@ -1357,12 +1570,22 @@ def build_full(template: Path, data: dict, out_path: Path) -> Path:
     if insert_before is None:
         raise RuntimeError("文档缺少 sectPr")
 
-    counter = 0  # 表序号，全文连续
+    # 表序号，全文连续。
+    #
+    # ★ 起点是 4：前面已经占用了 表1（软件信息表）、表2（分布统计）、
+    #   表3（问题分类统计）、表4（测试结果记录单）。
+    #   所以第一张用例表是 **表5**，不是表4。
+    #   踩过两次：写 0 → 用例表从表1 重数；写 3 → 用例表从表4 开始，
+    #   跟记录单的表4 撞号。
+    counter = 4
 
     def add_para(proto, text):
         el = copy.deepcopy(proto)
         insert_before.addprevious(el)
-        set_para_text(Paragraph(el, doc), text)
+        paragraph = Paragraph(el, doc)
+        set_para_text(paragraph, text)
+        # 返回段落对象：调用方可能需要继续给它加属性（如段前分页）
+        return paragraph
 
     for s_index, stage in enumerate(stages, start=1):
         stage_name = stage.get("name") or "集成测试"
@@ -1383,7 +1606,7 @@ def build_full(template: Path, data: dict, out_path: Path) -> Path:
                 counter += 1
                 code = pick_case_code(case, meta, fallback_seq=counter)
                 # 表N 标识 <用例标识>
-                add_para(proto_caption_p, "表%d 标识%s" % (counter, code))
+                add_para(proto_caption_p, "表%d %s" % (counter, code))
 
                 tbl_el = copy.deepcopy(proto_case_tbl)
                 insert_before.addprevious(tbl_el)
@@ -1425,12 +1648,12 @@ def build_full(template: Path, data: dict, out_path: Path) -> Path:
                 for case in r_feature.get("cases") or []:
                     counter += 1
                     code = pick_case_code(case, meta, fallback_seq=counter)
-                    add_para(proto_caption_p, "表%d 标识%s" % (counter, code))
+                    add_para(proto_caption_p, "表%d %s" % (counter, code))
                     tbl_el = copy.deepcopy(proto_case_tbl)
                     insert_before.addprevious(tbl_el)
                     fill_case_table(Table(tbl_el, doc), dict(case, caseCode=code), people, r_feature, meta)
         else:
-            add_para(proto_incons_body_p, "无（本次测试无未通过用例重跑）。")
+            add_para(proto_incons_body_p, "无")
 
     # ── ⑤ 注释 / 附录 A / 附录 B ──
     add_para(proto_module_p, "注释")
@@ -1439,17 +1662,32 @@ def build_full(template: Path, data: dict, out_path: Path) -> Path:
     # 附录 A：**每一条问题一张表**（模板「表x软件问题报告单」那张 10 行 6 列表）。
     # 以前这里只写一行文字（「问题编号 xxx：…」），用户第 6 点指的就是这个：
     # 附录 A 本来就应该有表格，有表不填却说「见上表」更没道理。
-    add_para(proto_module_p, "附录A软件问题报告单")
+    #
+    # ★ 用户要求（2026-11-20）：**一张表一页**，表1 一页、表2 一页，不要连着排。
+    #   并且：**附录标题要和它下面的第一张表在同一页**。
+    #
+    #   所以分页点落在「附录A软件问题报告单」这个标题上，而不是表1 的表题上：
+    #     标题(pageBreakBefore) → 表1 → [分页] 表2 → [分页] 表3 …
+    #   踩过两次：
+    #     ① 只在表2 起分页 → 标题 + 表1 与正文最后一张用例表挤在同一页（3 个东西一页）；
+    #     ② 标题和表1 都分页 → 标题独占一页、表1 被推到下一页，标题下面空一大片。
+    appendix_a_title = add_para(proto_module_p, "附录A软件问题报告单")
+    # 标题从新页开始（附录是独立章节，必须另起页）
+    page_break_before(appendix_a_title)
+
     if all_issues and proto_issue_tbl is not None:
         for idx, issue in enumerate(all_issues, start=1):
             issue_no = "%s-JT-WT-%03d" % (meta.get("projectCode") or "PROJ", idx)
             if proto_appendix_caption_p is not None:
-                add_para(proto_appendix_caption_p, "表%d 软件问题报告单 %s" % (idx, issue_no))
+                caption = add_para(proto_appendix_caption_p, "表%d 软件问题报告单 %s" % (idx, issue_no))
+                # 表 2 起才分页；表 1 紧跟标题（与标题同页）
+                if idx > 1:
+                    page_break_before(caption)
             tbl_el = copy.deepcopy(proto_issue_tbl)
             insert_before.addprevious(tbl_el)
-            fill_issue_report_table(
-                Table(tbl_el, doc), issue, issue_no, meta, idx
-            )
+            issue_table = Table(tbl_el, doc)
+            fill_issue_report_table(issue_table, issue, issue_no, meta, idx)
+            keep_table_on_one_page(issue_table)
     else:
         add_para(proto_incons_body_p, "本次测试未发现软件问题。")
 
@@ -1457,15 +1695,24 @@ def build_full(template: Path, data: dict, out_path: Path) -> Path:
     # 以前直接写「见上表，处理情况待补充。」—— 用户第 6 点明确否掉这种写法：
     # 附录 B 自己也有表，就该自己填。本轮问题基本都未修复，所以处理结果
     # 按用户要求写「未处理」+ 具体原因，而不是编一个「已修改」。
-    add_para(proto_module_p, "附录B软件问题处理单")
+    #
+    # 同样「标题 + 第一张表同页」：分页点落在附录B 标题上，表 2 起才分页。
+    appendix_b_title = add_para(proto_module_p, "附录B软件问题处理单")
+    page_break_before(appendix_b_title)
+
     if all_issues and proto_fix_tbl is not None:
         for idx, issue in enumerate(all_issues, start=1):
             issue_no = "%s-JT-WT-%03d" % (meta.get("projectCode") or "PROJ", idx)
             if proto_appendix_caption_p is not None:
-                add_para(proto_appendix_caption_p, "表%d 软件问题处理单 %s" % (idx, issue_no))
+                caption = add_para(proto_appendix_caption_p, "表%d 软件问题处理单 %s" % (idx, issue_no))
+                # 表 2 起分页；表 1 与「附录B软件问题处理单」标题同页
+                if idx > 1:
+                    page_break_before(caption)
             tbl_el = copy.deepcopy(proto_fix_tbl)
             insert_before.addprevious(tbl_el)
-            fill_issue_fix_table(Table(tbl_el, doc), issue, issue_no, meta, idx)
+            fix_table = Table(tbl_el, doc)
+            fill_issue_fix_table(fix_table, issue, issue_no, meta, idx)
+            keep_table_on_one_page(fix_table)
     else:
         add_para(proto_incons_body_p, "无")
 
@@ -1477,6 +1724,23 @@ def build_full(template: Path, data: dict, out_path: Path) -> Path:
         cleaned = strip_hint(raw)
         if cleaned != raw:
             set_para_text(paragraph, cleaned)
+
+    # ── ⑦ 把残留的 `表x` 换成真实编号（必须在 ⑥ 之后：防提示清理影响文字匹配）──
+    renumber_table_captions(doc, all_issues)
+
+    # ── ⑧ 附录 A/B 的表题居中（用户明确要求）──
+    #     只对「表N 软件问题报告单 xxx」「表N 软件问题处理单 xxx」这两类生效，
+    #     正文里的表题（表1 软件信息表 等）**不动**。
+    for paragraph in doc.paragraphs:
+        text = (paragraph.text or "").strip()
+        if "软件问题报告单" in text and text.startswith("表"):
+            center_paragraph(paragraph)
+        elif "软件问题处理单" in text and text.startswith("表"):
+            center_paragraph(paragraph)
+
+    # ── ⑨ 套标题格式（1/2/3 级：宋体小四不加粗、段前后 0、1.5 倍行距）──
+    #     必须放在最后：前面各步会增删/改写段落，这里统一按最终文字判定层级。
+    style_headings(doc)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     doc.save(str(out_path))
@@ -1534,16 +1798,14 @@ def fill_record_table(table: Table, features: list, meta: dict, stage_name: str 
         set_cell_text(row.cells[4], code)
         set_cell_text(row.cells[5], verdict)
 
-    # ── 纵向合并「测试阶段」与「功能点名称」 ──
-    # 只合并**连续同值**行：功能项在表里本来就是成块排列的，
-    # 一旦跨块就不合并（避免把不相邻的功能项硬并成一格）。
-    if all_cases:
-        merge_runs(
-            table, 1,
-            [case.get("stage") or feature.get("stage") or stage_name or ""
-             for feature, case in all_cases],
-        )
-        merge_runs(table, 2, [feature.get("name", "") for feature, _ in all_cases])
+    # ── 不做纵向合并（用户明确要求）──
+    #
+    # 模板原文这张表是 6 个普通格、零合并（已核实：8 行 6 列，全为 /s1）。
+    # 我上一轮为了「74 行别重复 74 遍用户注册与登录」加了合并，那是自作主张，
+    # 用户手改版把它全部还原成逐行重复。
+    #
+    # 逐行重复的好处：每一行都能独立阅读、复制、排序，也便于后续按程序处理；
+    # 合并反而让「这一行属于哪个阶段」依赖于往上看。
 
     relax_line_spacing(table)
 
@@ -1666,21 +1928,26 @@ def fill_issue_report_table(table: Table, issue: dict, issue_no: str, meta: dict
 
     software = meta.get("softwareName") or "被测软件"
     version = meta.get("softwareVersion") or "x.xx.A"
-    project = meta.get("vendor") or software
+    # 项目名称 ≠ 研制单位：模板里「项目名称」要填**项目**，「程序/文档名」填**软件**。
+    # 我原来用 vendor（研制单位）当项目名，没传就变成「未采集」—— 用户已指出。
+    project = (meta.get("projectName") or meta.get("vendor")
+               or meta.get("softwareName") or "未采集")
+    today = issue.get("foundAt") or issue.get("reportedAt") or issue.get("date") or _today()
 
     rows = table.rows
     _set_row_pairs(rows[0], ["问题编号", issue_no, "项目名称", project, "程序/文档名", software])
     _set_row_pairs(
         rows[1],
         [
-            "发现日期", issue.get("foundAt") or issue.get("date") or "",
-            "报告日期", issue.get("reportedAt") or issue.get("date") or "",
+            # 用户手改版：发现日期/报告日期都填真实日期，不空着
+            "发现日期", issue.get("foundAt") or today,
+            "报告日期", issue.get("reportedAt") or today,
             "报告人", issue.get("reporter") or DEFAULT_PEOPLE,
         ],
     )
     # 问题类别：四选一打勾
     _set_choice_row(rows[2], "问题类别", ["程序问题", "文档问题", "设计问题", "其他问题"], kind_label)
-    # 问题级别：三选一打勾（第 4 格写「—」占位，第 5 格留空）
+    # 问题级别：三选一打勾
     _set_choice_row(rows[3], "问题级别", ["重大", "严重", "一般"], level)
 
     _set_label_value_row(rows[4], "研发阶段", meta.get("testStage") or issue.get("stage") or "集成测试阶段")
@@ -1688,8 +1955,13 @@ def fill_issue_report_table(table: Table, issue: dict, issue_no: str, meta: dict
     _set_label_value_row(rows[6], "问题现象描述", issue.get("desc") or issue.get("title") or "问题描述待补充")
     _set_label_value_row(rows[7], "更改建议", issue.get("suggestion") or "按软件需求规格说明修正实现，修正后重新执行相关测试用例验证。")
 
-    # r8 / r9 是整行合并的签字区，保留模板文字，只补上人
-    _fill_signature_row(rows[8], "软件开发技术负责人确认：%s    签字：            日期：" % DEFAULT_PEOPLE)
+    # r8 / r9 是整行合并的签字区。
+    # 用户手改版：admin 放在**签字**位、日期填真实值（我原来把 admin 塞在「确认：」后面）。
+    _fill_signature_row(
+        rows[8],
+        "软件开发技术负责人确认：        签字：%s          日期：%s"
+        % (DEFAULT_PEOPLE, today),
+    )
     _fill_signature_row(rows[9], "备注：%s" % (issue.get("note") or "无"))
     relax_line_spacing(table)
 
@@ -1723,6 +1995,7 @@ def fill_issue_fix_table(table: Table, issue: dict, issue_no: str, meta: dict, s
     stage = meta.get("testStage") or issue.get("stage") or "集成测试阶段"
     handled = bool(issue.get("handled"))
     fix_no = "WTCLD-" + issue_no
+    today = issue.get("foundAt") or issue.get("reportedAt") or issue.get("fixDate") or _today()
 
     rows = table.rows
     # r0：处理单编号 / 问题报告单编号
@@ -1733,7 +2006,7 @@ def fill_issue_fix_table(table: Table, issue: dict, issue_no: str, meta: dict, s
     set_cell_text(rows[1].cells[4], version)
     # r2：处理责任人 / 处理日期
     set_cell_text(rows[2].cells[1], issue.get("owner") or DEFAULT_PEOPLE)
-    set_cell_text(rows[2].cells[4], issue.get("fixDate") or "")
+    set_cell_text(rows[2].cells[4], issue.get("fixDate") or today)
     # r3：发现问题阶段（跨 4 格）
     set_cell_text(rows[3].cells[1], stage)
     # r4：问题等级
@@ -1762,16 +2035,18 @@ def fill_issue_fix_table(table: Table, issue: dict, issue_no: str, meta: dict, s
     )
     # r9：处理结果确认 / 确认日期
     set_cell_text(rows[9].cells[1], "已确认" if handled else "未确认")
-    set_cell_text(rows[9].cells[4], issue.get("confirmDate") or "")
+    set_cell_text(rows[9].cells[4], issue.get("confirmDate") or today)
     # r10：项目负责人签字
     _fill_signature_row(rows[10], "软件项目负责人：%s          日期：%s" % (
-        issue.get("owner") or DEFAULT_PEOPLE, issue.get("fixDate") or ""))
-    # r11 / r12：回归测试确认（本轮没有回归，写「无」）
+        issue.get("owner") or DEFAULT_PEOPLE, issue.get("fixDate") or today))
+    # r11 是表头（修改后的软件资料名称 / 版本号 / 确认人签字 / 日期），
+    # r12 是数据行。用户手改版：资料名称「无」、版本号留空、确认人 admin、日期真实值。
+    # 我原来把「无（本轮无回归测试）」写在资料名称格、又在版本号格写「—」，不合规范。
     if len(rows) > 12:
-        set_cell_text(rows[12].cells[1], "无（本轮无回归测试）")
-        set_cell_text(rows[12].cells[2], "—")
-        set_cell_text(rows[12].cells[3], "")
-        set_cell_text(rows[12].cells[4], "")
+        set_cell_text(rows[12].cells[1], "无")
+        set_cell_text(rows[12].cells[2], "")
+        set_cell_text(rows[12].cells[3], DEFAULT_PEOPLE)
+        set_cell_text(rows[12].cells[4], today)
     relax_line_spacing(table)
 
 
@@ -1790,10 +2065,19 @@ def _set_row_pairs(row, pairs) -> None:
 
 
 def _set_choice_row(row, label: str, options: list, chosen: str) -> None:
-    """处理「四个选项平铺」这种行：把选中的那格前面打勾，其余照原样保留。
+    """处理「四个选项平铺」这种行：选中的打勾、没选中的留空框。
 
     例：问题级别 | 重大 | 严重 | 一般 | <空>
-    选中「一般」后 → 问题级别 | 重大 | 严重 | ✓ 一般 | —（第 5 格占位）
+    选中「一般」后 → 问题级别 | □ 重大 | □ 严重 | ☑ 一般 | （空）
+
+    ★ 用户反馈（2026-11-20）：勾选框没了。
+      原因：我上一版直接写字面 `√`（U+221A 数学根号），那不是勾选框，
+      在 Word 里看起来就是一个歪斜的根号字符。
+      模板原本的约定是用 **EQ 域画方框**（`eq \\o\\ac(□,√)`），
+      生成器里已经有这套机制：`CHECK` 常量展开成「☑」，`EMPTY_BOX` 是「□」。
+      所以这里必须用 `CHECK + " " + option` / `EMPTY_BOX + " " + option`。
+
+    ★ 用户明确要求：**要自动打勾，但不要「—」占位**。多余格子留空。
     """
     cells = row.cells
     if not cells:
@@ -1803,12 +2087,22 @@ def _set_choice_row(row, label: str, options: list, chosen: str) -> None:
         if index >= len(cells):
             break
         if norm(option) == norm(chosen):
-            set_cell_text(cells[index], "√ " + option)
+            # CHECK 由 set_cell_text 展开成 7 个 run 的 EQ 域 → Word 里显示勾选方框
+            set_cell_text(cells[index], CHECK + " " + option)
         else:
-            set_cell_text(cells[index], "　 " + option)
-    # 选项之后的空格子：放一个「—」，别让它看起来像漏填
+            # 未选中的也给一个空方框，与选中的形成对照（一眼看出哪些可选项）
+            set_cell_text(cells[index], EMPTY_BOX + " " + option)
+    # 选项之后的空格子：留空（不写「—」）
     for index in range(1 + len(options), len(cells)):
-        set_cell_text(cells[index], "—")
+        set_cell_text(cells[index], "")
+
+
+def _today() -> str:
+    """报告里的日期默认值（YYYY-MM-DD）。
+
+    没有显式给发现/报告日期时用它，而不是留空 —— 用户手改版里两处都填了真实日期。
+    """
+    return datetime.now().strftime("%Y-%m-%d")
 
 
 def _set_label_value_row(row, label: str, value: str) -> None:
@@ -1827,6 +2121,30 @@ def _fill_signature_row(row, text: str) -> None:
     if not cells:
         return
     set_cell_text(cells[0], text)
+
+
+def page_break_before(paragraph) -> None:
+    """让该段落从新的一页开始（Word 的「段前分页」）。
+
+    用户明确要求（2026-11-20）：附录 A / 附录 B 里的表**一张表一页**，
+    不要连着排（表1 一页、表2 一页…）。
+
+    为什么用 pageBreakBefore 而不是插一个分页符段落：
+        · 插 `<w:br w:type="page"/>` 会在分页处多出一个空段落，页首多一行空白；
+        · `pageBreakBefore` 是段落自身的属性，分页干净，且在 Word 的
+          「段落 → 换行和分页 → 段前分页」里能直接看到，便于人工调整。
+    """
+    p_pr = paragraph._p.get_or_add_pPr()
+    node = p_pr.find(qn("w:pageBreakBefore"))
+    if node is None:
+        node = p_pr.makeelement(qn("w:pageBreakBefore"), {})
+        # pageBreakBefore 在 pPr 的子元素顺序里有位置要求，插到 keepNext/spacing 之前
+        anchor = p_pr.find(qn("w:spacing"))
+        if anchor is not None:
+            anchor.addprevious(node)
+        else:
+            p_pr.append(node)
+    node.set(qn("w:val"), "1")
 
 
 def keep_table_on_one_page(table: Table) -> None:
