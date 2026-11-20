@@ -383,6 +383,7 @@ window.__ModuleLoader__.load({
  */
 .dp-run-all-btn,
 .dp-report-btn,
+.dp-export-btn,
 .dp-log-btn {
 	display: inline-flex;
 	align-items: center;
@@ -404,16 +405,20 @@ window.__ModuleLoader__.load({
 }
 .dp-run-all-btn:disabled,
 .dp-report-btn:disabled,
+.dp-export-btn:disabled,
 .dp-log-btn:disabled { opacity: .55; cursor: not-allowed; }
 .dp-run-all-btn:hover:not(:disabled),
 .dp-report-btn:hover:not(:disabled),
+.dp-export-btn:hover:not(:disabled),
 .dp-log-btn:hover:not(:disabled),
 .dp-run-all-btn:active:not(:disabled),
 .dp-report-btn:active:not(:disabled),
+.dp-export-btn:active:not(:disabled),
 .dp-log-btn:active:not(:disabled) { background: var(--dp-bg2); border-color: var(--dp-border); }
 /* focus 与 .dp-select:focus 一致，键盘操作时同一套高亮 */
 .dp-run-all-btn:focus-visible,
 .dp-report-btn:focus-visible,
+.dp-export-btn:focus-visible,
 .dp-log-btn:focus-visible {
 	outline: none;
 	border-color: var(--dp-brand);
@@ -1102,7 +1107,7 @@ window.__ModuleLoader__.load({
 .dp-search input:hover { border-color: color-mix(in srgb, var(--dp-brand) 62%, var(--dp-border)); }
 .dp-toolbar .dp-select,
 .dp-root .dp-btn,
-.dp-run-all-btn, .dp-report-btn, .dp-log-btn,
+.dp-run-all-btn, .dp-report-btn, .dp-export-btn, .dp-log-btn,
 .it-switch-btn, .it-version-btn, .it-filter-btn {
 	border-radius: 6px;
 	box-shadow: var(--dp-control-shadow);
@@ -3826,6 +3831,60 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 				openLatestReport("all", "", "最近一次整体执行还没有生成 Word 报告。", "还没有生成总报告。");
 			}
 
+			/**
+			 * 「导出」：把最近一次整体执行的 Word 报告另存到用户选的文件夹。
+			 *
+			 * 不复用集成页那套导出函数：它们写在 IntegrationPanel 内部、
+			 * 绑着那边的 sessionId 与提示状态。这里让单元页自成一套，
+			 * 不改集成页，也不给两页之间增加耦合；宿主端点相同，
+			 * 所以「只导 docx，不导 PDF」这点两页一致。
+			 */
+			var UNIT_EXPORT_PICK_DIR_TIMEOUT_MS = 5 * 60 * 1000;
+
+			function pickExportDirForUnit() {
+				var sid = panelSessionId(props);
+				return callApi("/data-panel/export/pick-dir", {
+					method: "POST",
+					headers: { "content-type": "application/json", accept: "application/json" },
+					body: JSON.stringify({ sessionId: sid, cwd: cwdOf(sid) }),
+				}, UNIT_EXPORT_PICK_DIR_TIMEOUT_MS).then(function (data) {
+					if (data && data.canceled === true) return "";
+					return data && typeof data.dir === "string" ? data.dir : "";
+				});
+			}
+
+			function exportTotalReport() {
+				var sid = panelSessionId(props);
+				if (sid === "") { store.setError("还没取得当前会话"); return; }
+				setRunResult("正在查找最近的测试报告…");
+				fetchReportLatest(sid, "all", "").then(function (result) {
+					if (!result || !result.exists) { setRunResult(""); store.setError("还没有生成总报告。"); return null; }
+					if (!result.docx || !result.docx.path) { setRunResult(""); store.setError("最近一次整体执行还没有生成 Word 报告。"); return null; }
+					setRunResult("请选择导出到的文件夹…");
+					return pickExportDirForUnit().then(function (dir) {
+						if (dir === "") { setRunResult("已取消导出。"); return null; }
+						setRunResult("正在导出报告…");
+						return callApi("/data-panel/export", {
+							method: "POST",
+							headers: { "content-type": "application/json", accept: "application/json" },
+							body: JSON.stringify({ sessionId: sid, cwd: cwdOf(sid), dir: dir, paths: [result.docx.path] }),
+						}, 120000).then(function (data) {
+							var exported = Array.isArray(data && data.exported) ? data.exported : [];
+							if (exported.length === 0) {
+								setRunResult("");
+								store.setError("导出失败：" + ((data && data.error) || "没有成功导出报告"));
+								return null;
+							}
+							setRunResult("已导出到 " + (data.dir || dir));
+							return data;
+						});
+					});
+				}).catch(function (failure) {
+					setRunResult("");
+					store.setError("导出失败：" + (failure && failure.message ? failure.message : String(failure)));
+				});
+			}
+
 			useEffect(function () {
 				// 面板打开是一个明确信号：至少此刻要确保会话订阅已经建立，
 				// 否则用户切换会话时这里不会自动刷新（重启后曾出现过）。
@@ -4236,6 +4295,13 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 							},
 								h(Icon, { name: "doc", size: 15 }),
 								"报告"),
+							h(Button, {
+								className: "dp-export-btn",
+								onClick: function () { exportTotalReport(); },
+								title: "把最近一次整体执行的 Word 报告导出到本地文件夹"
+							},
+								h(Icon, { name: "download", size: 15 }),
+								"导出"),
 							SHOW_REPORT_LIST ? h(Button, {
 								onClick: function () { setReportView(true); },
 								title: "查看已生成的测试报告列表"

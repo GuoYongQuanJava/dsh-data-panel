@@ -181,3 +181,29 @@ test('freeNameIn 连续撞名时序号递增', async () => {
   assert.equal(await __test.freeNameIn(out, 'a.docx'), 'a (2).docx')
   assert.equal(await __test.freeNameIn(out, 'never.docx'), 'never.docx')
 })
+
+test('选文件夹输出用 Base64 回传，中文目录不乱码', () => {
+  const dir = 'D:\\测试资料\\报告输出'
+  const b64 = Buffer.from(dir, 'utf8').toString('base64')
+  assert.deepEqual(__test.parsePickDirOutput(`OK64 ${b64}\r\n`), { ok: true, dir })
+})
+
+test('选文件夹输出：取消与失败', () => {
+  assert.deepEqual(__test.parsePickDirOutput('CANCEL'), { ok: true, canceled: true, dir: '' })
+  const reason = '无法打开文件夹对话框'
+  const b64 = Buffer.from(reason, 'utf8').toString('base64')
+  const failed = __test.parsePickDirOutput(`FAIL64 ${b64}`)
+  assert.equal(failed.ok, false)
+  assert.equal(failed.reason, reason)
+})
+
+test('选文件夹输出：旧纯文本格式仍兼容，异常输出按失败处理', () => {
+  assert.deepEqual(__test.parsePickDirOutput('OK D:\\out\n'), { ok: true, dir: 'D:\\out' })
+  assert.equal(__test.parsePickDirOutput('这不是预期输出').ok, false)
+})
+
+test('选文件夹脚本用 Write-B64 输出路径，不再直连 Write-Output', () => {
+  const source = __test.pickExportDirectory.toString()
+  assert.match(source, /Write-B64 'OK64' \$dialog\.SelectedPath/)
+  assert.doesNotMatch(source, /Write-Output \('OK '/)
+})

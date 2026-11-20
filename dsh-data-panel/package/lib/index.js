@@ -2119,6 +2119,31 @@ async function handleReportPdf(req, res) {
 }
 
 /**
+ * 解析「选文件夹」脚本的 stdout。
+ *
+ * 为什么不让 PowerShell 直接 `Write-Output 'OK <路径>'`：PS 5.1 在 stdout
+ * 被重定向时按**控制台代码页**编码（中文系统是 GBK），而 runProcess 按 UTF-8
+ * 解码 —— 中文目录名必然乱码，随后 resolveExportDirectory 会拿着乱码路径
+ * 找不到目录，导出直接失败。所以路径一律走 Base64（纯 ASCII）回传。
+ */
+function parsePickDirOutput(stdout) {
+  const output = String(stdout || '').trim()
+  const decodeB64 = (text) => Buffer.from(text, 'base64').toString('utf8')
+  if (output.startsWith('OK64 ')) {
+    const dir = decodeB64(output.slice(5).trim()).trim()
+    if (dir === '') return { ok: false, reason: '选择目录失败：没有取到路径' }
+    return { ok: true, dir }
+  }
+  // 兼容旧格式：脚本回退成纯文本时仍能用（中文路径可能乱码）。
+  if (output.startsWith('OK ')) return { ok: true, dir: output.slice(3).trim() }
+  if (output === 'CANCEL') return { ok: true, canceled: true, dir: '' }
+  if (output.startsWith('FAIL64 ')) {
+    return { ok: false, reason: decodeB64(output.slice(7).trim()) || '选择目录失败' }
+  }
+  return { ok: false, reason: output.replace(/^FAIL\s*/, '') || '选择目录失败' }
+}
+
+/**
  * 弹原生「选择文件夹」对话框，返回用户选的绝对路径。
  *
  * 为什么要宿主来做：面板跑在浏览器里，`<input webkitdirectory>` 与
@@ -2134,18 +2159,24 @@ async function pickExportDirectory(timeoutMs = 5 * 60 * 1000) {
   // -File 方式启动的 powershell.exe 默认就是 STA，这里显式再声明一次。
   const script = `$ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms | Out-Null
+# 中文路径不能用 Write-Output 直接输出：PS 5.1 重定向 stdout 时按控制台代码页（GBK）
+# 编码，Node 侧按 UTF-8 解码就成乱码。Base64 是纯 ASCII，跨代码页安全。
+function Write-B64([string]$prefix, [string]$text) {
+  $bytes = [System.Text.Encoding]::UTF8.GetBytes($text)
+  Write-Output ($prefix + ' ' + [System.Convert]::ToBase64String($bytes))
+}
 $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
 $dialog.Description = '选择报告导出到的文件夹'
 $dialog.ShowNewFolderButton = $true
 try {
   $result = $dialog.ShowDialog()
   if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
-    Write-Output ('OK ' + $dialog.SelectedPath)
+    Write-B64 'OK64' $dialog.SelectedPath
   } else {
     Write-Output 'CANCEL'
   }
 } catch {
-  Write-Output ('FAIL ' + $_.Exception.Message)
+  Write-B64 'FAIL64' $_.Exception.Message
 } finally {
   if ($dialog -ne $null) { try { $dialog.Dispose() } catch {} }
 }
@@ -2163,12 +2194,7 @@ try {
       const detail = result.reason || (result.stderr || '').trim() || `选择目录失败（退出码 ${result.code}）`
       return { ok: false, reason: detail }
     }
-    const output = (result.stdout || '').trim()
-    if (output.startsWith('OK ')) {
-      return { ok: true, dir: output.slice(3).trim() }
-    }
-    if (output === 'CANCEL') return { ok: true, canceled: true, dir: '' }
-    return { ok: false, reason: output.replace(/^FAIL\s*/, '') || '选择目录失败' }
+    return parsePickDirOutput(result.stdout)
   } catch (error) {
     return { ok: false, reason: error instanceof Error ? error.message : String(error) }
   } finally {
@@ -2759,6 +2785,7 @@ export const __test = {
   handleExport,
   handlePickDir,
   pickExportDirectory,
+  parsePickDirOutput,
   freeNameIn,
   resolveExportDirectory,
   listRuns,
