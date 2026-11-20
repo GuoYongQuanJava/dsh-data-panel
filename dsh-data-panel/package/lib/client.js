@@ -703,6 +703,9 @@ window.__ModuleLoader__.load({
 /* 主表上方的小工具条：左边说明标签，右边「筛选」，整行浅底以便和表格分开 */
 .it-subbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 9px; padding: 6px 4px 6px 10px; border-radius: 9px; background: var(--dp-bg2); }
 .it-subbar-label { color: var(--dp-text2); font-size: 12.5px; font-weight: 600; }
+/* 左侧组：标题 + 「多选」。外面 .it-subbar 是 space-between，
+   若两个元素直接做兄弟，「多选」会被挤到正中间 —— 必须包一层。 */
+.it-subbar-left { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .it-toolbar .dp-select { flex: 0 0 auto; width: auto; }
 /* 下拉的包裹层默认 flex-shrink:1，nowrap 下会被压扁；锁成固有宽度，只让搜索框收缩 */
 .it-toolbar .it-switch,
@@ -958,6 +961,16 @@ window.__ModuleLoader__.load({
 .it-multi-export { display: inline-flex; align-items: center; gap: 5px; height: 28px; padding: 0 11px; border: 1px solid transparent; border-radius: 8px; background: color-mix(in srgb, var(--dp-brand) 9%, transparent); color: var(--dp-brand); font: inherit; font-size: 12.5px; white-space: nowrap; cursor: pointer; }
 .it-multi-export:hover:not(:disabled) { background: color-mix(in srgb, var(--dp-brand) 15%, transparent); }
 .it-multi-export:disabled { opacity: .5; cursor: not-allowed; }
+/* 「已选 N 条」计数：贴在这条最右侧，不挤主操作 */
+.it-multi-picked { margin-left: auto; color: var(--dp-text2); white-space: nowrap; }
+.it-multi-picked b { color: var(--dp-brand); font-weight: 650; }
+/* 多选态下被勾中的行：淡品牌底色，和报告页的勾选观感一致 */
+.it-table tr.is-picked > td { background: color-mix(in srgb, var(--dp-brand) 5%, transparent); }
+/* 多选勾选框：跟单元测试表格里的 .dp-pick input 同一套度量 */
+.it-table th input[type="checkbox"],
+.it-table td input[type="checkbox"] { width: 14px; height: 14px; margin: 0; accent-color: var(--dp-brand); cursor: pointer; vertical-align: middle; }
+/* 「多选」按钮：紧跟标题，间距交给 .it-subbar-left 的 gap 控制 */
+.it-subbar .it-multi-enter { flex: 0 0 auto; }
 
 /* 组内分页 / 子表分页共用一套（图 5 的形态）：共 N 条，每页 [15条/页] ‹ 1 › */
 .it-sub-pager, .it-sub-pager-wrap { display: flex; align-items: center; justify-content: flex-end; gap: 8px; padding: 8px 10px; color: var(--dp-text2); font-size: 12.5px; }
@@ -1424,6 +1437,23 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 		function itScenarioOf(record) {
 			var name = typeof record?.scenario === "string" ? record.scenario.trim() : "";
 			return name === "" ? IT_SCENARIOS_NONE : name;
+		}
+
+		/**
+		 * 界面上要显示的用例标识。
+		 *
+		 * 规范（生成用例时就必须产出 `caseCode`）要求**显示用 caseCode**，
+		 * 格式形如 `GN-651-JYSG_SRS_UI_TESTING-1-T001.CTD`；
+		 * 而 `caseId` 是内部主键（面板、执行记录、报告都靠它关联），不该占人眼那一列。
+		 *
+		 * 兜底：老数据可能只有 caseId 没有 caseCode（规范加进来之前生成的），
+		 * 这时退回 caseId，不要显示空 —— 否则整列空白比显示旧编号更糟。
+		 */
+		function caseLabel(record) {
+			var code = record && typeof record.caseCode === "string" ? record.caseCode.trim() : "";
+			if (code !== "") return code;
+			var id = record && typeof record.caseId === "string" ? record.caseId.trim() : "";
+			return id !== "" ? id : "—";
 		}
 
 		/**
@@ -5636,7 +5666,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 								: shown.map(function (record) {
 									var meta = IT_STATUS[record.status] || IT_STATUS.none;
 									return h("tr", { key: record.id, "data-it": "overview-" + record.id },
-										h("td", { className: "it-case-id" }, record.caseId || "—"),
+										h("td", { className: "it-case-id" }, caseLabel(record)),
 										h("td", { className: "it-left" }, record.title || "—"),
 										h("td", null, itScenarioOf(record)),
 										h("td", null, h("span", { className: "it-pill", "data-tone": meta.tone }, meta.label)),
@@ -5911,6 +5941,49 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			var stepOpenState = useState([]);
 			var stepOpen = stepOpenState[0];
 			var setStepOpen = stepOpenState[1];
+			/*
+			 * 测试步骤页的多选态。
+			 *
+			 * 与报告页的 multiSelect / selected 是两套独立状态：两个子页各自勾各自的，
+			 * 切页不该串味。命名上加了 step 前缀就是为了防止两边共用一份。
+			 */
+			var stepMultiState = useState(false);
+			var stepMultiSelect = stepMultiState[0];
+			var setStepMultiSelect = stepMultiState[1];
+			/*
+			 * 多选只认「执行记录」，不认「用例」。
+			 *
+			 * 键是 `用例id|runId` —— 一次执行就是一条，勾主表等于把它下面所有记录一起勾上。
+			 * 为什么不存 record.id：那样 10 条记录只算 1 条，计数就错了。
+			 * 这也是「已选 N 条」的唯一数据源，主表复选框只是它的派生视图。
+			 */
+			var stepPickedRunsState = useState([]);
+			var stepPickedRuns = stepPickedRunsState[0];
+			var setStepPickedRuns = stepPickedRunsState[1];
+
+			/** 某条用例下所有执行记录的勾选键。 */
+			function runKeysOf(record) {
+				return (Array.isArray(record && record.records) ? record.records : [])
+					.filter(function (run) { return run && run.runId; })
+					.map(function (run) { return record.id + "|" + run.runId; });
+			}
+			/** 某条用例是否「全部记录都被勾上」（至少 1 条记录）。 */
+			function recordFullyPicked(record) {
+				var keys = runKeysOf(record);
+				return keys.length > 0 && keys.every(function (k) { return stepPickedRuns.indexOf(k) !== -1; });
+			}
+			/** 勾 / 取消勾一条用例下的全部执行记录。 */
+			function setRecordPicked(record, on) {
+				var keys = runKeysOf(record);
+				if (keys.length === 0) return;
+				setStepPickedRuns(function (prev) {
+					if (on) {
+						var add = keys.filter(function (k) { return prev.indexOf(k) === -1; });
+						return add.length === 0 ? prev : prev.concat(add);
+					}
+					return prev.filter(function (k) { return keys.indexOf(k) === -1; });
+				});
+			}
 			// 详情层：null | { mode, record }。
 			var detailState = useState(null);
 			var detail = detailState[0];
@@ -6424,6 +6497,41 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			 * 与「查看」共用同一份报告文件；这里走 openReportFile 的「保存」语义不可得时
 			 * 直接打开文件所在目录并提示，避免静默失败。
 			 */
+			/**
+			 * 批量导出「已选执行记录」的报告。
+			 *
+			 * 入参是勾选键数组，每个键 `用例id|runId` 对应一份报告。
+			 * 单独提供 exportRunReport 会误以为按用例导出，这里按记录逐条走。
+			 */
+			function exportPickedRuns(keys) {
+				var list = Array.isArray(keys) ? keys : [];
+				if (list.length === 0) { setNotice("还没有勾选任何执行记录，先勾上再导出。"); return; }
+				if (sessionId === "") { setNotice("当前会话还没就绪，切到对话再点一次。"); return; }
+
+				var targets = [];
+				list.forEach(function (key) {
+					var parts = String(key).split("|");
+					var recordId = parts[0];
+					var runId = parts[1];
+					var record = records.filter(function (r) { return r.id === recordId; })[0];
+					if (!record || !runId) return;
+					var run = (Array.isArray(record.records) ? record.records : [])
+						.filter(function (r) { return r.runId === runId; })[0];
+					if (run) targets.push({ run: run, caseId: record.caseId });
+				});
+
+				if (targets.length === 0) {
+					setNotice("已选 " + list.length + " 条执行记录都找不到对应数据，可能已被删除。");
+					return;
+				}
+				setNotice("正在导出 " + targets.length + " 份报告…");
+				targets.forEach(function (t) { exportRunReport(t.run, t.caseId); });
+				if (targets.length < list.length) {
+					setNotice("已选 " + list.length + " 条，实际导出 " + targets.length + " 份（"
+						+ (list.length - targets.length) + " 条已失效，跳过）。");
+				}
+			}
+
 			function exportRunReport(run, caseId) {
 				var runId = run && run.runId ? String(run.runId) : "";
 				if (runId === "") { setNotice("这条执行记录没有 runId，无法导出报告。"); return; }
@@ -6654,6 +6762,9 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 					"- 倒数第二段：`1`=正常用例，`2`=专门测异常情况的用例",
 					"- **详细需求追踪条目** = 用例标识去掉 `-1-T001.CTD` 尾部",
 					"- 存进用例的 `caseCode` 字段；内部主键 `caseId` 保持不变（面板/执行靠它关联）",
+					"- **面板的四个表格都要显示这一列**（都是「测试用例标识」列）：",
+					"  ① 测试用例页主表  ② 测试步骤页主表  ③ 步骤页展开的执行记录子表  ④ 报告页子表",
+					"  显示值一律取 `caseCode`；老数据没有 `caseCode` 时才退回 `caseId`。",
 					"",
 					"### 怎么记录这两类报告的位置",
 					"执行结束后写一份 `reports/<runId>/report-data.json`，至少包含：",
@@ -7049,7 +7160,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 									: h("table", { className: "it-table" },
 										h("thead", null,
 											h("tr", null,
-												h("th", { style: { width: "52px" } }, "序号"),
+												h("th", { style: { width: "210px" } }, "测试用例标识"),
 												h("th", { style: { width: "26%" } }, "用例名称"),
 												h("th", null, "用例描述"),
 												h("th", { style: { width: "78px" } }, "操作")
@@ -7063,7 +7174,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 												onMouseEnter: function () { if (dragFrom !== null) moveRecord(dragFrom, index); },
 												onMouseLeave: function () {}
 											},
-												h("td", null,
+												h("td", { className: "it-left" },
 													h("div", { className: "it-no-cell" },
 														/*
 														 * 拖拽手柄：6 个灰点 3×2、透明背景。
@@ -7081,7 +7192,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 																beginDrag(index);
 															}
 														}, h(Icon, { name: "grip", size: 14 })),
-														h("span", null, String((Math.min(Math.max(1, casePage), Math.max(1, Math.ceil(rows.length / pageSize))) - 1) * pageSize + index + 1))
+														h("span", { className: "it-case-id" }, caseLabel(record))
 													)
 												),
 												h("td", { className: "it-left" },
@@ -7275,13 +7386,65 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 						}),
 						h("div", { className: "it-main" },
 							/*
-							 * 主表上方：左边「测试步骤」说明，右边「筛选」按钮；勾选后下面多一条提示条。
-							 * 筛选按钮固定在这里，不随工具栏拥挤而移位。
+							 * 主表上方：左边「测试步骤」说明 + 「多选」按钮，右边「筛选」按钮。
+							 * 多选态下整条换成多选操作条（计数 / 退出 / 导出 / 全选 / 清空），
+							 * 与报告页那套一致 —— 两个页面的多选观感必须一样，不各写一套。
 							 */
-							h("div", { className: "it-subbar", "data-it": "steps-subbar" },
-								h("span", { className: "it-subbar-label" }, "测试步骤"),
-								filterParts.button
-							),
+							stepMultiSelect
+								? h("div", { className: "it-multi-bar", "data-it": "steps-multi-bar" },
+									h("span", { className: "it-multi-stat" },
+										"测试步骤 ",
+										h("b", null, String(rows.length)),
+										" 条用例 / ",
+										h("b", null, String(rows.reduce(function (sum, record) { return sum + itStepCount(record); }, 0))),
+										" 个步骤"
+									),
+									h("button", {
+										type: "button",
+										className: "it-multi-link is-strong",
+										"data-it": "steps-multi-exit",
+										onClick: function () { setStepMultiSelect(false); setStepPickedRuns([]); }
+									}, "退出多选"),
+									h("button", {
+										type: "button",
+										className: "it-multi-export",
+										"data-it": "steps-multi-export",
+										disabled: stepPickedRuns.length === 0,
+										onClick: function () { exportPickedRuns(stepPickedRuns); }
+									}, h(Icon, { name: "download", size: 13 }), "导出已选报告"),
+									h("button", {
+										type: "button",
+										className: "it-multi-link",
+										"data-it": "steps-multi-all",
+										onClick: function () {
+											// 全选 = 当前页所有用例下的所有执行记录
+											var all = [];
+											rows.forEach(function (r) { all = all.concat(runKeysOf(r)); });
+											setStepPickedRuns(all);
+										}
+									}, "全选"),
+									h("button", {
+										type: "button",
+										className: "it-multi-link",
+										"data-it": "steps-multi-clear",
+										onClick: function () { setStepPickedRuns([]); }
+									}, "清空"),
+									h("span", { className: "it-multi-picked", "data-it": "steps-multi-picked" },
+										"已选 ", h("b", null, String(stepPickedRuns.length)), " 条")
+								)
+								: h("div", { className: "it-subbar", "data-it": "steps-subbar" },
+									h("div", { className: "it-subbar-left" },
+										h("span", { className: "it-subbar-label" }, "测试步骤"),
+										h("button", {
+											type: "button",
+											className: "it-multi-enter",
+											"data-it": "steps-multi-enter",
+											title: "进入多选，可批量导出报告",
+											onClick: function () { setStepMultiSelect(true); }
+										}, "多选")
+									),
+									filterParts.button
+								),
 							filterParts.bar,
 							/* 表格 + 分页条包在卡片里，与单元测试同构 */
 							h("div", { className: "it-card" },
@@ -7298,7 +7461,29 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 									: h("table", { className: "it-table it-table-steps" },
 										h("thead", null,
 											h("tr", null,
-												h("th", { style: { width: "72px" } }, "序号"),
+												stepMultiSelect
+													? h("th", { style: { width: "40px" } },
+														h("input", {
+															type: "checkbox",
+															"aria-label": "全选当前页所有执行记录",
+															"data-it": "steps-pick-all",
+															checked: (function () {
+																var all = [];
+																shown.forEach(function (r) { all = all.concat(runKeysOf(r)); });
+																return all.length > 0 && all.every(function (k) { return stepPickedRuns.indexOf(k) !== -1; });
+															})(),
+															onChange: function () {
+																var all = [];
+																shown.forEach(function (r) { all = all.concat(runKeysOf(r)); });
+																var every = all.length > 0 && all.every(function (k) { return stepPickedRuns.indexOf(k) !== -1; });
+																setStepPickedRuns(every
+																	? stepPickedRuns.filter(function (k) { return all.indexOf(k) === -1; })
+																	: stepPickedRuns.concat(all.filter(function (k) { return stepPickedRuns.indexOf(k) === -1; })));
+															}
+														})
+													)
+													: null,
+												h("th", { style: { width: stepMultiSelect ? "170px" : "210px" } }, "测试用例标识"),
 												h("th", { style: { width: "17%" } }, "用例名称"),
 												h("th", { style: { width: "90px" } }, "测试方法"),
 												h("th", null, "输入步骤"),
@@ -7311,14 +7496,31 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 											var first = (record.steps || [])[0];
 											var currentPage = Math.min(Math.max(1, stepPage), Math.max(1, Math.ceil(rows.length / pageSize)));
 											var open = stepOpen.indexOf(record.id) !== -1;
+											// 主表这一行的勾选态 = 它下面所有执行记录是否都被勾上。
+											var picked = recordFullyPicked(record);
+											var runCount = runKeysOf(record).length;
 											return h(React.Fragment, { key: record.id },
-												h("tr", { className: cn(open ? "is-open" : ""), "data-case-row": record.id },
+												h("tr", { className: cn(open ? "is-open" : "", picked ? "is-picked" : ""), "data-case-row": record.id },
+													stepMultiSelect
+														? h("td", null,
+															h("input", {
+																type: "checkbox",
+																"aria-label": "选择 " + caseLabel(record) + (runCount > 0 ? "（含 " + runCount + " 条执行记录）" : ""),
+																"data-it": "steps-pick-" + record.id,
+																// 没有执行记录的用例勾不上（勾了也没报告可导）
+																disabled: runCount === 0,
+																checked: picked,
+																onChange: function () { setRecordPicked(record, !picked); }
+															})
+														)
+														: null,
 													/*
-													 * 序号格里放「箭头 + 数字」：箭头是这一行唯一的下拉入口，
+													 * 标识格里放「箭头 + 用例标识」：箭头是这一行唯一的下拉入口，
 													 * 点开在下方挂一张执行结果子表（用例标识 / 名称 / 方法 / 结果 / 时间 / 操作）。
 													 * 用例名称本身不再可点 —— 名称只是内容，不是入口。
+													 * 序号列已去掉，箭头和标识共处一格，省一列宽度给内容。
 													 */
-													h("td", null,
+													h("td", { className: "it-left" },
 														h("div", { className: "it-no-cell" },
 															h("button", {
 																type: "button",
@@ -7330,7 +7532,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 																"data-it": "expand-" + record.id,
 																onClick: function () { toggleStepOpen(record.id); }
 															}, h(Icon, { name: "chevron", size: 19 })),
-															h("span", null, String((currentPage - 1) * pageSize + index + 1))
+															h("span", { className: "it-case-id" }, caseLabel(record))
 														)
 													),
 													h("td", { className: "it-left" },
@@ -7370,13 +7572,17 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 												),
 												open
 													? h("tr", { className: "it-expand-row" },
-														h("td", { colSpan: 7, "data-it": "step-runs-" + record.id },
+														h("td", { colSpan: stepMultiSelect ? 8 : 7, "data-it": "step-runs-" + record.id },
 															h("div", { className: "it-expand-box" },
 																h("table", { className: "it-mini it-mini-runs" },
 																	h("thead", null,
 																		h("tr", null,
-																			h("th", { style: { width: "52px" } }, "序号"),
-																			h("th", { style: { width: "96px" } }, "测试用例标识"),
+																			// 子表表头不放全选框：全选/取消统一在主表那一列做，
+																			// 这里只留每行的勾选框，避免两处开关打架。
+																			stepMultiSelect
+																				? h("th", { style: { width: "36px" } }, "")
+																				: null,
+																			h("th", { style: { width: "190px" } }, "测试用例标识"),
 																			h("th", null, "测试用例名称"),
 																			h("th", { style: { width: "96px" } }, "测试方法"),
 																			h("th", { style: { width: "72px" } }, "执行结果"),
@@ -7387,7 +7593,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 																	h("tbody", null, (function () {
 																		var runs = record.records || [];
 																		if (runs.length === 0) {
-																			return h("tr", null, h("td", { colSpan: 7, className: "it-muted" }, "这条用例还没有执行记录"));
+																			return h("tr", null, h("td", { colSpan: stepMultiSelect ? 7 : 6, className: "it-muted" }, "这条用例还没有执行记录"));
 																		}
 																		// 子表自己分页：页码按用例 id 各记一份
 																		var cur = Math.min(Math.max(1, subPage[record.id] || 1), Math.max(1, Math.ceil(runs.length / subSize)));
@@ -7395,9 +7601,26 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 																		return runs.slice(start, start + subSize).map(function (run, i) {
 																			var runIndex = start + i;
 																			var runMeta = IT_STATUS[run.result] || IT_STATUS.none;
-																			return h("tr", { key: run.runId },
-																				h("td", null, String(runIndex + 1)),
-																				h("td", null, h("span", { className: "it-case-id" }, record.caseId || "—")),
+																			// 子表勾选按「用例id|runId」区分：同一条用例可能有多条执行记录。
+																			var isPicked = stepPickedRuns.indexOf(record.id + "|" + run.runId) !== -1;
+																			return h("tr", { key: run.runId, className: cn(isPicked ? "is-picked" : "") },
+																				stepMultiSelect
+																					? h("td", null,
+																						h("input", {
+																							type: "checkbox",
+																							"aria-label": "选择执行记录 " + run.runId,
+																							"data-it": "step-runs-pick-" + run.runId,
+																							checked: isPicked,
+																							onChange: function () {
+																								var key = record.id + "|" + run.runId;
+																								setStepPickedRuns(isPicked
+																									? stepPickedRuns.filter(function (k) { return k !== key; })
+																									: stepPickedRuns.concat([key]));
+																							}
+																						})
+																					)
+																					: null,
+																				h("td", null, h("span", { className: "it-case-id" }, caseLabel(record))),
 																				h("td", { className: "it-left" }, record.title || "—"),
 																				h("td", null, (first && first.action) || "—"),
 																				h("td", null, h("span", { className: "it-pill", "data-tone": runMeta.tone }, runMeta.label)),
@@ -7618,8 +7841,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 												h("thead", null,
 													h("tr", null,
 														multiSelect ? h("th", { style: { width: "40px" } }, "") : null,
-														h("th", { style: { width: "52px" } }, "序号"),
-														h("th", { style: { width: "96px" } }, "用例标识"),
+														h("th", { style: { width: "210px" } }, "测试用例标识"),
 														h("th", null, "用例名称"),
 														h("th", { style: { width: "96px" } }, "测试方法"),
 														h("th", { style: { width: "72px" } }, "执行结果"),
@@ -7654,8 +7876,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 																}, checked ? h(Icon, { name: "check", size: 11 }) : null)
 															)
 															: null,
-														h("td", null, String(groupStart + index + 1)),
-														h("td", null, h("span", { className: "it-case-id" }, record.caseId || "—")),
+														h("td", null, h("span", { className: "it-case-id" }, caseLabel(record))),
 														h("td", { className: "it-left" },
 															h("button", {
 																type: "button",
