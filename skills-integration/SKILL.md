@@ -124,8 +124,8 @@ Step 6  生成 Word 报告
 主表：按【功能项】分组，每组下面是属于它的用例
       列：测试用例标识 / 用例名称 / 用例描述 / 操作
       （**没有序号列**；标识列最左侧是拖拽手柄，可拖动调顺序）
-      标识列显示 `caseCode`（如 GN-651-JYSG_SRS_UI_TESTING-1-T001.CTD），
-      老数据没有 caseCode 时才退回内部的 caseId
+      标识列显示 `caseCode`（如 GN-651-JYSG_SRS_UI_TESTING-1-T001.CTD）；
+      **绝不会**退回内部 `caseId`（那种 `V0_0_1-IT-001` 看着像版本号，报告里不许出现）
 子表：展开某条用例 → 看它的步骤（Step 3 生成后才有内容）
 ```
 
@@ -382,6 +382,40 @@ major * 1000000 + minor * 1000 + patch
 - 步骤版本内部记 `sourceCaseVersion`（来源用例版本，例 `V0.0.2`），界面 hover 版本号时用 tooltip 显示「由用例 V0.0.2 生成」。
 - 报告版本内部记 `sourceStepVersion` 与 `runId`。
 
+### ★ 报告版本号必须向面板要（写死会覆盖上一次报告）
+
+**铁律：每次一键执行都新建一个报告版本，版本号由面板分配，脚本里一个字都不许写死。**
+
+生成报告前先调：
+
+```
+POST /data-panel/integration
+{ "sessionId": "<当前会话>", "kind": "report", "op": "createVersion",
+  "runId": "<本次 runId>", "sourceStepVersion": "<步骤版本>" }
+→ { ok: true, name: "V0.0.2", index: {...} }
+```
+
+拿 `name` 去命名 `report-versions/<name 换下划线>/report.json` 与 docx 文件名。
+
+**绝对不要**：
+
+- ❌ 在脚本里写 `REPORT_VERSION = "V0.0.1"`；
+- ❌ 自己造一份 `report-versions/index.json` 整体覆盖写（会把已有版本全抹掉）。
+
+**为什么这条这么硬**（2026-11-20 实测事故）：runId 精度只到分钟（`run_20261120_1020_all`），
+同一分钟内连点两次「一键执行」拿到的是**同一个 runId**。旧脚本写死 `V0.0.1` 又重写
+`index.json`，于是第二次执行直接盖掉第一次 —— 用户看到的是「执行了两次，报告页还是
+只有 V0.0.1」，而磁盘上真的只剩一份 docx。
+
+面板侧的 `createVersion` 已按这个口径改：**版本号与 runId 解耦**，重复 runId 也照常
+递增（V0.0.1 → V0.0.2 → V0.0.3）；只有显式传 `reuseRunId: true` 才复用已有版本。
+
+### 报告页显示哪个版本
+
+报告页的版本下拉展示的是 **`report-versions/index.json` 里的版本**，与用例/步骤版本
+是两套编号。选中某个报告版本时，页面只显示**那一次执行**（按该版本的 `runId` 过滤
+执行记录），不是历次执行堆在一起。
+
 **功能项的位置**：功能项**属于用例版本内部**，是该版本的分组维度，不跨版本独立存在。用例 V0.0.1 和 V0.0.2 各有自己的一套功能项，互不继承。
 
 ```
@@ -477,7 +511,36 @@ margin       / 余量测试
 #### 产出
 
 - **功能项清单**（属于本次用例版本）。字段、三级来源判定、`code-derived` 归纳方法见 [功能项生成规范](references/feature-item.md)。
+- **测试阶段划分**（见下节，必须做）。
 - **覆盖清单**：按 [功能项覆盖清单](references/test-scope.md) 枚举本轮纳入、排除、暂缓的功能项，排除项要写明理由。不能只挑几个好测的功能项就开工。
+
+#### ★ 1-1.5 划分测试阶段（生成用例时就要定，不要留到报告阶段）
+
+用户明确要求（2026-11-20）：**生成用例时就把功能项分到 3-4 个测试阶段**，
+每个阶段只负责一部分功能项。不要图省事把全部功能项都塞进「第一阶段」。
+
+**划法：按业务模块**，不是按数量硬切。典型三段（按被测系统实际改）：
+
+| 阶段 | 典型内容 |
+|---|---|
+| 第一阶段 | 基础能力：账号与登录、浏览与检索、基础数据维护 |
+| 第二阶段 | 核心交易：下单与结算、支付、状态流转、钱款相关 |
+| 第三阶段 | 后台与运营：权限、消息通知、后台管理、报表统计 |
+
+**落进数据的字段**：
+
+```json
+// features.json 里每个功能项
+{ "id": "ft_001", "code": "F-001", "name": "用户注册与登录", "stage": "第一阶段" }
+
+// cases.json 里每条用例继承同一 stage（便于单条报告也能显示）
+{ "caseId": "V0_0_1-IT-001", "featureId": "ft_001", "stage": "第一阶段", ... }
+```
+
+**为什么必须在生成用例时定**：报告侧完全按 `stage` 生成 ——
+3.1 总体评估按阶段出段、3.1 分布表按阶段合并单元格并出小计、
+第 4 章起按阶段分章（阶段 1 = 第 4 章，阶段 2 = 第 5 章…）。
+生成用例时没有 `stage`，整份报告只能退化成「全是第一阶段」，无法事后补救。
 
 #### 无需求规则时怎么归纳功能项
 
@@ -745,13 +808,57 @@ margin       / 余量测试
 
 **报告只消费「已经真实跑过的那次 run」**，永远指向具体那次执行，不随当前数据漂移。
 
+## ★★ 集成测试报告与单元测试报告是两套东西，绝不能混用
+
+**这是硬性边界，写代码/写脚本前先读这一节。**
+
+| | 单元测试报告 | 集成测试报告 |
+|---|---|---|
+| 生成器 | `testReport/report-tool/bridge.py` + `builder.py` | `integrationReport/integration_report.py` |
+| 入口函数 | `bridge.py` 的命令行 / `cmd.py` | `build_single_step()` / `build_full()` |
+| 数据来源 | `result.json` 的 `tests[]`（逐测试函数） | `steps[]`（逐步骤）+ 快照用例 |
+| 关键字段 | `scope`、`coverage`、`complexity`、`testFunc` | `stepVersion`、`caseVersion`、`caseCode`、`stages` |
+| 模板 | 单元测试报告模板 + 覆盖率/圈复杂度章节 | 配置项测试报告模板（1 范围…附录 A/B） |
+| 表格形态 | 按测试函数一行 | 单用例 16 行表 + 阶段分章 + 附录问题单 |
+
+**绝对不要做的事**：
+
+- ❌ 拿 `bridge.py` / `report-tool/` 生成集成报告
+- ❌ 把集成数据（`steps[]`）喂给单元测试的 `builder.py`（字段对不上，直接取不到值）
+- ❌ 在集成报告里写覆盖率、圈复杂度、MC/DC、测试函数名 —— 这些是单元测试的指标，集成测试没有
+- ❌ 反过来把 `integration_report.py` 的逻辑套到单元测试数据上
+
+**唯一的共用点**是「按 `runId` 定位报告目录 + 用系统关联程序打开 docx」这一条通用约定，
+仅此而已。报告**内容**的每一个字都来自各自的生成器。
+
+**为什么强调**（2026-11-20 用户明确要求）：两套报告的章节结构、表格形态、数据模型
+完全不同。混用会直接产出错报告 —— 例如把集成数据喂给单元测试生成器，会得到一份
+字段全空、章节对不上的 docx，而且**不会报错**，很难发现。
+
+---
+
 ## ★ 报告必须调原型，不许自己写填表逻辑
 
-**报告生成器**：
+**报告生成器**（`integration_report.py`）：**按插件包自身位置定位，不要写死绝对路径**。
 
+查找顺序（与单元测试的 `run_tests.py` 同一套做法 —— 它用
+`new URL('../assets/run_tests.py', import.meta.url)` 从包内解析，从不硬编码）：
+
+1. `<插件包>/assets/integration_report.py` —— 随插件分发的首选位置
+2. `<仓库根>/integrationReport/integration_report.py` —— 仓库内的开发态位置
+3. 环境变量 `INTEGRATION_REPORT_SCRIPT` 指定的路径（特殊情况用）
+
+**面板已经把真实路径回传给你**：`GET /data-panel/integration` 的响应里有
+`reportScript` 字段，直接用它，别自己拼路径：
+
+```python
+# 优先用面板给的 reportScript；拿不到才按上面的顺序自己找
+PROTOTYPE = PANEL_REPORT_SCRIPT or find_report_script()
 ```
-F:\插件开发\dsh-data-panel\integrationReport\integration_report.py
-```
+
+> 为什么不写死：这条路径原来固定写成**某台机器上的绝对路径**，
+> 别人 clone 到别的盘就失效 —— 而下面第 3 条又要求「缺失必须报错不许降级」，
+> 于是换台机器报告直接生成不出来。**根因是路径写法，不是生成器本身。**
 
 它对外只有两个函数，**报告一律从这里出**：
 
@@ -766,7 +873,7 @@ F:\插件开发\dsh-data-panel\integrationReport\integration_report.py
 import importlib.util
 from pathlib import Path
 
-PROTOTYPE = r"F:\插件开发\dsh-data-panel\integrationReport\integration_report.py"
+# PROTOTYPE 来自面板的 reportScript，或按上面 1/2/3 的顺序找到
 spec = importlib.util.spec_from_file_location("ir", PROTOTYPE)
 proto = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(proto)
@@ -785,14 +892,47 @@ proto.build_single_step(Path(TEMPLATE), data, Path(out_path))
 
 3. **报告生成器缺失时明确报错，不许降级**。
    ```
-   报告生成器缺失：F:\插件开发\dsh-data-panel\integrationReport\integration_report.py
-   请确认该文件存在（它随仓库分发，见 integrationReport/README.md）；不要在缺生成器的情况下自己实现报告生成。
+   报告生成器缺失：<按上面 1/2/3 都找不到 integration_report.py>
+   请确认该文件存在（它随仓库分发，见 integrationReport/README.md）；
+   或用环境变量 INTEGRATION_REPORT_SCRIPT 指定路径。
+   不要在缺生成器的情况下自己实现报告生成。
    ```
    不许静默退回「自己写个简单版」——那样出来的报告不符合规范，而且没人会发现。
 
 ### 写脚本是允许的，但只做「取数据 + 调原型」
 
-自建脚本（如 `tools/build_single_step_report.py`）的职责只有：
+### ★ 推荐做法：直接用 `bridge.py`，不要自己写转换脚本
+
+仓库里已经有**数据转换层**，与单元测试的 `testReport/report-tool/bridge.py` 是同一个分工：
+
+```powershell
+cd <仓库根>\integrationReport
+python bridge.py --session-root <会话>\integration `
+                 --run-id <本次 runId> `
+                 --project-code <项目缩写> `
+                 --software-name "<软件名>" `
+                 --software-version <版本> `
+                 --report-version <面板分配的版本号>
+```
+
+它负责：读步骤/快照/执行结果 → 写 `report-plan.json` + `report-data.json` → 调生成器出 docx。
+
+**两步分工（与单元测试一致）**：
+
+```
+steps.json + cases.snapshot.json + runs/<runId>/{result,observations}.json
+        ↓  bridge.py                   ← 数据转换（本步可复核、可倒查）
+report-plan.json + report-data.json
+        ↓  integration_report.py       ← 填表排版
+总体报告 + cases/*.docx
+```
+
+**为什么不要再自己写转换脚本**（这条踩过）：
+转换逻辑散落在会话目录的临时脚本里，别人拉仓库后根本没有那份脚本；
+而且每次重写都容易错字段（已踩过：`result.json` 的步骤号是 `stepNo` 不是 `no`，
+写错会让 173 个步骤只匹配到 74 条证据、结论全变成「未执行」）。
+
+自建脚本只在 `bridge.py` 不够用时才写，职责仍然只有「取数据 + 调生成器」：
 
 ```
 读 steps.json / cases.snapshot.json / observations.json
@@ -804,11 +944,99 @@ proto.build_single_step(Path(TEMPLATE), data, Path(out_path))
 
 **填表、合并单元格、勾选框、分页控制全部由原型负责**，脚本里不该出现这些。
 
-> 这个文件不在仓库内（独立目录）。换机器部署时要一并带过去。
+### ★ 用例标识：只认 `caseCode`，绝不用 `caseId` 兜底
+
+报告里所有「测试用例标识」列**只能**出现规范形态：
+
+```
+GN-651-JYSG_DM_AUTH_LOGIN-1-T001.CTD
+```
+
+**不许**出现 `V0_0_1-IT-001` 这种内部主键 —— 它带版本前缀，肉眼看着就像版本号，
+这正是「有的报告标识写得跟版本号一样、有的又对」的根因：
+
+- 生成用例时产出了 `caseCode` → 报告对；
+- 某批用例漏了 `caseCode`，旧代码拿 `caseId` 兜底 → 报告里就冒出个像版本号的串。
+
+现在原型里的 `pick_case_code()` 已封死这条路：合法 `caseCode` → 用它；
+没有/形状不合规 → **按规范现场生成**；连项目缩写都没有 → 写 `T001` 占位，
+**无论如何都不会退回 `caseId`**。脚本侧只需保证每条用例都带 `caseCode`。
+
+### 测试阶段：生成用例时就分成 3-4 个
+
+用户明确要求（2026-11-20）：
+
+- **生成用例时就把功能项分到 3-4 个测试阶段**，不要全塞进「第一阶段」。
+- 阶段按**业务模块**划分（如：基础账号与商品 → 交易与支付 → 后台与消息），
+  名称自定但要能看懂。
+- 落进数据的字段：每个功能项带 `stage`，所属用例继承同一 `stage`。
+- 报告侧因此会自然得到：
+  - 3.1 总体评估 **每阶段一段**；
+  - 3.1 分布统计表 **同阶段的「序号」「测试阶段」两列纵向合并**（一格代表该阶段的功能项数）；
+  - **每阶段一组小计**（用例汇总 / 占总测试用例百分比%），表尾再来一行全项目总计；
+  - 第 4 章起 **每阶段一章**（阶段 1 = 第 4 章，阶段 2 = 第 5 章…）。
+
+### 表格排版：列宽固定铺满版心
+
+原型已对所有数据表做 `tblLayout=fixed` + 逐列写死宽度（铺满 A4 版心 8306 缇），
+并放开模板里 19 缇的过紧行距。**不要在脚本里再调列宽/字号**去凑观感 ——
+那样每次生成都可能不一样。要改排版就改编型的宽度常量：
+
+| 常量 | 对应表 |
+|---|---|
+| `INFO_TABLE_WIDTHS` | 1.2 软件信息表（9 列） |
+| `DISTRIBUTION_WIDTHS` | 3.1 分布统计表（11 列） |
+| `ISSUE_TABLE_WIDTHS` | 3.1 软件问题分类统计（8 列） |
+| `RECORD_TABLE_WIDTHS` | 3.1 测试结果记录单（6 列） |
+| `CASE_TABLE_WIDTHS` | 4.x.1 单用例表（5 列） |
+| `APPENDIX_ISSUE_WIDTHS` / `APPENDIX_FIX_WIDTHS` | 附录 A / 附录 B |
+
+### 附录 A / 附录 B：必须是表格，不许写成文字段落
+
+用户明确要求（2026-11-20）：
+
+- **附录 A 软件问题报告单**：每条问题**一张表**（模板「表x软件问题报告单」那张）。
+  不许只写一行「问题编号 xxx：…」的文字。
+- **附录 B 软件问题处理单**：每条问题**一张表**。
+  **不许写「见上表，处理情况待补充」** —— 自己有表就自己填。
+- 处理情况按**实际**填：本轮未修复就写「处理结果：未处理」+ 未处理原因，
+  **不许**为了好看编一个「已修改」。
+
+数据侧要给的字段（可选，缺了原型会写合理默认值）：
+
+```json
+{
+  "title": "问题标题", "desc": "问题现象描述", "level": "一般|严重|重大",
+  "caseCode": "关联用例标识", "foundAt": "发现日期", "reportedAt": "报告日期",
+  "suggestion": "更改建议",
+  "handled": false, "fixReason": "未处理原因", "fixAction": "处理措施",
+  "impact": "处理影响分析", "owner": "处理责任人", "fixDate": "处理日期"
+}
+```
+
+### 模板里的 `xxx` 一律要换成真数据
+
+模板中的 `xxx` 是**预留占位**，不是要照抄的内容。原型已覆盖：
+
+| 位置 | 处理 |
+|---|---|
+| 3.1 总体评估 | 每阶段一段，填真实用例数/通过/未通过/问题数/起止日期 |
+| 3.1 结尾段 | 软件名换真值；**代码注释率没有测量数据就整句不写**（不编百分比） |
+| 3.2 充分性分析 | 用例总数 + 功能项覆盖 x/y；**不凭空写 100% 需求覆盖率** |
+| 3.3 测试环境的影响 | 按 `meta.runEnv` 写实际环境，或按 `meta.envImpact` |
+| 3.4 改进建议 | 模板固定文案，保留 |
+| 附录 A/B | 表格逐格填真数据 |
 
 #### 两种报告：取模板的不同范围（**这是核心区别**）
 
-两类报告**用同一份配置项测试报告模板**（`F:\插件开发\dsh-data-panel\testReport\templates\` 系列），区别只在**取模板的哪一部分**：
+两类报告**用同一份配置项测试报告模板**（`配置项测试报告模板.docx`），区别只在**取模板的哪一部分**：
+
+> **模板随仓库进库**（`integrationReport/配置项测试报告模板.docx`，90 KB），
+> 克隆后直接可用 —— 与单元测试的 `testReport/templates/单元测试报告模板.docx` 一致。
+> 查找顺序：命令行参数 → 环境变量 `INTEGRATION_REPORT_TEMPLATE` → 生成器同目录。
+> **不要写死某个机器上的绝对路径**，也**不要**把模板放到桌面等仓库外位置。
+>
+> ⚠️ 单元测试模板（50 KB）和集成测试模板（90 KB）**不是同一个文件，不能互相替换**。
 
 | | 单条执行报告 | 全部（一键执行）报告 |
 |---|---|---|
@@ -1025,7 +1253,7 @@ if (-not (Test-Path -LiteralPath $reportRoot -PathType Container)) {
 > ⚠️ **本机当前状态**：`~/.dsh/tools/testReport` **未部署**（已实测不存在），但模板与生成器原型在仓库内可用。Step 6 之前必须先确认部署，不要默认它存在。
 > 报告字段的 24 条待定规范仍需等真实测试项目逐条确认，不要自行编造口径。
 > 可直接参照的已跑通产物：把 `integrationReport\sample-project.json` / `sample-step.json` 跑一遍生成的那两份 docx（见 `integrationReport/README.md`）。
-> 生成器：`F:\插件开发\dsh-data-panel\integrationReport\integration_report.py`（独立实现，不 import 也不修改 `testReport/`）。
+> 生成器：`integrationReport/integration_report.py`（独立实现，不 import 也不修改 `testReport/`）。**按插件包自身位置定位，不写死绝对路径**，见上文「报告必须调原型」。
 
 ---
 
@@ -1226,7 +1454,7 @@ POST /data-panel/integration { sessionId, kind, op, ... }
 - **单步执行也必须生成单条报告**（`integration/reports/<runId>/`，只取 4.1.1 那张表）；「不进报告页」不等于「不出报告」
 - **子表挂在测试步骤主表的每一行下面**：主表一行 = 一条用例，子表 = 这条用例的执行记录；一条记录一次执行（单步算一条、一键也算一条），**混在同一个子表里，靠时间区分**
 - **执行记录只存 `runId` / `at` / `result` / `durationMs` 四个字段**，不存 `observed`、不存逐步骤明细（那些在 `runs/<runId>/` 里）
-- **报告必须调生成器** `F:\插件开发\dsh-data-panel\integrationReport\integration_report.py`（`build_single_step` / `build_full`），**不许自己写填表逻辑、不许复制生成器改、生成器缺失要报错**
+- **报告必须调生成器** `integrationReport/integration_report.py`（`build_single_step` / `build_full`），**不许自己写填表逻辑、不许复制生成器改、生成器缺失要报错**。路径按插件包自身位置解析（见上文），**不要写死绝对路径**
 - **单条报告只取 4.1.1「测试结果总结」那一张表**，用 `build_single_step()`，落 `reports/<runId>/cases/`（60 条用例 = 60 份）
 - **总体报告按配置项测试模板整体编排**，用 `build_full()`，落 `reports/<runId>/`（整项目只有 1 份）
 - **单条报告要列出整条用例的全部步骤**，未执行的标 `notRun` 并注明「未执行（本次只执行第 N 步）」
@@ -1286,5 +1514,5 @@ POST /data-panel/integration { sessionId, kind, op, ... }
 
 > 注：第 3 步若要让生成器随**插件包**分发（而不是仅随仓库），还需把它挪进
 > `dsh-data-panel/package/assets/` 并加进 `package.json` 的 `files` 数组。
-> 当前 `F:\插件开发\dsh-data-panel\integrationReport\` 的定位与单元测试的 `testReport/` 一致：
-> 随仓库走、不进插件包。
+> 当前 `<仓库根>/integrationReport/` 的定位与单元测试的 `testReport/` 一致：
+> 随仓库走、不进插件包。代码已同时支持这两种位置（`integrationReportScriptPath()`）。

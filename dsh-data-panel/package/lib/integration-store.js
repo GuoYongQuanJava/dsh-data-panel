@@ -211,12 +211,42 @@ export async function readAll(sessionRoot) {
  * 新建一个版本（每次生成动作都新建，绝不覆盖旧版本）。
  *
  * `seed` 提供该版本的初始内容；不传就是空。
+ *
+ * ★ 关于「每次一键执行都要新建一个报告版本」：
+ *   调用方**不要自己猜版本号**，否则就会出现「第二次一键执行还是 V0.0.1」
+ *   这种把上一次报告覆盖掉的事故（根因是脚本里写死了 V0.0.1 并整体重写
+ *   index.json）。正确做法只有一条：
+ *
+ *     POST /data-panel/integration  { kind:"report", op:"createVersion", runId:<次 run> }
+ *     → { name: "V0.0.2", index: {...} }
+ *
+ *   name 由这里分配，调用方拿它去命名 docx 与目录。
+ *
+ * 同一 runId 的重复调用是**幂等**的：已经有版本记着这个 runId 就复用那个版本，
+ * 不再新建。这样「同一个 run 重跑一次报告」不会白刷一个版本，而真正的新一轮
+ * 一键执行（runId 不同）一定会拿到新版本号。
  */
 export async function createVersion(sessionRoot, kind, options = {}) {
   const dirRoot = kindRoot(sessionRoot, kind)
   const index = await readIndex(sessionRoot, kind)
-  const name = options.name ? requireVersionName(options.name) : nextVersionName(index.versions)
   const now = options.at || new Date().toISOString()
+  const runId = options.runId || ''
+
+  // 同一 runId 已有版本 → 默认**也新建**。
+  //
+  // 为什么默认不幂等：runId 的精度只到分钟（如 run_20261120_1020_all），
+  // 同一分钟内连点两次「一键执行」会拿到同一个 runId，旧实现就把上一次的
+  // 报告版本与 docx 全盖掉了 —— 用户看到的就是「第二次执行后还是 V0.0.1」。
+  // 现在版本号与 runId 解耦：每次生成都新建一个报告版本，runId 只作为来源标注。
+  // 只有调用方显式传 reuseRunId:true（例如重跑同一 run 的报告）才复用。
+  if (runId && options.reuseRunId === true) {
+    const existing = index.versions.find((item) => item?.runId === runId)
+    if (existing && typeof existing.name === 'string' && existing.name !== '') {
+      return { name: existing.name, index, reused: true }
+    }
+  }
+
+  const name = options.name ? requireVersionName(options.name) : nextVersionName(index.versions)
 
   const entry = {
     name,
@@ -224,7 +254,7 @@ export async function createVersion(sessionRoot, kind, options = {}) {
     status: 'current',
     ...(options.sourceCaseVersion ? { sourceCaseVersion: options.sourceCaseVersion } : {}),
     ...(options.sourceStepVersion ? { sourceStepVersion: options.sourceStepVersion } : {}),
-    ...(options.runId ? { runId: options.runId } : {}),
+    ...(runId ? { runId } : {}),
   }
 
   // 旧版本一律转为 archived，新的成为 current；旧版本目录保留不删。

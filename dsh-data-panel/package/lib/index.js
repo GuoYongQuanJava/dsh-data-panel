@@ -77,6 +77,56 @@ const INTEGRATION_PATH = '/data-panel/integration'
 const MAX_RUN_LOG = 4 * 1024 * 1024
 const RUNNER_ASSET = new URL('../assets/run_tests.py', import.meta.url)
 
+/*
+ * 集成测试报告生成器的候选位置。
+ *
+ * ★ 这里刻意**不写死任何绝对路径**。
+ *
+ * 历史坑：这份路径原来写死在 SKILL.md 和面板话术里，是一个**本机仓库的绝对路径**。
+ * 在那台机器上能用，别人 clone 到别的盘就直接失效 —— 而 Skill 又规定
+ * 「生成器缺失要明确报错、不许降级」，于是换台机器报告根本生成不出来。
+ *
+ * 与单元测试的 RUNNER_ASSET 一样，按**插件包自身位置**定位
+ * （`new URL(..., import.meta.url)`），跟仓库放在哪个盘、叫什么名字都无关：
+ *
+ *   1. `<包>/assets/integration_report.py`          —— 随插件分发，首选
+ *   2. `<包>/../integrationReport/integration_report.py` —— 仓库内的开发态布局
+ *      （`<仓库>/dsh-data-panel/package/` 的上一层就是 `<仓库>/`）
+ *
+ * 按顺序找第一个存在的；全都不存在时由调用方明确报错，绝不静默降级。
+ */
+const INTEGRATION_REPORT_CANDIDATES = [
+  // ① 随插件分发：<包>/assets/
+  new URL('../assets/integration_report.py', import.meta.url),
+  // ② 开发态：仓库根下的 integrationReport/（lib → package → dsh-data-panel → 仓库根）
+  new URL('../../../integrationReport/integration_report.py', import.meta.url),
+  // ③ 万一有人把整个目录拷进包内
+  new URL('../integrationReport/integration_report.py', import.meta.url),
+]
+
+/**
+ * 解析集成测试报告生成器的实际路径。
+ *
+ * @returns 绝对路径；找不到时返回空串（调用方负责报错，不要在这里抛）。
+ */
+function integrationReportScriptPath() {
+  // ③ 环境变量兜底：特殊情况（生成器放在共享盘 / 自定义位置）用
+  const fromEnv = typeof process.env.INTEGRATION_REPORT_SCRIPT === 'string'
+    ? process.env.INTEGRATION_REPORT_SCRIPT.trim()
+    : ''
+  if (fromEnv !== '' && existsSyncSafe(fromEnv)) return fromEnv
+
+  for (const candidate of INTEGRATION_REPORT_CANDIDATES) {
+    try {
+      const file = fileURLToPath(candidate)
+      if (existsSyncSafe(file)) return file
+    } catch {
+      // 非法 URL / 平台不支持 —— 继续试下一个候选
+    }
+  }
+  return ''
+}
+
 /** Single write lane: read-modify-write operations never interleave. */
 let lane = Promise.resolve()
 
@@ -907,6 +957,35 @@ async function readSnapshotCase(root, runId, caseId) {
 }
 
 
+/**
+ * 报告目录的候选根。
+ *
+ * 为什么需要多套：本插件有两套完全不同的资产布局。
+ *
+ *   单元测试（run/prepare 那一套）          集成测试（integration-store 那一套）
+ *   <项目>/.dsh/test-sessions/<sid>/        <项目>/.dsh/test-sessions/<sid>/integration/
+ *     runs/<runId>/                           runs/<runId>/
+ *     reports/<runId>/                        reports/<runId>/
+ *
+ * 集成测试的报告落在**后者**（Skill 约定的目录），而 `/data-panel/run/report`
+ * 原来只在前者里找 —— 于是报告文件明明就在磁盘上，面板却提示
+ * 「这次执行还没有生成 Word 报告」。这里把两套根都列出来。
+ *
+ * 顺序上集成根优先：集成页的 runId 形如 `run_20261120_1020_all`，
+ * 与单元测试的 runId（带毫秒+随机后缀）不会撞车，先查集成根也更省事。
+ */
+function reportRoots(roots) {
+  const candidates = []
+  for (const root of roots) {
+    candidates.push(join(root, 'integration'))
+  }
+  for (const root of roots) {
+    candidates.push(root)
+  }
+  // 去重，避免同一个目录被查两遍
+  return candidates.filter((item, index) => candidates.indexOf(item) === index)
+}
+
 function runQueryOf(req) {
   const url = new URL(req.url, 'http://localhost')
   return {
@@ -1574,7 +1653,8 @@ async function handleRunReport(req, res) {
     const query = runQueryOf(req)
     if (query.sessionId === '') throw bad(400, '缺少会话 ID')
     // 报告目录也按“会话资产根映射”找，切了工作目录也不会丢。
-    const roots = await resolveReadRoots(query.sessionId, query.cwd)
+    // reportRoots() 会把集成测试那套根（<root>/integration）也纳入候选。
+    const roots = reportRoots(await resolveReadRoots(query.sessionId, query.cwd))
     const reportsDirs = roots.map((root) => join(root, 'reports'))
 
     if (query.runId !== '') {
@@ -1745,7 +1825,7 @@ async function handleOpenFile(req, res) {
     }
     if (!info.isFile()) throw bad(400, '报告路径不是文件')
     const cwd = await resolveSessionCwd(sessionId, body.cwd)
-    const roots = await resolveReadRoots(sessionId, cwd)
+    const roots = reportRoots(await resolveReadRoots(sessionId, cwd))
     const allowed = roots.some((root) => {
       const reports = resolve(root, 'reports')
       return file === reports || file.startsWith(reports + sep)
@@ -1774,7 +1854,7 @@ async function handleRunReportLatest(req, res) {
     const scope = query.scope === 'case' ? 'case' : 'all'
     if (scope === 'case' && query.caseId === '') throw bad(400, '单条报告需要 caseId')
 
-    const roots = await resolveReadRoots(query.sessionId, query.cwd)
+    const roots = reportRoots(await resolveReadRoots(query.sessionId, query.cwd))
     let best = null
     for (const root of roots) {
       let names = []
@@ -1969,8 +2049,27 @@ async function handleIntegration(req, res) {
       return typeof fromBody === 'string' ? fromBody.trim() : ''
     }
 
-    const sessionRoot = sessionAssetRoot(await resolveSessionCwd(sessionId, query('cwd')), sessionId)
+    const project = await resolveSessionCwd(sessionId, query('cwd'))
+    const sessionRoot = sessionAssetRoot(project, sessionId)
     const root = integrationRoot(sessionRoot)
+
+    /*
+     * 记住这个会话的资产根 —— 与单元测试侧 prepareRun() 的做法完全一致。
+     *
+     * 为什么必须在这里也记一次：resolveReadRoots() 优先读这份映射
+     * （`~/.dsh/plugin-data/dsh-data-panel/assets-<sid>.json`），只有从没执行过
+     * 的会话才退回「客户端传的 cwd」。
+     *
+     * 集成测试面板从来不调 prepareRun()（那是单元测试的执行链路），所以如果这里
+     * 不记，集成会话就永远没有映射文件，读侧只能靠 cwd 猜 —— 一旦客户端 cwd 与
+     * 真实项目目录有任何偏差（切过工作目录、从别的入口进来），报告/日志/结果
+     * 全都找不到。2026-11-20 的「报告明明在磁盘上，面板却说没生成」就是这条引发。
+     *
+     * 传 sessionRoot（`<项目>/.dsh/test-sessions/<sid>`）而不是 root（带
+     * `/integration`）：映射里存的是**标准资产根**，报告侧统一用
+     * reportRoots() 在此基础上向下找 integration/，两边口径一致。
+     */
+    await rememberAssetRoot(sessionId, sessionRoot, project)
 
     if (req.method === 'GET') {
       const kind = query('kind')
@@ -1980,11 +2079,13 @@ async function handleIntegration(req, res) {
         const index = await readIndex(sessionRoot, kind)
         const target = version !== '' ? version : index.activeVersion
         const data = target === '' ? null : await readVersion(sessionRoot, kind, target)
-        send(res, 200, { ok: true, root, kind, index, activeVersion: target, data })
+        send(res, 200, { ok: true, root, kind, index, activeVersion: target, data, reportScript: integrationReportScriptPath() })
         return
       }
       const all = await readAll(sessionRoot)
-      send(res, 200, { ok: true, root, kinds: all })
+      // reportScript：宿主按插件包自身位置解析出的生成器路径（可能为空）。
+      // 面板把它写进话术里，替代过去写死的 `F:\插件开发\...` —— 换机器就失效。
+      send(res, 200, { ok: true, root, kinds: all, reportScript: integrationReportScriptPath() })
       return
     }
 
@@ -2110,6 +2211,7 @@ export const __test = {
   readStore,
   persist,
   sessionAssetRoot,
+  integrationReportScriptPath,
   exportCases,
   testFuncOf,
   prepareRun,
