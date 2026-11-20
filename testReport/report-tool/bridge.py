@@ -27,6 +27,7 @@ import argparse
 import hashlib
 import json
 import random
+import re
 import sys
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -168,6 +169,117 @@ def actual_outputs(case: dict, evidence: dict | None) -> list:
         actual_map = {**actual_map, expected[0][0]: evidence["actual"]}
     return [[name, wanted, actual_map[name] if isinstance(actual_map.get(name), str) else "未采集"]
             for name, wanted in expected]
+
+
+EXC_LABELS = {
+    "AssertionError": "断言失败",
+    "ZeroDivisionError": "除零错误",
+    "TypeError": "类型错误",
+    "ValueError": "取值错误",
+    "KeyError": "缺少键",
+    "IndexError": "下标越界",
+    "AttributeError": "属性不存在",
+    "FileNotFoundError": "文件不存在",
+    "ImportError": "导入失败",
+    "RuntimeError": "运行时错误",
+    "OverflowError": "数值溢出",
+    "TimeoutError": "执行超时",
+}
+
+_EXC_RE = re.compile(r"\b([A-Z][A-Za-z]*(?:Error|Exception))\b")
+_FILE_LINE_RE = re.compile(
+    r"((?:[A-Za-z]:)?[\w./\\-]+\.(?:cpp|cc|cxx|c|hpp|h|py|js|ts|tsx|go|rs|java|cs|rb|php)):(\d+)")
+
+
+def failure_location(text: str) -> str:
+    """从异常文本里取出「文件:行号」，取不到返回空串。"""
+    match = _FILE_LINE_RE.search(text or "")
+    return f"{match.group(1)}:{match.group(2)}" if match else ""
+
+
+def cn_time(value: object) -> str:
+    """ISO 时间 → 报告用的 `YYYY/MM/DD HH:MM`；解析不了原样返回。"""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text
+    if moment.tzinfo is not None:
+        moment = moment.astimezone()
+    return moment.strftime("%Y/%m/%d %H:%M")
+
+
+def summarize_failure(evidence: dict | None, fallback: str = "") -> str:
+    """把英文断言/异常原文压成一句中文，并带上证据位置。
+
+    认得 GoogleTest 的 Expected equality / Value of 块和常见异常类型；认不出来
+    时保留原文首行——只改写表述，不推测原因。
+    """
+    if not isinstance(evidence, dict):
+        return fallback or "未记录异常"
+    text = str(evidence.get("detail") or evidence.get("message") or "")
+    if not text:
+        return fallback or "未记录异常"
+    location = failure_location(text)
+    suffix = f"（证据：{location}）" if location else ""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+
+    # GoogleTest: Expected equality of these values: / 0.00 / Which is: 0 / pay / Which is: -180
+    if any("Expected equality of these values" in line for line in lines):
+        names, values = [], []
+        for line in lines:
+            if line.startswith("Which is:"):
+                if names:
+                    values.append(line.split(":", 1)[1].strip())
+                continue
+            if "Expected equality" in line or line.startswith(("Failure", "error")):
+                continue
+            if _FILE_LINE_RE.search(line):
+                continue
+            names.append(line)
+        if len(names) >= 2 and len(values) >= 2:
+            return f"断言失败：{names[1]} 期望 {names[0]}，实际 {values[1]}{suffix}"
+
+    # GoogleTest: Value of: x / Actual: 1 / Expected: 2
+    value_of = next((l for l in lines if l.startswith("Value of:")), "")
+    expected = next((l for l in lines if l.startswith("Expected:")), "")
+    actual = next((l for l in lines if l.startswith("Actual:")), "")
+    if expected and actual:
+        target = value_of.split(":", 1)[1].strip() if value_of else "结果"
+        return (f"断言失败：{target} 期望 {expected.split(':', 1)[1].strip()}，"
+                f"实际 {actual.split(':', 1)[1].strip()}{suffix}")
+
+    # 常见异常类型
+    match = _EXC_RE.search(text)
+    if match:
+        label = EXC_LABELS.get(match.group(1), "异常")
+        rest = text.replace(match.group(0), "", 1).strip().splitlines()
+        brief = rest[0].strip(" :：") if rest else ""
+        return f"{label}：{brief or match.group(1)}{suffix}"
+
+    # pytest 的裸 assert
+    first = lines[0] if lines else ""
+    if first.startswith("assert ") or " assert " in first:
+        return f"断言失败：{first}{suffix}"
+    return f"测试判定失败：{first or '未记录'}{suffix}"
+
+
+def short_function_name(name: object) -> str:
+    """从 subjectFunction 取函数短名：`src/order.cpp::Order::payable` → `payable`。"""
+    text = str(name or "").strip()
+    if "::" in text:
+        text = text.rsplit("::", 1)[-1].strip()
+    if "/" in text or "\\" in text:
+        text = re.split(r"[/\\]", text)[-1].strip()
+    return text
+
+
+def _unit_label(name: object) -> str:
+    """单元标识：函数短名 + 「单元测试」，如 `pickPWL单元测试`。"""
+    short = short_function_name(name) or "未记录单元标识"
+    return short if short.endswith("单元测试") else f"{short}单元测试"
 
 
 # ── v2 新增函数 ─────────────────────────────────────────────────
@@ -669,6 +781,27 @@ def main() -> int:
             raw_type = case.get("testType", "")
             ctype = TYPE_MAP.get(raw_type, TYPE_MAP.get("functional", "功能测试"))
 
+            # 异常现象描述用中文摘要（问题 2），原始英文/断言细节仍可作为证据位置保留。
+            if status == "passed":
+                issue_text = "无"
+                issue_evidence = ""
+            elif status == "notRun":
+                issue_text = f"未执行：{reason}" if reason else "未执行"
+                issue_evidence = ""
+            elif status == "unconfirmed":
+                issue_text = f"未能确认：{reason or '没有该用例的逐条执行结果'}"
+                issue_evidence = failure_location(str((evidence or {}).get("detail") or "")) if evidence else ""
+            else:
+                issue_text = summarize_failure(evidence, reason)
+                raw_detail = str((evidence or {}).get("detail") or (evidence or {}).get("message") or "")
+                issue_evidence = failure_location(raw_detail)
+
+            # 执行时间：先用例级 startedAt，没有就用本次 run 的开始时间（问题 6）。
+            raw_started = ""
+            if status != "notRun":
+                raw_started = str((evidence or {}).get("startedAt") or result.get("startedAt") or "")
+            case_executed_at = cn_time(raw_started)
+
             cases_out.append({
                 "id": case_id,
                 "name": case.get("title", case_id),
@@ -685,12 +818,13 @@ def main() -> int:
                 "status": status,
                 "notRunReason": reason if status == "notRun" else "",
 
-                "issue": reason or "未记录异常",
+                "issue": issue_text,
+                "issueEvidence": issue_evidence,
                 "bugId": "未记录",
                 "designer": str(case.get("designer") or cfg.get('designer') or "未提供"),
                 "reviewer": str(case.get("reviewer") or cfg.get('reviewer') or "未提供"),
                 "tester": str(case.get("tester") or cfg.get('tester') or "未提供"),
-                "executedAt": evidence.get("startedAt", "") if evidence and status != "notRun" else "",
+                "executedAt": case_executed_at,
             })
 
         # ── 该函数汇总 ──
@@ -707,7 +841,7 @@ def main() -> int:
                 "notRun": func_not_run,
                 "unconfirmed": func_unconfirmed,
             },
-            "unitId": func_name,
+            "unitId": _unit_label(func_name),
             "trace": "未提供设计追溯",
             "driver": "未记录驱动模块",
             # 函数级覆盖率：优先用本次 coverage.xml 里**该函数自己**的数字；
@@ -851,7 +985,16 @@ def main() -> int:
             "staticIssues": [],
             "codeIssues": [],
             "dynamicIssues": [
-                {"id": c["id"], "title": c["name"], "severity": "未记录", "status": c["status"]}
+                {
+                    "id": c["id"],
+                    "title": c["name"],
+                    "severity": "一般",
+                    "status": c["status"],
+                    # 中文摘要 + 证据位置：附录问题单直接拿这两项填。
+                    "description": c.get("issue") or "",
+                    "evidence": c.get("issueEvidence") or "",
+                    "suggestion": "请排查定位并修复后回归验证。",
+                }
                 for phase in phase_list
                 for func in phase["functions"]
                 for c in func["cases"]

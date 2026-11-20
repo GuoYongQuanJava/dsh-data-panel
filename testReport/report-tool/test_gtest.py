@@ -15,10 +15,33 @@
 
 import importlib.util
 from pathlib import Path
+import os
 
-ASSETS = Path(__file__).resolve().parents[2] / "dsh-data-panel" / "package" / "assets"
-if not ASSETS.is_dir():
-    ASSETS = Path(__file__).resolve().parents[2] / "package" / "assets"
+import pytest
+
+
+def _find_assets():
+    """定位插件资产（run_tests.py 所在目录）；部署形态不同，逐个候选试。"""
+    here = Path(__file__).resolve().parent
+    candidates = []
+    env = os.environ.get("DSH_DATA_PANEL_ASSETS", "").strip()
+    if env:
+        candidates.append(Path(env))
+    candidates += [
+        here.parents[1] / "dsh-data-panel" / "package" / "assets",  # 仓库布局
+        here.parents[1] / "package" / "assets",
+        here / "assets",
+    ]
+    for candidate in candidates:
+        if (candidate / "run_tests.py").is_file():
+            return candidate
+    return None
+
+
+ASSETS = _find_assets()
+if ASSETS is None:
+    pytest.skip("未找到插件资产 run_tests.py（可用 DSH_DATA_PANEL_ASSETS 指向所在目录）",
+                allow_module_level=True)
 
 
 def load_runner_module():

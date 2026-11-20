@@ -1986,10 +1986,11 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 		var store = createStore();
 
 		/** 调一个 /data-panel/* 的 JSON 接口（统一错误处理）。 */
-		function callApi(path, init) {
+		function callApi(path, init, timeoutMs) {
 			// 本地宿主正常都是毫秒级；加超时避免某次请求挂住，界面一直停在“正在查找…”。
 			var controller = typeof AbortController === "function" ? new AbortController() : null;
-			var timer = controller !== null ? setTimeout(function () { controller.abort(); }, 8000) : null;
+			var budget = typeof timeoutMs === "number" && timeoutMs > 0 ? timeoutMs : 8000;
+			var timer = controller !== null ? setTimeout(function () { controller.abort(); }, budget) : null;
 			var options = init || {};
 			if (controller !== null) options = Object.assign({}, options, { signal: controller.signal });
 			function clearTimer() {
@@ -2003,7 +2004,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 					return data;
 				});
 			}).catch(function (error) {
-				if (error && error.name === "AbortError") throw new Error("请求超时（8 秒），请稍后重试");
+				if (error && error.name === "AbortError") throw new Error("请求超时（" + Math.round(budget / 1000) + " 秒），请稍后重试");
 				throw error;
 			}).finally(clearTimer);
 		}
@@ -8856,7 +8857,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			return files[0];
 		}
 
-		/** 优先把报告开在右侧栏（better-sidebar 会把 docx 交给 DSH 的文档预览）。 */
+		/** 优先把报告开在右侧栏（PDF / docx 都交给 DSH 的文档预览）。 */
 		function openReportInSidebar(path, sessionId) {
 			var service = betterSidebarService(true);
 			if (service === null || typeof service.openFile !== "function") return false;
@@ -8875,12 +8876,54 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			}
 		}
 
-		/** 打开报告：优先走 host 的 /data-panel/open（不依赖前端 remote/workspaces）。 */
+		/** PDF 转换在宿主侧最多 90 秒，前端给 120 秒；不走 callApi 默认的 8 秒。 */
+		var REPORT_PDF_TIMEOUT_MS = 120000;
+
+		/**
+		 * 取报告同目录的 PDF（宿主用 Word / LibreOffice 转换，按 docx 时间缓存）。
+		 *
+		 * 只有右侧栏确实能把文件交给 DSH 文档预览时才值得转；否则直接返回 null，
+		 * 让调用方走原来的 docx / 系统默认程序链路，避免白等一次转换。
+		 */
+		function requestReportPdf(path, sessionId) {
+			if (typeof path !== "string" || path === "" || typeof sessionId !== "string" || sessionId === "") {
+				return Promise.resolve(null);
+			}
+			var service = betterSidebarService(true);
+			if (service === null || typeof service.openFile !== "function") return Promise.resolve(null);
+			return callApi("/data-panel/report/pdf", {
+				method: "POST",
+				headers: { "content-type": "application/json", accept: "application/json" },
+				body: JSON.stringify({ sessionId: sessionId, cwd: cwdOf(sessionId), path: path }),
+			}, REPORT_PDF_TIMEOUT_MS).then(function (data) {
+				if (data && data.ok === true && typeof data.path === "string" && data.path !== "") return data.path;
+				return null;
+			}).catch(function (failure) {
+				// 没装 Word / LibreOffice 或转换失败只是“没有 PDF”，不是“报告打不开”。
+				try {
+					console.info("[dsh-data-panel] PDF 预览不可用，回退 docx：" + (failure && failure.message ? failure.message : String(failure)));
+				} catch (ignored) {}
+				return null;
+			});
+		}
+
+		/** 打开报告：先尝试同目录 PDF，失败/不可用时完整回退原来的 docx 链路。 */
 		function openReportFile(path, sessionId, onOpened) {
 			if (typeof path !== "string" || path === "") {
 				store.setError("报告文件路径为空");
-				return;
+				return Promise.resolve();
 			}
+			return requestReportPdf(path, sessionId).then(function (pdfPath) {
+				if (pdfPath !== null && openReportInSidebar(pdfPath, sessionId)) {
+					if (typeof onOpened === "function") onOpened();
+					return;
+				}
+				openReportDocx(path, sessionId, onOpened);
+			});
+		}
+
+		/** 原来的 docx 打开链路：右侧栏优先，失败再交给宿主用系统默认程序打开。 */
+		function openReportDocx(path, sessionId, onOpened) {
 			if (openReportInSidebar(path, sessionId)) {
 				if (typeof onOpened === "function") onOpened();
 				return;
@@ -9428,6 +9471,8 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			itVersionValue: itVersionValue,
 			buildIntegrationSeed: buildIntegrationSeed,
 				docxFor: docxFor,
+			openReportFile: openReportFile,
+			openReportDocx: openReportDocx,
 			itFilterRecords: itFilterRecords,
 			itScenarioRows: itScenarioRows,
 			fmtDuration: fmtDuration,

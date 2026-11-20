@@ -18,9 +18,9 @@ import { createHash, randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { mkdir, readFile, readdir, rename, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import { existsSync, readFileSync } from 'node:fs'
-import { homedir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { PRESET_TOOLS, PRESETS, detectPreset, renderRunnerSpec, resolveRunner, targetDeclared, targetLine, targetOf } from './runners.js'
 import { resolveSpecs, resolveTool, resolveTools, searchLayers } from './toolchain.js'
 import { assessScope } from './scope.js'
@@ -71,6 +71,11 @@ const RUN_RESULT_PATH = '/data-panel/run/result'
 const RUN_REPORT_PATH = '/data-panel/run/report'
 const RUN_DELETE_PATH = '/data-panel/run/delete'
 const OPEN_PATH = '/data-panel/open'
+const REPORT_PDF_PATH = '/data-panel/report/pdf'
+/** PDF 转换总预算：Word 优先，剩余时间给 LibreOffice 兜底。 */
+const REPORT_PDF_TIMEOUT_MS = 90 * 1000
+/** 同一份 PDF 的并发转换共享一个 promise，避免重复拉起 Word。 */
+const reportPdfJobs = new Map()
 const RUN_REPORT_LATEST_PATH = '/data-panel/run/report/latest'
 /** 集成测试数据层：独立的路径，绝不复用单元的 /data-panel/api（那是 5 类硬校验的 store）。 */
 const INTEGRATION_PATH = '/data-panel/integration'
@@ -1724,6 +1729,33 @@ function openWithShell(file) {
   })
 }
 
+/**
+ * 校验一个「本会话 reports/ 下已存在」的报告文件。
+ *
+ * /data-panel/open 与 /data-panel/report/pdf 共用这份校验：两处各写一遍的话，
+ * 任一处改漏都会变成“这个接口能读到别的会话的文件”。
+ */
+async function resolveReportFile(sessionId, rawPath, hintCwd) {
+  const raw = typeof rawPath === 'string' ? rawPath.trim() : ''
+  if (raw === '' || !isAbsolute(raw)) throw bad(400, '报告路径必须是绝对路径')
+  const file = resolve(raw)
+  let info = null
+  try {
+    info = await stat(file)
+  } catch {
+    throw bad(404, '报告文件不存在：' + file)
+  }
+  if (!info.isFile()) throw bad(400, '报告路径不是文件')
+  const cwd = await resolveSessionCwd(sessionId, hintCwd)
+  const roots = await resolveReadRoots(sessionId, cwd)
+  const allowed = roots.some((root) => {
+    const reports = resolve(root, 'reports')
+    return file === reports || file.startsWith(reports + sep)
+  })
+  if (!allowed) throw bad(400, '只允许打开本会话 reports/ 下的文件')
+  return { file, info, cwd, roots }
+}
+
 /** 打开本会话 reports/ 下的报告文件。 */
 async function handleOpenFile(req, res) {
   try {
@@ -1734,25 +1766,261 @@ async function handleOpenFile(req, res) {
     const body = await readJson(req)
     const sessionId = extractSessionId(req, body)
     if (sessionId === '') throw bad(400, '缺少会话 ID')
-    const raw = typeof body.path === 'string' ? body.path.trim() : ''
-    if (raw === '' || !isAbsolute(raw)) throw bad(400, '报告路径必须是绝对路径')
-    const file = resolve(raw)
-    let info = null
-    try {
-      info = await stat(file)
-    } catch {
-      throw bad(404, '报告文件不存在：' + file)
-    }
-    if (!info.isFile()) throw bad(400, '报告路径不是文件')
-    const cwd = await resolveSessionCwd(sessionId, body.cwd)
-    const roots = await resolveReadRoots(sessionId, cwd)
-    const allowed = roots.some((root) => {
-      const reports = resolve(root, 'reports')
-      return file === reports || file.startsWith(reports + sep)
-    })
-    if (!allowed) throw bad(400, '只允许打开本会话 reports/ 下的文件')
+    const { file } = await resolveReportFile(sessionId, body.path, body.cwd)
     await openWithShell(file)
     send(res, 200, { ok: true })
+  } catch (error) {
+    const status = Number.isInteger(error?.status) ? error.status : 500
+    send(res, status, { ok: false, error: error instanceof Error ? error.message : '服务内部错误' })
+  }
+}
+
+/** 同名同目录的 PDF 路径。 */
+function pdfPathOf(docx) {
+  return docx.replace(/\.docx$/i, '.pdf')
+}
+
+/** PDF 存在、非空、且不比 docx 旧时才算可复用。 */
+async function pdfUpToDate(pdf, docx) {
+  try {
+    const [pdfInfo, docxInfo] = await Promise.all([stat(pdf), stat(docx)])
+    return pdfInfo.isFile() && pdfInfo.size > 0 && pdfInfo.mtimeMs >= docxInfo.mtimeMs
+  } catch {
+    return false
+  }
+}
+
+/** 转换刚写完的 PDF 至少要是非空文件。 */
+async function pdfWritten(pdf) {
+  try {
+    const info = await stat(pdf)
+    return info.isFile() && info.size > 0
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 跑一个子进程，带超时；失败/超时都返回原因，不向调用方抛异常。
+ * 超时用 SIGKILL 结束 PowerShell / soffice，避免点击后永远挂在等结果。
+ */
+function runProcess(command, args, timeoutMs) {
+  return new Promise((resolvePromise) => {
+    let child = null
+    try {
+      child = spawn(command, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+    } catch (error) {
+      resolvePromise({ ok: false, reason: error instanceof Error ? error.message : String(error) })
+      return
+    }
+    let stdout = ''
+    let stderr = ''
+    let settled = false
+    let timer = null
+    const finish = (result) => {
+      if (settled) return
+      settled = true
+      if (timer !== null) clearTimeout(timer)
+      resolvePromise(result)
+    }
+    child.stdout?.on('data', (chunk) => { stdout += chunk.toString('utf8') })
+    child.stderr?.on('data', (chunk) => { stderr += chunk.toString('utf8') })
+    child.once('error', (error) => {
+      const reason = error?.code === 'ENOENT'
+        ? `找不到 ${command}`
+        : (error instanceof Error ? error.message : String(error))
+      finish({ ok: false, reason })
+    })
+    child.once('close', (code) => finish({ ok: code === 0, code, stdout, stderr }))
+    timer = setTimeout(() => {
+      try { child.kill('SIGKILL') } catch { /* 进程可能已经退出 */ }
+      finish({ ok: false, timedOut: true, reason: `转换超时（${Math.round(timeoutMs / 1000)} 秒）` })
+    }, timeoutMs)
+  })
+}
+
+/** PowerShell 单引号字符串里的单引号要写两遍。 */
+function quotePowerShell(value) {
+  return String(value).replace(/'/g, "''")
+}
+
+/**
+ * 用 Word COM 把 docx 导出成 PDF。
+ *
+ * 做法对齐 testReport/report-tool/toc_refresh.py：隐藏 Word、关闭弹窗、
+ * 只退出“本次由宿主启动”的实例，绝不碰用户已经开着的 Word。
+ */
+async function convertWithWord(docx, pdf, timeoutMs) {
+  const scriptPath = join(tmpdir(), `dsh-data-panel-word-${process.pid}-${Date.now()}.ps1`)
+  const script = `$ErrorActionPreference = 'Stop'
+$src = '${quotePowerShell(docx)}'
+$dst = '${quotePowerShell(pdf)}'
+$word = $null
+$doc = $null
+$startedByUs = $false
+try {
+  $word = New-Object -ComObject Word.Application
+  $startedByUs = ($word.Documents.Count -eq 0)
+  $word.Visible = $false
+  $word.DisplayAlerts = 0
+  $word.AutomationSecurity = 3
+  $word.Options.UpdateFieldsAtPrint = $false
+  $doc = $word.Documents.Open($src, $false, $true, $false)
+  $doc.ExportAsFixedFormat($dst, 17, $false)
+  $doc.Close(0)
+  $doc = $null
+  Write-Output 'OK'
+} catch {
+  Write-Output ('FAIL ' + $_.Exception.Message)
+} finally {
+  if ($doc -ne $null) { try { $doc.Close(0) } catch {} }
+  if ($word -ne $null) {
+    if ($startedByUs) { try { $word.Quit() } catch {} }
+    try { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($word) } catch {}
+  }
+}
+`
+  try {
+    // Windows PowerShell 5.1 不带 BOM 时按 ANSI 读脚本；报告路径常含中文，必须写 BOM。
+    await writeFile(scriptPath, '\uFEFF' + script, 'utf8')
+    const result = await runProcess(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptPath],
+      timeoutMs,
+    )
+    if (!result.ok) {
+      const detail = result.reason || (result.stderr || '').trim() || `Word 退出码 ${result.code}`
+      return { ok: false, reason: detail }
+    }
+    const output = (result.stdout || '').trim()
+    if (!output.startsWith('OK')) {
+      return { ok: false, reason: output.replace(/^FAIL\s*/, '') || 'Word 转换失败' }
+    }
+    if (!(await pdfWritten(pdf))) return { ok: false, reason: 'Word 没有生成 PDF' }
+    return { ok: true, engine: 'word' }
+  } catch (error) {
+    return { ok: false, reason: error instanceof Error ? error.message : String(error) }
+  } finally {
+    try { await unlink(scriptPath) } catch { /* 临时脚本可能已不在 */ }
+  }
+}
+
+/** 找一个可用的 soffice.exe（显式环境变量 → 常见安装目录 → PATH）。 */
+function findSoffice() {
+  const explicit = (process.env.DSH_SOFFICE_PATH || process.env.SOFFICE_PATH || '').trim()
+  if (explicit !== '' && existsSync(explicit)) return explicit
+  const candidates = []
+  const programFiles = process.env.ProgramFiles || 'C:\\Program Files'
+  const programFilesX86 = process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)'
+  candidates.push(join(programFiles, 'LibreOffice', 'program', 'soffice.exe'))
+  candidates.push(join(programFilesX86, 'LibreOffice', 'program', 'soffice.exe'))
+  if (process.env.LOCALAPPDATA) {
+    candidates.push(join(process.env.LOCALAPPDATA, 'Programs', 'LibreOffice', 'program', 'soffice.exe'))
+  }
+  const pathValue = process.env.PATH || ''
+  const parts = pathValue.split(process.platform === 'win32' ? ';' : ':')
+  for (const part of parts) {
+    const dir = part.trim()
+    if (dir === '') continue
+    candidates.push(join(dir, 'soffice.exe'))
+    candidates.push(join(dir, 'soffice'))
+  }
+  for (const candidate of candidates) {
+    try {
+      if (existsSync(candidate)) return candidate
+    } catch {
+      // 不可读的目录直接跳过。
+    }
+  }
+  return ''
+}
+
+/** LibreOffice 兜底：只写同目录同名 PDF，并给独立的用户配置目录避免锁冲突。 */
+async function convertWithSoffice(docx, pdf, timeoutMs) {
+  const soffice = findSoffice()
+  if (soffice === '') return { ok: false, reason: '未安装 LibreOffice（soffice.exe）' }
+  const profileDir = join(tmpdir(), `dsh-data-panel-soffice-${process.pid}-${Date.now()}`)
+  const result = await runProcess(
+    soffice,
+    [
+      '--headless',
+      '--norestore',
+      `-env:UserInstallation=${pathToFileURL(profileDir).href}`,
+      '--convert-to', 'pdf',
+      '--outdir', dirname(pdf),
+      docx,
+    ],
+    timeoutMs,
+  )
+  if (!result.ok) {
+    const detail = result.reason || (result.stderr || '').trim() || `soffice 退出码 ${result.code}`
+    return { ok: false, reason: detail }
+  }
+  if (!(await pdfWritten(pdf))) return { ok: false, reason: 'LibreOffice 没有生成 PDF' }
+  return { ok: true, engine: 'libreoffice' }
+}
+
+/** Word 优先、LibreOffice 兜底；总预算 90 秒，任一成功即返回。 */
+async function convertDocxToPdf(docx, pdf) {
+  const deadline = Date.now() + REPORT_PDF_TIMEOUT_MS
+  const reasons = []
+  // 旧 PDF 在这里删：并发的第二个请求会复用一个 job，不会重复删刚写好的文件。
+  try { await unlink(pdf) } catch { /* 没有旧 PDF */ }
+  const word = await convertWithWord(docx, pdf, Math.min(60000, REPORT_PDF_TIMEOUT_MS))
+  if (word.ok) return { ok: true, engine: word.engine }
+  reasons.push('Word：' + word.reason)
+  try { await unlink(pdf) } catch { /* Word 半途失败的残留 */ }
+  const remaining = deadline - Date.now()
+  if (remaining < 1000) {
+    reasons.push('LibreOffice：没有剩余时间')
+    return { ok: false, reason: reasons.join('；') }
+  }
+  const soffice = await convertWithSoffice(docx, pdf, remaining)
+  if (soffice.ok) return { ok: true, engine: soffice.engine }
+  reasons.push('LibreOffice：' + soffice.reason)
+  return { ok: false, reason: reasons.join('；') }
+}
+
+/** 同一份 PDF 的并发转换共享同一个 promise。 */
+function convertDocxToPdfOnce(docx, pdf) {
+  const key = pdf.toLowerCase()
+  const running = reportPdfJobs.get(key)
+  if (running !== undefined) return running
+  const job = convertDocxToPdf(docx, pdf).finally(() => {
+    if (reportPdfJobs.get(key) === job) reportPdfJobs.delete(key)
+  })
+  reportPdfJobs.set(key, job)
+  return job
+}
+
+/**
+ * 给右侧栏准备 PDF：输入必须是本会话 reports/ 下的 .docx。
+ *
+ * 成功返回同目录同名 .pdf；转换器都不可用时返回 200 + { ok:false, reason }，
+ * 让客户端无痛回退到原来的 docx 打开链路，而不是把点击变成报错。
+ */
+async function handleReportPdf(req, res) {
+  try {
+    if (req.method !== 'POST') {
+      send(res, 405, { ok: false, error: '仅支持 POST' })
+      return
+    }
+    const body = await readJson(req)
+    const sessionId = extractSessionId(req, body)
+    if (sessionId === '') throw bad(400, '缺少会话 ID')
+    const { file } = await resolveReportFile(sessionId, body.path, body.cwd)
+    if (!/\.docx$/i.test(file)) throw bad(400, '只支持 .docx 报告')
+    const pdf = pdfPathOf(file)
+    if (await pdfUpToDate(pdf, file)) {
+      send(res, 200, { ok: true, path: pdf, cached: true, engine: 'cache' })
+      return
+    }
+    const outcome = await convertDocxToPdfOnce(file, pdf)
+    if (outcome.ok) {
+      send(res, 200, { ok: true, path: pdf, cached: false, engine: outcome.engine })
+      return
+    }
+    send(res, 200, { ok: false, error: outcome.reason, reason: outcome.reason, docx: file })
   } catch (error) {
     const status = Number.isInteger(error?.status) ? error.status : 500
     send(res, status, { ok: false, error: error instanceof Error ? error.message : '服务内部错误' })
@@ -2056,6 +2324,7 @@ export function apply(ctx) {
     [RUN_DELETE_PATH, handleRunDelete, 'dsh-data-panel: run delete'],
     [RUN_REPORT_LATEST_PATH, handleRunReportLatest, 'dsh-data-panel: run report latest'],
     [OPEN_PATH, handleOpenFile, 'dsh-data-panel: open file'],
+    [REPORT_PDF_PATH, handleReportPdf, 'dsh-data-panel: report pdf'],
     [TOOLS_PATH, handleTools, 'dsh-data-panel: tools'],
     [INTEGRATION_PATH, handleIntegration, 'dsh-data-panel: integration store'],
   ]
@@ -2117,6 +2386,7 @@ export const __test = {
   handleTestCode,
   handleRunReportLatest,
   handleOpenFile,
+  handleReportPdf,
   listRuns,
   handleRunList,
   handleRunLog,

@@ -239,6 +239,59 @@ text3 = "".join(p.text for p in doc3.paragraphs)
 check("不小于30%" not in text3,
       "注释率未采集 → 报告不含「不小于30%」声称")
 
+print("\n== 附录问题单 ==")
+
+issue_payload = make_payload([{"name": "第一阶段", "functions": [
+    mkfunction("F", [mkcase("A-1.CTD", [], [])])]}])
+issue_payload["issues"] = {
+    "docIssues": [], "staticIssues": [], "codeIssues": [], "resolvedIssues": [],
+    "dynamicIssues": [{
+        "id": "A-1.CTD", "title": "T001", "severity": "一般", "status": "failed",
+        "description": "断言失败：pay 期望 0.00，实际 -180",
+        "evidence": "src/a.cpp:12",
+        "suggestion": "请排查定位并修复后回归验证。",
+    }],
+}
+issue_out = tmp / "issue.docx"
+build(str(TEMPLATE), issue_payload, str(issue_out), refresh_toc=False)
+issue_doc = Document(str(issue_out))
+appendix_hit = False
+for table in issue_doc.tables:
+    table_text = " ".join(cell.text for row in table.rows for cell in row.cells)
+    if "A-1.CTD" in table_text and "断言失败：pay" in table_text and "src/a.cpp:12" in table_text:
+        appendix_hit = True
+        check("√程序问题" in table_text, "附录问题单勾选「程序问题」")
+        check("√一般" in table_text, "附录问题单勾选「一般」")
+        break
+check(appendix_hit, "附录问题单填入失败用例的中文摘要与证据")
+
+print("\n== 表题与二级标题缩进 ==")
+
+cap_payload = make_payload([{"name": "第一阶段", "functions": [
+    mkfunction("F", [mkcase("CAP-1.CTD", [], []), mkcase("CAP-2.CTD", [], [])])]}])
+cap_out = tmp / "caption.docx"
+build(str(TEMPLATE), cap_payload, str(cap_out), refresh_toc=False)
+cap_doc = Document(str(cap_out))
+captions = [p.text.strip() for p in cap_doc.paragraphs
+            if p.style is not None and p.style.name == "表题" and p.text.strip().startswith("表")]
+check(any(c.startswith("表4") and "CAP-1.CTD" in c for c in captions),
+      f"用例表题从表4开始并带用例标识（实际前四条：{captions[:4]}）")
+check(any(c.startswith("表5") and "CAP-2.CTD" in c for c in captions),
+      "第二条用例表题接着编号表5")
+check(all(c.split(" ", 1)[0].startswith("表") and " " in c for c in captions),
+      "表题格式为「表x 标题」")
+
+indented = []
+for para in cap_doc.paragraphs:
+    if para.style is None or para.style.name != "编号标题2":
+        continue
+    pPr = para._p.pPr
+    ind = pPr.find(qn("w:ind")) if pPr is not None else None
+    attrs = {k.split('}')[-1]: v for k, v in (ind.attrib if ind is not None else {}).items()}
+    if any(v not in ("0", None) for v in attrs.values()):
+        indented.append((para.text.strip()[:16], attrs))
+check(not indented, f"二级标题无缩进（异常：{indented[:2]}）")
+
 shutil.rmtree(tmp, ignore_errors=True)
 
 print()

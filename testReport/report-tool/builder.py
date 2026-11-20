@@ -33,6 +33,8 @@ v2 结构与模板约定
     N 注释
     附录A~F
 """
+import re
+
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -1262,6 +1264,13 @@ def build(
 
     # ── 附录 ──
     _fill_appendices(list(body), data, proto_body)
+    # ── 附录问题单：把本次问题填进附录B~E（问题 5）──
+    _fill_issue_appendices(doc, data)
+
+    # ── 表题与标题版式（问题 1/2）──
+    _add_case_table_captions(doc)      # 先给用例表补「表x 用例标识」
+    _renumber_all_captions(doc)        # 再按正文顺序重排整篇表号
+    _flush_level2_headings(doc)        # 二级标题取消缩进，顶头
 
     # ── 表格宽度归一化 + 页脚页码 ──
     table_count = _normalize_tables(doc)
@@ -1295,3 +1304,221 @@ def build(
     )
     print(f'目录：{toc_note}')
     return Path(out_path)
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  附录问题单（B/C/D/E）
+# ════════════════════════════════════════════════════════════════════════
+
+# 附录标题关键词 → issues 里的分类键
+ISSUE_APPENDICES = (
+    ('文档审查问题', 'docIssues', '文档问题'),
+    ('静态分析问题', 'staticIssues', '程序问题'),
+    ('代码审查问题', 'codeIssues', '程序问题'),
+    ('动态单元测试问题', 'dynamicIssues', '程序问题'),
+)
+
+SEVERITY_OPTIONS = ('重大', '严重', '一般')
+CATEGORY_OPTIONS = ('程序问题', '文档问题', '设计问题', '其他问题')
+
+
+def _issue_appendices_sections(doc: Document) -> list:
+    """按正文顺序找出「附录标题 → 该附录下的第一张表」，只收问题单类附录。"""
+    body = doc.element.body
+    sections = []
+    current = ''
+    for el in body:
+        if el.tag == qn('w:p'):
+            flat = _flat(el).strip()
+            if flat.startswith('附录'):
+                current = flat
+            continue
+        if el.tag != qn('w:tbl') or not current:
+            continue
+        for keyword, bucket, category in ISSUE_APPENDICES:
+            if keyword in current:
+                sections.append((current, el, bucket, category))
+                break
+        current = ''  # 每个附录只看第一张表（一张空白表单）
+    return sections
+
+
+def _fill_one_issue_form(table, item: Dict[str, Any], index: int,
+                         project: str, reporter: str, found_date: str,
+                         category: str) -> None:
+    """把一条问题写进 6×10 的附录问题单。"""
+
+    # 「程序/文档名」只放文件级信息，不把整段问题描述塞进来。
+    import re as _re
+
+    def artifact_name() -> str:
+        evidence = str(item.get('evidence') or '')
+        match = _re.search(r"([\w./\\-]+\.(?:cpp|cc|cxx|c|hpp|h|py|js|ts|tsx|go|rs|java|cs|rb|php))", evidence)
+        if match:
+            return match.group(1)
+        return str(item.get('file') or '')
+    def put(row: int, col: int, text: str) -> None:
+        try:
+            set_cell_text(table.cell(row, col), text)
+        except (IndexError, ValueError):
+            pass
+
+    issue_id = str(item.get('id') or f'WT-{index:03d}')
+    put(0, 1, issue_id)
+    put(0, 3, project or '未提供')
+    put(0, 5, artifact_name() or '未记录')
+    put(1, 1, found_date or '未记录')
+    put(1, 3, found_date or '未记录')
+    put(1, 5, reporter)
+
+    # 问题类别 / 级别：模板是纯文字选项，命中项前加√
+    if category in CATEGORY_OPTIONS:
+        put(2, CATEGORY_OPTIONS.index(category) + 1, f'√{category}')
+    severity = str(item.get('severity') or '一般').strip()
+    if severity not in SEVERITY_OPTIONS:
+        severity = '一般'
+    put(3, SEVERITY_OPTIONS.index(severity) + 1, f'√{severity}')
+
+    put(4, 1, '单元测试阶段')
+    put(5, 1, f'{issue_id} 待处理')
+
+    description = str(item.get('description') or item.get('title') or '').strip()
+    evidence = str(item.get('evidence') or '').strip()
+    if evidence and evidence not in description:
+        description = f'{description}（证据：{evidence}）' if description else f'证据：{evidence}'
+    put(6, 1, description or '未记录')
+    put(7, 1, str(item.get('suggestion') or '请排查定位并修复后回归验证。'))
+    put(9, 1, f'来源：本次执行记录 {issue_id}。')
+
+
+def _fill_issue_appendices(doc: Document, data: Dict[str, Any]) -> None:
+    """把本次问题按类别填进附录B~E 的问题单（问题 5）。
+
+    模板每类只有一张空白表单；同一类有多个问题时克隆原表（编号连续）。
+    没有问题的类别保持空白，不写占位文字。
+    """
+    issues = data.get('issues') or {}
+    if not isinstance(issues, dict):
+        return
+    meta = data.get('meta') or {}
+    people = meta.get('people') or {}
+    project = str(meta.get('project') or '').strip()
+    reporter = str(people.get('tester') or '').strip() or '测试人员未记录'
+    year, month, day = _cn_date(meta.get('executedAt') or '')
+    found_date = f'{year}-{month:02d}-{day:02d}' if year else ''
+
+    for _title, tbl_el, bucket, category in _issue_appendices_sections(doc):
+        items = issues.get(bucket) or []
+        if not items:
+            continue
+        pristine = deepcopy(tbl_el)  # 克隆源：始终用空白表单
+        anchor_el = tbl_el
+        for index, item in enumerate(items, 1):
+            if not isinstance(item, dict):
+                continue
+            if index == 1:
+                target = tbl_el
+            else:
+                new_el = deepcopy(pristine)
+                anchor_el.addnext(new_el)
+                anchor_el = new_el
+                target = new_el
+            _fill_one_issue_form(Table(target, doc), item, index,
+                                 project, reporter, found_date, category)
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  表题与标题版式
+# ════════════════════════════════════════════════════════════════════════
+
+CAPTION_PREFIX_RE = re.compile(r'^表\s*\d*\s*')
+
+
+def _set_paragraph_text(p_el, text: str) -> None:
+    """把一个段落的内容改成 text，保留首个 run 的格式（与表题重排同一套写法）。"""
+    runs = p_el.findall(qn('w:r'))
+    if not runs:
+        run = OxmlElement('w:r')
+        p_el.append(run)
+        runs = [run]
+    for extra in runs[1:]:
+        p_el.remove(extra)
+    first = runs[0]
+    for child in list(first):
+        if child.tag != qn('w:rPr'):
+            first.remove(child)
+    node = OxmlElement('w:t')
+    node.text = text
+    node.set(qn('xml:space'), 'preserve')
+    first.append(node)
+
+
+def _is_caption_paragraph(p) -> bool:
+    """表题判定：样式是「表题」，或者正文以「表+数字」开头（避免误伤「表示…」）。"""
+    flat = p.text.strip()
+    if not flat.startswith('表'):
+        return False
+    if p.style is not None and p.style.name == '表题':
+        return True
+    return bool(re.match(r'^表\s*\d+', flat))
+
+
+def _add_case_table_captions(doc: Document) -> int:
+    """给每张用例表（11 列）补一条「表x 用例标识」表题；返回补了几张。
+
+    模板里用例表没有表题，只有 表1~表3 的固定表；这里先写成占位形式
+    （`表 <caseId>`），随后由 _renumber_all_captions 按正文顺序统一编号。
+    """
+    proto = None
+    for p in doc.paragraphs:
+        if p.style is not None and p.style.name == '表题' and p.text.strip().startswith('表'):
+            proto = p._p
+            break
+    if proto is None:
+        return 0
+    added = 0
+    for table in list(doc.tables):
+        if len(table.columns) != 11:
+            continue
+        try:
+            case_id = table.cell(1, 7).text.strip()
+        except (IndexError, ValueError):
+            case_id = ''
+        prev = table._tbl.getprevious()
+        if prev is not None and prev.tag == qn('w:p') and _flat(prev).strip().startswith('表'):
+            continue
+        caption = deepcopy(proto)
+        _set_paragraph_text(caption, ('表 ' + case_id).rstrip())
+        table._tbl.addprevious(caption)
+        added += 1
+    return added
+
+
+def _renumber_all_captions(doc: Document) -> int:
+    """按正文顺序把全篇表题重排成 表1、表2…（保留标题文字）。返回总表数。"""
+    number = 0
+    for p in doc.paragraphs:
+        if not _is_caption_paragraph(p):
+            continue
+        rest = CAPTION_PREFIX_RE.sub('', p.text.strip(), count=1).strip()
+        number += 1
+        _set_paragraph_text(p._p, f'表{number} {rest}'.rstrip())
+    return number
+
+
+def _flush_level2_headings(doc: Document) -> int:
+    """二级标题（编号标题2）取消所有缩进，顶头左对齐。返回处理了几段。"""
+    fixed = 0
+    for p in doc.paragraphs:
+        if p.style is None or p.style.name != STYLE_H2:
+            continue
+        pPr = p._p.get_or_add_pPr()
+        ind = pPr.find(qn('w:ind'))
+        if ind is None:
+            ind = OxmlElement('w:ind')
+            pPr.append(ind)
+        for attr in ('left', 'leftChars', 'firstLine', 'firstLineChars',
+                     'hanging', 'hangingChars', 'right', 'rightChars'):
+            ind.set(qn('w:' + attr), '0')
+        fixed += 1
+    return fixed

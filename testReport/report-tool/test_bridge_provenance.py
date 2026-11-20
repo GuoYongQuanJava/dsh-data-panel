@@ -5,12 +5,36 @@ import importlib.util
 import subprocess
 import sys
 from pathlib import Path
+import os
+
+import pytest
 
 from schema import validate
 
 
 BRIDGE = Path(__file__).with_name("bridge.py")
-RUNNER = Path(__file__).resolve().parents[2] / "dsh-data-panel" / "package" / "assets" / "run_tests.py"
+
+
+def _find_runner():
+    """定位插件资产 run_tests.py；部署形态不同，逐个候选试。"""
+    here = Path(__file__).resolve().parent
+    candidates = []
+    env = os.environ.get("DSH_DATA_PANEL_ASSETS", "").strip()
+    if env:
+        candidates.append(Path(env))
+    candidates += [
+        here.parents[1] / "dsh-data-panel" / "package" / "assets",  # 仓库布局
+        here.parents[1] / "package" / "assets",
+        here / "assets",
+    ]
+    for candidate in candidates:
+        path = candidate / "run_tests.py"
+        if path.is_file():
+            return path
+    return None
+
+
+RUNNER = _find_runner()
 
 
 def build_report(tmp_path, case, test):
@@ -95,6 +119,8 @@ def test_unknown_result_validates_as_unconfirmed(tmp_path):
 
 
 def test_runner_parses_only_valid_named_json():
+    if RUNNER is None:
+        pytest.skip("未找到插件资产 run_tests.py（可用 DSH_DATA_PANEL_ASSETS 指向所在目录）")
     spec = importlib.util.spec_from_file_location("dsh_runner_report_test", RUNNER)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -135,3 +161,53 @@ def test_rawWarnings_preserved_in_scope(tmp_path):
     })
     assert source_scope["available"] is True
     assert source_scope["rawWarnings"] == ["bar", "baz"]
+
+
+def test_failure_summary_is_chinese_and_keeps_evidence():
+    import bridge as bridge_module
+
+    evidence = {
+        "message": (r"E:\proj\tests\test_generated.cpp:222" + "\n"
+                    "Expected equality of these values:\n  0.00\n    Which is: 0\n  pay\n    Which is: -180"),
+    }
+    text = bridge_module.summarize_failure(evidence)
+    assert "断言失败" in text
+    assert "pay" in text and "0.00" in text and "-180" in text
+    assert "test_generated.cpp:222" in text
+    assert "Expected equality" not in text
+
+
+def test_failure_summary_falls_back_for_unknown_text():
+    import bridge as bridge_module
+
+    text = bridge_module.summarize_failure({"message": "something odd happened"})
+    assert text.startswith("测试判定失败：")
+    assert bridge_module.summarize_failure(None, "未执行") == "未执行"
+
+
+def test_unit_label_uses_short_function_name():
+    import bridge as bridge_module
+
+    assert bridge_module._unit_label("src/order.cpp::Order::payable") == "payable单元测试"
+    assert bridge_module._unit_label("pickPWL") == "pickPWL单元测试"
+    assert bridge_module._unit_label("pickPWL单元测试") == "pickPWL单元测试"
+
+
+def test_cn_time_formats_iso_timestamp():
+    import re as re_module
+
+    import bridge as bridge_module
+
+    formatted = bridge_module.cn_time("2026-11-16T01:00:00Z")
+    assert re_module.fullmatch(r"\d{4}/\d{2}/\d{2} \d{2}:\d{2}", formatted), formatted
+    assert bridge_module.cn_time("") == ""
+    assert bridge_module.cn_time("不是时间") == "不是时间"
+
+
+def test_case_executed_at_falls_back_to_run_start(tmp_path):
+    case = {"caseId": "TC-9", "title": "时间回填", "testType": "functional", "testFunc": "test_t"}
+    # tests[] 里没有 startedAt，应该用 result.startedAt 回填执行时间
+    test = {"caseId": "TC-9", "func": "test_t", "outcome": "passed"}
+    output = build_report(tmp_path, case, test)
+    assert output["executedAt"], "执行时间不应该为空"
+    assert "/" in output["executedAt"]

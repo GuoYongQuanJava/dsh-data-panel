@@ -153,9 +153,64 @@ def main(argv: list = None):
             for key in ("overallAssessment", "environmentImpact", "improvements"):
                 if notes.get(key) and not payload.get(key):
                     payload[key] = notes[key]
-            for key in ("issues", "consistency"):
-                if notes.get(key) and not payload.get(key):
-                    payload[key] = notes[key]
+            # issues：report-notes 是扁平的 [{category, description, evidence}]，
+            # 要按类别归入报告数据的 docIssues/staticIssues/codeIssues/dynamicIssues，
+            # 否则问题单永远为空（payload.issues 是字典，旧的 truthy 判断会直接跳过）。
+            notes_issues = notes.get("issues")
+            if isinstance(notes_issues, list) and notes_issues:
+                buckets = {"doc": "docIssues", "static": "staticIssues",
+                           "code": "codeIssues", "dynamic": "dynamicIssues"}
+                issues = payload.setdefault("issues", {})
+                if not isinstance(issues, dict):
+                    issues = {}
+                    payload["issues"] = issues
+                for key in buckets.values():
+                    issues.setdefault(key, [])
+                for index, item in enumerate(notes_issues, 1):
+                    if not isinstance(item, dict):
+                        continue
+                    description = str(item.get("description") or "").strip()
+                    if not description:
+                        continue
+                    category = str(item.get("category") or "").strip().lower()
+                    bucket = buckets.get(category, "codeIssues")
+                    evidence = str(item.get("evidence") or "").strip()
+                    severity = str(item.get("severity") or "一般").strip()
+                    # dynamic：bridge 已按真实逐条结果生成条目，有同一 caseId 就合并，
+                    # 避免同一个问题在附录里出现两次。
+                    merged = False
+                    if category == "dynamic":
+                        haystack = description + " " + evidence
+                        for existing in issues["dynamicIssues"]:
+                            case_id = str(existing.get("id") or "")
+                            if case_id and case_id in haystack:
+                                existing["description"] = description
+                                existing["evidence"] = evidence
+                                existing["severity"] = severity
+                                merged = True
+                                break
+                    if merged:
+                        continue
+                    issues[bucket].append({
+                        "id": str(item.get("id") or f"WT-{index:03d}"),
+                        "title": description[:120],
+                        "description": description,
+                        "evidence": evidence,
+                        "severity": severity,
+                        "status": "open",
+                        "suggestion": str(item.get("suggestion") or ""),
+                    })
+
+            # consistency：保留已有结果，不覆盖。
+            notes_consistency = notes.get("consistency")
+            if isinstance(notes_consistency, list) and notes_consistency:
+                current = payload.get("consistency")
+                if not isinstance(current, dict):
+                    current = {"checked": True, "discrepancies": []}
+                    payload["consistency"] = current
+                if not current.get("discrepancies"):
+                    current["discrepancies"] = notes_consistency
+                current["checked"] = True
     # ── build ──
     try:
         out_path = build(
