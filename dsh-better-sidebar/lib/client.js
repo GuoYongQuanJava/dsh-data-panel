@@ -17147,7 +17147,7 @@ window.__ModuleLoader__.load({
 						objectUrl = URL.createObjectURL(new Blob([bytes], { type: "application/pdf" }));
 						setLoad({
 							status: "ready",
-							url: objectUrl
+							url: objectUrl + "#zoom=page-width" // 按页宽适配，A4 长文档默认只显示左侧约 57%
 						});
 					} catch (error) {
 						if (controller.signal.aborted) return;
