@@ -772,11 +772,21 @@ window.__ModuleLoader__.load({
  * 集成页原来把表格和分页条平铺在页面上，看起来比单元测试"散"。
  * 这里补一层同款卡片，让两边结构一致。
  */
-.it-card { border: 1px solid var(--dp-border); border-radius: 14px; background: var(--dp-bg); overflow: hidden; }
+/* 卡片弹性列：表头吸顶、分页贴底，只有中间表格区滚动（与单元测试 .dp-card 一致）。
+   高度不靠 JS 实测：整页 flex 撑满，页底不留空白。 */
+.it-card { display: flex; flex-direction: column; border: 1px solid var(--dp-border); border-radius: 14px; background: var(--dp-bg); overflow: hidden; }
 /* 卡片里的表格不再需要自己那层边框（会和卡片边框叠成双线） */
-.it-card > .it-table-wrap { border: 0; border-radius: 0; }
+.it-card > .it-table-wrap { flex: 1 1 auto; min-height: 0; border: 0; border-radius: 0; overflow-y: auto; }
 /* 卡片底部：分页条固定在这一条里，和单元测试的 .dp-card-foot 一致 */
-.it-card > .it-pager { margin: 0; padding: 10px 14px 11px; border-top: 1px solid var(--dp-border); background: var(--dp-bg); }
+.it-card > .it-pager { flex: 0 0 auto; margin: 0; padding: 10px 14px 11px; border-top: 1px solid var(--dp-border); background: var(--dp-bg); }
+/* 表头吸顶：卡片内只有表格区滚动，所以 sticky 挂在滚动容器上。 */
+.it-card .it-table thead th { position: sticky; top: 0; z-index: 2; }
+/* 整页撑满：shell 变弹性列，看板占据剩余高度，卡片在其中铺满。 */
+.it-root .dp-shell { display: flex; flex-direction: column; height: 100%; min-height: 0; box-sizing: border-box; }
+.it-root .it-board { flex: 1 1 auto; min-height: 0; align-items: stretch; }
+.it-root .it-main { display: flex; flex-direction: column; min-height: 0; }
+.it-root .it-card { flex: 1 1 auto; min-height: 0; }
+.it-root .it-side { min-height: 0; }
 .it-table { width: 100%; min-width: 520px; border-collapse: collapse; font-size: 12px; }
 .it-table th { padding: 8px 7px; border-bottom: 1px solid var(--dp-border); background: var(--dp-bg2); color: var(--dp-text3); font-size: 11px; font-weight: 600; letter-spacing: .04em; text-align: center; white-space: nowrap; }
 .it-table td { padding: 9px 7px; border-bottom: 1px solid var(--dp-border2); color: var(--dp-text2); vertical-align: middle; text-align: center; }
@@ -932,6 +942,9 @@ window.__ModuleLoader__.load({
  * 每组一张卡片：可折叠的标题行 + 组内表格，标题行右侧是「通过 X / 失败 Y」。
  */
 .it-report-groups { display: flex; flex-direction: column; gap: 9px; }
+/* 报告卡片：内容区自己滚（卡内报外层分页），外围撑满整页 */
+.it-card > .it-report-groups { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 10px; }
+.it-card > .dp-pager.it-pager { flex: 0 0 auto; }
 .it-report-group { border: 1px solid var(--dp-border); border-radius: 11px; background: var(--dp-bg); overflow: hidden; }
 /* 组内表格自己带一层边框，和卡片边框叠在一起会显粗，这里让表格贴边无框 */
 .it-report-group .it-table-wrap { border: 0; border-radius: 0; }
@@ -5876,6 +5889,8 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			var sideResizingState = useState(false);
 			var sideResizing = sideResizingState[0];
 			var setSideResizing = sideResizingState[1];
+			// 高度不靠 JS 量：整页用 flex 撑满（见 .it-root / .it-board / .it-card 样式），
+			// 面板在 display:none 时也能正确铺满，切页签无需重新计算。
 			/*
 			 * 显式功能项清单（features.json 里的 name 列表）。
 			 *
@@ -5931,6 +5946,16 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 					return next;
 				});
 			}
+			/*
+			 * 报告页的外层分页：只控制「每页显示几个功能项分组」，
+			 * 组内分页（reportPageMap）保持原样，形成两级分页。
+			 */
+			var reportGroupPageState = useState(1);
+			var reportGroupPage = reportGroupPageState[0];
+			var setReportGroupPage = reportGroupPageState[1];
+			var reportGroupSizeState = useState(10);
+			var reportGroupSize = reportGroupSizeState[0];
+			var setReportGroupSize = reportGroupSizeState[1];
 			var pageSizeState = useState(10);
 			var pageSize = pageSizeState[0];
 			var setPageSize = pageSizeState[1];
@@ -7319,7 +7344,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			function sidebar() {
 				return h("aside", {
 					className: "it-side",
-					// 宽度跟拖动结果走；没拖过就用 CSS 默认宽度。
+					// 宽度跟拖动结果走；高度由 .it-board 的 stretch 自动拉到底。
 					style: sideWidth > 0 ? { width: sideWidth + "px" } : null
 				},
 					h("div", { className: "it-side-head" },
@@ -7359,27 +7384,34 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			 * 复用单元测试的 .dp-pager 一套（共 N 条 / 每页几条 / 上一页 / 页码 / 下一页），
 			 * 换成 15 条的需求就改 sizes 即可。
 			 */
-			function pager(rows, pageValue, setPageValue, testId) {
-				var pageCount = Math.max(1, Math.ceil(rows.length / pageSize));
+			/**
+			 * 通用分页条。可选传入 size / setSize / unit，让不同页面（如报告页按功能项分组）
+			 * 共用同一套样式，又不互相干扰；不传则沿用面板级 pageSize。
+			 */
+			function pager(rows, pageValue, setPageValue, testId, sizeArg, setSizeArg, unit) {
+				var size = sizeArg > 0 ? sizeArg : pageSize;
+				var setSize = typeof setSizeArg === "function" ? setSizeArg : setPageSize;
+				var unitText = unit || "条";
+				var pageCount = Math.max(1, Math.ceil(rows.length / size));
 				// 数据变少（删除、筛选）后当前页可能越界，这里就地夹紧，不改状态。
 				var current = Math.min(Math.max(1, pageValue), pageCount);
 				return h("div", { className: "dp-pager it-pager", "data-it": testId || "pager" },
-					h("span", { className: "dp-pager-total" }, "共 " + rows.length + " 条"),
+					h("span", { className: "dp-pager-total" }, "共 " + rows.length + " " + unitText),
 					/*
 					 * 这里只写「每页 + 下拉」，不再在末尾补一个「条」——
 					 * option 文案本身就是「10 条」，再补一个会显示成「每页 10 条 条」。
 					 */
 					h("span", { className: "dp-pager-size" }, "每页",
 						h("select", {
-							value: String(pageSize),
+							value: String(size),
 							onChange: function (event) {
 								var next = Number(event.target.value);
-								setPageSize(next > 0 ? next : 10);
+								setSize(next > 0 ? next : 10);
 								setPageValue(1);
 							},
 							"aria-label": "每页条数"
-						}, [5, 10, 15, 20, 50].map(function (size) {
-							return h("option", { key: size, value: String(size) }, size + " 条");
+						}, [5, 10, 15, 20, 50].map(function (option) {
+							return h("option", { key: option, value: String(option) }, option + " 条");
 						}))
 					),
 					h("button", {
@@ -8039,6 +8071,16 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 					});
 				});
 
+				/*
+				 * 外层分页：每页显示多少个功能项分组（每页条数可在底部下拉里调）。
+				 * 组内分页仍由 reportPageMap 控制，两层互不影响。
+				 */
+				var reportGroupPageCount = Math.max(1, Math.ceil(groups.length / reportGroupSize));
+				var reportGroupPageIndex = Math.min(Math.max(1, reportGroupPage), reportGroupPageCount);
+				var visibleGroups = groups.slice(
+					(reportGroupPageIndex - 1) * reportGroupSize,
+					reportGroupPageIndex * reportGroupSize
+				);
 				var allIds = groups.reduce(function (list, group) {
 					return list.concat(group.records.map(function (r) { return r.id; }));
 				}, []);
@@ -8115,7 +8157,8 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 						? h("div", { className: "it-empty" },
 							h("div", { className: "it-empty-title" }, "当前还没有测试报告"),
 							h("div", { className: "it-empty-hint" }, "在「测试步骤」页点「一键执行」，跑完就会在这里生成报告。"))
-						: h("div", { className: "it-report-groups" }, groups.map(function (group) {
+						: h("div", { className: "it-card", "data-it": "report-card" },
+							h("div", { className: "it-report-groups" }, visibleGroups.map(function (group) {
 							/*
 							 * 每个分组各自分页：页码按组名存，互不影响。
 							 * （图 4 里每组都有自己的独立分页条。）
@@ -8274,7 +8317,10 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 									)
 									: null
 							);
-						}))
+							})),
+								// 外层分页：只控制功能项分组；组内分页不变。复用同一套分页条。
+								pager(groups, reportGroupPage, setReportGroupPage, "report-groups-pager", reportGroupSize, setReportGroupSize, "个功能项")
+							)
 				);
 			}
 
