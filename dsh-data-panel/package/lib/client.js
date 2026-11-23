@@ -740,7 +740,13 @@ window.__ModuleLoader__.load({
 	 */
 	.it-toolbar-actions { margin-left: 0; flex: 1 1 auto; justify-content: flex-end; }
 }
-.it-notice { margin-bottom: 12px; padding: 8px 11px; border: 1px solid color-mix(in srgb, var(--dp-brand) 30%, transparent); border-radius: 10px; background: color-mix(in srgb, var(--dp-brand) 6%, transparent); color: var(--dp-text); font-size: 12px; }
+.it-notice { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 12px; padding: 8px 11px; border: 1px solid color-mix(in srgb, var(--dp-brand) 30%, transparent); border-radius: 10px; background: color-mix(in srgb, var(--dp-brand) 6%, transparent); color: var(--dp-text); font-size: 12px; }
+/* 提示文字占据剩余空间，长文案自动换行，不与关闭按钮挤在一起 */
+.it-notice-text { flex: 1 1 auto; min-width: 0; line-height: 1.5; }
+/* 关闭按钮：贴右上，默认淡出，hover 才明显 —— 保持提示条本身不抢视觉 */
+.it-notice-close { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; margin: -2px -4px 0 0; padding: 0; border: 0; border-radius: 6px; background: none; color: var(--dp-text3); cursor: pointer; transition: background .12s, color .12s; }
+.it-notice-close:hover { background: color-mix(in srgb, var(--dp-text) 10%, transparent); color: var(--dp-text); }
+.it-notice-close:focus-visible { outline: none; color: var(--dp-text); box-shadow: 0 0 0 2px color-mix(in srgb, var(--dp-brand) 40%, transparent); }
 
 /* 场景侧栏 + 表格 */
 .it-board { display: flex; align-items: flex-start; gap: 10px; }
@@ -6153,6 +6159,36 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 							stepByCaseId[item.caseId] = Array.isArray(item.steps) ? item.steps : [];
 						});
 						/*
+						 * ★ 兼容「扁平 steps」写法：按 caseId 自己分组。
+						 *
+						 * steps.json 有两种形态，后端 integration-store 两种都读下来了：
+						 *   A 分组式（契约形态）{ cases: [{ caseId, steps: [...] }, ...] }
+						 *   B 扁平式           { steps: [{ caseId, no, ... }, ...] } 或直接是数组
+						 *
+						 * 面板原先**只读 A**：B 时 stepCases 为空 → stepByCaseId 全空 →
+						 * 测试步骤页整片空白，但磁盘上明明有步骤。
+						 * 用户 2026-11-23 踩到的就是这个：模型写成扁平数组，界面什么都不显示。
+						 *
+						 * 这里在 A 没给出内容时，把后端的 data.steps 按 caseId 归组兜底。
+						 * 注意只补**空**的键：A 里显式给了空 steps 的用例，不该被扁平数据覆盖。
+						 */
+						var flatSteps = (stepKind.data && Array.isArray(stepKind.data.steps))
+							? stepKind.data.steps
+							: [];
+						if (flatSteps.length > 0) {
+							var grouped = Object.create(null);
+							flatSteps.forEach(function (step) {
+								if (!step || typeof step.caseId !== "string") return;
+								if (!grouped[step.caseId]) grouped[step.caseId] = [];
+								grouped[step.caseId].push(step);
+							});
+							Object.keys(grouped).forEach(function (caseId) {
+								if (stepByCaseId[caseId] === undefined) {
+									stepByCaseId[caseId] = grouped[caseId];
+								}
+							});
+						}
+						/*
 						 * ★ 把执行记录合并进用例（子表 + 名称后的角标都靠它）。
 						 *
 						 * exec-records.json 的结构是 { 步骤版本: { caseId: [记录...] } }，
@@ -8688,7 +8724,24 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 								: null
 						)
 					),
-					notice !== "" ? h("div", { className: "it-notice", "data-it": "notice" }, notice) : null,
+					notice !== ""
+						? h("div", { className: "it-notice", "data-it": "notice" },
+							h("span", { className: "it-notice-text" }, notice),
+							/*
+							 * 关闭按钮：提示条只是旁白，看过了就该能收起。
+							 * 没有它时，一句「已刷新…」会一直挂在那儿直到下一次操作覆盖，
+							 * 用户会以为界面卡住了。
+							 */
+							h("button", {
+								type: "button",
+								className: "it-notice-close",
+								"data-it": "notice-close",
+								title: "关闭提示",
+								"aria-label": "关闭提示",
+								onClick: function () { setNotice(""); }
+							}, h(Icon, { name: "close", size: 13 }))
+						)
+						: null,
 					// 表格始终在：详情/编辑、总体报告都是弹窗，不再顶掉内容。
 					body
 				),

@@ -220,11 +220,20 @@ def check_steps(doc, case_ids, report):
     if not isinstance(doc, dict):
         report.fail(where, "顶层必须是对象（{stepVersion, sourceCaseVersion, cases}）")
         return
-    for key in ("stepVersion", "sourceCaseVersion", "cases"):
+    # ★ 必须是「分组式」：cases[] 里每条用例挂自己的 steps。
+    #   扁平式（顶层 steps[] 或纯数组）面板读不到 → 测试步骤页整片空白。
+    #   面板已加兼容兜底，但契约仍要求分组式，否则报告与统计都可能出错。
+    if not isinstance(doc.get("cases"), list):
+        hint = ""
+        if isinstance(doc.get("steps"), list):
+            hint = "（发现顶层 steps[] 扁平写法 —— 必须改成 cases:[{caseId, steps:[...]}]）"
+        report.fail(where, "缺少 cases[] 分组结构%s" % hint)
+        return
+    for key in ("stepVersion", "sourceCaseVersion"):
         if key not in doc:
             report.fail(where, "缺少顶层字段 %s" % key)
     cases = doc.get("cases")
-    if not isinstance(cases, list) or not cases:
+    if not cases:
         report.fail(where, "cases 必须是非空数组")
         return
     if case_ids:

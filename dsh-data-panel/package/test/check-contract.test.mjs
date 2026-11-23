@@ -174,3 +174,20 @@ test('抓出 stress 类型（本轮禁止）', async () => {
   assert.equal(status, 1, out)
   assert.match(out, /测试类型非法.*stress/)
 })
+
+test('抓出 steps.json 写成扁平数组（面板会整片空白）', async () => {
+  /*
+   * 用户 2026-11-23 实测：模型把 steps.json 写成扁平数组，测试步骤页什么都不显示。
+   * 面板已加兼容兜底，但契约仍要求分组式 —— 校验器要直接 FAIL 并给出正确写法。
+   */
+  const root = await makeValid()
+  const p = join(root, 'step-versions', 'V0_0_1', 'steps.json')
+  await writeJson(p, {
+    stepVersion: 'V0.0.1',
+    steps: [{ caseId: 'V0_0_1-IT-001', stepNo: 1, action: 'a' }],
+  })
+  const { status, out } = run(root)
+  assert.equal(status, 1, out)
+  assert.match(out, /缺少 cases\[\] 分组结构/)
+  assert.match(out, /扁平写法.*必须改成 cases/)
+})

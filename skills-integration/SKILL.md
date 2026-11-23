@@ -1476,15 +1476,55 @@ $reportRoot = $candidates[0]
 
 ### 步骤（执行原子）
 
+单条步骤长这样：
+
 ```json
 {
   "no": 1,
-  "action": "打开商品详情页",
-  "operation": "浏览器访问 /product/123",
-  "expected": "页面标题显示「无线蓝牙耳机」",
+  "action": "<这一步做什么>",
+  "operation": "<具体怎么操作：输入什么、点哪里>",
+  "expected": "<可观察的预期结果>",
   "target": "test_v0_0_1_it001_step1"
 }
 ```
+
+#### ★ `steps.json` 的顶层结构：**必须按用例分组**
+
+```json
+{
+  "stepVersion": "V0.0.1",
+  "sourceCaseVersion": "V0.0.1",
+  "generatedAt": "2026-11-20T10:00:00+08:00",
+  "channelLegend": { "cua": "界面自动化", "runner": "测试代码" },
+  "cases": [
+    {
+      "id": "it_1",
+      "caseId": "V0_0_1-IT-001",
+      "caseCode": "GN-651-JYSG_DM_AUTH-1-T001.CTD",
+      "featureId": "ft_001",
+      "featureName": "用户注册与登录",
+      "title": "手机号验证码登录",
+      "type": "functional",
+      "createdAt": "2026-11-20T10:00:00+08:00",
+      "steps": [ { "no": 1, "action": "...", "operation": "...", "expected": "...", "target": "...", "channel": "cua" } ],
+      "records": []
+    }
+  ]
+}
+```
+
+> **★★ 最常见的致命错：把 steps.json 写成扁平数组。**
+>
+> 错（面板读不到，**测试步骤页整片空白**）：
+> ```json
+> [ { "caseId": "V0_0_1-IT-001", "no": 1, ... }, { "caseId": "V0_0_1-IT-001", "no": 2, ... } ]
+> ```
+> 也错：`{ "stepVersion": "...", "steps": [ {...} ] }`
+>
+> 对：`{ "cases": [ { "caseId": "...", "steps": [ {...} ] } ] }` —— **每条用例挂自己的 steps**。
+>
+> 用户 2026-11-23 实测踩到：模型写成扁平数组，磁盘上明明有步骤，界面什么都不显示。
+> 面板已加兼容兜底（会按 caseId 自己分组），但**契约仍是分组式**，校验器会直接 FAIL。
 
 ### 执行记录（**挂在测试步骤主表某一行下面，用例级**）
 
