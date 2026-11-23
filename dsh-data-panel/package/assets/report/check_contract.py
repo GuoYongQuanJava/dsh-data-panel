@@ -1,0 +1,453 @@
+"""集成测试数据契约校验器 —— 把「散文规则」变成「可执行断言」。
+
+为什么需要这个脚本
+------------------
+Skill 里原有 19 条「重要规则」和 3 条「最容易犯的错」，全是散文。实测证明：
+散文写三遍、带反例，执行者照样会违反 —— 因为它**没有可执行的自检动作**，
+做的时候想不起来，做完也没法验证。这个脚本把这些规则变成一条命令：
+跑一次，PASS 才能宣告完成。
+
+实测踩过的坑（每一条都变成了这里的检查项）
+------------------------------------------
+1. `features.json` 缺 `id`/`code`，自拟 `featureId`/`moduleEn`
+2. `cases.json` 的用例缺 `id`（面板按 id 认行，缺了「展开一行全展开」）
+3. `runner.json` 根本没写（Skill 只说「与单元测试一致」，于是靠猜）
+4. `result.json` 写成 `tests[]`，而 `bridge.py` 要的是 `steps[]`
+   —— 执行者被迫「打派生视图补丁才跑通报告管线」
+5. 执行记录按**步骤**粒度写（3 步用例写 3 条），契约要求**用例级每 run 一条**
+6. `steps.json` 暴露 `func`/`codeFile`（测试函数名、代码文件），违反铁律
+7. 报告版本号手工硬编码 V0.0.1，没走面板分配
+
+用法
+----
+    python check_contract.py --root <会话集成根目录> [--step-version V0_0_1] [--run <runId>]
+
+    --root  形如 <项目>/.dsh/test-sessions/<SID>/integration
+    脚本自动发现最新的用例版本 / 步骤版本 / run，也可以用参数指定。
+
+退出码：0 = 全部通过；1 = 有 FAIL（打印清单）；2 = 参数或环境错误。
+"""
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+
+# ─────────────────────────── 契约定义 ───────────────────────────
+# 这些字段是照「真实跑通的数据」抄的，不是想象的：
+#   <项目>/.dsh/test-sessions/<SID>/integration/case-versions/V0_0_1/cases.json
+# 改动任何一条前，先确认面板代码（lib/client.js 的 normalizeCaseList）读的也是这些名字。
+
+FEATURE_REQUIRED = ["id", "code", "name"]
+FEATURE_OPTIONAL = ["description", "source", "stage"]
+
+CASE_REQUIRED = ["caseId", "featureId", "title", "type"]
+CASE_OPTIONAL = ["id", "caseCode", "description", "precondition", "expectedResult", "steps"]
+
+STEP_REQUIRED = ["no", "action", "operation", "expected"]
+STEP_OPTIONAL = ["target", "channel"]
+
+# runner.json：跑测试代码的那 5 类必须有
+RUNNER_REQUIRED_ANY = [["preset"], ["testFile", "command"]]
+
+# result.json：bridge.py 逐条读这些（见 integrationReport/bridge.py 的 load_execution）
+# ★ 历史上最大的坑：runner 原生输出 tests[]，而这里要 steps[]。
+RESULT_REQUIRED = ["runId", "steps"]
+RESULT_STEP_REQUIRED = ["caseId", "stepNo", "channel", "outcome"]
+
+# 执行记录（挂在 steps.json 的 cases[].records）：只能有这 5 个字段
+RECORD_ALLOWED = ["runId", "at", "result", "durationMs", "source"]
+
+# 铁律：界面/API/报告只出现步骤，不出现测试函数名与代码文件
+FORBIDDEN_IN_STEPS = ["func", "codeFile", "codeRef", "code", "testFunc"]
+
+VALID_TYPES = {"functional", "performance", "boundary", "api", "security", "margin", "logic"}
+BANNED_TYPES = {"stress"}
+
+# ★ outcome / result 的合法值都来自**代码**，不是想象：
+#   · bridge.py 的 OUTCOME_CONCLUSION：passed / failed / error / notRun / unconfirmed
+#   · 面板 client.js 只判断 result === "pass"，其余算未通过；steps.json 里实测也出现 fail
+# 这两套枚举不一样，校验时各按各的，不要强行统一 —— 它们服务于不同消费者。
+VALID_OUTCOMES = {"passed", "failed", "error", "notRun", "unconfirmed", "blocked", "unknown"}
+VALID_RESULTS = {"pass", "fail", "failed", "error", "notRun", "aborted", "unconfirmed"}
+
+# ★ 快照文件名是 cases.snapshot.json，不是 cases.json（实测）
+SNAPSHOT_FILES = ["steps.json", "cases.snapshot.json"]
+
+CASE_ID_RE = re.compile(r"^V\d+_\d+_\d+-IT-\d{3,}$")
+
+
+class Report:
+    def __init__(self):
+        self.fails = []
+        self.warns = []
+        self.oks = []
+
+    def fail(self, where, message):
+        self.fails.append((where, message))
+
+    def warn(self, where, message):
+        self.warns.append((where, message))
+
+    def ok(self, message):
+        self.oks.append(message)
+
+    def dump(self):
+        for message in self.oks:
+            print("  PASS  " + message)
+        for where, message in self.warns:
+            print("  WARN  [%s] %s" % (where, message))
+        for where, message in self.fails:
+            print("  FAIL  [%s] %s" % (where, message))
+        print("")
+        if self.fails:
+            print("结果：FAIL（%d 条不通过，%d 条警告）" % (len(self.fails), len(self.warns)))
+            return 1
+        print("结果：PASS（%d 项检查通过，%d 条警告）" % (len(self.oks), len(self.warns)))
+        return 0
+
+
+def load_json(path, report, label):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        report.fail(label, "文件不存在：%s" % path)
+    except json.JSONDecodeError as error:
+        report.fail(label, "不是合法 JSON：%s（%s）" % (path, error))
+    return None
+
+
+def latest_version(root, kind):
+    """取某个 kind 下版本号最大的目录名。"""
+    base = Path(root) / kind
+    if not base.is_dir():
+        return ""
+    names = [p.name for p in base.iterdir() if p.is_dir()]
+    if not names:
+        return ""
+
+    def key(name):
+        nums = re.findall(r"\d+", name)
+        return tuple(int(n) for n in nums) if nums else (0,)
+
+    return sorted(names, key=key)[-1]
+
+
+def check_keys(items, required, optional, where, report, label_field):
+    """逐项检查字段：缺必填就 FAIL，多出未声明字段就 WARN（提示自拟）。"""
+    missing_required = set()
+    extra = set()
+    for item in items:
+        for key in required:
+            if key not in item or item[key] in ("", None, []):
+                missing_required.add(key)
+        for key in item:
+            if key not in required and key not in optional:
+                extra.add(key)
+    if missing_required:
+        report.fail(where, "%s 缺少必填字段：%s" % (label_field, ", ".join(sorted(missing_required))))
+    else:
+        report.ok("%s 必填字段齐全（%s）" % (where, ", ".join(required)))
+    if extra:
+        report.warn(where, "出现契约外字段（疑似自拟）：%s" % ", ".join(sorted(extra)))
+
+
+# ─────────────────────────── 各项检查 ───────────────────────────
+
+def check_features(doc, report):
+    where = "features.json"
+    if not isinstance(doc, list):
+        report.fail(where, "顶层必须是数组，实际是 %s" % type(doc).__name__)
+        return []
+    if not doc:
+        report.fail(where, "功能项为空")
+        return []
+    check_keys(doc, FEATURE_REQUIRED, FEATURE_OPTIONAL, where, report, "功能项")
+    ids = [f.get("id") for f in doc if isinstance(f, dict)]
+    if len(ids) != len(set(ids)):
+        report.fail(where, "功能项 id 有重复")
+    codes = [f.get("code") for f in doc if isinstance(f, dict)]
+    if len(codes) != len(set(codes)):
+        report.fail(where, "功能项 code 有重复")
+    return ids
+
+
+def check_cases(doc, feature_ids, report):
+    where = "cases.json"
+    if not isinstance(doc, list):
+        report.fail(where, "顶层必须是数组，实际是 %s" % type(doc).__name__)
+        return []
+    if not doc:
+        report.fail(where, "用例为空")
+        return []
+    check_keys(doc, CASE_REQUIRED, CASE_OPTIONAL, where, report, "用例")
+
+    case_ids, bad_prefix, bad_type, orphan, no_id = [], [], [], [], []
+    for item in doc:
+        if not isinstance(item, dict):
+            continue
+        cid = str(item.get("caseId") or "")
+        case_ids.append(cid)
+        if not CASE_ID_RE.match(cid):
+            bad_prefix.append(cid)
+        if not isinstance(item.get("id"), str) or item.get("id") == "":
+            no_id.append(cid)
+        t = item.get("type")
+        if t in BANNED_TYPES:
+            bad_type.append("%s(stress 本轮禁止)" % cid)
+        elif t not in VALID_TYPES:
+            bad_type.append("%s(%s)" % (cid, t))
+        fid = item.get("featureId")
+        if feature_ids and fid not in feature_ids:
+            orphan.append("%s→%s" % (cid, fid))
+
+    if len(case_ids) != len(set(case_ids)):
+        report.fail(where, "caseId 有重复")
+    if bad_prefix:
+        report.fail(where, "caseId 格式不对（应为 V0_0_1-IT-001）：%s" % ", ".join(bad_prefix[:5]))
+    if bad_type:
+        report.fail(where, "测试类型非法：%s" % ", ".join(bad_type[:5]))
+    if orphan:
+        report.fail(where, "用例的 featureId 在 features.json 里找不到：%s" % ", ".join(orphan[:5]))
+    if no_id:
+        report.warn(where, "用例缺 id（面板会用 caseId 兜底，但规范要求写）：%d 条" % len(no_id))
+    return case_ids
+
+
+def check_steps(doc, case_ids, report):
+    where = "steps.json"
+    if not isinstance(doc, dict):
+        report.fail(where, "顶层必须是对象（{stepVersion, sourceCaseVersion, cases}）")
+        return
+    for key in ("stepVersion", "sourceCaseVersion", "cases"):
+        if key not in doc:
+            report.fail(where, "缺少顶层字段 %s" % key)
+    cases = doc.get("cases")
+    if not isinstance(cases, list) or not cases:
+        report.fail(where, "cases 必须是非空数组")
+        return
+    if case_ids:
+        missing = [c.get("caseId") for c in cases if c.get("caseId") not in case_ids]
+        if missing:
+            report.fail(where, "步骤里的 caseId 在用例版本里找不到：%s" % ", ".join(map(str, missing[:5])))
+        uncovered = set(case_ids) - {c.get("caseId") for c in cases}
+        if uncovered:
+            report.warn(where, "有 %d 条用例没有生成步骤" % len(uncovered))
+
+    # 铁律：不许暴露测试函数名 / 代码
+    leaked = set()
+    record_violations = []
+    step_missing = []
+    for case in cases:
+        if not isinstance(case, dict):
+            continue
+        for key in case:
+            if key in FORBIDDEN_IN_STEPS:
+                leaked.add("cases[]." + key)
+        for step in case.get("steps") or []:
+            if not isinstance(step, dict):
+                continue
+            for key in step:
+                if key in FORBIDDEN_IN_STEPS:
+                    leaked.add("steps[]." + key)
+            for key in STEP_REQUIRED:
+                if step.get(key) in ("", None):
+                    step_missing.append("%s#%s 缺 %s" % (case.get("caseId"), step.get("no"), key))
+        # 执行记录：字段白名单 + 粒度（每个 runId 只能一条）
+        records = case.get("records") or []
+        run_ids = []
+        for rec in records:
+            if not isinstance(rec, dict):
+                continue
+            extra = set(rec) - set(RECORD_ALLOWED)
+            if extra:
+                record_violations.append("%s 的记录多出字段 %s" % (case.get("caseId"), ", ".join(sorted(extra))))
+            run_ids.append(rec.get("runId"))
+            if rec.get("result") not in VALID_RESULTS:
+                record_violations.append("%s 的 result 非法：%s" % (case.get("caseId"), rec.get("result")))
+        dup = {r for r in run_ids if run_ids.count(r) > 1}
+        if dup:
+            record_violations.append("%s 同一 runId 有多条记录（应每 run 一条）：%s"
+                                     % (case.get("caseId"), ", ".join(map(str, dup))))
+
+    if leaked:
+        report.fail(where, "★ 铁律违反：暴露了测试函数名/代码字段：%s" % ", ".join(sorted(leaked)))
+    else:
+        report.ok("steps.json 未暴露测试函数名/代码字段")
+    if step_missing:
+        report.fail(where, "步骤缺必填字段：%s" % "; ".join(step_missing[:5]))
+    if record_violations:
+        report.fail(where, "执行记录不合契约：%s" % "; ".join(record_violations[:5]))
+    else:
+        report.ok("执行记录字段与粒度合规（每用例每 run 一条，仅 %s）" % "/".join(RECORD_ALLOWED))
+
+
+def check_runner(doc, report):
+    where = "runner.json"
+    if doc is None:
+        return
+    if not isinstance(doc, dict):
+        report.fail(where, "顶层必须是对象")
+        return
+    if not any(all(k in doc for k in group) for group in RUNNER_REQUIRED_ANY):
+        report.fail(where, "必须提供 preset，或 testFile，或 command")
+    else:
+        report.ok("runner.json 形态合法")
+    if "testFile" not in doc and "command" not in doc:
+        report.warn(where, "既没有 testFile 也没有 command，跑测试代码的 5 类将无法执行")
+
+
+def check_result(doc, case_ids, step_case_index, report):
+    where = "result.json"
+    if doc is None:
+        return
+    if not isinstance(doc, dict):
+        report.fail(where, "顶层必须是对象")
+        return
+    # ★ 最重要的一条：必须是 steps[]，不能是 tests[]
+    if "steps" not in doc:
+        hint = ""
+        if "tests" in doc:
+            hint = "（发现 tests[] —— bridge.py 要的是 steps[]，不能用 tests 代替）"
+        report.fail(where, "缺少 steps[]{0}".format(hint))
+        return
+    for key in ("runId", "stepVersion"):
+        if key not in doc:
+            report.warn(where, "缺少顶层字段 %s" % key)
+    steps = doc.get("steps")
+    if not isinstance(steps, list):
+        report.fail(where, "steps 必须是数组")
+        return
+    bad = []
+    for item in steps:
+        if not isinstance(item, dict):
+            continue
+        for key in RESULT_STEP_REQUIRED:
+            if item.get(key) in ("", None):
+                bad.append("%s#%s 缺 %s" % (item.get("caseId"), item.get("stepNo"), key))
+        if item.get("outcome") not in VALID_OUTCOMES:
+            bad.append("%s#%s outcome 非法：%s" % (item.get("caseId"), item.get("stepNo"), item.get("outcome")))
+        cid = item.get("caseId")
+        if case_ids and cid not in case_ids:
+            bad.append("%s 不在用例版本里" % cid)
+        if step_case_index is not None and cid in step_case_index:
+            nos = step_case_index[cid]
+            if item.get("stepNo") not in nos:
+                bad.append("%s 的 stepNo=%s 在 steps.json 里不存在" % (cid, item.get("stepNo")))
+    if bad:
+        report.fail(where, "逐步骤结果不合契约：%s" % "; ".join(bad[:5]))
+    else:
+        report.ok("result.json 的 steps[] 逐项字段合规（%d 条）" % len(steps))
+
+
+def check_snapshot(root, run_id, report):
+    where = "runs/%s/snapshot" % (run_id or "<runId>")
+    if not run_id:
+        report.warn(where, "没有指定 run，跳过快照检查")
+        return
+    snap = Path(root) / "runs" / run_id / "snapshot"
+    if not snap.is_dir():
+        report.fail(where, "快照目录不存在 —— 执行必须冻结快照，报告只认快照")
+        return
+    for name in SNAPSHOT_FILES:
+        if not (snap / name).is_file():
+            report.fail(where, "缺少快照文件 %s" % name)
+    report.ok("执行快照存在（runs/%s/snapshot/）" % run_id)
+
+
+def check_report_version(root, report, run_id):
+    where = "report-versions"
+    index_path = Path(root) / "report-versions" / "index.json"
+    if not index_path.is_file():
+        report.warn(where, "还没有报告版本（本次可能没生成报告）")
+        return
+    index = load_json(index_path, report, where)
+    if not isinstance(index, dict):
+        return
+    versions = index.get("versions") or []
+    if not versions:
+        report.warn(where, "报告版本清单为空")
+        return
+    if run_id:
+        hit = [v for v in versions if run_id in json.dumps(v, ensure_ascii=False)]
+        if not hit:
+            report.fail(where, "当前 runId(%s) 没有对应的报告版本 —— 报告版本必须由面板分配，不能手写 V0.0.1" % run_id)
+        else:
+            report.ok("报告版本由面板分配且对应本轮 runId")
+    names = [v.get("name") for v in versions if isinstance(v, dict)]
+    if len(names) != len(set(names)):
+        report.fail(where, "报告版本号有重复")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="集成测试数据契约校验")
+    parser.add_argument("--root", required=True, help="会话集成根目录（.../integration）")
+    parser.add_argument("--step-version", default="", help="步骤版本，默认取最新")
+    parser.add_argument("--case-version", default="", help="用例版本，默认取最新")
+    parser.add_argument("--run", default="", help="要校验的 runId，默认取最新")
+    args = parser.parse_args(argv)
+
+    root = Path(args.root)
+    if not root.is_dir():
+        print("FAIL 集成根目录不存在：%s" % root, file=sys.stderr)
+        return 2
+
+    report = Report()
+    print("校验集成测试数据契约")
+    print("  根目录：%s" % root)
+
+    case_ver = args.case_version or latest_version(root, "case-versions")
+    step_ver = args.step_version or latest_version(root, "step-versions")
+    run_id = args.run
+    if run_id == "":
+        runs_dir = root / "runs"
+        if runs_dir.is_dir():
+            names = sorted([p.name for p in runs_dir.iterdir() if p.is_dir()])
+            run_id = names[-1] if names else ""
+    print("  用例版本：%s   步骤版本：%s   run：%s\n" % (case_ver or "(无)", step_ver or "(无)", run_id or "(无)"))
+
+    feature_ids = []
+    case_ids = []
+    step_case_index = None
+
+    if case_ver:
+        features = load_json(root / "case-versions" / case_ver / "features.json", report, "features.json")
+        if features is not None:
+            feature_ids = check_features(features, report)
+        cases = load_json(root / "case-versions" / case_ver / "cases.json", report, "cases.json")
+        if cases is not None:
+            case_ids = check_cases(cases, feature_ids, report)
+    else:
+        report.fail("case-versions", "找不到任何用例版本")
+
+    if step_ver:
+        steps_doc = load_json(root / "step-versions" / step_ver / "steps.json", report, "steps.json")
+        if steps_doc is not None:
+            check_steps(steps_doc, case_ids, report)
+            step_case_index = {}
+            for case in steps_doc.get("cases") or []:
+                if isinstance(case, dict):
+                    step_case_index[case.get("caseId")] = {
+                        s.get("no") for s in (case.get("steps") or []) if isinstance(s, dict)
+                    }
+    else:
+        report.warn("step-versions", "还没有步骤版本（Step 3 尚未执行）")
+
+    check_runner(load_json(root / "runner.json", report, "runner.json"), report)
+
+    if run_id:
+        check_snapshot(root, run_id, report)
+        result = load_json(root / "runs" / run_id / "result.json", report, "result.json")
+        if result is not None:
+            check_result(result, case_ids, step_case_index, report)
+        check_report_version(root, report, run_id)
+    else:
+        report.warn("runs", "还没有任何执行记录（Step 5 尚未执行）")
+
+    print("")
+    return report.dump()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

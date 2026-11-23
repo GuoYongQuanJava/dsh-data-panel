@@ -2665,7 +2665,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 							className: "dp-input",
 							value: value,
 							maxLength: 60,
-							placeholder: "例如：订单模块",
+							placeholder: "填写层级名称",
 							"data-it": "layer-name-input",
 							onChange: function (event) { setValue(event.target.value); setError(""); },
 							onKeyDown: function (event) { if (event.key === "Enter") submit(); }
@@ -2713,7 +2713,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 						className: "dp-input",
 						value: value,
 						maxLength: 30,
-						placeholder: "例如：商品与购物车",
+						placeholder: "填写功能项名称",
 						"data-it": "feature-name-input",
 						onChange: function (event) { setValue(event.target.value); setError(""); },
 						onKeyDown: function (event) { if (event.key === "Enter") submit(); }
@@ -3427,7 +3427,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 							className: "dp-input",
 							value: values.title,
 							maxLength: 200,
-							placeholder: "例如：T001（详细场景填写在测试说明）",
+							placeholder: "填写用例名称",
 							onChange: function (event) { set("title", event.target.value); }
 						})
 					),
@@ -5347,7 +5347,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 				]
 			},
 				h("div", { className: "it-detail" },
-					field("title", "用例名称", "如 商品加入购物车", { required: true }),
+					field("title", "用例名称", "填写这条用例验证什么", { required: true }),
 					/*
 					 * 用例功能项：下拉选择已有功能项。
 					 * 功能项由对话框按代码/需求规则生成（集成测试场景），
@@ -6187,43 +6187,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 								});
 							});
 						})();
-						var list = rawList.map(function (item) {
-							if (!item || typeof item !== "object") return item;
-							var next = Object.assign({}, item);
-							if (!next.scenario && next.featureId && featureName[next.featureId]) {
-								next.scenario = featureName[next.featureId];
-							}
-							var own = Array.isArray(next.steps) ? next.steps : [];
-							if (own.length === 0 && next.caseId && stepByCaseId[next.caseId]) {
-								next.steps = stepByCaseId[next.caseId];
-							}
-							var ownRuns = Array.isArray(next.records) ? next.records : [];
-							if (ownRuns.length === 0 && next.caseId && execByCaseId[next.caseId]) {
-								next.records = execByCaseId[next.caseId];
-							}
-							/*
-							 * ★ 由执行记录推导 status / lastRunAt。
-							 *
-							 * cases.json 里**没有**这两个字段（用例本身是静态定义），
-							 * 面板的看板、报告页、总体报告统计都读 record.status。
-							 * 不在这里补，所有用例都会显示「未执行」、通过数恒为 0。
-							 *
-							 * 取最新一条记录（records 已按时间倒序）：
-							 *   result pas  → status "pass"
-							 *   result 其它 → status "fail"（error 也算没通过）
-							 *   没有记录     → status "none"
-							 */
-							var runs = Array.isArray(next.records) ? next.records : [];
-							if (runs.length > 0) {
-								var latestRun = runs[0];
-								next.status = latestRun.result === "pass" ? "pass" : "fail";
-								next.lastRunAt = latestRun.at || "";
-							} else if (!next.status) {
-								next.status = "none";
-								next.lastRunAt = "";
-							}
-							return next;
-						});
+						var list = normalizeCaseList(rawList, featureName, stepByCaseId, execByCaseId);
 						setRemote({ kinds: kinds, features: features });
 						/*
 						 * 显式功能项清单进状态：侧栏的「新建功能项」要往这份清单里加，
@@ -6240,9 +6204,30 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 							var names = versions.length > 0
 								? versions.map(function (item) { return item.name; })
 								: ["V0.0.1"];
+							/*
+							 * ★ 所有版本都灌上真实内容，不能只填 activeVersion。
+							 *
+							 * 原来这里是 `byVersion[name] = name === activeVersion ? list : []`，
+							 * 非当前版本一律给空数组。于是用户「生成了 V0.0.2，面板里切过去是
+							 * 空的，得回对话框让模型切版本」—— 切版本这种日常操作被迫依赖对话。
+							 *
+							 * 现在后端 readAll 会把每个版本的内容一起带上来（caseKind.byVersion），
+							 * 这里逐个归一化后填进去；某一版没有内容时才退到空数组。
+							 */
+							var allByVersion = caseKind.byVersion && typeof caseKind.byVersion === "object"
+								? caseKind.byVersion
+								: {};
 							var byVersion = {};
 							names.forEach(function (name) {
-								byVersion[name] = name === caseKind.activeVersion ? list : [];
+								var raw = Array.isArray(allByVersion[name] && allByVersion[name].cases)
+									? allByVersion[name].cases
+									: (name === caseKind.activeVersion ? rawList : null);
+								if (raw === null) {
+									// 后端没给这一版的内容：保持空，等切过去时再按需加载。
+									byVersion[name] = [];
+									return;
+								}
+								byVersion[name] = normalizeCaseList(raw, featureName, stepByCaseId, execByCaseId);
 							});
 							if (byVersion[caseKind.activeVersion] === undefined) {
 								byVersion[caseKind.activeVersion || names[0]] = list;
@@ -6269,10 +6254,24 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 							return previous !== "" ? previous : (reportVersionList[0] && reportVersionList[0].name ? reportVersionList[0].name : "");
 						});
 						setLoadState("ready");
+						/*
+						 * 刷新成功要给出可感知的反馈。
+						 *
+						 * 用户反馈「点刷新没反应」：数据没变化时界面本来就一样，
+						 * 不给一句话就分不清是「刷新了但没变」还是「点了没生效」。
+						 * 这里只在**手动刷新**（keepVersion=true）时提示，首次加载不打扰。
+						 */
+						if (keepVersion === true) {
+							var total = Array.isArray(list) ? list.length : 0;
+							setNotice("已刷新：当前版本 " + (caseKind.activeVersion || "V0.0.1") + " 共 " + total + " 条用例。");
+						}
 					})
 					.catch(function (error) {
 						setLoadError(error && error.message ? error.message : String(error));
 						setLoadState("error");
+						if (keepVersion === true) {
+							setNotice("刷新失败：" + (error && error.message ? error.message : String(error)));
+						}
 					});
 			}
 
@@ -6284,6 +6283,72 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 				if (loadState === "idle") loadIntegration(false);
 				return undefined;
 			}, [active]);
+
+			/**
+			 * 把一份 cases.json 的原始数组归一化成面板内部的行结构。
+			 *
+			 * 必须做的事（漏一件界面就出问题）：
+			 *   1. 补 id          —— 文件里没有，但展开/勾选/key 全靠它
+			 *   2. 补 scenario    —— 由 featureId 查功能项名
+			 *   3. 合并 steps / records —— 从 step 版本、执行记录里按 caseId 关联
+			 *   4. 推导 status / lastRunAt —— 看板与报告都读这两个字段
+			 *
+			 * 抽成函数是因为「当前版本」和「其他版本」都要走同一套归一化，
+			 * 两处各写一遍必然有一处漏改（原来其他版本直接给空数组，就是这个毛病）。
+			 */
+			function normalizeCaseList(rawList, featureName, stepByCaseId, execByCaseId) {
+				return (Array.isArray(rawList) ? rawList : []).map(function (item, itemIndex) {
+					if (!item || typeof item !== "object") return item;
+					var next = Object.assign({}, item);
+					/*
+					 * ★ 补 id：cases.json 里没有这个字段，但面板内部处处按 id 认行
+					 *   （展开子表、勾选、React key）。不补的话 record.id 恒为
+					 *   undefined，步骤页点一次展开就把 undefined 塞进数组，
+					 *   于是 **所有行一起展开**（用户 2026-11-20 报的现象）。
+					 *
+					 * 用 caseId 兜底最稳：它在同一版本内唯一，且不依赖文件里有没有 id。
+					 * 文件里真写了 id 就用文件里的（兼容 Skill 将来的约定）。
+					 */
+					if (typeof next.id !== "string" || next.id === "") {
+						next.id = typeof next.caseId === "string" && next.caseId !== ""
+							? next.caseId
+							: "case-" + String(itemIndex);
+					}
+					if (!next.scenario && next.featureId && featureName[next.featureId]) {
+						next.scenario = featureName[next.featureId];
+					}
+					var own = Array.isArray(next.steps) ? next.steps : [];
+					if (own.length === 0 && next.caseId && stepByCaseId[next.caseId]) {
+						next.steps = stepByCaseId[next.caseId];
+					}
+					var ownRuns = Array.isArray(next.records) ? next.records : [];
+					if (ownRuns.length === 0 && next.caseId && execByCaseId[next.caseId]) {
+						next.records = execByCaseId[next.caseId];
+					}
+					/*
+					 * ★ 由执行记录推导 status / lastRunAt。
+					 *
+					 * cases.json 里**没有**这两个字段（用例本身是静态定义），
+					 * 面板的看板、报告页、总体报告统计都读 record.status。
+					 * 不在这里补，所有用例都会显示「未执行」、通过数恒为 0。
+					 *
+					 * 取最新一条记录（records 已按时间倒序）：
+					 *   result pass → status "pass"
+					 *   result 其它 → status "fail"（error 也算没通过）
+					 *   没有记录    → status "none"
+					 */
+					var runs = Array.isArray(next.records) ? next.records : [];
+					if (runs.length > 0) {
+						var latestRun = runs[0];
+						next.status = latestRun.result === "pass" ? "pass" : "fail";
+						next.lastRunAt = latestRun.at || "";
+					} else if (!next.status) {
+						next.status = "none";
+						next.lastRunAt = "";
+					}
+					return next;
+				});
+			}
 
 			/** 改当前版本的数据；其他版本原样保留。 */
 			function patchRecords(next) {
@@ -6403,8 +6468,13 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 				setVersionOpen(false);
 				setResultOpen(false);
 				setExpandedGroups([]);
-				// 真正重读磁盘：重拉集成测试数据层，而不是只提示「演示数据」。
-				setNotice("");
+				/*
+				 * 真正重读磁盘：重拉集成测试数据层，而不是只提示「演示数据」。
+				 *
+				 * 先给一句「正在刷新」——用户点完立刻有反馈，不会以为按钮坏了。
+				 * 完成/失败的具体结果由 loadIntegration 自己回填 notice。
+				 */
+				setNotice("正在刷新…");
 				loadIntegration(true);
 			}
 			/**

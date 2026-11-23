@@ -488,6 +488,30 @@ test('步骤页子表分页：选项 15/30/50/100，页码按用例各记一份'
   assert.ok(find(tree, 'sub-page-next'), '要有下一页')
 })
 
+test('步骤页点展开只展开被点的那一行，不是全部一起展开', () => {
+  /*
+   * 用户 2026-11-20 报的现象：点子表的展开按钮，所有用例的子表都展开了。
+   *
+   * 根因是 cases.json 里没有 id 字段，面板没补，record.id 恒为 undefined，
+   * 于是 stepOpen.indexOf(undefined) 永远命中 → 每一行的 open 都是 true。
+   * 这条测试同时守住两件事：id 必须被补上、展开态必须按行隔离。
+   */
+  const h = harness()
+  const render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a', initialSeed: h.TEST_SEED })
+  find(render(), 'tab-steps').props.onClick()
+  const ids = rowIds(render())
+  assert.ok(ids.length >= 2, '测试数据里至少要有两行才测得出串味')
+  assert.equal(ids.every(id => typeof id === 'string' && id !== ''), true, '每行都要有非空 id')
+
+  find(render(), 'expand-' + ids[0]).props.onClick()
+  const tree = render()
+  // 展开的行会多出一个执行结果子表容器（data-it = step-runs-<id>）
+  const opened = nodes(tree)
+    .filter(n => n.props && String(n.props['data-it'] || '').startsWith('step-runs-'))
+    .map(n => n.props['data-it'])
+  assert.deepEqual(opened, ['step-runs-' + ids[0]], '只该展开第一行，其余保持收起')
+})
+
 test('刷新会收起所有下拉菜单', () => {
   /*
    * 这个 harness 的 state 是跨渲染复用的，多次点击不同下拉时 slot 会错位，
@@ -506,7 +530,15 @@ test('刷新会收起所有下拉菜单', () => {
   assert.equal(find(tree, 'switch-menu-panel'), undefined, '刷新后子页下拉仍是关闭的')
   assert.equal(find(tree, 'version-menu-panel'), undefined, '刷新后版本下拉仍是关闭的')
   assert.equal(find(tree, 'result-menu-panel'), undefined, '刷新后筛选下拉仍是关闭的')
-  assert.equal(find(tree, 'notice'), undefined, '刷新不再弹演示提示（现在真的去读磁盘了）')
+  /*
+   * 刷新必须给出可感知的反馈。
+   *
+   * 曾经是「刷新后什么都不提示」，用户因此反馈「点刷新没反应」——
+   * 数据没变化时界面本来就不变，没有一句话就分不清是刷新了还是点了没生效。
+   */
+  const noticeNode = find(tree, 'notice')
+  assert.ok(noticeNode, '刷新后要有反馈提示')
+  assert.match(String([].concat(noticeNode.children).join('')), /正在刷新/, '点下去要立刻有反馈')
 })
 
 

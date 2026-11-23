@@ -31,7 +31,7 @@ Step 1  生成测试用例
 Step 3  生成测试步骤
 ★ Step 4  【步骤人工审查】── 你停下 ★
         ↓  用户改完步骤 → 点「一键执行」
-Step 5  执行测试
+Step 5  执行测试          ← 总线/后端形态：**先读 bus-backend/SKILL.md**
 Step 6  生成 Word 报告
 ```
 
@@ -50,6 +50,45 @@ Step 6  生成 Word 报告
 2. **代码是内部产物**：界面 / 面板 API / 报告**只出现步骤**，不出现测试函数名、代码片段、`codeRef`。模型内部要产代码，但绝不往外暴露。
 3. **快照冻结**：生成步骤时冻结用例快照，执行**只认快照**，不读当前用例版本。
 
+## ★★ 先记住这条命令：契约校验器（**它取代了下面 19 条散文规则的自检**）
+
+> **实测教训**：散文规则写三遍、带反例，执行者照样会违反 —— 因为它没有**可执行的
+> 自检动作**。一次真实审计抓出 10 条偏离，其中 7 条是「字段自拟」「该做的没做」。
+> 所以从这一版起，**规则有了把手**：
+
+```
+python <插件包>/assets/report/check_contract.py --root <项目>/.dsh/test-sessions/<SID>/integration
+```
+
+**三个关口必须跑，PASS 才能继续：**
+
+| 时机 | 命令 | 不通过就不许 |
+|---|---|---|
+| Step 1 写完用例后 | `--root ...`（会自动校验 features/cases） | 交给用户审查 |
+| Step 3 写完步骤后 | 同上（会自动带上 steps） | 交给用户审查 |
+| **Step 5 落盘后** | `--root ... --run <runId>` | **生成报告** |
+
+它会逐项检查（这些全是**真实踩过的坑**，不是假想）：
+
+| 检查 | 抓什么 |
+|---|---|
+| 必填字段 | `features` 缺 `id`/`code`、`cases` 缺 `featureId`/`type` |
+| **契约外字段 → WARN** | 自拟 `moduleEn` / `purpose` / `stepNo` 之类 |
+| `caseId` 格式 | 必须是 `V0_0_1-IT-001` 形态 |
+| `featureId` 可解析 | 用例的 `featureId` 必须在 features.json 里存在 |
+| **铁律：不许暴露代码** | `steps.json` 出现 `func`/`codeFile`/`code` 直接 FAIL |
+| **执行记录粒度** | 同一 `runId` 在同一用例下出现多条 → FAIL（应每 run 一条） |
+| 记录字段白名单 | 只允许 `runId`/`at`/`result`/`durationMs`/`source` |
+| **`result.json` 必须是 `steps[]`** | 出现 `tests[]` → FAIL，并提示「bridge.py 要的是 steps[]」 |
+| 快照冻结 | `runs/<runId>/snapshot/` 缺 `steps.json` 或 `cases.snapshot.json` → FAIL |
+| 报告版本 | 本轮 runId 没有对应报告版本 → FAIL（防手写 `V0.0.1`） |
+
+> **脚本报 FAIL 时的处理**：按提示改数据，**改完重跑**，直到 PASS。
+> 不许「我知道它报什么，先往下走」——那正是审计里 10 条偏离的产生方式。
+>
+> 完整契约（每个字段的类型、必填与否、真实样本）见「数据模型」与「存储结构」两节；
+> 校验脚本本身在 `<插件包>/assets/report/check_contract.py`。
+
 ## 当前能力边界（只声明真实可用的）
 
 **不要假设本清单之外的任何能力存在。** 缺什么就明确报错并给出修复方法，不允许静默降级成「读代码推断界面结果」这类**产生假证据**的做法。
@@ -59,22 +98,42 @@ Step 6  生成 Word 报告
 | **CUA 桌面 MCP** | ✅ 可用（62 个 `mcp__cua__*` 工具，本机已验证） | `functional` 功能测试；需要真实界面操作与取证的类型 |
 | **`run_tests.py` 执行链路** | ✅ 复用单元测试的 runner | 其余 5 类：`performance` / `boundary` / `api` / `security` / `margin` |
 | 独立浏览器自动化驱动（Playwright / Selenium 等） | ❌ 未接入 | 需要浏览器时**只能经 CUA 驱动**，规则见 desktop-e2e |
-| 集成测试面板 API（`/data-panel/integration`） | ❌ 未实现 | 数据只写文件；见「面板 API」一节 |
-| 报告工具（`~/.dsh/tools/testReport`） | ❌ 未部署 | Step 6 前必须先检查；见 Step 6 |
+| 集成测试面板数据（会话目录下的 JSON 文件） | ✅ 已实现 | 面板直接读取会话目录下的 JSON 文件；数据只写文件，**文件格式就是面板的接口契约** |
+| 报告工具（优先 `~/.dsh/tools/testReport`，找不到按 Step 6「报告工具部署检查」的兜底顺序继续找） | ⚠️ 先查再用 | Step 6 前必须按兜底顺序查一遍；见 Step 6 |
 | 强度测试 `stress` | ⛔ 本轮不做 | 禁止生成 |
 
 **只有两条执行通道**：CUA（`functional`）和 `run_tests.py`（其余 5 类）。没有第三条，也不要用某一条去假扮另一条。
 
 ## 按被测类型加载专项 Skill
 
-在 Step 1 判定被测对象之后、开始生成用例之前，按被测对象的真实类型加载对应专项 Skill：
+专项 Skill 是随本 Skill 一起部署的子目录，按当前文件实际路径解析相对链接。
+**若文件缺失，明确报告部署不完整，不能声称已读取或猜测其内容。**
 
-| 被测对象 | 专项 Skill | 条件 |
-|---|---|---|
-| 桌面应用（GUI 操作、真实窗口） | [桌面端 E2E（CUA）](desktop-e2e/SKILL.md) | 功能测试走 `mcp__cua__*` 工具时**必须**读 |
-| Web 页面 | 暂无独立专项 | 当前只用 CUA 驱动浏览器，规则见 desktop-e2e |
+### 什么时候加载哪个
 
-主 Skill 负责六步流程、功能项、用例与步骤数据、版本规则、执行、证据链和报告；专项 Skill 只补充「怎么在真实界面上操作和取证」，不另起流程、不重复要求审查确认。
+| 被测对象 | 专项 Skill | 加载时机 | 条件 |
+|---|---|---|---|
+| 桌面应用（GUI 操作、真实窗口） | [桌面端 E2E（CUA）](desktop-e2e/SKILL.md) | **Step 1** 判定类型时 | 功能测试走 `mcp__cua__*` 工具时**必须**读 |
+| Web 页面 | 暂无独立专项 | — | 当前只用 CUA 驱动浏览器，规则见 desktop-e2e |
+| **多个后台进程经总线（DDS 等）互联、无界面或界面只是显示** | [**总线/后端进程集成测试**](bus-backend/SKILL.md) | **Step 5 开始执行前** | 断言依据是「总线上出现什么帧、字段什么值」时**必须**读 |
+
+> ★ **总线形态的加载时机是 Step 5，不是 Step 1。**
+> 原因：Step 1-4 产出的用例与步骤数据形态和本 Skill 完全一致，不需要额外规则；
+> 只有**真正要跑步骤**时，才需要那套工装三件套、构建门、RESULT/KV 协议与排障定式。
+
+### Step 5 开跑前的强制判定
+
+**在开始执行任何步骤之前，先回答这个问题**：
+
+> 被测系统的断言依据，是「界面上看到什么」，还是「总线上出现什么帧/字段」？
+
+- **总线/消息/多进程后端** → **必须先读 [bus-backend/SKILL.md](bus-backend/SKILL.md)**，
+  按它的阶段 1-7 准备工装与执行。**不读就开跑属于流程违规**。
+- 界面上看到什么 → 按 [desktop-e2e/SKILL.md](desktop-e2e/SKILL.md) 用 CUA。
+- 两者都有 → 两个都要读，各自负责自己那部分；界面步与总线步的结论**互不影响**。
+
+主 Skill 负责六步流程、功能项、用例与步骤数据、版本规则、执行、证据链和报告；
+专项 Skill 只补充「这一类被测对象怎么执行和取证」，**不另起流程、不重复要求审查确认、不改变数据契约**。
 
 专项 Skill 是随本 Skill 一起部署的子目录，按当前文件实际路径解析相对链接。**若文件缺失，明确报告部署不完整，不能声称已读取或猜测其内容。**
 
@@ -581,11 +640,38 @@ margin       / 余量测试
 5. **写入两个位置（必须同时完成）**：
 
    1. 文件：`<项目>/.dsh/test-sessions/<SID>/integration/case-versions/<V>/features.json` 与 `cases.json`
-   2. 面板 API：见「面板 API」一节
+   2. 步骤版本里记下 `sourceCaseVersion`（面板靠它把两套版本对上）
 
-> ⚠️ **本步当前状态**：集成测试面板 API 尚未实现（面板现为纯前端演示）。见「面板 API」一节的降级方式，**不要假装写入成功**。
+   > 面板直接读这些 JSON 文件，**写完刷新就能看到**。字段必须严格按「数据模型」一节，
+   > 见那里的「契约逐字声明」。
 
-6. **交付后交给用户改**：告诉用户「用例已生成，请在测试用例页按需增删改、调顺序」。**不要自己接着去生成步骤**——必须等用户点「生成测试步骤」，见 Step 2 与 Step 3。
+6. **★ 写盘后强制自检（不通过不许交给用户）**
+
+   写完文件、告诉用户之前，逐条核对：
+
+   | 检查项 | 判定标准 |
+   |---|---|
+   | 功能项 `id` 齐全 | 每个功能项都有非空 `id` |
+   | 用例 `featureId` 能对上 | 每条用例的 `featureId` 都能在 features.json 里找到 |
+   | 用例 `caseId` 唯一且带版本前缀 | 同一版本内无重复；前缀与本次用例版本一致 |
+   | `type` 合法 | 全部属于 7 类枚举，且不含 `stress` |
+   | 必填字段齐全 | `title` / `description` / `precondition` / `expectedResult` 都非空 |
+   | `steps` 是空数组 | Step 3 才生成步骤，这里不许写 |
+
+   **任何一条不通过，先改文件再交给用户。** 用户不会去翻 JSON 核对，
+   他只看面板 —— 字段错了的现象是「用例列表是空的」或「挂了几个没归属的用例」，
+   那时再排查成本高得多。
+
+   **★ 上面这张表已经有脚本了，直接跑它，别靠眼睛：**
+
+   ```
+   python <插件包>/assets/report/check_contract.py --root <项目>/.dsh/test-sessions/<SID>/integration
+   ```
+
+   必须看到 `结果：PASS` 才能进入第 7 步。脚本会把你漏掉的每一项都指出来，
+   包括自拟字段（比如把 `featureId` 写成 `moduleEn`）。**报 FAIL 就改，改完重跑，直到 PASS。**
+
+7. **交付后交给用户改**：告诉用户「用例已生成，请在测试用例页按需增删改、调顺序」。**不要自己接着去生成步骤**——必须等用户点「生成测试步骤」，见 Step 2 与 Step 3。
 
 **用户改过之后你怎么读数据**：以面板当前显示的用例为准重新取一遍，不要拿自己生成的记忆往下走。用户新增的用例同样要生成步骤。
 
@@ -697,6 +783,20 @@ margin       / 余量测试
 
 ### Step 5: 执行测试
 
+> **★★ 开跑前先做这一步（否则属于流程违规）**
+>
+> 判断被测系统的断言依据：**「界面上看到什么」还是「总线上出现什么帧/字段」**？
+>
+> | 判定 | 动作 |
+> |---|---|
+> | 多进程后端 / DDS / 消息总线 / 无界面 | **必须先读 [bus-backend/SKILL.md](bus-backend/SKILL.md)**，按它的阶段 1-7 准备工装与执行 |
+> | 点按钮、读控件树 | 按 [desktop-e2e/SKILL.md](desktop-e2e/SKILL.md) 用 CUA |
+> | 两者都有 | 两个都读；界面步与总线步的结论**互不影响** |
+>
+> 总线形态下**不要**直接用 `run_tests.py` 跑现成测试文件就算完 ——
+> 需要先建工装三件套（观察者/仿真节点/注入器）与构建门，否则会退化成
+> 「读代码推断总线行为」这种**产生假证据**的做法。
+
 两种入口，**结果去处完全不同**：
 
 | 触发方式 | 范围 | 结果落在哪 | 单条报告 | 产生报告版本 |
@@ -785,6 +885,53 @@ margin       / 余量测试
    - 再上一层是**总体报告**按钮：出整个项目的一份测试报告，**按配置项测试报告模板整体排版**
 
 **全部测试报告导出**与单元测试一致（多选 / 全选 / 导出已选）。
+
+#### ★ 一键执行后的强制断言（**落盘后必须逐条核对，不通过不许进入 Step 6**）
+
+执行记录写进 `exec-records.json` 之后，**立刻**按下面四条自查。任何一条不通过，
+**先修数据再往下走**，不要让用户看到一份带着重复记录的报告。
+
+| # | 不变量（公式级） | 怎么查 | 不通过怎么办 |
+|---|---|---|---|
+| 1 | **同一次 runId 在一条用例下只能有一条记录** | 对每条用例的 `records[]`，取 `runId` 去重后的数量，应与记录条数相等 | 去重：保留最后写入的那条 |
+| 2 | **记录的 caseId 必须能在当版 cases.json 里找到** | 记录里的用例键 ⊆ `cases[].caseId` | 删掉挂不上用例的孤儿记录，并报出来 |
+| 3 | **每条入选用例都必须有本轮记录** | 参与本轮执行的用例数 == 带本轮 `runId` 记录的用例数 | 缺的补一条 `result:"notRun"`，不许省略 |
+| 4 | **记录里的 runId 必须能在 `runs/` 下找到目录** | 每条 `runId` 对应 `runs/<runId>/result.json` 存在 | 找不到就是证据缺失，明确报错，别写假记录 |
+
+> **为什么必须有这一条**
+>
+> 用户实测遇到「一键执行后，每个步骤子表出现 2 条以上执行记录」。
+> 根因是回写时**没有做幂等**：同一次 run 被写了多次（重跑、重复回写、或前后两次执行混在一起）。
+> 子表按时间倒序展示，用户看到的就是「一次执行冒出好几条」，报告里的统计也跟着翻倍。
+>
+> 上面的表单就是防线：**写入前按 runId 去重，写入后逐条核对**。
+> 这四条是**断言**，不是建议 —— 不通过就必须修，不许带着问题进报告阶段。
+
+**★ 这四条也有脚本了，落盘后立刻跑：**
+
+```
+python <插件包>/assets/report/check_contract.py --root <项目>/.dsh/test-sessions/<SID>/integration --run <runId>
+```
+
+它除了上面四条，还会一起检查：`result.json` 是不是 `steps[]` 形态、
+快照有没有冻结、报告版本是不是面板分配的、`steps.json` 有没有泄露函数名。
+**必须 `结果：PASS` 才能进入 Step 6 生成报告。**
+
+#### ★ 落盘后把完整报告摘要附在回复末尾
+
+数据落盘并断言通过后，回复用户时**末尾附一段完整的结果摘要**，格式固定：
+
+```
+本轮执行摘要
+- runId：<runId>
+- 用例总数：N（通过 X / 未通过 Y / 未执行 Z）
+- 记录条数：N（去重后）
+- 不变量校验：4/4 通过
+- 报告位置：<overallDocx 路径>
+```
+
+**为什么要求附这个**：用户不可能去翻 JSON 文件核对，摘要就是他唯一的验收依据。
+没有这段摘要，等于让用户凭空相信「跑完了」。
 
 #### 两条执行通道
 
@@ -1241,16 +1388,28 @@ GN-651-JYSG_SRS_UI_TESTING-1-T001.CTD
 
 #### 报告工具部署检查（先做，缺就明说）
 
+报告工具**优先**在当前用户目录的 `.dsh\tools\testReport`。这个位置不存在时**不要直接报错停下**，按下面的顺序继续找，找到就用，全都找不到才报「报告工具未部署」：
+
 ```powershell
-$reportRoot = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.dsh\tools\testReport'
-if (-not (Test-Path -LiteralPath $reportRoot -PathType Container)) {
-  throw "报告工具未部署：$reportRoot"
+$candidates = @(
+  (Join-Path ([Environment]::GetFolderPath('UserProfile')) '.dsh\tools\testReport'),  # 约定位置
+  (Join-Path $env:DSH_HOME 'tools\testReport'),                                        # 环境变量给的 DSH_HOME
+  '<仓库根>\testReport'                                                                # 仓库内随包副本
+) | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Container) }
+
+if ($candidates.Count -eq 0) {
+  throw "报告工具未部署：约定位置、DSH_HOME、仓库内都没找到"
 }
+$reportRoot = $candidates[0]
 ```
 
-报告工具独立部署在当前用户目录的 `.dsh\tools\testReport`，不从项目目录或 `DSH_HOME` 查找。**找不到工具就明确报「报告工具未部署」，不要猜测其他位置，也不要编造报告内容。**
+**找到之后要在回复里说明用的是哪个路径**（用户需要知道本轮用的是约定部署还是仓库副本），不要静默替换。
 
-> ⚠️ **本机当前状态**：`~/.dsh/tools/testReport` **未部署**（已实测不存在），但模板与生成器原型在仓库内可用。Step 6 之前必须先确认部署，不要默认它存在。
+> **为什么加兜底**：约定位置 `~/.dsh/tools/testReport` 在本机实测**不存在**，但仓库里 `testReport/` 是完整的、随包可用的。
+> 只认约定位置会让整条报告链路卡在一个纯部署问题上，而工具明明就在手边。
+> **找不到工具就明确报「报告工具未部署」，不要猜测其他位置，也不要编造报告内容** —— 但「按上面三个位置找过」是允许的，不属于猜测。
+
+> ⚠️ **本机当前状态**：`~/.dsh/tools/testReport` **未部署**（已实测不存在），仓库内 `testReport/` 与 `integrationReport/` 可用。Step 6 之前按上面的兜底顺序确认。
 > 报告字段的 24 条待定规范仍需等真实测试项目逐条确认，不要自行编造口径。
 > 可直接参照的已跑通产物：把 `integrationReport\sample-project.json` / `sample-step.json` 跑一遍生成的那两份 docx（见 `integrationReport/README.md`）。
 > 生成器：`integrationReport/integration_report.py`（独立实现，不 import 也不修改 `testReport/`）。**按插件包自身位置定位，不写死绝对路径**，见上文「报告必须调原型」。
@@ -1259,17 +1418,34 @@ if (-not (Test-Path -LiteralPath $reportRoot -PathType Container)) {
 
 ## 数据模型
 
+> **★ 契约逐字声明（写文件前先读这一段）**
+>
+> 下面每个 JSON 实例就是面板的**接口契约**。面板按这些字段名直接读取，
+> 字段名对不上，面板就读不到 —— 界面上表现为「数据是空的」或「展开一行全展开了」。
+>
+> 因此：
+> 1. **逐字段照抄**，禁止自拟字段名、禁止改数据形态（数组不能写成对象、字符串不能写成数组）。
+> 2. 需要额外信息就**新增字段**，不要改动已有字段的含义。
+> 3. 标注「面板补」的字段**不用你写**，面板会自己补；写错了也不影响。
+> 4. 标注「必填」的字段**必须写**，缺了面板会当成脏数据跳过。
+
 ### 功能项
 
 ```json
 {
   "id": "ft_xxx",
   "code": "F-001",
-  "name": "商品与购物车",
-  "description": "商品的浏览、加购、结算",
+  "name": "<功能项名称>",
+  "description": "<这个功能项覆盖什么行为>",
   "source": "requirement | skill | code-derived"
 }
 ```
+
+> **字段说明**
+>
+> - `id`（**必填**）：功能项的唯一标识，用例的 `featureId` 指向它。**面板按它对应用例归属**，缺了用例就挂不到功能项上。格式建议 `ft_` + 数字/短名。
+> - `code`（必填）：给人看的编号，报告「测试需求追踪」列用它。
+> - `name`（必填）：面板显示的功能项名称，同一版本内**不能重复**。
 
 ### 用例
 
@@ -1278,14 +1454,25 @@ if (-not (Test-Path -LiteralPath $reportRoot -PathType Container)) {
   "id": "it_xxx",
   "caseId": "V0_0_1-IT-001",
   "featureId": "ft_xxx",
-  "title": "商品加入购物车",
+  "title": "<这条用例验证什么>",
   "type": "functional",
   "description": "说明前置状态、操作、具体输入、验证目标",
-  "precondition": "已登录，购物车为空",
-  "expectedResult": "购物车显示 1 件商品，小计正确",
+  "precondition": "<执行前需要满足的状态>",
+  "expectedResult": "<预期的最终结果>",
   "steps": []
 }
 ```
+
+> **字段说明**
+>
+> - `id`（写不写都行，**面板会补**）：面板内部认行用的键 —— 展开子表、勾选、列表 key 都靠它。
+>   文件里没写时面板自动用 `caseId` 兜底，所以**不会出问题**；写了就用你写的。
+>   > 历史坑：这里以前有 `id` 但没写用途，文件里又实际不写，导致面板拿到的 `id` 是空的，
+>   > 「点一行展开，所有行一起展开」。面板现在已用 `caseId` 兜底修好，但规范里必须说清它干什么用。
+> - `caseId`（**必填**）：用例标识，形如 `V0_0_1-IT-001`，**同名版本内唯一**。面板、步骤、执行记录全靠它关联。
+> - `featureId`（必填）：指向功能项的 `id`，决定这条用例归到哪个功能项下。
+> - `title` / `type` / `description` / `precondition` / `expectedResult`（必填）：面板列表与报告直接取这些字段显示。
+> - `steps`：留空数组。步骤在 Step 3 单独生成、单独存版本，**不要写在这里**。
 
 ### 步骤（执行原子）
 
@@ -1330,6 +1517,69 @@ if (-not (Test-Path -LiteralPath $reportRoot -PathType Container)) {
 ```
 
 **`outcome` 只认硬证据**：`runner+model` 来自 `result.json` 的逐条结果；`model` 来自 CUA 实际调用返回。找不到证据就标 `unknown`/`未确认`，**绝不用整体状态推断通过**。
+
+> ★ 注意 `outcome` 的合法值是 **`passed` / `failed` / `error` / `notRun` / `unconfirmed`**（来自 `bridge.py` 的 `OUTCOME_CONCLUSION`）。
+> 不是 `pass`，也不是 `skipped`。写错报告会取不到结论。
+
+### `runner.json`（跑测试代码的 5 类必须写）
+
+```json
+{
+  "preset": "pytest",
+  "testFile": "root:integration/tests/test_integration_api.py",
+  "mode": "batch"
+}
+```
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `preset` | 是（三选一） | `pytest` / `node-test` / `gtest-batch` 等，见单元测试 runner 的预设清单 |
+| `testFile` | 是（与 `command` 二选一） | 测试文件路径；`root:` 前缀表示相对项目根 |
+| `command` | 是（与 `testFile` 二选一） | 完全自定义命令，数组形态 |
+| `mode` | 否 | `batch`（整批跑）/ `per-case`（逐条跑） |
+
+> **`runner.json` 放在 `<integration>/runner.json`（集成根下）**，不是放进版本目录。
+> 历史上这里只写了「格式与单元测试完全一致」，执行者只能猜 —— 结果整份没写，
+> 跑测试代码的 5 类直接没法执行。
+
+### `runs/<runId>/result.json`（**报告管线的真实输入，最容易写错**）
+
+```json
+{
+  "runId": "run_20261120_1852_all",
+  "stepVersion": "V0_0_1",
+  "caseVersion": "V0_0_1",
+  "startedAt": "2026-11-20T18:52:00+08:00",
+  "steps": [
+    {
+      "caseId": "V0_0_1-IT-001",
+      "stepNo": 1,
+      "target": "test_v0_0_1_it001_step1",
+      "channel": "cua",
+      "outcome": "passed",
+      "durationMs": 1200,
+      "observed": "登录页渲染完成",
+      "reason": ""
+    }
+  ]
+}
+```
+
+**★★ 必须是 `steps[]`，不能是 `tests[]`。**
+
+| | runner 原生输出 | `bridge.py` 需要的 |
+|---|---|---|
+| 顶层键 | `tests[]`（逐测试函数） | **`steps[]`（逐步骤）** |
+| 每项键 | `name` / `status` / `duration` | `caseId` / `stepNo` / `channel` / `outcome` |
+
+> **这是本次审计发现的最高价值问题。** `bridge.py` 的 `load_execution()` 只读 `result.json`
+> 的 `steps[]`；而 pytest / vitest 的原生报告是 `tests[]`。Skill 两头都没写清楚，
+> 执行者只能自己「打派生视图补丁」才跑通报告 —— 那既不可复现，也没人知道对不对。
+>
+> **正确做法**：runner 跑完后，由你**按上面的形态重新写一份 `result.json`**，
+> 逐步骤映射（一个测试函数对应一个 `stepNo`）。不要指望 runner 直接产出这个形态。
+>
+> `channel` 只能是 `runner` 或 `cua`；`outcome` 见上一条的合法值。
 
 ---
 
@@ -1414,25 +1664,29 @@ $env:DSH_WEB_URL/data-panel/integration
 
 所有接口**必须**带当前会话 ID。`sessionId` 缺失或为空 → 返回 400，不会静默写到其他位置。
 
-> ⚠️ **当前实现状态（重要，必须如实告知用户）**
+> ✅ **当前实现状态（2026-11-20 已实现，不要再按旧说法汇报）**
 >
-> `/data-panel/integration` **尚未实现**。面板集成页现在是纯前端演示数据（`buildIntegrationSeed()`），不写后端、不发请求。
+> 集成测试数据层**已经实现**。面板直接读取会话目录下的 JSON 文件，
+> 数据只写文件，**文件格式就是面板的接口契约**。
 >
 > 因此现阶段：
-> 1. 用例 / 步骤 / 报告数据**只写文件**（上面的存储结构），这是唯一真实落盘的证据。
-> 2. 调用面板 API 会失败。**不要伪造成「已写入面板」，不要因为接口不存在就往单元测试的 `/data-panel/api` 写。**
-> 3. 在最终对话里明确说明：本轮面板侧数据未同步，原因是阶段 1（集成数据层）尚未实现。
-> 4. 阶段 1 合入后，本节的接口按下列约定启用，无需改 Skill 流程。
+> 1. 用例 / 步骤 / 报告数据**写文件**即可，面板刷新就能看到。
+> 2. **不要再说「面板 API 未实现」「数据未同步到面板」**——那是阶段 1 之前的旧状态。
+> 3. 写文件必须严格按「数据模型」一节的字段，见下一节开头的契约声明。
+> 4. 面板自己会读所有版本的内容，**不需要**为了「让用户看到新版本」而让用户回对话切版本。
 
-约定接口（阶段 1 实现后启用）：
+约定接口：
 
 ```
 GET  /data-panel/integration?sessionId=<SID>&kind=case|step|report
 POST /data-panel/integration { sessionId, kind, op, ... }
-     kind=case   op=createVersion / saveCases
-     kind=step   op=createVersion / saveSteps
-     kind=report op=createVersion / saveReport
+     kind=case   op=createVersion / saveVersion / setActive
+     kind=step   op=createVersion / saveVersion / setActive
+     kind=report op=createVersion / saveVersion / setActive
 ```
+
+**写文件是主路径，接口是面板自己用的**。你按上面的存储结构直接写 JSON 文件，
+面板刷新就能读到；不必绕道调接口。
 
 ---
 
