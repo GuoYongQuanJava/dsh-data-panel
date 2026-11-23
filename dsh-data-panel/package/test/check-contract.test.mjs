@@ -36,7 +36,7 @@ async function makeValid() {
   await writeJson(join(root, 'case-versions', 'V0_0_1', 'cases.json'), [
     {
       id: 'it_1', caseId: 'V0_0_1-IT-001', caseCode: 'GN-1-T001.CTD', featureId: 'ft_001',
-      title: '用例一', type: 'functional', description: 'd', precondition: 'p',
+      title: '用例一', type: 'functional', description: 'd', precondition: 'p', stage: '阶段一',
       expectedResult: 'e', steps: [],
     },
   ])
@@ -190,4 +190,32 @@ test('抓出 steps.json 写成扁平数组（面板会整片空白）', async ()
   assert.equal(status, 1, out)
   assert.match(out, /缺少 cases\[\] 分组结构/)
   assert.match(out, /扁平写法.*必须改成 cases/)
+})
+
+
+test('抓出功能项/用例缺 stage（报告按它分章，事后无法补救）', async () => {
+  /*
+   * 真实数据暴露：功能项有 stage，但 74 条用例一条都没继承。
+   * Skill 明确要求「用例继承同一 stage（便于单条报告也能显示）」，
+   * 校验器以前完全不查 —— 这条测试守住它。
+   */
+  const root = await makeValid()
+  const p = join(root, 'case-versions', 'V0_0_1', 'cases.json')
+  const doc = JSON.parse(await (await import('node:fs/promises')).readFile(p, 'utf8'))
+  delete doc[0].stage
+  await writeJson(p, doc)
+  const { status, out } = run(root)
+  assert.equal(status, 1, out)
+  assert.match(out, /用例缺 stage/)
+})
+
+test('抓出功能项缺 stage', async () => {
+  const root = await makeValid()
+  const p = join(root, 'case-versions', 'V0_0_1', 'features.json')
+  const doc = JSON.parse(await (await import('node:fs/promises')).readFile(p, 'utf8'))
+  delete doc[0].stage
+  await writeJson(p, doc)
+  const { status, out } = run(root)
+  assert.equal(status, 1, out)
+  assert.match(out, /功能项缺 stage/)
 })

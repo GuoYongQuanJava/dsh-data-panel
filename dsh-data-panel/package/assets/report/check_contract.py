@@ -164,6 +164,21 @@ def check_features(doc, report):
         report.fail(where, "功能项为空")
         return []
     check_keys(doc, FEATURE_REQUIRED, FEATURE_OPTIONAL, where, report, "功能项")
+
+    # ★ stage 必须是必填：报告完全按 stage 分章。
+    #   生成用例时没有 stage，整份报告只能退化成「全是第一阶段」，事后无法补救。
+    no_stage = [str(f.get("code") or f.get("id")) for f in doc
+                if isinstance(f, dict) and str(f.get("stage") or "").strip() == ""]
+    if no_stage:
+        report.fail(where, "功能项缺 stage（报告按它分章，事后无法补救）：%s"
+                    % ", ".join(no_stage[:6]))
+    else:
+        stages = {str(f.get("stage")).strip() for f in doc if isinstance(f, dict)}
+        report.ok("功能项都带 stage（%d 个阶段：%s）" % (len(stages), " / ".join(sorted(stages))))
+        # 阶段太少会让报告退化成一章，太多则失去分层意义。1-4 是合理区间。
+        if len(stages) > 4:
+            report.warn(where, "阶段数 %d 偏多（建议 3-4 个）" % len(stages))
+
     ids = [f.get("id") for f in doc if isinstance(f, dict)]
     if len(ids) != len(set(ids)):
         report.fail(where, "功能项 id 有重复")
@@ -173,7 +188,7 @@ def check_features(doc, report):
     return ids
 
 
-def check_cases(doc, feature_ids, report):
+def check_cases(doc, feature_ids, report, feature_stage=None):
     where = "cases.json"
     if not isinstance(doc, list):
         report.fail(where, "顶层必须是数组，实际是 %s" % type(doc).__name__)
@@ -183,7 +198,9 @@ def check_cases(doc, feature_ids, report):
         return []
     check_keys(doc, CASE_REQUIRED, CASE_OPTIONAL, where, report, "用例")
 
+    feature_stage = feature_stage or {}
     case_ids, bad_prefix, bad_type, orphan, no_id = [], [], [], [], []
+    no_stage_case, stage_mismatch = [], []
     for item in doc:
         if not isinstance(item, dict):
             continue
@@ -201,6 +218,11 @@ def check_cases(doc, feature_ids, report):
         fid = item.get("featureId")
         if feature_ids and fid not in feature_ids:
             orphan.append("%s→%s" % (cid, fid))
+        # 用例要继承所属功能项的 stage：单条报告也靠它显示阶段
+        if str(item.get("stage") or "").strip() == "":
+            no_stage_case.append(cid)
+        elif feature_stage and fid in feature_stage and str(item.get("stage")).strip() != feature_stage[fid]:
+            stage_mismatch.append("%s(%s≠%s)" % (cid, item.get("stage"), feature_stage[fid]))
 
     if len(case_ids) != len(set(case_ids)):
         report.fail(where, "caseId 有重复")
@@ -212,6 +234,14 @@ def check_cases(doc, feature_ids, report):
         report.fail(where, "用例的 featureId 在 features.json 里找不到：%s" % ", ".join(orphan[:5]))
     if no_id:
         report.warn(where, "用例缺 id（面板会用 caseId 兜底，但规范要求写）：%d 条" % len(no_id))
+    # ★ 用例必须继承功能项的 stage（单条报告靠它显示阶段）
+    if no_stage_case:
+        report.fail(where, "用例缺 stage（应继承所属功能项的 stage，单条报告靠它显示）：%d 条，如 %s"
+                    % (len(no_stage_case), ", ".join(no_stage_case[:3])))
+    else:
+        report.ok("用例都继承了 stage")
+    if stage_mismatch:
+        report.warn(where, "用例 stage 与所属功能项不一致：%s" % ", ".join(stage_mismatch[:3]))
     return case_ids
 
 
@@ -424,9 +454,15 @@ def main(argv=None):
         features = load_json(root / "case-versions" / case_ver / "features.json", report, "features.json")
         if features is not None:
             feature_ids = check_features(features, report)
+            # 功能项 id → stage，供用例继承检查用
+            feature_stage = {
+                f.get("id"): str(f.get("stage")).strip()
+                for f in features
+                if isinstance(f, dict) and f.get("id") and str(f.get("stage") or "").strip()
+            }
         cases = load_json(root / "case-versions" / case_ver / "cases.json", report, "cases.json")
         if cases is not None:
-            case_ids = check_cases(cases, feature_ids, report)
+            case_ids = check_cases(cases, feature_ids, report, feature_stage)
     else:
         report.fail("case-versions", "找不到任何用例版本")
 
