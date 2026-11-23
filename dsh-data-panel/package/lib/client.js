@@ -101,6 +101,11 @@ window.__ModuleLoader__.load({
 .dp-search input::placeholder { color: var(--dp-text3); }
 .dp-select { height: 36px; padding: 0 28px 0 10px; border: 1px solid var(--dp-border); border-radius: 10px; background: var(--dp-bg); color: var(--dp-text); font: inherit; font-size: 13px; outline: none; cursor: pointer; }
 .dp-select:focus { border-color: var(--dp-brand); box-shadow: 0 0 0 3px color-mix(in srgb, var(--dp-brand) 13%, transparent); }
+/* 测试类型多选：横向铺开的复选框行。 */
+.dp-type-checks { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 20px; padding: 2px 0; }
+.dp-type-check { display: inline-flex; align-items: center; gap: 6px; color: var(--dp-text2); font-size: 13px; line-height: 1.4; cursor: pointer; user-select: none; }
+.dp-type-check-box { width: 14px; height: 14px; margin: 0; accent-color: var(--dp-brand); cursor: pointer; }
+.dp-type-check.is-on .dp-type-check-label { color: var(--dp-text); font-weight: 600; }
 .dp-btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 36px; padding: 0 14px; border: 1px solid var(--dp-border); border-radius: 10px; background: var(--dp-bg); color: var(--dp-text); font: inherit; font-size: 13px; font-weight: 500; white-space: nowrap; cursor: pointer; transition: background .15s, border-color .15s, color .15s, box-shadow .15s, filter .15s; }
 .dp-btn:hover { background: var(--dp-bg2); }
 .dp-btn:focus-visible { outline: 2px solid var(--dp-brand); outline-offset: 2px; }
@@ -247,13 +252,9 @@ window.__ModuleLoader__.load({
 .dp-board.is-resizing .dp-sidebar { transition: none; }
 .dp-sidebar { display: flex; flex-direction: column; flex: 0 0 auto; width: 128px; max-height: 62vh; padding: 8px 6px; border: 1px solid var(--dp-border); border-radius: 12px; background: var(--dp-bg); transition: width .16s ease, padding .16s ease; }
 /* 层级列表：唯一可滚动区，撑满除表头/分页外的剩余高度。 */
+/* 层级列表：行保持正常行高，不拉伸；条目多时自己滚动。 */
 .dp-cat-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; }
-/* 分页条：不分页时整条不渲染，所以不会留空。 */
-.dp-cat-pager { display: flex; flex: 0 0 auto; align-items: center; justify-content: space-between; gap: 4px; margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--dp-border2); }
-.dp-cat-pager-btn { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: var(--dp-text3); cursor: pointer; transition: background .12s, color .12s; }
-.dp-cat-pager-btn:hover:not(:disabled) { background: var(--dp-bg3); color: var(--dp-text); }
-.dp-cat-pager-btn:disabled { opacity: .4; cursor: not-allowed; }
-.dp-cat-pager-page { flex: 1 1 auto; color: var(--dp-text3); font-size: 11px; font-variant-numeric: tabular-nums; text-align: center; white-space: nowrap; }
+/* 表头：固定高度，不参与行拉伸。 */
 .dp-sidebar-head { display: flex; flex: 0 0 auto; align-items: center; justify-content: space-between; gap: 6px; margin-bottom: 4px; }
 .dp-main { flex: 1 1 auto; min-width: 0; }
 .dp-sidebar-title { color: var(--dp-text3); font-size: 11px; font-weight: 650; letter-spacing: .08em; text-transform: uppercase; white-space: nowrap; }
@@ -2186,7 +2187,10 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 		}
 
 		function Field(props) {
-			return h("label", { className: cn("dp-field", props.full ? "full" : "") },
+			// 默认仍是 <label>（点标题能聚焦输入框）；传 asDiv 时用 <div>，
+			// 供复选框组使用——否则外层 label 会把整块区域的点击都转给第一个复选框。
+			var tag = props.asDiv ? "div" : "label";
+			return h(tag, { className: cn("dp-field", props.full ? "full" : "") },
 				h("span", { className: "dp-label" }, props.label, props.required ? h("em", null, "*") : null),
 				props.children,
 				props.hint ? h("span", { className: "dp-hint" }, props.hint) : null
@@ -2221,14 +2225,44 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			else delete next[id];
 			return next;
 		}
-		function SecondaryType(props) {
-			var secondary = typesOf(props.values).filter(function (type) { return type !== props.values.testType; })[0] || "";
-			return h(Field, { label: "附加测试类型（可选）", hint: "默认留空；只有同一场景确实同时验证另一类目标时才选。" },
-				h("select", { className: "dp-select", value: secondary, onChange: function (event) {
-					props.onChange(event.target.value ? [props.values.testType, event.target.value] : [props.values.testType]);
-				} }, h("option", { value: "" }, "无"), TEST_TYPE_KEYS.filter(function (type) { return type !== props.values.testType; }).map(function (type) {
-					return h("option", { key: type, value: type }, TEST_TYPES[type].label);
-				})))
+		/**
+		 * 测试类型：五类全部铺开成复选框，可多选。
+		 * 选中项同时写回 testTypes（全部）与 testType（第一个，保证原有字段语义）。
+		 */
+		function TestTypeChecks(props) {
+			var selected = typesOf(props.values).filter(function (type) { return TEST_TYPE_KEYS.indexOf(type) !== -1; });
+			return h("div", { className: "dp-type-checks" },
+				TEST_TYPE_KEYS.map(function (key) {
+					var on = selected.indexOf(key) !== -1;
+					// 注意：外层 Field 已经是 <label>，这里不能再嵌 label，否则整块区域都会关联到第一个复选框。
+					var toggle = function () {
+						var next = on
+							? selected.filter(function (type) { return type !== key; })
+							: selected.concat(key);
+						next = TEST_TYPE_KEYS.filter(function (type) { return next.indexOf(type) !== -1; });
+						props.onChange(next);
+					};
+					return h("span", {
+						key: key,
+						className: cn("dp-type-check", on ? "is-on" : ""),
+						onClick: function (event) {
+							// 点复选框本身由 onChange 处理，避免重复切换。
+							if (event && event.target && event.target.type === "checkbox") return;
+							toggle();
+						}
+					},
+						h("input", {
+							type: "checkbox",
+							className: "dp-type-check-box",
+							value: key,
+							checked: on,
+							onClick: function (event) { event.stopPropagation(); },
+							onChange: toggle
+						}),
+						h("span", { className: "dp-type-check-label" }, TEST_TYPES[key].label)
+					);
+				})
+			);
 		}
 
 		/** 单元格文本。默认截断 2 行；lines={1} 单行 + title 悬停看全文，lines={3} 截断 3 行。 */
@@ -2553,7 +2587,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 				var name = categoryOf(record);
 				if (name !== "") seen[name] = true;
 			});
-			var rows = [{ key: "__all__", value: "", label: "全部层级", count: list.length }];
+			var rows = [{ key: "__all__", value: "", label: "全部用例", count: list.length }];
 			Object.keys(seen).sort(function (a, b) { return a.localeCompare(b, "zh-CN"); }).forEach(function (name) {
 				rows.push({
 					key: "layer:" + name,
@@ -3127,7 +3161,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			var inputProps = Object.assign({
 				type: "search",
 				value: props.value,
-				placeholder: props.placeholder || "搜索用例名称 / 用例标识 / 测试说明",
+				placeholder: props.placeholder || "搜索用例名称 / 用例标识 / 测试说明 / 执行状态",
 				// 回调可能来自单元测试（传字符串）或集成测试（传 event），两种都吃。
 				onChange: function (event) {
 					if (typeof props.onChange !== "function") return;
@@ -3208,73 +3242,30 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 		 * 自己量自己的话会陷入「内容变高 → 自己更高 → 又能放更多」的循环。
 		 */
 		function CategorySidebar(props) {
-			var functionRowsList = props.rows;
-			var layerRowsList = Array.isArray(props.layerRows) ? props.layerRows : [];
+			var functionRowsList = Array.isArray(props.rows) ? props.rows : [];
 			var activeCategory = props.activeCategory;
 			var activeLayer = props.activeLayer;
-			// 当前生效的维度：'' = 按函数（默认，保持原有行为），'layer' = 按自定义层级。
-			var axis = props.axis === "layer" ? "layer" : "function";
-			var rows = axis === "layer" ? layerRowsList : functionRowsList;
+			// 默认（也是唯一）的维度：按被测函数分组。
+			// 「自定义层级 / 按被测函数」两个切换按钮已移除，层级不再作为独立的可切维度。
+			var axis = "function";
+			// 去掉「未关联函数」那一行，只留「全部用例」+ 各被测函数。
+			var rows = functionRowsList.filter(function (row) { return row.value !== null; });
 
 			var docked = props.docked === true;
 			var boardHeight = Number(props.boardHeight) || 0;
-			var pageState = useState(1);
-			var page = pageState[0];
-			var setPage = pageState[1];
+			// 不再分页：层级多时靠 .dp-cat-scroll 自己滚动。
+			var listRows = rows;
 
-			var headHeight = 30;
-			var pagerHeight = 33;
-			var rowHeight = docked ? 29 : 31;
-			// 能放下几条层级：先减掉表头和分页条，再按行高除。
-			var capacity = boardHeight > 0
-				? Math.max(1, Math.floor((boardHeight - headHeight - pagerHeight) / rowHeight))
-				: 0;
-			// 还没量到高度（首帧）就别分页，宁可不折也不能把行藏起来。
-			var needPager = capacity > 0 && rows.length > capacity;
-			var totalPages = needPager ? Math.ceil(rows.length / capacity) : 1;
-			var currentPage = Math.min(Math.max(1, page), totalPages);
-			var visibleRows = needPager
-				? rows.slice((currentPage - 1) * capacity, currentPage * capacity)
-				: rows;
-
-			// 行数变少（删层级 / 换会话 / 切维度）时把页码收回到合法范围，否则会停在空页上。
-			useEffect(function () {
-				if (page > totalPages) setPage(totalPages);
-			}, [page, totalPages]);
-
-			/*
-			 * 两段标题。点标题 = 切到该维度并回到「全部」，
-			 * 这样从「按函数」切回「按层级」不用先去点某一条。
-			 */
-			/*
-			 * 两段标题。点标题 = 切到该维度并回到「全部」，
-			 * 这样从「按函数」切回「按层级」不用先去点某一条。
-			 * 整行就是一个 <button>，点击热区覆盖左右内边距，不是只有文字可点。
-			 */
-			function section(title, key, count) {
-				var on = axis === key;
-				return h("button", {
-					type: "button",
-					className: cn("dp-cat-section", on ? "is-active" : ""),
-					title: "按「" + title + "」查看",
-					"aria-pressed": on,
-					"data-it": "cat-section-" + key,
-					onClick: function () {
-						if (typeof props.onAxisChange === "function") props.onAxisChange(key);
-					}
-				},
-					h("span", { className: "dp-cat-section-label" }, title),
-					h("span", { className: "dp-cat-section-count" }, String(count))
-				);
-			}
 
 			return h("aside", {
 				className: "dp-sidebar",
-				// 高度跟表格走：有量到值就锁死上限，量不到用 CSS 里的兜底 62vh。
+				// 固定高度：直通底部，不跟着内容走（有量到表格高度就用它，否则用 CSS 兜底 62vh）。
 				// 宽度同理：拖动过就锁用户选的宽度，没拖过沿用 CSS 默认值。
 				style: (boardHeight > 0 || props.width > 0)
 					? {
-						maxHeight: boardHeight > 0 ? boardHeight + "px" : undefined,
+						height: boardHeight > 0 ? boardHeight + "px" : undefined,
+						// CSS 里的 62vh 只是首帧兜底；量到真实高度后不再限制上限。
+						maxHeight: boardHeight > 0 ? "none" : undefined,
 						width: props.width > 0 ? props.width + "px" : undefined
 					}
 					: null,
@@ -3288,43 +3279,29 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 							label: "新建层级",
 							"data-it": "cat-create",
 							onClick: function () {
-								// 新建层级前先把维度切到「自定义层级」，否则刚建完看不到它。
-								if (typeof props.onAxisChange === "function") props.onAxisChange("layer");
 								if (typeof props.onCreate === "function") props.onCreate();
 							}
 						})
 					)
 				),
 				h("div", { className: "dp-cat-scroll" },
-					// ── 段一：自定义层级 ──
-					section("自定义层级", "layer", layerRowsList.length > 0 ? layerRowsList.length - 1 : 0),
-					axis === "layer"
-						? (layerRowsList.length <= 1
-							? h("div", { className: "dp-cat-empty" }, "还没有层级，点上边的 + 新建一个。")
-							: null)
-						: null,
-					// ── 段二：按被测函数 ──
-					section("按被测函数", "function", functionRowsList.length > 2 ? functionRowsList.length - 2 : 0),
-					/*
-					 * 行列表。函数维度的第一行是「全部用例」分组标题，
-					 * 层级维度的第一行「全部层级」同样是分组标题 —— 两者都会切回全部。
-					 */
-					visibleRows.map(function (row) {
-						// 「全部用例」/「全部层级」：value 为空串，两个维度都是这个约定。
+					// 只有「全部用例」时也不留空提示（函数分组总是有首行）。
+					listRows.map(function (row) {
+						// 首行「全部用例」：value 为空串，点它 = 清掉层级筛选。
 						if (row.value === "") {
 							return h("button", {
 								key: row.key,
 								type: "button",
-								className: cn("dp-cat-group", (axis === "layer" ? activeLayer : activeCategory) === "" ? "is-active" : ""),
-								// 条数本来就常驻显示，tooltip 里不再重复（用户反馈 hover 时多冒一个数字）。
+								className: cn("dp-cat-group", activeCategory === "" && activeLayer === "" ? "is-active" : ""),
+								// 条数本来就常驻显示，tooltip 里不再重复。
 								title: "显示全部用例",
-								onClick: function () { props.onSelect(""); },
+								onClick: function () { props.onSelect(""); }
 							},
 								h("span", { className: "dp-cat-group-name" }, row.label),
 								h("span", { className: "dp-cat-group-count" }, String(row.count))
 							);
 						}
-						var selected = axis === "layer" ? activeLayer === row.value : activeCategory === row.value;
+						var selected = row.kind === "layer" ? activeLayer === row.value : activeCategory === row.value;
 						return h("div", {
 							key: row.key,
 							className: cn("dp-cat", selected ? "is-active" : ""),
@@ -3334,16 +3311,13 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 								className: "dp-cat-main",
 								// 同上：条数已常驻显示，tooltip 只留名字。
 								title: row.label,
-								onClick: function () { props.onSelect(row.value); },
+								onClick: function () { props.onSelect(row.value, row.kind); },
 							},
 								h("span", { className: "dp-cat-name" }, row.label),
 								h("span", { className: "dp-cat-count" }, String(row.count))
 							),
-							/*
-							 * 只有自定义层级这一段才有改名/删除 —— 函数层级是自动聚合出来的，
-							 * 删它等于删用例上的函数关联，语义不同，这里不提供。
-							 */
-							axis === "layer"
+							// 只有自定义层级才有改名/删除；函数行是自动聚合的。
+							row.kind === "layer"
 								? h("span", { className: "dp-cat-ops" },
 									h("span", {
 										role: "button",
@@ -3364,26 +3338,6 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 						);
 					})
 				),
-				// 放不下才分页；放得下就整条不渲染，不留空条。
-				needPager ? h("div", { className: "dp-cat-pager" },
-					h("button", {
-						type: "button",
-						className: "dp-cat-pager-btn",
-						disabled: currentPage <= 1,
-						title: "上一页层级",
-						"aria-label": "上一页层级",
-						onClick: function () { if (currentPage > 1) setPage(currentPage - 1); }
-					}, h(Icon, { name: "chevron", size: 12, style: { transform: "rotate(180deg)" } })),
-					h("span", { className: "dp-cat-pager-page" }, currentPage + "/" + totalPages),
-					h("button", {
-						type: "button",
-						className: "dp-cat-pager-btn",
-						disabled: currentPage >= totalPages,
-						title: "下一页层级",
-						"aria-label": "下一页层级",
-						onClick: function () { if (currentPage < totalPages) setPage(currentPage + 1); }
-					}, h(Icon, { name: "chevron", size: 12 }))
-				) : null
 			);
 		}
 
@@ -3464,7 +3418,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 							onChange: function (event) { set("title", event.target.value); }
 						})
 					),
-					h(Field, { label: "用例标识", hint: "留空会自动生成一个 TC-xxxxxxxx。" },
+					h(Field, { label: "用例标识", hint: "留空会自动生成一个 TC-xxxxxxxx。", full: true },
 						h("input", {
 							className: "dp-input dp-input-mono",
 							value: values.caseId,
@@ -3473,14 +3427,12 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 							onChange: function (event) { set("caseId", event.target.value); }
 						})
 					),
-					h(Field, { label: "测试类型" },
-						h("select", {
-							className: "dp-select",
-							value: values.testType,
-							onChange: function (event) { set("testType", event.target.value); set("testTypes", [event.target.value]); }
-						}, testTypeOptions(values.testType))
+					h(Field, { label: "测试类型", full: true, asDiv: true },
+						h(TestTypeChecks, {
+							values: values,
+							onChange: function (types) { set("testTypes", types); set("testType", types[0] || ""); }
+						})
 					),
-					h(SecondaryType, { values: values, onChange: function (types) { set("testTypes", types); } }),
 					h(FunctionField, { value: values.subjectFunction, functions: props.functions, listId: "dp-form-functions", onChange: function (value) { set("subjectFunction", value); } }),
 					h(Field, { label: "测试说明", full: true },
 						h("textarea", {
@@ -3659,6 +3611,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			var layerState = useState("");
 			var activeLayer = layerState[0];
 			var setActiveLayer = layerState[1];
+			// 左栏固定按被测函数分组（不再提供维度切换）。
 			var axisState = useState("function");
 			var axis = axisState[0];
 			var setAxis = axisState[1];
@@ -3896,30 +3849,42 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 				var needle = query.trim().toLowerCase();
 				return records.filter(function (record) {
 					/*
-					 * 两个维度互斥，按当前 axis 只判一个：
-					 *   按函数 —— 函数关联来自统一字段，不从旧分类或测试函数猜测；
-					 *   按层级 —— 只看记录的 category 字段。
+					/*
+					 * 左栏已合成一份扁平列表：层级行和函数行混排，两者互斥。
+					 *   有 activeLayer → 只按记录 category 筛；
+					 *   否则有 activeCategory → 按统一函数字段筛。
 					 */
-					if (axis === "layer") {
-						if (activeLayer !== "" && categoryOf(record) !== activeLayer) return false;
+					if (activeLayer !== "") {
+						if (categoryOf(record) !== activeLayer) return false;
 					} else if (activeCategory !== "") {
 						var owned = subjectFunctionOf(record);
 						if (activeCategory === null ? owned !== "" : owned !== activeCategory) return false;
 					}
 					if (type !== "all" && typesOf(record).indexOf(type) === -1) return false;
 					if (!needle) return true;
-					return [record.caseId, record.title, record.description, record.input, record.expected, record.subjectFunction]
+					// 搜索范围：标识 / 名称 / 说明 / 输入 / 预期 / 被测函数 + 执行状态（仅新增，不改原逻辑）。
+					var runStatus = caseStatuses[record.id] || "";
+					var statusLabel = CASE_OUTCOME[runStatus] || "未执行";
+					return [record.caseId, record.title, record.description, record.input, record.expected, record.subjectFunction, statusLabel, runStatus, runStatus === "" ? "未执行" : ""]
 						.join(" ")
 						.toLowerCase()
 						.indexOf(needle) !== -1;
 				});
-			}, [records, query, type, activeCategory, activeLayer, axis]);
+			}, [records, query, type, activeCategory, activeLayer, axis, caseStatuses]);
 
 
 			var categoryRows = useMemo(function () { return functionRows(records); }, [records]);
 			var functionNames = categoryRows.slice(2).map(function (row) { return row.value; });
 			// 自定义层的左栏行：显式清单 ∪ 记录里用到的（空层级也要能看见）。
 			var layerRowsData = useMemo(function () { return layerRows(records, snap.categories); }, [records, snap.categories]);
+			// 左栏合并成一份扁平列表：全部用例 → 自定义层级 → 按被测函数分组。
+			// 层级行和函数行同级并列，靠 kind 区分点击后走哪个筛选。
+			var sidebarRows = useMemo(function () {
+				var allRow = categoryRows.slice(0, 1).map(function (row) { return { key: row.key, value: row.value, label: row.label, count: row.count, kind: "all" }; });
+				var layerOnly = layerRowsData.slice(1).map(function (row) { return { key: row.key, value: row.value, label: row.label, count: row.count, kind: "layer" }; });
+				var fnOnly = categoryRows.slice(2).map(function (row) { return { key: row.key, value: row.value, label: row.label, count: row.count, kind: "function" }; });
+				return allRow.concat(layerOnly, fnOnly);
+			}, [categoryRows, layerRowsData]);
 
 			var pickedSet = useMemo(function () {
 				var map = Object.create(null);
@@ -4334,7 +4299,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 				// 表格卡片的高度由 boardRef 量出来，交给左栏算每页能放几层。
 				h("div", { className: cn("dp-board", resizing ? "is-resizing" : "") },
 					h(CategorySidebar, {
-						rows: categoryRows,
+						rows: sidebarRows,
 						layerRows: layerRowsData,
 						axis: axis,
 						activeCategory: activeCategory,
@@ -4343,8 +4308,8 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 						docked: docked,
 						boardHeight: boardHeight,
 						width: sidebarWidth,
-						onSelect: function (value) {
-							if (axis === "layer") pickLayer(value);
+						onSelect: function (value, kind) {
+							if (kind === "layer") pickLayer(value);
 							else pickFunction(value);
 						},
 						onAxisChange: pickAxis,
@@ -4717,7 +4682,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 							onChange: function (event) { set("title", event.target.value); }
 						})
 					),
-					h(Field, { label: "用例标识" },
+					h(Field, { label: "用例标识", full: true },
 						h("input", {
 							className: "dp-input dp-input-mono",
 							value: values.caseId,
@@ -4726,14 +4691,12 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 							onChange: function (event) { set("caseId", event.target.value); }
 						})
 					),
-					h(Field, { label: "测试类型" },
-						h("select", {
-							className: "dp-select",
-							value: values.testType,
-							onChange: function (event) { set("testType", event.target.value); set("testTypes", [event.target.value]); }
-						}, testTypeOptions(values.testType))
+					h(Field, { label: "测试类型", full: true, asDiv: true },
+						h(TestTypeChecks, {
+							values: values,
+							onChange: function (types) { set("testTypes", types); set("testType", types[0] || ""); }
+						})
 					),
-					h(SecondaryType, { values: values, onChange: function (types) { set("testTypes", types); } }),
 					h(FunctionField, { value: values.subjectFunction, functions: functionRows(store.getSnapshot().records).slice(2).map(function (row) { return row.value; }), listId: "dp-detail-functions", onChange: function (value) { set("subjectFunction", value); } }),
 					h(Field, { label: "测试说明" },
 						h("textarea", {
@@ -8386,6 +8349,8 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 					h("div", { className: "dp-toolbar it-toolbar" },
 						h(SearchBox, {
 							value: query,
+							// 集成测试页面没有按执行状态搜索，保持原提示文案。
+							placeholder: "搜索用例名称 / 用例标识 / 测试说明",
 							onChange: function (event) {
 								setQuery(event && event.target ? event.target.value : "");
 								resetPages();
@@ -9845,7 +9810,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			itVersionValue: itVersionValue,
 			DetailView: DetailView,
 			DetailEditor: DetailEditor,
-			SecondaryType: SecondaryType,
+			TestTypeChecks: TestTypeChecks,
 			displayRunLog: displayRunLog,
 			runSummaryKey: runSummaryKey,
 			updateCaseStatus: updateCaseStatus,
