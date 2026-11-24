@@ -789,6 +789,20 @@ window.__ModuleLoader__.load({
 .it-card .it-table thead th { position: sticky; top: 0; z-index: 2; }
 /* 整页撑满：shell 变弹性列，看板占据剩余高度，卡片在其中铺满。 */
 .it-root .dp-shell { display: flex; flex-direction: column; height: 100%; min-height: 0; box-sizing: border-box; }
+/*
+ * ★ 报告页专用：解除「整页定高 + 卡内滚动」，改成内容自然撑开、外层整页滚动。
+ *
+ * 原因（2026-11-24 实修）：报告页有「组内每页条数」原生 <select> 下拉。
+ * 定高布局下 .it-card / .it-report-group 都是 overflow:hidden + 内部滚动容器，
+ * 下拉选项被裁掉且滚不到 —— 表现为「只会挤压不会展开，超出的部分看不到」。
+ *
+ * 现在：dp-shell 不再定高，高度由内容决定；滚动交给最外层 .it-root.dp-root（它本来就有 overflow-y:auto）。
+ * 其他两个 tab（用例 / 步骤）保持原来的定高 + 表头吸顶 + 分页贴底，不受影响。
+ */
+.it-root.is-report-tab .dp-shell { height: auto; min-height: 100%; }
+.it-root.is-report-tab .it-board { flex: 0 0 auto; }
+.it-root.is-report-tab .it-main { flex: 0 0 auto; min-height: 0; }
+.it-root.is-report-tab .it-card { flex: 0 0 auto; }
 .it-root .it-board { flex: 1 1 auto; min-height: 0; align-items: stretch; }
 .it-root .it-main { display: flex; flex-direction: column; min-height: 0; }
 .it-root .it-card { flex: 1 1 auto; min-height: 0; }
@@ -858,6 +872,8 @@ window.__ModuleLoader__.load({
 .it-pill[data-tone="error"] { background: color-mix(in srgb, var(--dp-warning) 15%, transparent); color: var(--dp-warning); }
 .it-pill[data-tone="idle"] { background: var(--dp-bg3); color: var(--dp-text3); }
 .it-pill[data-tone="brand"] { background: color-mix(in srgb, var(--dp-brand) 12%, transparent); color: var(--dp-brand); }
+/* 测试类型胶囊：中性灰蓝，和「执行结果」的红绿黄区分开，一眼能分「类型」和「结果」 */
+.it-pill[data-tone="type"] { background: color-mix(in srgb, #64748b 13%, transparent); color: #8b93a1; }
 .it-ops { display: flex; justify-content: center; gap: 1px; }
 .it-empty { padding: 34px 16px; color: var(--dp-text3); font-size: 12.5px; text-align: center; }
 /* 空状态：标题稍重一点，说明文字更轻，比原来单行灰字更好读 */
@@ -948,10 +964,32 @@ window.__ModuleLoader__.load({
  * 每组一张卡片：可折叠的标题行 + 组内表格，标题行右侧是「通过 X / 失败 Y」。
  */
 .it-report-groups { display: flex; flex-direction: column; gap: 9px; }
-/* 报告卡片：内容区自己滚（卡内报外层分页），外围撑满整页 */
-.it-card > .it-report-groups { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 10px; }
-.it-card > .dp-pager.it-pager { flex: 0 0 auto; }
-.it-report-group { border: 1px solid var(--dp-border); border-radius: 11px; background: var(--dp-bg); overflow: hidden; }
+/*
+ * ★ 报告卡片：**不用卡内滚动，改成整页滚动**（2026-11-24 修）。
+ *
+ * 原来这里是 flex: 1 1 auto; min-height: 0; overflow-y: auto，配合 .it-card 的
+ * overflow: hidden，形成两层裁切上下文。后果：
+ *   · 组内「每页 N 条」是原生 <select>，展开的选项被 .it-report-groups 裁掉，
+ *     看起来「只会挤压不会自然展开」；
+ *   · 内容超出卡片高度时既滚不到、也看不到，页面上半截被定死。
+ *
+ * 现在：卡片高度由内容撑开（height: auto），滚动交给最外层页面；
+ * 底部翻页条用 sticky 贴视口底，滚到哪都能翻页。
+ */
+.it-card > .it-report-groups { flex: 0 0 auto; min-height: 0; overflow: visible; padding: 10px; }
+/* 报告卡片本身不再裁切内容：下拉/悬浮层要能溢出到卡片外 */
+.it-card.is-report { overflow: visible; height: auto; flex: 0 0 auto; }
+/* 翻页条：贴视口底部（sticky 而不是 fixed，不会脱离卡片宽度） */
+.it-card.is-report > .dp-pager.it-pager {
+	flex: 0 0 auto;
+	position: sticky;
+	bottom: 0;
+	z-index: 3;
+	background: var(--dp-bg);
+	box-shadow: 0 -1px 0 var(--dp-border);
+}
+/* 组卡片同理：不要裁掉下拉选项 */
+.it-report-group { border: 1px solid var(--dp-border); border-radius: 11px; background: var(--dp-bg); overflow: visible; }
 /* 组内表格自己带一层边框，和卡片边框叠在一起会显粗，这里让表格贴边无框 */
 .it-report-group .it-table-wrap { border: 0; border-radius: 0; }
 .it-report-head { display: flex; align-items: center; gap: 7px; width: 100%; padding: 9px 11px; border-bottom: 1px solid var(--dp-border); background: var(--dp-bg2); color: var(--dp-text); font: inherit; text-align: left; transition: background .12s; }
@@ -1364,6 +1402,30 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			margin: { label: "余量测试" }
 		};
 		var IT_TYPE_KEYS = ["functional", "performance", "boundary", "api", "stress", "security", "margin"];
+
+		/**
+		 * 测试类型的显示文案。
+		 *
+		 * 三个 tab（用例 / 步骤 / 报告）的主表都要显示「测试类型」列，
+		 * 统一走这里取文案，别各写一套映射。
+		 * 未知类型原样回显（不吞成空），空值给破折号。
+		 */
+		function itTypeLabel(type) {
+			if (type === undefined || type === null || type === "") return "—";
+			var meta = IT_TYPES[type];
+			return (meta && meta.label) || String(type);
+		}
+
+		/**
+		 * 测试类型单元格：一个浅色胶囊，和「执行结果」的 it-pill 同族但不同色。
+		 *
+		 * 用 data-tone="type" 区分语义色，避免各表自己写颜色。
+		 */
+		function itTypePill(type) {
+			var label = itTypeLabel(type);
+			if (label === "—") return "—";
+			return h("span", { className: "it-pill it-type-pill", "data-tone": "type" }, label);
+		}
 
 		var IT_STATUS = {
 			pass: { label: "通过", tone: "ok" },
@@ -5241,7 +5303,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 					caseId: source.caseId || "",
 					title: source.title || "",
 					scenario: source.scenario || "",
-					type: source.type || "ui",
+					type: source.type || "functional",
 					description: source.description || "",
 					precondition: source.precondition || ""
 				};
@@ -5354,6 +5416,45 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			},
 				h("div", { className: "it-detail" },
 					field("title", "用例名称", "填写这条用例验证什么", { required: true }),
+					/*
+					 * 测试类型：7 类固定枚举（与 Skill 的 type-7-criteria.md 一致）。
+					 *
+					 * 为什么必须有这个下拉：
+					 *   · 三个 tab 的主表都新增了「测试类型」列，值就取用例的 type；
+					 *   · 用户在面板上手建/改用例时得能选类型，不能让模型生成的那次决定死；
+					 *   · 原来这里没有控件、默认值还写成了 "ui"（非法值），
+					 *     新建的用例类型是空的或乱的，表格里显示成原始英文串。
+					 *
+					 * stress（强度测试）本轮不生成，但历史数据里可能有，所以：
+					 *   · 编辑已存在 stress 用例 → 仍然列出并保持选中（不然一保存就被改掉）
+					 *   · 新建 → 不提供 stress 选项（Skill 明令禁止生成）
+					 */
+					(function () {
+						var currentType = form.type || "functional";
+						var keys = IT_TYPE_KEYS.filter(function (key) {
+							// 新建时不提供 stress；编辑已有 stress 用例时才保留这一项
+							if (key === "stress" && currentType !== "stress") return false;
+							return true;
+						});
+						return h("label", { key: "type", className: "it-field" },
+							labelRow("测试类型", false),
+							readonly
+								? h("div", { className: "it-input", style: { minHeight: "30px", background: "var(--dp-bg2)" } }, itTypeLabel(currentType))
+								: h("div", { className: "it-input-wrap" },
+									h("select", {
+										className: "it-input",
+										value: currentType,
+										"data-it": "field-type",
+										"aria-label": "测试类型",
+										onChange: edit("type")
+									},
+										keys.map(function (key) {
+											return h("option", { key: key, value: key }, IT_TYPES[key].label);
+										})
+									)
+								)
+						);
+					})(),
 					/*
 					 * 用例功能项：下拉选择已有功能项。
 					 * 功能项由对话框按代码/需求规则生成（集成测试场景），
@@ -6583,7 +6684,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 					"## 硬性约束",
 					"- **测试代码是内部产物**：面板、API、报告里只出现步骤，不出现测试函数名、代码片段、codeRef。",
 					"- 步骤格式：{ no, action, operation, expected, target, channel }。",
-					"  channel 说明这一步走哪条通道：runner=调工装测试函数（主力），cmd=构建门/环境检查，uia=读控件树断言界面（仅必须时）。",
+					"  channel 说明这一步走哪条通道：code=产品源码白盒编入，service=启停被测服务，runner=调工装测试函数（主力），cmd=构建门/环境检查。",
 					"- 本次新建一个步骤版本，**不要覆盖已有版本**；旧版本保留。",
 					"- 步骤版本要记 sourceCaseVersion = " + version + "。",
 					"- 强度测试不做。",
@@ -7004,7 +7105,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 				}
 				var typeLabel = (IT_TYPES[record.type] && IT_TYPES[record.type].label) || record.type || "—";
 				var promptSteps = steps.map(function (item) {
-					var channel = item.channel === "runner" ? "测试函数（runner）" : (item.channel === "cmd" ? "命令步骤（cmd）" : (item.channel === "uia" ? "界面断言（uia）" : (item.channel === "cua" ? "界面操作（历史 cua）" : "未标注")));
+					var channel = item.channel === "code" ? "白盒编入（code）" : (item.channel === "service" ? "启停服务（service）" : (item.channel === "runner" ? "测试函数（runner）" : (item.channel === "cmd" ? "命令步骤（cmd）" : (item.channel === "cua" || item.channel === "uia" ? "界面操作（历史，已停用）" : "未标注"))));
 					return [
 						"  第 " + (item.no || 0) + " 步",
 						"    动作：" + (item.action || "—"),
@@ -7032,7 +7133,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 					"",
 					"## 执行要求",
 					"1. 严格按上面列出的步骤执行，**只认步骤版本冻结的用例快照**，不读当前用例版本。",
-					"2. 按步骤的 channel 执行：runner=调工装测试函数走 run_tests.py，cmd=跑构建门/环境检查，uia=用 UI Automation 读控件树断言界面。自己直接执行，不要回来问我。",
+					"2. 按步骤的 channel 执行：code=把产品源码编进测试做白盒验证，service=启停被测服务，runner=调工装测试函数走 run_tests.py，cmd=跑构建门/环境检查。自己直接执行，不要回来问我。",
 					"3. 这是**单步执行**：结果写到测试步骤页这条用例的子表里，",
 					"   **不产生报告版本、不进测试报告页**。",
 					"   （每次执行对这条用例只追加一条执行记录。）",
@@ -7094,7 +7195,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 					"",
 					"## 执行要求",
 					"1. 严格按步骤版本执行，**只认 cases.snapshot.json 冻结的用例**，不读当前用例版本。",
-					"2. 按步骤的 channel 执行：runner=调工装测试函数走 run_tests.py，cmd=跑构建门/环境检查，uia=用 UI Automation 读控件树断言界面。自己直接执行，三种并存是正常的，分别记录、分别标来源。",
+					"2. 按步骤的 channel 执行：code=把产品源码编进测试做白盒验证，service=启停被测服务，runner=调工装测试函数走 run_tests.py，cmd=跑构建门/环境检查。自己直接执行，四种并存是正常的，分别记录、分别标来源。",
 					"3. 执行记录要挂到测试步骤页主表每一行下面的子表里（每次一键执行对每条用例只加一条）。",
 					"   **每条记录必须标 source = \"all\"**（表示这是一键执行），否则报告页看不到它：",
 					"   面板靠 source 区分「单步执行（step，只在步骤页）」和「一键执行（all，进报告页）」。",
@@ -7601,6 +7702,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 												h("th", { style: { width: "210px" } }, "测试用例标识"),
 												h("th", { style: { width: "26%" } }, "用例名称"),
 												h("th", null, "用例描述"),
+												h("th", { style: { width: "90px" } }, "测试类型"),
 												h("th", { style: { width: "78px" } }, "操作")
 											)
 										),
@@ -7639,6 +7741,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 												h("td", { className: "it-left" },
 													h("p", { className: "it-cell-full", title: record.description || "" }, record.description || "—")
 												),
+												h("td", null, itTypePill(record.type)),
 												h("td", null,
 													h("div", { className: "it-ops" },
 														h(IconButton, { name: "edit", label: "编辑", "data-it": "edit-btn-" + record.id, onClick: function () { setDetail({ mode: "edit", record: record }); } }),
@@ -7923,6 +8026,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 													: null,
 												h("th", { style: { width: stepMultiSelect ? "170px" : "210px" } }, "测试用例标识"),
 												h("th", { style: { width: "17%" } }, "用例名称"),
+												h("th", { style: { width: "90px" } }, "测试类型"),
 												h("th", { style: { width: "90px" } }, "测试方法"),
 												h("th", null, "输入步骤"),
 												h("th", null, "预期结果"),
@@ -7991,6 +8095,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 															: null
 													),
 													h("td", null, (first && first.action) || "—"),
+													h("td", null, itTypePill(record.type)),
 													h("td", { className: "it-left" }, stepLines(record, "operation") || h("span", { className: "it-muted" }, "—")),
 													h("td", { className: "it-left" }, stepLines(record, "expected") || h("span", { className: "it-muted" }, "—")),
 													/*
@@ -8022,6 +8127,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 																				: null,
 																			h("th", { style: { width: "190px" } }, "测试用例标识"),
 																			h("th", null, "测试用例名称"),
+																			h("th", { style: { width: "86px" } }, "测试类型"),
 																			h("th", { style: { width: "96px" } }, "测试方法"),
 																			h("th", { style: { width: "72px" } }, "执行结果"),
 																			h("th", { style: { width: "96px" } }, "测试时间"),
@@ -8060,6 +8166,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 																					: null,
 																				h("td", null, h("span", { className: "it-case-id" }, caseLabel(record))),
 																				h("td", { className: "it-left" }, record.title || "—"),
+																				h("td", null, itTypePill(record.type)),
 																				h("td", null, (first && first.action) || "—"),
 																				h("td", null, h("span", { className: "it-pill", "data-tone": runMeta.tone }, runMeta.label)),
 																				h("td", null, itTime(run.at)),
@@ -8261,7 +8368,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 						? h("div", { className: "it-empty" },
 							h("div", { className: "it-empty-title" }, "当前还没有测试报告"),
 							h("div", { className: "it-empty-hint" }, "在「测试步骤」页点「一键执行」，跑完就会在这里生成报告。"))
-						: h("div", { className: "it-card", "data-it": "report-card" },
+						: h("div", { className: "it-card is-report", "data-it": "report-card" },
 							h("div", { className: "it-report-groups" }, visibleGroups.map(function (group) {
 							/*
 							 * 每个分组各自分页：页码按组名存，互不影响。
@@ -8318,6 +8425,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 														multiSelect ? h("th", { style: { width: "40px" } }, "") : null,
 														h("th", { style: { width: "210px" } }, "测试用例标识"),
 														h("th", null, "用例名称"),
+														h("th", { style: { width: "86px" } }, "测试类型"),
 														h("th", { style: { width: "96px" } }, "测试方法"),
 														h("th", { style: { width: "72px" } }, "执行结果"),
 														h("th", { style: { width: "96px" } }, "测试时间"),
@@ -8361,6 +8469,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 																onClick: function () { setDetail({ mode: "view", record: record }); }
 															}, record.title || "—")
 														),
+														h("td", null, itTypePill(record.type)),
 														h("td", null, (first && first.action) || "—"),
 														h("td", null, h("span", { className: "it-pill", "data-tone": meta.tone }, meta.label)),
 														h("td", null, itDate(shownRun ? shownRun.at : record.lastRunAt)),
@@ -8448,7 +8557,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			};
 
 			return h("div", {
-				className: cn("it-root dp-root", props.narrow === true ? "is-narrow" : "", props.dock === true ? "dp-docked" : ""),
+				className: cn("it-root dp-root", props.narrow === true ? "is-narrow" : "", props.dock === true ? "dp-docked" : "", tab === "reports" ? "is-report-tab" : ""),
 				// 非激活时只是隐藏，不卸载：切回单元测试再回来，子页和筛选都还在。
 				style: active ? null : { display: "none" },
 				"data-it": "integration-root"
