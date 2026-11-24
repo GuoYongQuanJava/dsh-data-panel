@@ -195,6 +195,15 @@ export async function readVersion(sessionRoot, kind, version) {
  *
  * 三个页面各自有「当前版本」，各自读自己的。某个页面还没数据时给空数组，
  * 不要抛错 —— 首次使用时三个页面都是空的。
+ *
+ * ★ `byVersion` 必须把所有版本的**实际内容**都带上。
+ *
+ * 之前这里只读 activeVersion，其他版本只有名字没有数据。结果就是用户
+ * 「生成了一份 V0.0.2，面板里点过去是空的，要回对话框让模型切版本」——
+ * 切换动作完全由对话驱动，面板自己做不到。切版本是面板的日常操作，
+ * 不该依赖模型；数据一次给全，前端切过去直接就有。
+ *
+ * 单个版本读失败不影响其余：给 null，让那一版显示为空而不是整批 500。
  */
 export async function readAll(sessionRoot) {
   const result = {}
@@ -202,7 +211,14 @@ export async function readAll(sessionRoot) {
     const index = await readIndex(sessionRoot, kind)
     const active = index.activeVersion || index.versions[index.versions.length - 1]?.name || ''
     const data = active ? await readVersion(sessionRoot, kind, active) : null
-    result[kind] = { index, activeVersion: active, data }
+    // 所有版本的内容：键是版本名，值是该版本内容（读不到就是 null）。
+    const byVersion = {}
+    for (const item of index.versions) {
+      const name = typeof item?.name === 'string' ? item.name : ''
+      if (name === '') continue
+      byVersion[name] = await readVersion(sessionRoot, kind, name)
+    }
+    result[kind] = { index, activeVersion: active, data, byVersion }
   }
   return result
 }

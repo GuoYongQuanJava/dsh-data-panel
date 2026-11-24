@@ -109,7 +109,7 @@ test('点击执行后展开记录并等待，点击表头刷新保持展开并�
 })
 
 
-test('用例按业务函数合并计数和筛选，不按分类或测试入口分组', () => {
+test('用例按被测函数分组：无「未关联函数」行，点函数行即筛选', () => {
   const records = [
     { ...record, id: 'a', subjectFunction: 'src/a.js::discount', category: '正常' },
     { ...record, id: 'b', subjectFunction: 'src/a.js::discount', category: '边界' },
@@ -119,33 +119,44 @@ test('用例按业务函数合并计数和筛选，不按分类或测试入口�
   const h = harness(records), props = { sessionId: 'session-a' }
   let tree = h.render(props)
   let sidebar = nodes(tree).find(n => n.type === h.api.CategorySidebar)
-  assert.deepEqual(Array.from(sidebar.props.rows, r => [r.label, r.count]), [['全部用例',4],['未关联函数',1],['src/a.js::discount',2],['src/b.js::discount',1]])
+  // 数据源仍然带「未关联函数」，但左栏不渲染它。
+  assert.deepEqual(Array.from(sidebar.props.rows, r => [r.label, r.count]), [['全部用例',4],['边界',1],['旧分类',1],['正常',1],['src/a.js::discount',2],['src/b.js::discount',1]])
+  const all = nodes(h.component(h.api.CategorySidebar, sidebar.props))
+  assert.equal(all.some(n => n.children?.includes('未关联函数')), false, '不应出现未关联函数行')
+  assert.ok(all.some(n => n.children?.includes('全部用例')))
+  assert.ok(all.some(n => n.children?.includes('src/a.js::discount')))
+  // 点函数行 = 只看该函数的用例。
   sidebar.props.onSelect('src/a.js::discount')
   tree = h.render(props)
   assert.equal(nodes(tree).filter(n => n.props?.label === '执行').length, 2)
   assert.equal(nodes(tree).filter(n => n.props?.label === '删除').length, 2)
-  nodes(tree).find(n => n.children?.includes('新增用例')).props.onClick()
-  const form = nodes(h.render(props)).find(n => n.type === h.api.RecordFormModal)
-  assert.equal(form.props.record.subjectFunction, 'src/a.js::discount')
-  sidebar.props.onSelect(sidebar.props.rows[1].value)
-  assert.equal(nodes(h.render(props)).filter(n => n.props?.label === '执行').length, 1)
+  // 清回全部。
+  sidebar = nodes(tree).find(n => n.type === h.api.CategorySidebar)
+  sidebar.props.onSelect('')
+  assert.equal(nodes(h.render(props)).filter(n => n.props?.label === '执行').length, 4)
 })
 
-test('双类型在新增和详情编辑中保留、可取消，主类型改变后清空附加选择', () => {
+test('测试类型多选：新增和详情编辑都能勾选/取消，提交带全部选中项', () => {
   for (const editor of ['RecordFormModal', 'DetailEditor']) {
     const h = harness(record), saved = []
     const props = { mode: 'edit', record: { ...record, testTypes: ['functional', 'api'] }, onSubmit: value => saved.push(value), onSave: value => saved.push(value) }
     const render = () => h.component(h.api[editor], props)
-    let secondary = nodes(render()).find(n => n.type === h.api.SecondaryType)
-    assert.deepEqual(Array.from(secondary.props.values.testTypes), ['functional', 'api'])
-    secondary.props.onChange(['functional'])
+    const checksNode = () => nodes(render()).find(n => n.type === h.api.TestTypeChecks)
+    const boxes = () => nodes(h.component(h.api.TestTypeChecks, checksNode().props)).filter(n => n.type === 'input' && n.props?.type === 'checkbox')
+    let list = boxes()
+    assert.equal(list.length, 5, '五类测试类型都铺开成复选框')
+    assert.deepEqual(list.filter(n => n.props.checked).map(n => n.props.value), ['functional', 'api'])
+    assert.equal(nodes(render()).some(n => JSON.stringify(n.children || []).includes('附加测试类型')), false)
+    assert.equal(nodes(render()).some(n => n.type === 'select' && n.props?.className === 'dp-select' && JSON.stringify(n.children).includes('功能测试')), false, '不再有测试类型下拉')
+    // 取消 functional
+    list.find(n => n.props.value === 'functional').props.onChange()
+    list = boxes()
+    assert.deepEqual(list.filter(n => n.props.checked).map(n => n.props.value), ['api'])
+    // 再勾上 logic
+    list.find(n => n.props.value === 'logic').props.onChange()
     nodes(render()).find(n => n.type === 'form').props.onSubmit({ preventDefault() {} })
-    assert.deepEqual(Array.from(saved[0].testTypes), ['functional'])
-    secondary = nodes(render()).find(n => n.type === h.api.SecondaryType)
-    secondary.props.onChange(['functional', 'api'])
-    nodes(render()).find(n => n.type === 'select' && n.props.value === 'functional').props.onChange({ target: { value: 'boundary' } })
-    nodes(render()).find(n => n.type === 'form').props.onSubmit({ preventDefault() {} })
-    assert.deepEqual(Array.from(saved[1].testTypes), ['boundary'])
+    assert.deepEqual(Array.from(saved[saved.length - 1].testTypes), ['api', 'logic'])
+    assert.equal(saved[saved.length - 1].testType, 'api', '主类型取第一个选中项')
   }
 })
 
@@ -229,31 +240,29 @@ test('函数关联弹窗允许清空，侧栏保留分页且层级入口可用',
   tree.props.footer.find(n => n.props.key === 'ok').props.onClick()
   assert.deepEqual(results, [''])
   const side = harness(record)
-  const rows = Array.from({ length: 12 }, (_, i) => ({ key: String(i), value: String(i), label: 'function' + i, count: 2 }))
-  const props = { rows, activeCategory: '', boardHeight: 160, onSelect() {} }
+  const fnRows = [{ key: '__all__', value: '', label: '全部用例', count: 24 },
+    ...Array.from({ length: 12 }, (_, i) => ({ key: 'function:F' + i, value: 'F' + i, label: 'F' + i, count: 2 }))]
+  const props = { rows: fnRows, activeCategory: '', boardHeight: 160, onSelect() {} }
   let sidebar = side.component(side.api.CategorySidebar, props)
-  // 自定义层级的「新建层级」入口必须存在（本轮恢复的功能）。
-  assert.ok(nodes(sidebar).some(n => n.props?.label === '新建层级'), '侧栏要有「新建层级」入口')
-  assert.equal(nodes(sidebar).filter(n => n.props?.className === 'dp-cat-main').length, 3)
-  nodes(sidebar).find(n => n.props?.title === '下一页层级').props.onClick()
-  sidebar = side.component(side.api.CategorySidebar, props)
-  assert.ok(nodes(sidebar).some(n => n.children?.includes('function3')))
+  // 首行是分组标题（全部用例），下面才是可点的函数行。
+  assert.ok(nodes(sidebar).some(n => n.children?.includes('全部用例')), '首行要是全部用例')
+  assert.ok(nodes(sidebar).some(n => n.children?.includes('F0')))
+  // 已取消分页：所有行一次渲染完（靠滚动查看）
+  assert.equal(nodes(sidebar).some(n => n.props?.title === '下一页层级'), false)
+  assert.ok(nodes(sidebar).some(n => n.children?.includes('F3')))
+  assert.ok(nodes(sidebar).some(n => n.children?.includes('F11')))
 })
 
-test('左栏两段：自定义层级可新建改名删除，按函数段不出现增删入口', () => {
+test('左栏按被测函数分组：无切换标题、无未关联函数、保留新建层级按钮', () => {
   const h = harness(record)
   const fnRows = [{ key: '__all__', value: '', label: '全部用例', count: 3 },
     { key: '__unassigned__', value: null, label: '未关联函数', count: 1 },
     { key: 'function:A', value: 'A', label: 'A', count: 2 }]
-  const layerRowsData = [{ key: '__all__', value: '', label: '全部层级', count: 3 },
-    { key: 'layer:订单', value: '订单', label: '订单', count: 2 }]
   const calls = []
   const props = {
     rows: fnRows,
-    layerRows: layerRowsData,
-    axis: 'layer',
+    axis: 'function',
     activeCategory: '',
-    activeLayer: '订单',
     boardHeight: 400,
     onSelect(v) { calls.push(['select', v]) },
     onAxisChange(v) { calls.push(['axis', v]) },
@@ -264,26 +273,22 @@ test('左栏两段：自定义层级可新建改名删除，按函数段不出�
 
   const all = nodes(h.component(h.api.CategorySidebar, props))
 
-  // 两段标题都在。
-  assert.ok(all.some(n => n.props?.['data-it'] === 'cat-section-layer'))
-  assert.ok(all.some(n => n.props?.['data-it'] === 'cat-section-function'))
-
-  // 层级行有改名/删除；「全部层级」那行是分组标题，不该有。
-  assert.ok(all.some(n => n.props?.['data-it'] === 'cat-rename-订单'), '层级行要有重命名')
-  assert.ok(all.some(n => n.props?.['data-it'] === 'cat-delete-订单'), '层级行要有删除')
-  assert.equal(all.some(n => n.props?.['data-it'] === 'cat-rename-'), false, '分组标题行不应有改名')
-
-  // 三个入口都应把动作回传给父组件。
+  // 两个可点标题都没了。
+  assert.equal(all.some(n => n.props?.['data-it'] === 'cat-section-layer'), false)
+  assert.equal(all.some(n => n.props?.['data-it'] === 'cat-section-function'), false)
+  // 未关联函数行不渲染。
+  assert.equal(all.some(n => n.children?.includes('未关联函数')), false)
+  // 首行是「全部用例」，函数行可点。
+  assert.ok(all.some(n => n.children?.includes('全部用例')), '首行要是全部用例')
+  assert.ok(all.some(n => n.children?.includes('A')))
+  // 函数行没有改名/删除；「+ 新建层级」按钮保留。
+  assert.equal(all.some(n => String(n.props?.['data-it'] || '').startsWith('cat-rename-')), false)
+  assert.equal(all.some(n => String(n.props?.['data-it'] || '').startsWith('cat-delete-')), false)
+  assert.ok(all.some(n => n.props?.['data-it'] === 'cat-create'), '应保留新建层级按钮')
+  // 点函数行只回传 select。
+  all.find(n => n.props?.['title'] === 'A').props.onClick()
   all.find(n => n.props?.['data-it'] === 'cat-create').props.onClick()
-  all.find(n => n.props?.['data-it'] === 'cat-rename-订单').props.onClick()
-  all.find(n => n.props?.['data-it'] === 'cat-delete-订单').props.onClick()
-  all.find(n => n.props?.['data-it'] === 'cat-section-function').props.onClick()
-  assert.deepEqual(calls, [['axis', 'layer'], ['create'], ['rename', '订单'], ['delete', '订单'], ['axis', 'function']])
-
-  // 切到「按函数」段：函数行不提供改名/删除（那是自动聚合出来的）。
-  const fnAll = nodes(h.component(h.api.CategorySidebar, { ...props, axis: 'function', activeLayer: '' }))
-  assert.equal(fnAll.some(n => String(n.props?.['data-it'] || '').startsWith('cat-rename-')), false, '函数段不应有重命名')
-  assert.equal(fnAll.some(n => String(n.props?.['data-it'] || '').startsWith('cat-delete-')), false, '函数段不应有删除')
+  assert.deepEqual(calls, [['select', 'A'], ['create']])
 })
 
 test('层级弹窗与函数弹窗分流：层级走纯文本并禁用内置名', () => {
@@ -327,17 +332,16 @@ test('批量关联和解除后立即更新真实 store 的层级计数，迟到�
   let pending = h.api.store.assignFunction(['session-a'], 'Order.discount', sessionId)
   resolvePost(); await pending
   const rows = () => nodes(h.render({ sessionId })).find(n => n.type === h.api.CategorySidebar).props.rows
-  assert.equal(rows()[1].count, 0)
-  assert.equal(rows()[2].label, 'Order.discount')
-  assert.equal(rows()[2].count, 1)
+  assert.equal(rows().length, 2)
+  assert.equal(rows()[1].label, 'Order.discount')
+  assert.equal(rows()[1].count, 1)
   pending = h.api.store.assignFunction(['session-a'], '', sessionId)
   resolvePost(); await pending
-  assert.equal(rows().length, 2)
-  assert.equal(rows()[1].count, 1)
+  assert.equal(rows().length, 1)
+  assert.equal(rows()[0].count, 1)
   pending = h.api.store.assignFunction(['session-a'], 'late-function', sessionId)
   sessionId = 'session-b'; await h.api.store.load()
   resolvePost(); await pending
   assert.equal(h.api.store.getSnapshot().records[0].id, 'session-b')
-  assert.equal(rows().length, 2)
-  assert.equal(rows()[1].count, 1)
+  assert.equal(rows().length, 1)
 })

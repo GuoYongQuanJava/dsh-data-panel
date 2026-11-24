@@ -101,6 +101,11 @@ window.__ModuleLoader__.load({
 .dp-search input::placeholder { color: var(--dp-text3); }
 .dp-select { height: 36px; padding: 0 28px 0 10px; border: 1px solid var(--dp-border); border-radius: 10px; background: var(--dp-bg); color: var(--dp-text); font: inherit; font-size: 13px; outline: none; cursor: pointer; }
 .dp-select:focus { border-color: var(--dp-brand); box-shadow: 0 0 0 3px color-mix(in srgb, var(--dp-brand) 13%, transparent); }
+/* 测试类型多选：横向铺开的复选框行。 */
+.dp-type-checks { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 20px; padding: 2px 0; }
+.dp-type-check { display: inline-flex; align-items: center; gap: 6px; color: var(--dp-text2); font-size: 13px; line-height: 1.4; cursor: pointer; user-select: none; }
+.dp-type-check-box { width: 14px; height: 14px; margin: 0; accent-color: var(--dp-brand); cursor: pointer; }
+.dp-type-check.is-on .dp-type-check-label { color: var(--dp-text); font-weight: 600; }
 .dp-btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 36px; padding: 0 14px; border: 1px solid var(--dp-border); border-radius: 10px; background: var(--dp-bg); color: var(--dp-text); font: inherit; font-size: 13px; font-weight: 500; white-space: nowrap; cursor: pointer; transition: background .15s, border-color .15s, color .15s, box-shadow .15s, filter .15s; }
 .dp-btn:hover { background: var(--dp-bg2); }
 .dp-btn:focus-visible { outline: 2px solid var(--dp-brand); outline-offset: 2px; }
@@ -247,13 +252,9 @@ window.__ModuleLoader__.load({
 .dp-board.is-resizing .dp-sidebar { transition: none; }
 .dp-sidebar { display: flex; flex-direction: column; flex: 0 0 auto; width: 128px; max-height: 62vh; padding: 8px 6px; border: 1px solid var(--dp-border); border-radius: 12px; background: var(--dp-bg); transition: width .16s ease, padding .16s ease; }
 /* 层级列表：唯一可滚动区，撑满除表头/分页外的剩余高度。 */
+/* 层级列表：行保持正常行高，不拉伸；条目多时自己滚动。 */
 .dp-cat-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; }
-/* 分页条：不分页时整条不渲染，所以不会留空。 */
-.dp-cat-pager { display: flex; flex: 0 0 auto; align-items: center; justify-content: space-between; gap: 4px; margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--dp-border2); }
-.dp-cat-pager-btn { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: var(--dp-text3); cursor: pointer; transition: background .12s, color .12s; }
-.dp-cat-pager-btn:hover:not(:disabled) { background: var(--dp-bg3); color: var(--dp-text); }
-.dp-cat-pager-btn:disabled { opacity: .4; cursor: not-allowed; }
-.dp-cat-pager-page { flex: 1 1 auto; color: var(--dp-text3); font-size: 11px; font-variant-numeric: tabular-nums; text-align: center; white-space: nowrap; }
+/* 表头：固定高度，不参与行拉伸。 */
 .dp-sidebar-head { display: flex; flex: 0 0 auto; align-items: center; justify-content: space-between; gap: 6px; margin-bottom: 4px; }
 .dp-main { flex: 1 1 auto; min-width: 0; }
 .dp-sidebar-title { color: var(--dp-text3); font-size: 11px; font-weight: 650; letter-spacing: .08em; text-transform: uppercase; white-space: nowrap; }
@@ -739,7 +740,13 @@ window.__ModuleLoader__.load({
 	 */
 	.it-toolbar-actions { margin-left: 0; flex: 1 1 auto; justify-content: flex-end; }
 }
-.it-notice { margin-bottom: 12px; padding: 8px 11px; border: 1px solid color-mix(in srgb, var(--dp-brand) 30%, transparent); border-radius: 10px; background: color-mix(in srgb, var(--dp-brand) 6%, transparent); color: var(--dp-text); font-size: 12px; }
+.it-notice { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 12px; padding: 8px 11px; border: 1px solid color-mix(in srgb, var(--dp-brand) 30%, transparent); border-radius: 10px; background: color-mix(in srgb, var(--dp-brand) 6%, transparent); color: var(--dp-text); font-size: 12px; }
+/* 提示文字占据剩余空间，长文案自动换行，不与关闭按钮挤在一起 */
+.it-notice-text { flex: 1 1 auto; min-width: 0; line-height: 1.5; }
+/* 关闭按钮：贴右上，默认淡出，hover 才明显 —— 保持提示条本身不抢视觉 */
+.it-notice-close { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; margin: -2px -4px 0 0; padding: 0; border: 0; border-radius: 6px; background: none; color: var(--dp-text3); cursor: pointer; transition: background .12s, color .12s; }
+.it-notice-close:hover { background: color-mix(in srgb, var(--dp-text) 10%, transparent); color: var(--dp-text); }
+.it-notice-close:focus-visible { outline: none; color: var(--dp-text); box-shadow: 0 0 0 2px color-mix(in srgb, var(--dp-brand) 40%, transparent); }
 
 /* 场景侧栏 + 表格 */
 .it-board { display: flex; align-items: flex-start; gap: 10px; }
@@ -771,11 +778,21 @@ window.__ModuleLoader__.load({
  * 集成页原来把表格和分页条平铺在页面上，看起来比单元测试"散"。
  * 这里补一层同款卡片，让两边结构一致。
  */
-.it-card { border: 1px solid var(--dp-border); border-radius: 14px; background: var(--dp-bg); overflow: hidden; }
+/* 卡片弹性列：表头吸顶、分页贴底，只有中间表格区滚动（与单元测试 .dp-card 一致）。
+   高度不靠 JS 实测：整页 flex 撑满，页底不留空白。 */
+.it-card { display: flex; flex-direction: column; border: 1px solid var(--dp-border); border-radius: 14px; background: var(--dp-bg); overflow: hidden; }
 /* 卡片里的表格不再需要自己那层边框（会和卡片边框叠成双线） */
-.it-card > .it-table-wrap { border: 0; border-radius: 0; }
+.it-card > .it-table-wrap { flex: 1 1 auto; min-height: 0; border: 0; border-radius: 0; overflow-y: auto; }
 /* 卡片底部：分页条固定在这一条里，和单元测试的 .dp-card-foot 一致 */
-.it-card > .it-pager { margin: 0; padding: 10px 14px 11px; border-top: 1px solid var(--dp-border); background: var(--dp-bg); }
+.it-card > .it-pager { flex: 0 0 auto; margin: 0; padding: 10px 14px 11px; border-top: 1px solid var(--dp-border); background: var(--dp-bg); }
+/* 表头吸顶：卡片内只有表格区滚动，所以 sticky 挂在滚动容器上。 */
+.it-card .it-table thead th { position: sticky; top: 0; z-index: 2; }
+/* 整页撑满：shell 变弹性列，看板占据剩余高度，卡片在其中铺满。 */
+.it-root .dp-shell { display: flex; flex-direction: column; height: 100%; min-height: 0; box-sizing: border-box; }
+.it-root .it-board { flex: 1 1 auto; min-height: 0; align-items: stretch; }
+.it-root .it-main { display: flex; flex-direction: column; min-height: 0; }
+.it-root .it-card { flex: 1 1 auto; min-height: 0; }
+.it-root .it-side { min-height: 0; }
 .it-table { width: 100%; min-width: 520px; border-collapse: collapse; font-size: 12px; }
 .it-table th { padding: 8px 7px; border-bottom: 1px solid var(--dp-border); background: var(--dp-bg2); color: var(--dp-text3); font-size: 11px; font-weight: 600; letter-spacing: .04em; text-align: center; white-space: nowrap; }
 .it-table td { padding: 9px 7px; border-bottom: 1px solid var(--dp-border2); color: var(--dp-text2); vertical-align: middle; text-align: center; }
@@ -931,6 +948,9 @@ window.__ModuleLoader__.load({
  * 每组一张卡片：可折叠的标题行 + 组内表格，标题行右侧是「通过 X / 失败 Y」。
  */
 .it-report-groups { display: flex; flex-direction: column; gap: 9px; }
+/* 报告卡片：内容区自己滚（卡内报外层分页），外围撑满整页 */
+.it-card > .it-report-groups { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 10px; }
+.it-card > .dp-pager.it-pager { flex: 0 0 auto; }
 .it-report-group { border: 1px solid var(--dp-border); border-radius: 11px; background: var(--dp-bg); overflow: hidden; }
 /* 组内表格自己带一层边框，和卡片边框叠在一起会显粗，这里让表格贴边无框 */
 .it-report-group .it-table-wrap { border: 0; border-radius: 0; }
@@ -2186,7 +2206,10 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 		}
 
 		function Field(props) {
-			return h("label", { className: cn("dp-field", props.full ? "full" : "") },
+			// 默认仍是 <label>（点标题能聚焦输入框）；传 asDiv 时用 <div>，
+			// 供复选框组使用——否则外层 label 会把整块区域的点击都转给第一个复选框。
+			var tag = props.asDiv ? "div" : "label";
+			return h(tag, { className: cn("dp-field", props.full ? "full" : "") },
 				h("span", { className: "dp-label" }, props.label, props.required ? h("em", null, "*") : null),
 				props.children,
 				props.hint ? h("span", { className: "dp-hint" }, props.hint) : null
@@ -2221,14 +2244,44 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			else delete next[id];
 			return next;
 		}
-		function SecondaryType(props) {
-			var secondary = typesOf(props.values).filter(function (type) { return type !== props.values.testType; })[0] || "";
-			return h(Field, { label: "附加测试类型（可选）", hint: "默认留空；只有同一场景确实同时验证另一类目标时才选。" },
-				h("select", { className: "dp-select", value: secondary, onChange: function (event) {
-					props.onChange(event.target.value ? [props.values.testType, event.target.value] : [props.values.testType]);
-				} }, h("option", { value: "" }, "无"), TEST_TYPE_KEYS.filter(function (type) { return type !== props.values.testType; }).map(function (type) {
-					return h("option", { key: type, value: type }, TEST_TYPES[type].label);
-				})))
+		/**
+		 * 测试类型：五类全部铺开成复选框，可多选。
+		 * 选中项同时写回 testTypes（全部）与 testType（第一个，保证原有字段语义）。
+		 */
+		function TestTypeChecks(props) {
+			var selected = typesOf(props.values).filter(function (type) { return TEST_TYPE_KEYS.indexOf(type) !== -1; });
+			return h("div", { className: "dp-type-checks" },
+				TEST_TYPE_KEYS.map(function (key) {
+					var on = selected.indexOf(key) !== -1;
+					// 注意：外层 Field 已经是 <label>，这里不能再嵌 label，否则整块区域都会关联到第一个复选框。
+					var toggle = function () {
+						var next = on
+							? selected.filter(function (type) { return type !== key; })
+							: selected.concat(key);
+						next = TEST_TYPE_KEYS.filter(function (type) { return next.indexOf(type) !== -1; });
+						props.onChange(next);
+					};
+					return h("span", {
+						key: key,
+						className: cn("dp-type-check", on ? "is-on" : ""),
+						onClick: function (event) {
+							// 点复选框本身由 onChange 处理，避免重复切换。
+							if (event && event.target && event.target.type === "checkbox") return;
+							toggle();
+						}
+					},
+						h("input", {
+							type: "checkbox",
+							className: "dp-type-check-box",
+							value: key,
+							checked: on,
+							onClick: function (event) { event.stopPropagation(); },
+							onChange: toggle
+						}),
+						h("span", { className: "dp-type-check-label" }, TEST_TYPES[key].label)
+					);
+				})
+			);
 		}
 
 		/** 单元格文本。默认截断 2 行；lines={1} 单行 + title 悬停看全文，lines={3} 截断 3 行。 */
@@ -2553,7 +2606,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 				var name = categoryOf(record);
 				if (name !== "") seen[name] = true;
 			});
-			var rows = [{ key: "__all__", value: "", label: "全部层级", count: list.length }];
+			var rows = [{ key: "__all__", value: "", label: "全部用例", count: list.length }];
 			Object.keys(seen).sort(function (a, b) { return a.localeCompare(b, "zh-CN"); }).forEach(function (name) {
 				rows.push({
 					key: "layer:" + name,
@@ -2618,7 +2671,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 							className: "dp-input",
 							value: value,
 							maxLength: 60,
-							placeholder: "例如：订单模块",
+							placeholder: "填写层级名称",
 							"data-it": "layer-name-input",
 							onChange: function (event) { setValue(event.target.value); setError(""); },
 							onKeyDown: function (event) { if (event.key === "Enter") submit(); }
@@ -2666,7 +2719,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 						className: "dp-input",
 						value: value,
 						maxLength: 30,
-						placeholder: "例如：商品与购物车",
+						placeholder: "填写功能项名称",
 						"data-it": "feature-name-input",
 						onChange: function (event) { setValue(event.target.value); setError(""); },
 						onKeyDown: function (event) { if (event.key === "Enter") submit(); }
@@ -3169,7 +3222,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			var inputProps = Object.assign({
 				type: "search",
 				value: props.value,
-				placeholder: props.placeholder || "搜索用例名称 / 用例标识 / 测试说明",
+				placeholder: props.placeholder || "搜索用例名称 / 用例标识 / 测试说明 / 执行状态",
 				// 回调可能来自单元测试（传字符串）或集成测试（传 event），两种都吃。
 				onChange: function (event) {
 					if (typeof props.onChange !== "function") return;
@@ -3250,73 +3303,30 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 		 * 自己量自己的话会陷入「内容变高 → 自己更高 → 又能放更多」的循环。
 		 */
 		function CategorySidebar(props) {
-			var functionRowsList = props.rows;
-			var layerRowsList = Array.isArray(props.layerRows) ? props.layerRows : [];
+			var functionRowsList = Array.isArray(props.rows) ? props.rows : [];
 			var activeCategory = props.activeCategory;
 			var activeLayer = props.activeLayer;
-			// 当前生效的维度：'' = 按函数（默认，保持原有行为），'layer' = 按自定义层级。
-			var axis = props.axis === "layer" ? "layer" : "function";
-			var rows = axis === "layer" ? layerRowsList : functionRowsList;
+			// 默认（也是唯一）的维度：按被测函数分组。
+			// 「自定义层级 / 按被测函数」两个切换按钮已移除，层级不再作为独立的可切维度。
+			var axis = "function";
+			// 去掉「未关联函数」那一行，只留「全部用例」+ 各被测函数。
+			var rows = functionRowsList.filter(function (row) { return row.value !== null; });
 
 			var docked = props.docked === true;
 			var boardHeight = Number(props.boardHeight) || 0;
-			var pageState = useState(1);
-			var page = pageState[0];
-			var setPage = pageState[1];
+			// 不再分页：层级多时靠 .dp-cat-scroll 自己滚动。
+			var listRows = rows;
 
-			var headHeight = 30;
-			var pagerHeight = 33;
-			var rowHeight = docked ? 29 : 31;
-			// 能放下几条层级：先减掉表头和分页条，再按行高除。
-			var capacity = boardHeight > 0
-				? Math.max(1, Math.floor((boardHeight - headHeight - pagerHeight) / rowHeight))
-				: 0;
-			// 还没量到高度（首帧）就别分页，宁可不折也不能把行藏起来。
-			var needPager = capacity > 0 && rows.length > capacity;
-			var totalPages = needPager ? Math.ceil(rows.length / capacity) : 1;
-			var currentPage = Math.min(Math.max(1, page), totalPages);
-			var visibleRows = needPager
-				? rows.slice((currentPage - 1) * capacity, currentPage * capacity)
-				: rows;
-
-			// 行数变少（删层级 / 换会话 / 切维度）时把页码收回到合法范围，否则会停在空页上。
-			useEffect(function () {
-				if (page > totalPages) setPage(totalPages);
-			}, [page, totalPages]);
-
-			/*
-			 * 两段标题。点标题 = 切到该维度并回到「全部」，
-			 * 这样从「按函数」切回「按层级」不用先去点某一条。
-			 */
-			/*
-			 * 两段标题。点标题 = 切到该维度并回到「全部」，
-			 * 这样从「按函数」切回「按层级」不用先去点某一条。
-			 * 整行就是一个 <button>，点击热区覆盖左右内边距，不是只有文字可点。
-			 */
-			function section(title, key, count) {
-				var on = axis === key;
-				return h("button", {
-					type: "button",
-					className: cn("dp-cat-section", on ? "is-active" : ""),
-					title: "按「" + title + "」查看",
-					"aria-pressed": on,
-					"data-it": "cat-section-" + key,
-					onClick: function () {
-						if (typeof props.onAxisChange === "function") props.onAxisChange(key);
-					}
-				},
-					h("span", { className: "dp-cat-section-label" }, title),
-					h("span", { className: "dp-cat-section-count" }, String(count))
-				);
-			}
 
 			return h("aside", {
 				className: "dp-sidebar",
-				// 高度跟表格走：有量到值就锁死上限，量不到用 CSS 里的兜底 62vh。
+				// 固定高度：直通底部，不跟着内容走（有量到表格高度就用它，否则用 CSS 兜底 62vh）。
 				// 宽度同理：拖动过就锁用户选的宽度，没拖过沿用 CSS 默认值。
 				style: (boardHeight > 0 || props.width > 0)
 					? {
-						maxHeight: boardHeight > 0 ? boardHeight + "px" : undefined,
+						height: boardHeight > 0 ? boardHeight + "px" : undefined,
+						// CSS 里的 62vh 只是首帧兜底；量到真实高度后不再限制上限。
+						maxHeight: boardHeight > 0 ? "none" : undefined,
 						width: props.width > 0 ? props.width + "px" : undefined
 					}
 					: null,
@@ -3330,43 +3340,29 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 							label: "新建层级",
 							"data-it": "cat-create",
 							onClick: function () {
-								// 新建层级前先把维度切到「自定义层级」，否则刚建完看不到它。
-								if (typeof props.onAxisChange === "function") props.onAxisChange("layer");
 								if (typeof props.onCreate === "function") props.onCreate();
 							}
 						})
 					)
 				),
 				h("div", { className: "dp-cat-scroll" },
-					// ── 段一：自定义层级 ──
-					section("自定义层级", "layer", layerRowsList.length > 0 ? layerRowsList.length - 1 : 0),
-					axis === "layer"
-						? (layerRowsList.length <= 1
-							? h("div", { className: "dp-cat-empty" }, "还没有层级，点上边的 + 新建一个。")
-							: null)
-						: null,
-					// ── 段二：按被测函数 ──
-					section("按被测函数", "function", functionRowsList.length > 2 ? functionRowsList.length - 2 : 0),
-					/*
-					 * 行列表。函数维度的第一行是「全部用例」分组标题，
-					 * 层级维度的第一行「全部层级」同样是分组标题 —— 两者都会切回全部。
-					 */
-					visibleRows.map(function (row) {
-						// 「全部用例」/「全部层级」：value 为空串，两个维度都是这个约定。
+					// 只有「全部用例」时也不留空提示（函数分组总是有首行）。
+					listRows.map(function (row) {
+						// 首行「全部用例」：value 为空串，点它 = 清掉层级筛选。
 						if (row.value === "") {
 							return h("button", {
 								key: row.key,
 								type: "button",
-								className: cn("dp-cat-group", (axis === "layer" ? activeLayer : activeCategory) === "" ? "is-active" : ""),
-								// 条数本来就常驻显示，tooltip 里不再重复（用户反馈 hover 时多冒一个数字）。
+								className: cn("dp-cat-group", activeCategory === "" && activeLayer === "" ? "is-active" : ""),
+								// 条数本来就常驻显示，tooltip 里不再重复。
 								title: "显示全部用例",
-								onClick: function () { props.onSelect(""); },
+								onClick: function () { props.onSelect(""); }
 							},
 								h("span", { className: "dp-cat-group-name" }, row.label),
 								h("span", { className: "dp-cat-group-count" }, String(row.count))
 							);
 						}
-						var selected = axis === "layer" ? activeLayer === row.value : activeCategory === row.value;
+						var selected = row.kind === "layer" ? activeLayer === row.value : activeCategory === row.value;
 						return h("div", {
 							key: row.key,
 							className: cn("dp-cat", selected ? "is-active" : ""),
@@ -3376,16 +3372,13 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 								className: "dp-cat-main",
 								// 同上：条数已常驻显示，tooltip 只留名字。
 								title: row.label,
-								onClick: function () { props.onSelect(row.value); },
+								onClick: function () { props.onSelect(row.value, row.kind); },
 							},
 								h("span", { className: "dp-cat-name" }, row.label),
 								h("span", { className: "dp-cat-count" }, String(row.count))
 							),
-							/*
-							 * 只有自定义层级这一段才有改名/删除 —— 函数层级是自动聚合出来的，
-							 * 删它等于删用例上的函数关联，语义不同，这里不提供。
-							 */
-							axis === "layer"
+							// 只有自定义层级才有改名/删除；函数行是自动聚合的。
+							row.kind === "layer"
 								? h("span", { className: "dp-cat-ops" },
 									h("span", {
 										role: "button",
@@ -3406,26 +3399,6 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 						);
 					})
 				),
-				// 放不下才分页；放得下就整条不渲染，不留空条。
-				needPager ? h("div", { className: "dp-cat-pager" },
-					h("button", {
-						type: "button",
-						className: "dp-cat-pager-btn",
-						disabled: currentPage <= 1,
-						title: "上一页层级",
-						"aria-label": "上一页层级",
-						onClick: function () { if (currentPage > 1) setPage(currentPage - 1); }
-					}, h(Icon, { name: "chevron", size: 12, style: { transform: "rotate(180deg)" } })),
-					h("span", { className: "dp-cat-pager-page" }, currentPage + "/" + totalPages),
-					h("button", {
-						type: "button",
-						className: "dp-cat-pager-btn",
-						disabled: currentPage >= totalPages,
-						title: "下一页层级",
-						"aria-label": "下一页层级",
-						onClick: function () { if (currentPage < totalPages) setPage(currentPage + 1); }
-					}, h(Icon, { name: "chevron", size: 12 }))
-				) : null
 			);
 		}
 
@@ -3538,7 +3511,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 							placeholder: "填写被测函数与测试类型后自动生成",
 						})
 					),
-					h(Field, { label: "用例标识", hint: "留空会自动生成一个 TC-xxxxxxxx。" },
+					h(Field, { label: "用例标识", hint: "留空会自动生成一个 TC-xxxxxxxx。", full: true },
 						h("input", {
 							className: "dp-input dp-input-mono",
 							value: values.caseId,
@@ -3547,14 +3520,12 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 							onChange: function (event) { set("caseId", event.target.value); }
 						})
 					),
-					h(Field, { label: "测试类型" },
-						h("select", {
-							className: "dp-select",
-							value: values.testType,
-							onChange: function (event) { set("testType", event.target.value); set("testTypes", [event.target.value]); }
-						}, testTypeOptions(values.testType))
+					h(Field, { label: "测试类型", full: true, asDiv: true },
+						h(TestTypeChecks, {
+							values: values,
+							onChange: function (types) { set("testTypes", types); set("testType", types[0] || ""); }
+						})
 					),
-					h(SecondaryType, { values: values, onChange: function (types) { set("testTypes", types); } }),
 					h(FunctionField, { value: values.subjectFunction, functions: props.functions, listId: "dp-form-functions", onChange: function (value) { set("subjectFunction", value); } }),
 					h(Field, { label: "测试说明", full: true },
 						h("textarea", {
@@ -3733,6 +3704,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			var layerState = useState("");
 			var activeLayer = layerState[0];
 			var setActiveLayer = layerState[1];
+			// 左栏固定按被测函数分组（不再提供维度切换）。
 			var axisState = useState("function");
 			var axis = axisState[0];
 			var setAxis = axisState[1];
@@ -3970,30 +3942,42 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 				var needle = query.trim().toLowerCase();
 				return records.filter(function (record) {
 					/*
-					 * 两个维度互斥，按当前 axis 只判一个：
-					 *   按函数 —— 函数关联来自统一字段，不从旧分类或测试函数猜测；
-					 *   按层级 —— 只看记录的 category 字段。
+					/*
+					 * 左栏已合成一份扁平列表：层级行和函数行混排，两者互斥。
+					 *   有 activeLayer → 只按记录 category 筛；
+					 *   否则有 activeCategory → 按统一函数字段筛。
 					 */
-					if (axis === "layer") {
-						if (activeLayer !== "" && categoryOf(record) !== activeLayer) return false;
+					if (activeLayer !== "") {
+						if (categoryOf(record) !== activeLayer) return false;
 					} else if (activeCategory !== "") {
 						var owned = subjectFunctionOf(record);
 						if (activeCategory === null ? owned !== "" : owned !== activeCategory) return false;
 					}
 					if (type !== "all" && typesOf(record).indexOf(type) === -1) return false;
 					if (!needle) return true;
-					return [record.caseId, record.title, record.description, record.input, record.expected, record.subjectFunction]
+					// 搜索范围：标识 / 名称 / 说明 / 输入 / 预期 / 被测函数 + 执行状态（仅新增，不改原逻辑）。
+					var runStatus = caseStatuses[record.id] || "";
+					var statusLabel = CASE_OUTCOME[runStatus] || "未执行";
+					return [record.caseId, record.title, record.description, record.input, record.expected, record.subjectFunction, statusLabel, runStatus, runStatus === "" ? "未执行" : ""]
 						.join(" ")
 						.toLowerCase()
 						.indexOf(needle) !== -1;
 				});
-			}, [records, query, type, activeCategory, activeLayer, axis]);
+			}, [records, query, type, activeCategory, activeLayer, axis, caseStatuses]);
 
 
 			var categoryRows = useMemo(function () { return functionRows(records); }, [records]);
 			var functionNames = categoryRows.slice(2).map(function (row) { return row.value; });
 			// 自定义层的左栏行：显式清单 ∪ 记录里用到的（空层级也要能看见）。
 			var layerRowsData = useMemo(function () { return layerRows(records, snap.categories); }, [records, snap.categories]);
+			// 左栏合并成一份扁平列表：全部用例 → 自定义层级 → 按被测函数分组。
+			// 层级行和函数行同级并列，靠 kind 区分点击后走哪个筛选。
+			var sidebarRows = useMemo(function () {
+				var allRow = categoryRows.slice(0, 1).map(function (row) { return { key: row.key, value: row.value, label: row.label, count: row.count, kind: "all" }; });
+				var layerOnly = layerRowsData.slice(1).map(function (row) { return { key: row.key, value: row.value, label: row.label, count: row.count, kind: "layer" }; });
+				var fnOnly = categoryRows.slice(2).map(function (row) { return { key: row.key, value: row.value, label: row.label, count: row.count, kind: "function" }; });
+				return allRow.concat(layerOnly, fnOnly);
+			}, [categoryRows, layerRowsData]);
 
 			var pickedSet = useMemo(function () {
 				var map = Object.create(null);
@@ -4408,7 +4392,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 				// 表格卡片的高度由 boardRef 量出来，交给左栏算每页能放几层。
 				h("div", { className: cn("dp-board", resizing ? "is-resizing" : "") },
 					h(CategorySidebar, {
-						rows: categoryRows,
+						rows: sidebarRows,
 						layerRows: layerRowsData,
 						axis: axis,
 						activeCategory: activeCategory,
@@ -4417,8 +4401,8 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 						docked: docked,
 						boardHeight: boardHeight,
 						width: sidebarWidth,
-						onSelect: function (value) {
-							if (axis === "layer") pickLayer(value);
+						onSelect: function (value, kind) {
+							if (kind === "layer") pickLayer(value);
 							else pickFunction(value);
 						},
 						onAxisChange: pickAxis,
@@ -4791,7 +4775,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 							onChange: function (event) { set("title", event.target.value); }
 						})
 					),
-					h(Field, { label: "用例标识" },
+					h(Field, { label: "用例标识", full: true },
 						h("input", {
 							className: "dp-input dp-input-mono",
 							value: values.caseId,
@@ -4800,14 +4784,12 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 							onChange: function (event) { set("caseId", event.target.value); }
 						})
 					),
-					h(Field, { label: "测试类型" },
-						h("select", {
-							className: "dp-select",
-							value: values.testType,
-							onChange: function (event) { set("testType", event.target.value); set("testTypes", [event.target.value]); }
-						}, testTypeOptions(values.testType))
+					h(Field, { label: "测试类型", full: true, asDiv: true },
+						h(TestTypeChecks, {
+							values: values,
+							onChange: function (types) { set("testTypes", types); set("testType", types[0] || ""); }
+						})
 					),
-					h(SecondaryType, { values: values, onChange: function (types) { set("testTypes", types); } }),
 					h(FunctionField, { value: values.subjectFunction, functions: functionRows(store.getSnapshot().records).slice(2).map(function (row) { return row.value; }), listId: "dp-detail-functions", onChange: function (value) { set("subjectFunction", value); } }),
 					h(Field, { label: "测试说明" },
 						h("textarea", {
@@ -5445,7 +5427,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 				]
 			},
 				h("div", { className: "it-detail" },
-					field("title", "用例名称", "如 商品加入购物车", { required: true }),
+					field("title", "用例名称", "填写这条用例验证什么", { required: true }),
 					/*
 					 * 用例功能项：下拉选择已有功能项。
 					 * 功能项由对话框按代码/需求规则生成（集成测试场景），
@@ -5987,6 +5969,8 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			var sideResizingState = useState(false);
 			var sideResizing = sideResizingState[0];
 			var setSideResizing = sideResizingState[1];
+			// 高度不靠 JS 量：整页用 flex 撑满（见 .it-root / .it-board / .it-card 样式），
+			// 面板在 display:none 时也能正确铺满，切页签无需重新计算。
 			/*
 			 * 显式功能项清单（features.json 里的 name 列表）。
 			 *
@@ -6042,6 +6026,16 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 					return next;
 				});
 			}
+			/*
+			 * 报告页的外层分页：只控制「每页显示几个功能项分组」，
+			 * 组内分页（reportPageMap）保持原样，形成两级分页。
+			 */
+			var reportGroupPageState = useState(1);
+			var reportGroupPage = reportGroupPageState[0];
+			var setReportGroupPage = reportGroupPageState[1];
+			var reportGroupSizeState = useState(10);
+			var reportGroupSize = reportGroupSizeState[0];
+			var setReportGroupSize = reportGroupSizeState[1];
 			var pageSizeState = useState(10);
 			var pageSize = pageSizeState[0];
 			var setPageSize = pageSizeState[1];
@@ -6239,6 +6233,36 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 							stepByCaseId[item.caseId] = Array.isArray(item.steps) ? item.steps : [];
 						});
 						/*
+						 * ★ 兼容「扁平 steps」写法：按 caseId 自己分组。
+						 *
+						 * steps.json 有两种形态，后端 integration-store 两种都读下来了：
+						 *   A 分组式（契约形态）{ cases: [{ caseId, steps: [...] }, ...] }
+						 *   B 扁平式           { steps: [{ caseId, no, ... }, ...] } 或直接是数组
+						 *
+						 * 面板原先**只读 A**：B 时 stepCases 为空 → stepByCaseId 全空 →
+						 * 测试步骤页整片空白，但磁盘上明明有步骤。
+						 * 用户 2026-11-23 踩到的就是这个：模型写成扁平数组，界面什么都不显示。
+						 *
+						 * 这里在 A 没给出内容时，把后端的 data.steps 按 caseId 归组兜底。
+						 * 注意只补**空**的键：A 里显式给了空 steps 的用例，不该被扁平数据覆盖。
+						 */
+						var flatSteps = (stepKind.data && Array.isArray(stepKind.data.steps))
+							? stepKind.data.steps
+							: [];
+						if (flatSteps.length > 0) {
+							var grouped = Object.create(null);
+							flatSteps.forEach(function (step) {
+								if (!step || typeof step.caseId !== "string") return;
+								if (!grouped[step.caseId]) grouped[step.caseId] = [];
+								grouped[step.caseId].push(step);
+							});
+							Object.keys(grouped).forEach(function (caseId) {
+								if (stepByCaseId[caseId] === undefined) {
+									stepByCaseId[caseId] = grouped[caseId];
+								}
+							});
+						}
+						/*
 						 * ★ 把执行记录合并进用例（子表 + 名称后的角标都靠它）。
 						 *
 						 * exec-records.json 的结构是 { 步骤版本: { caseId: [记录...] } }，
@@ -6273,43 +6297,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 								});
 							});
 						})();
-						var list = rawList.map(function (item) {
-							if (!item || typeof item !== "object") return item;
-							var next = Object.assign({}, item);
-							if (!next.scenario && next.featureId && featureName[next.featureId]) {
-								next.scenario = featureName[next.featureId];
-							}
-							var own = Array.isArray(next.steps) ? next.steps : [];
-							if (own.length === 0 && next.caseId && stepByCaseId[next.caseId]) {
-								next.steps = stepByCaseId[next.caseId];
-							}
-							var ownRuns = Array.isArray(next.records) ? next.records : [];
-							if (ownRuns.length === 0 && next.caseId && execByCaseId[next.caseId]) {
-								next.records = execByCaseId[next.caseId];
-							}
-							/*
-							 * ★ 由执行记录推导 status / lastRunAt。
-							 *
-							 * cases.json 里**没有**这两个字段（用例本身是静态定义），
-							 * 面板的看板、报告页、总体报告统计都读 record.status。
-							 * 不在这里补，所有用例都会显示「未执行」、通过数恒为 0。
-							 *
-							 * 取最新一条记录（records 已按时间倒序）：
-							 *   result pas  → status "pass"
-							 *   result 其它 → status "fail"（error 也算没通过）
-							 *   没有记录     → status "none"
-							 */
-							var runs = Array.isArray(next.records) ? next.records : [];
-							if (runs.length > 0) {
-								var latestRun = runs[0];
-								next.status = latestRun.result === "pass" ? "pass" : "fail";
-								next.lastRunAt = latestRun.at || "";
-							} else if (!next.status) {
-								next.status = "none";
-								next.lastRunAt = "";
-							}
-							return next;
-						});
+						var list = normalizeCaseList(rawList, featureName, stepByCaseId, execByCaseId);
 						setRemote({ kinds: kinds, features: features });
 						/*
 						 * 显式功能项清单进状态：侧栏的「新建功能项」要往这份清单里加，
@@ -6326,9 +6314,30 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 							var names = versions.length > 0
 								? versions.map(function (item) { return item.name; })
 								: ["V0.0.1"];
+							/*
+							 * ★ 所有版本都灌上真实内容，不能只填 activeVersion。
+							 *
+							 * 原来这里是 `byVersion[name] = name === activeVersion ? list : []`，
+							 * 非当前版本一律给空数组。于是用户「生成了 V0.0.2，面板里切过去是
+							 * 空的，得回对话框让模型切版本」—— 切版本这种日常操作被迫依赖对话。
+							 *
+							 * 现在后端 readAll 会把每个版本的内容一起带上来（caseKind.byVersion），
+							 * 这里逐个归一化后填进去；某一版没有内容时才退到空数组。
+							 */
+							var allByVersion = caseKind.byVersion && typeof caseKind.byVersion === "object"
+								? caseKind.byVersion
+								: {};
 							var byVersion = {};
 							names.forEach(function (name) {
-								byVersion[name] = name === caseKind.activeVersion ? list : [];
+								var raw = Array.isArray(allByVersion[name] && allByVersion[name].cases)
+									? allByVersion[name].cases
+									: (name === caseKind.activeVersion ? rawList : null);
+								if (raw === null) {
+									// 后端没给这一版的内容：保持空，等切过去时再按需加载。
+									byVersion[name] = [];
+									return;
+								}
+								byVersion[name] = normalizeCaseList(raw, featureName, stepByCaseId, execByCaseId);
 							});
 							if (byVersion[caseKind.activeVersion] === undefined) {
 								byVersion[caseKind.activeVersion || names[0]] = list;
@@ -6355,10 +6364,24 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 							return previous !== "" ? previous : (reportVersionList[0] && reportVersionList[0].name ? reportVersionList[0].name : "");
 						});
 						setLoadState("ready");
+						/*
+						 * 刷新成功要给出可感知的反馈。
+						 *
+						 * 用户反馈「点刷新没反应」：数据没变化时界面本来就一样，
+						 * 不给一句话就分不清是「刷新了但没变」还是「点了没生效」。
+						 * 这里只在**手动刷新**（keepVersion=true）时提示，首次加载不打扰。
+						 */
+						if (keepVersion === true) {
+							var total = Array.isArray(list) ? list.length : 0;
+							setNotice("已刷新：当前版本 " + (caseKind.activeVersion || "V0.0.1") + " 共 " + total + " 条用例。");
+						}
 					})
 					.catch(function (error) {
 						setLoadError(error && error.message ? error.message : String(error));
 						setLoadState("error");
+						if (keepVersion === true) {
+							setNotice("刷新失败：" + (error && error.message ? error.message : String(error)));
+						}
 					});
 			}
 
@@ -6370,6 +6393,72 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 				if (loadState === "idle") loadIntegration(false);
 				return undefined;
 			}, [active]);
+
+			/**
+			 * 把一份 cases.json 的原始数组归一化成面板内部的行结构。
+			 *
+			 * 必须做的事（漏一件界面就出问题）：
+			 *   1. 补 id          —— 文件里没有，但展开/勾选/key 全靠它
+			 *   2. 补 scenario    —— 由 featureId 查功能项名
+			 *   3. 合并 steps / records —— 从 step 版本、执行记录里按 caseId 关联
+			 *   4. 推导 status / lastRunAt —— 看板与报告都读这两个字段
+			 *
+			 * 抽成函数是因为「当前版本」和「其他版本」都要走同一套归一化，
+			 * 两处各写一遍必然有一处漏改（原来其他版本直接给空数组，就是这个毛病）。
+			 */
+			function normalizeCaseList(rawList, featureName, stepByCaseId, execByCaseId) {
+				return (Array.isArray(rawList) ? rawList : []).map(function (item, itemIndex) {
+					if (!item || typeof item !== "object") return item;
+					var next = Object.assign({}, item);
+					/*
+					 * ★ 补 id：cases.json 里没有这个字段，但面板内部处处按 id 认行
+					 *   （展开子表、勾选、React key）。不补的话 record.id 恒为
+					 *   undefined，步骤页点一次展开就把 undefined 塞进数组，
+					 *   于是 **所有行一起展开**（用户 2026-11-20 报的现象）。
+					 *
+					 * 用 caseId 兜底最稳：它在同一版本内唯一，且不依赖文件里有没有 id。
+					 * 文件里真写了 id 就用文件里的（兼容 Skill 将来的约定）。
+					 */
+					if (typeof next.id !== "string" || next.id === "") {
+						next.id = typeof next.caseId === "string" && next.caseId !== ""
+							? next.caseId
+							: "case-" + String(itemIndex);
+					}
+					if (!next.scenario && next.featureId && featureName[next.featureId]) {
+						next.scenario = featureName[next.featureId];
+					}
+					var own = Array.isArray(next.steps) ? next.steps : [];
+					if (own.length === 0 && next.caseId && stepByCaseId[next.caseId]) {
+						next.steps = stepByCaseId[next.caseId];
+					}
+					var ownRuns = Array.isArray(next.records) ? next.records : [];
+					if (ownRuns.length === 0 && next.caseId && execByCaseId[next.caseId]) {
+						next.records = execByCaseId[next.caseId];
+					}
+					/*
+					 * ★ 由执行记录推导 status / lastRunAt。
+					 *
+					 * cases.json 里**没有**这两个字段（用例本身是静态定义），
+					 * 面板的看板、报告页、总体报告统计都读 record.status。
+					 * 不在这里补，所有用例都会显示「未执行」、通过数恒为 0。
+					 *
+					 * 取最新一条记录（records 已按时间倒序）：
+					 *   result pass → status "pass"
+					 *   result 其它 → status "fail"（error 也算没通过）
+					 *   没有记录    → status "none"
+					 */
+					var runs = Array.isArray(next.records) ? next.records : [];
+					if (runs.length > 0) {
+						var latestRun = runs[0];
+						next.status = latestRun.result === "pass" ? "pass" : "fail";
+						next.lastRunAt = latestRun.at || "";
+					} else if (!next.status) {
+						next.status = "none";
+						next.lastRunAt = "";
+					}
+					return next;
+				});
+			}
 
 			/** 改当前版本的数据；其他版本原样保留。 */
 			function patchRecords(next) {
@@ -6489,8 +6578,13 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 				setVersionOpen(false);
 				setResultOpen(false);
 				setExpandedGroups([]);
-				// 真正重读磁盘：重拉集成测试数据层，而不是只提示「演示数据」。
-				setNotice("");
+				/*
+				 * 真正重读磁盘：重拉集成测试数据层，而不是只提示「演示数据」。
+				 *
+				 * 先给一句「正在刷新」——用户点完立刻有反馈，不会以为按钮坏了。
+				 * 完成/失败的具体结果由 loadIntegration 自己回填 notice。
+				 */
+				setNotice("正在刷新…");
 				loadIntegration(true);
 			}
 			/**
@@ -6563,7 +6657,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 					"## 硬性约束",
 					"- **测试代码是内部产物**：面板、API、报告里只出现步骤，不出现测试函数名、代码片段、codeRef。",
 					"- 步骤格式：{ no, action, operation, expected, target, channel }。",
-					"  channel 说明这一步走哪条通道：界面操作用 cua，跑测试代码用 runner。",
+					"  channel 说明这一步走哪条通道：runner=调工装测试函数（主力），cmd=构建门/环境检查，uia=读控件树断言界面（仅必须时）。",
 					"- 本次新建一个步骤版本，**不要覆盖已有版本**；旧版本保留。",
 					"- 步骤版本要记 sourceCaseVersion = " + version + "。",
 					"- 强度测试不做。",
@@ -6984,7 +7078,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 				}
 				var typeLabel = (IT_TYPES[record.type] && IT_TYPES[record.type].label) || record.type || "—";
 				var promptSteps = steps.map(function (item) {
-					var channel = item.channel === "cua" ? "界面操作（CUA）" : (item.channel === "runner" ? "测试代码（runner）" : "未标注");
+					var channel = item.channel === "runner" ? "测试函数（runner）" : (item.channel === "cmd" ? "命令步骤（cmd）" : (item.channel === "uia" ? "界面断言（uia）" : (item.channel === "cua" ? "界面操作（历史 cua）" : "未标注")));
 					return [
 						"  第 " + (item.no || 0) + " 步",
 						"    动作：" + (item.action || "—"),
@@ -7012,13 +7106,12 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 					"",
 					"## 执行要求",
 					"1. 严格按上面列出的步骤执行，**只认步骤版本冻结的用例快照**，不读当前用例版本。",
-					"2. 标注为界面操作（CUA）的步骤，自己直接调 mcp__cua__* 工具执行，不要回来问我。",
-					"3. 标注为测试代码（runner）的步骤，走 run_tests.py。",
-					"4. 这是**单步执行**：结果写到测试步骤页这条用例的子表里，",
+					"2. 按步骤的 channel 执行：runner=调工装测试函数走 run_tests.py，cmd=跑构建门/环境检查，uia=用 UI Automation 读控件树断言界面。自己直接执行，不要回来问我。",
+					"3. 这是**单步执行**：结果写到测试步骤页这条用例的子表里，",
 					"   **不产生报告版本、不进测试报告页**。",
 					"   （每次执行对这条用例只追加一条执行记录。）",
 					"",
-					"5. **执行记录必须标 source = \"step\"**（表示这是单步执行）。",
+					"4. **执行记录必须标 source = \"step\"**（表示这是单步执行）。",
 					"   面板靠它区分：单步记录只留在步骤页子表，**不会出现在测试报告页**。",
 					"   记录字段：{ runId, at, result, durationMs, source }。",
 					"",
@@ -7075,12 +7168,11 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 					"",
 					"## 执行要求",
 					"1. 严格按步骤版本执行，**只认 cases.snapshot.json 冻结的用例**，不读当前用例版本。",
-					"2. 功能测试（functional）走 CUA 桌面 MCP（mcp__cua__*），自己直接调用，不要回来问我。",
-					"3. 其余类型走 run_tests.py。两条通道并存是正常的，分别记录、分别标来源。",
-					"4. 执行记录要挂到测试步骤页主表每一行下面的子表里（每次一键执行对每条用例只加一条）。",
+					"2. 按步骤的 channel 执行：runner=调工装测试函数走 run_tests.py，cmd=跑构建门/环境检查，uia=用 UI Automation 读控件树断言界面。自己直接执行，三种并存是正常的，分别记录、分别标来源。",
+					"3. 执行记录要挂到测试步骤页主表每一行下面的子表里（每次一键执行对每条用例只加一条）。",
 					"   **每条记录必须标 source = \"all\"**（表示这是一键执行），否则报告页看不到它：",
 					"   面板靠 source 区分「单步执行（step，只在步骤页）」和「一键执行（all，进报告页）」。",
-					"5. 报告分两类，**排版方式完全不同，不要混用**（见下「报告要出什么」）。",
+					"4. 报告分两类，**排版方式完全不同，不要混用**（见下「报告要出什么」）。",
 					"",
 					"## ★ 报告要出什么（两类，别混淆）",
 					"",
@@ -7430,7 +7522,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			function sidebar() {
 				return h("aside", {
 					className: "it-side",
-					// 宽度跟拖动结果走；没拖过就用 CSS 默认宽度。
+					// 宽度跟拖动结果走；高度由 .it-board 的 stretch 自动拉到底。
 					style: sideWidth > 0 ? { width: sideWidth + "px" } : null
 				},
 					h("div", { className: "it-side-head" },
@@ -7470,27 +7562,34 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			 * 复用单元测试的 .dp-pager 一套（共 N 条 / 每页几条 / 上一页 / 页码 / 下一页），
 			 * 换成 15 条的需求就改 sizes 即可。
 			 */
-			function pager(rows, pageValue, setPageValue, testId) {
-				var pageCount = Math.max(1, Math.ceil(rows.length / pageSize));
+			/**
+			 * 通用分页条。可选传入 size / setSize / unit，让不同页面（如报告页按功能项分组）
+			 * 共用同一套样式，又不互相干扰；不传则沿用面板级 pageSize。
+			 */
+			function pager(rows, pageValue, setPageValue, testId, sizeArg, setSizeArg, unit) {
+				var size = sizeArg > 0 ? sizeArg : pageSize;
+				var setSize = typeof setSizeArg === "function" ? setSizeArg : setPageSize;
+				var unitText = unit || "条";
+				var pageCount = Math.max(1, Math.ceil(rows.length / size));
 				// 数据变少（删除、筛选）后当前页可能越界，这里就地夹紧，不改状态。
 				var current = Math.min(Math.max(1, pageValue), pageCount);
 				return h("div", { className: "dp-pager it-pager", "data-it": testId || "pager" },
-					h("span", { className: "dp-pager-total" }, "共 " + rows.length + " 条"),
+					h("span", { className: "dp-pager-total" }, "共 " + rows.length + " " + unitText),
 					/*
 					 * 这里只写「每页 + 下拉」，不再在末尾补一个「条」——
 					 * option 文案本身就是「10 条」，再补一个会显示成「每页 10 条 条」。
 					 */
 					h("span", { className: "dp-pager-size" }, "每页",
 						h("select", {
-							value: String(pageSize),
+							value: String(size),
 							onChange: function (event) {
 								var next = Number(event.target.value);
-								setPageSize(next > 0 ? next : 10);
+								setSize(next > 0 ? next : 10);
 								setPageValue(1);
 							},
 							"aria-label": "每页条数"
-						}, [5, 10, 15, 20, 50].map(function (size) {
-							return h("option", { key: size, value: String(size) }, size + " 条");
+						}, [5, 10, 15, 20, 50].map(function (option) {
+							return h("option", { key: option, value: String(option) }, option + " 条");
 						}))
 					),
 					h("button", {
@@ -8150,6 +8249,16 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 					});
 				});
 
+				/*
+				 * 外层分页：每页显示多少个功能项分组（每页条数可在底部下拉里调）。
+				 * 组内分页仍由 reportPageMap 控制，两层互不影响。
+				 */
+				var reportGroupPageCount = Math.max(1, Math.ceil(groups.length / reportGroupSize));
+				var reportGroupPageIndex = Math.min(Math.max(1, reportGroupPage), reportGroupPageCount);
+				var visibleGroups = groups.slice(
+					(reportGroupPageIndex - 1) * reportGroupSize,
+					reportGroupPageIndex * reportGroupSize
+				);
 				var allIds = groups.reduce(function (list, group) {
 					return list.concat(group.records.map(function (r) { return r.id; }));
 				}, []);
@@ -8226,7 +8335,8 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 						? h("div", { className: "it-empty" },
 							h("div", { className: "it-empty-title" }, "当前还没有测试报告"),
 							h("div", { className: "it-empty-hint" }, "在「测试步骤」页点「一键执行」，跑完就会在这里生成报告。"))
-						: h("div", { className: "it-report-groups" }, groups.map(function (group) {
+						: h("div", { className: "it-card", "data-it": "report-card" },
+							h("div", { className: "it-report-groups" }, visibleGroups.map(function (group) {
 							/*
 							 * 每个分组各自分页：页码按组名存，互不影响。
 							 * （图 4 里每组都有自己的独立分页条。）
@@ -8385,7 +8495,10 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 									)
 									: null
 							);
-						}))
+							})),
+								// 外层分页：只控制功能项分组；组内分页不变。复用同一套分页条。
+								pager(groups, reportGroupPage, setReportGroupPage, "report-groups-pager", reportGroupSize, setReportGroupSize, "个功能项")
+							)
 				);
 			}
 
@@ -8460,6 +8573,8 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 					h("div", { className: "dp-toolbar it-toolbar" },
 						h(SearchBox, {
 							value: query,
+							// 集成测试页面没有按执行状态搜索，保持原提示文案。
+							placeholder: "搜索用例名称 / 用例标识 / 测试说明",
 							onChange: function (event) {
 								setQuery(event && event.target ? event.target.value : "");
 								resetPages();
@@ -8681,7 +8796,24 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 								: null
 						)
 					),
-					notice !== "" ? h("div", { className: "it-notice", "data-it": "notice" }, notice) : null,
+					notice !== ""
+						? h("div", { className: "it-notice", "data-it": "notice" },
+							h("span", { className: "it-notice-text" }, notice),
+							/*
+							 * 关闭按钮：提示条只是旁白，看过了就该能收起。
+							 * 没有它时，一句「已刷新…」会一直挂在那儿直到下一次操作覆盖，
+							 * 用户会以为界面卡住了。
+							 */
+							h("button", {
+								type: "button",
+								className: "it-notice-close",
+								"data-it": "notice-close",
+								title: "关闭提示",
+								"aria-label": "关闭提示",
+								onClick: function () { setNotice(""); }
+							}, h(Icon, { name: "close", size: 13 }))
+						)
+						: null,
 					// 表格始终在：详情/编辑、总体报告都是弹窗，不再顶掉内容。
 					body
 				),
@@ -9919,7 +10051,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			itVersionValue: itVersionValue,
 			DetailView: DetailView,
 			DetailEditor: DetailEditor,
-			SecondaryType: SecondaryType,
+			TestTypeChecks: TestTypeChecks,
 			displayRunLog: displayRunLog,
 			runSummaryKey: runSummaryKey,
 			updateCaseStatus: updateCaseStatus,

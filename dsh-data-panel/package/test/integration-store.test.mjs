@@ -511,3 +511,47 @@ test('报告生成器路径按包位置解析，不含机器相关的绝对路�
   const inside = resolved.startsWith(pkgRoot) || resolved.startsWith(repoRoot)
   assert.ok(inside, '生成器应位于插件包或仓库内，实际：' + resolved)
 })
+
+test('readAll 带上所有版本的内容，切版本不需要依赖对话', async () => {
+  /*
+   * 用户 2026-11-20 反馈：生成了 V0.0.2，面板里切过去是空的，
+   * 必须在对话框让模型「切换到 V0.0.2」才会有数据。
+   *
+   * 根因是 readAll 只读 activeVersion 的内容，其他版本只有名字。
+   * 切版本是面板的日常操作，不该依赖模型 —— 所以现在每个版本的内容都要给。
+   */
+  const { base, sessionRoot } = makeSessionRoot()
+  try {
+    const root = join(sessionRoot, 'integration', 'case-versions')
+    // 两个版本各自有不同的用例
+    for (const [dir, caseId, title] of [
+      ['V0_0_1', 'V0_0_1-IT-001', '第一版用例'],
+      ['V0_0_2', 'V0_0_2-IT-001', '第二版用例'],
+    ]) {
+      writeJsonFile(join(root, dir, 'features.json'), [{ id: 'ft_001', name: '功能项' }])
+      writeJsonFile(join(root, dir, 'cases.json'), [{ caseId, featureId: 'ft_001', title }])
+    }
+    writeJsonFile(join(root, 'index.json'), {
+      versions: [
+        { name: 'V0.0.1', at: '2026-11-19T10:00:00Z', status: 'archived' },
+        { name: 'V0.0.2', at: '2026-11-20T10:00:00Z', status: 'current' },
+      ],
+      activeVersion: 'V0.0.2',
+      byVersion: {
+        'V0.0.1': { features: 'V0_0_1/features.json', cases: 'V0_0_1/cases.json' },
+        'V0.0.2': { features: 'V0_0_2/features.json', cases: 'V0_0_2/cases.json' },
+      },
+    })
+
+    const all = await readAll(sessionRoot)
+    assert.equal(all.case.activeVersion, 'V0.0.2')
+    // 当前版本照旧
+    assert.equal(all.case.data.cases[0].caseId, 'V0_0_2-IT-001')
+    // ★ 关键：非当前版本也必须有内容
+    assert.ok(all.case.byVersion, 'readAll 要返回 byVersion')
+    assert.equal(all.case.byVersion['V0.0.1'].cases[0].caseId, 'V0_0_1-IT-001', 'V0.0.1 的内容也要带上来')
+    assert.equal(all.case.byVersion['V0.0.2'].cases[0].caseId, 'V0_0_2-IT-001')
+  } finally {
+    rmSync(base, { recursive: true, force: true })
+  }
+})

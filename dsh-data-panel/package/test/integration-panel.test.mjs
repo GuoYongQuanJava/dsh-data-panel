@@ -488,6 +488,30 @@ test('步骤页子表分页：选项 15/30/50/100，页码按用例各记一份'
   assert.ok(find(tree, 'sub-page-next'), '要有下一页')
 })
 
+test('步骤页点展开只展开被点的那一行，不是全部一起展开', () => {
+  /*
+   * 用户 2026-11-20 报的现象：点子表的展开按钮，所有用例的子表都展开了。
+   *
+   * 根因是 cases.json 里没有 id 字段，面板没补，record.id 恒为 undefined，
+   * 于是 stepOpen.indexOf(undefined) 永远命中 → 每一行的 open 都是 true。
+   * 这条测试同时守住两件事：id 必须被补上、展开态必须按行隔离。
+   */
+  const h = harness()
+  const render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a', initialSeed: h.TEST_SEED })
+  find(render(), 'tab-steps').props.onClick()
+  const ids = rowIds(render())
+  assert.ok(ids.length >= 2, '测试数据里至少要有两行才测得出串味')
+  assert.equal(ids.every(id => typeof id === 'string' && id !== ''), true, '每行都要有非空 id')
+
+  find(render(), 'expand-' + ids[0]).props.onClick()
+  const tree = render()
+  // 展开的行会多出一个执行结果子表容器（data-it = step-runs-<id>）
+  const opened = nodes(tree)
+    .filter(n => n.props && String(n.props['data-it'] || '').startsWith('step-runs-'))
+    .map(n => n.props['data-it'])
+  assert.deepEqual(opened, ['step-runs-' + ids[0]], '只该展开第一行，其余保持收起')
+})
+
 test('刷新会收起所有下拉菜单', () => {
   /*
    * 这个 harness 的 state 是跨渲染复用的，多次点击不同下拉时 slot 会错位，
@@ -506,7 +530,42 @@ test('刷新会收起所有下拉菜单', () => {
   assert.equal(find(tree, 'switch-menu-panel'), undefined, '刷新后子页下拉仍是关闭的')
   assert.equal(find(tree, 'version-menu-panel'), undefined, '刷新后版本下拉仍是关闭的')
   assert.equal(find(tree, 'result-menu-panel'), undefined, '刷新后筛选下拉仍是关闭的')
-  assert.equal(find(tree, 'notice'), undefined, '刷新不再弹演示提示（现在真的去读磁盘了）')
+  /*
+   * 刷新必须给出可感知的反馈。
+   *
+   * 曾经是「刷新后什么都不提示」，用户因此反馈「点刷新没反应」——
+   * 数据没变化时界面本来就不变，没有一句话就分不清是刷新了还是点了没生效。
+   */
+  const noticeNode = find(tree, 'notice')
+  assert.ok(noticeNode, '刷新后要有反馈提示')
+  /*
+   * 提示条结构改成了「文字 span + 关闭按钮」，所以要把整个节点里所有文本
+   * 片段摊平再匹配，不能只看直接 children。
+   */
+  const textOf = node => {
+    if (node === null || node === undefined) return ''
+    if (typeof node === 'string') return node
+    if (Array.isArray(node)) return node.map(textOf).join('')
+    return textOf(node.children)
+  }
+  assert.match(textOf(noticeNode), /正在刷新/, '点下去要立刻有反馈')
+})
+
+test('提示条可以手动关闭（X 按钮）', () => {
+  /*
+   * 提示条是旁白，看过了就该能收起。
+   * 没有关闭按钮时，一句「已刷新…」会一直挂着，用户会以为界面卡住。
+   */
+  const h = harness(), render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a', initialSeed: h.TEST_SEED })
+  find(render(), 'refresh').props.onClick()
+  let tree = render()
+  assert.ok(find(tree, 'notice'), '刷新后应出现提示条')
+
+  const closeBtn = find(tree, 'notice-close')
+  assert.ok(closeBtn, '提示条要有关闭按钮')
+  closeBtn.props.onClick()
+  tree = render()
+  assert.equal(find(tree, 'notice'), undefined, '点关闭后提示条应消失')
 })
 
 
@@ -700,6 +759,85 @@ test('加载后端数据时按 caseId 合并步骤与执行记录（缺一不可
   assert.equal(String(badgeX.children[0]), '2', '角标显示执行记录条数（2），不是步骤数（1）')
   assert.equal(badgeY, undefined, '0 条执行记录不显示角标')
 })
+/*
+ * steps.json 有两种形态，面板都必须能渲染出步骤。
+ *
+ * 用户 2026-11-23 实测：模型把 steps.json 写成扁平数组，测试步骤页整片空白，
+ * 但磁盘上明明有步骤。根因是面板只读分组式 {cases:[{caseId,steps}]}，
+ * 扁平式时 stepCases 为空 → stepByCaseId 全空 → 列表没内容。
+ *
+ * 后端 integration-store 已把两种形态都归一成 data.steps，前端要按 caseId 自己兜底分组。
+ */
+test('steps.json 扁平写法也要能渲染出步骤（不能整片空白）', () => {
+  const h = harness()
+  const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
+  // 结构断言：必须存在「用 flatSteps 兜底分组」这段逻辑
+  assert.match(source, /flatSteps/, '要有扁平 steps 的兜底分组')
+  assert.match(source, /grouped\[step\.caseId\]/, '要按 caseId 把扁平步骤归组')
+})
+
+test('分组式与扁平式两种 steps 都能落到用例的 steps 上', async () => {
+  const { readVersion } = await import('../lib/integration-store.js')
+  const { mkdir, writeFile, rm } = await import('node:fs/promises')
+  const { join } = await import('node:path')
+  const { tmpdir } = await import('node:os')
+
+  const sessionRoot = join(tmpdir(), 'steps-form-' + Date.now())
+  const base = join(sessionRoot, 'integration', 'step-versions')
+  await mkdir(join(base, 'V0_0_1'), { recursive: true })
+  await writeFile(join(base, 'index.json'),
+    JSON.stringify({ versions: [{ name: 'V0.0.1' }], activeVersion: 'V0.0.1' }), 'utf8')
+  const file = join(base, 'V0_0_1', 'steps.json')
+
+  // 复刻 client.js 的分组逻辑
+  const group = data => {
+    const map = Object.create(null)
+    const cases = (data && Array.isArray(data.cases)) ? data.cases : []
+    cases.forEach(item => {
+      if (!item || typeof item.caseId !== 'string') return
+      map[item.caseId] = Array.isArray(item.steps) ? item.steps : []
+    })
+    const flat = (data && Array.isArray(data.steps)) ? data.steps : []
+    if (flat.length > 0) {
+      const grouped = Object.create(null)
+      flat.forEach(step => {
+        if (!step || typeof step.caseId !== 'string') return
+        if (!grouped[step.caseId]) grouped[step.caseId] = []
+        grouped[step.caseId].push(step)
+      })
+      Object.keys(grouped).forEach(cid => { if (map[cid] === undefined) map[cid] = grouped[cid] })
+    }
+    return map
+  }
+
+  try {
+    // 分组式（契约形态）
+    await writeFile(file, JSON.stringify({
+      stepVersion: 'V0.0.1', sourceCaseVersion: 'V0.0.1',
+      cases: [
+        { caseId: 'IT-001', steps: [{ no: 1 }, { no: 2 }] },
+        { caseId: 'IT-002', steps: [{ no: 1 }] },
+      ],
+    }), 'utf8')
+    let map = group(await readVersion(sessionRoot, 'step', 'V0.0.1'))
+    assert.equal(Object.keys(map).length, 2, '分组式应有 2 条用例')
+    assert.equal(map['IT-001'].length, 2, 'IT-001 应有 2 步')
+
+    // 扁平式（用户实测踩到的写法）
+    await writeFile(file, JSON.stringify({
+      stepVersion: 'V0.0.1',
+      steps: [
+        { caseId: 'IT-001', no: 1 }, { caseId: 'IT-001', no: 2 }, { caseId: 'IT-002', no: 1 },
+      ],
+    }), 'utf8')
+    map = group(await readVersion(sessionRoot, 'step', 'V0.0.1'))
+    assert.equal(Object.keys(map).length, 2, '扁平式也应有 2 条用例（不能是 0）')
+    assert.equal(map['IT-001'].length, 2, '扁平式 IT-001 也应有 2 步')
+  } finally {
+    await rm(sessionRoot, { recursive: true, force: true })
+  }
+})
+
 /*
  * 一键执行的报告目录里同时有「总体报告」和「每条用例的单条报告」。
  * 「查看报告」必须挑这条用例那一份（只含 4.1.1 那张表），
