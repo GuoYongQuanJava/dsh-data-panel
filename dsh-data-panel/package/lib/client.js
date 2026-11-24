@@ -2733,7 +2733,13 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			var setReloadTick = reloadState[1];
 			var scrollRef = useRef(null);
 			var pendingRef = useRef(null);
-			pendingRef.current = awaiting ? props.pendingRunId || "" : null;
+			// 轮询看到这次 run 已经落盘后，用 settledRunId 记住它，不再当“正在执行”过滤掉。
+			var settledState = useState("");
+			var settledRunId = settledState[0];
+			var setSettledRunId = settledState[1];
+			pendingRef.current = awaiting && settledRunId !== (props.pendingRunId || "")
+				? props.pendingRunId || ""
+				: null;
 
 			// 按实际行高显示前五条记录；更多记录在展开区内滚动。
 			useEffect(function () {
@@ -2784,6 +2790,42 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 				};
 			}, [sessionId, record.caseId, reloadTick, props.refreshTick]);
 
+
+			// 执行结束后自动刷新一次：只要这次 run 还没落盘（status 仍是 running），
+			// 就每 3 秒轻量重读一遍；一旦看到它结束就重读记录，用户不用去点表头的「刷新」。
+			// 有界（最多 40 次，约 2 分钟），且不监听对话、不做无上限轮询。
+			useEffect(function () {
+				var pendingRunId = props.pendingRunId || "";
+				if (!awaiting || sessionId === "" || pendingRunId === "") return undefined;
+				var alive = true;
+				var attempts = 0;
+				var timer = setInterval(function () {
+					if (!alive) return;
+					attempts += 1;
+					if (attempts > 40) { clearInterval(timer); return; }
+					fetchRunList(sessionId, "case", record.caseId).then(function (data) {
+						if (!alive) return;
+						var runs = (data && data.runs) || [];
+						var hit = null;
+						for (var i = 0; i < runs.length; i += 1) {
+							if (runs[i].runId === pendingRunId) { hit = runs[i]; break; }
+						}
+						if (hit === null || hit.status === "running") return;
+						// 这次 run 已经落盘：不再把它当“正在执行”，然后重读一次记录。
+						// 落盘了就把它记成“已结束”：下一次渲染不再把它当正在执行过滤掉，
+						// 即使父组件的 awaiting 还没清（清它要等用户点刷新）。
+						setSettledRunId(pendingRunId);
+						clearInterval(timer);
+						setReloadTick(function (n) { return n + 1; });
+					}).catch(function () {
+						// 网络抖动不打断轮询；到次数上限后会自己停。
+					});
+				}, 3000);
+				return function () {
+					alive = false;
+					clearInterval(timer);
+				};
+			}, [awaiting, props.pendingRunId, sessionId, record.caseId]);
 
 			function remove(runId) {
 				props.onRemove(runId, function (done) {
@@ -3388,6 +3430,30 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 		}
 
 		function RecordFormModal(props) {
+			// 用例名称 = 「函数短名 + 中文测试类型」，与服务端 resolveCaseTitle 同一规则。
+			// 面板只负责展示与提交时带上派生值；最终定稿以服务端为准。
+			function caseFunctionShortName(raw) {
+				var text = String(raw || "").trim();
+				if (!text) return "";
+				if (text.indexOf("::") !== -1) {
+					var parts = text.split("::").filter(function (part) { return part !== ""; });
+					text = parts.length > 0 ? parts[parts.length - 1] : "";
+				} else {
+					// `Order.discount` 是「类.方法」，`order.cpp` 是文件名：只对已知源码扩展名去后缀。
+					var segment = text.split(/[\\/]/).filter(function (part) { return part !== ""; }).pop() || "";
+					text = segment.replace(/\.(?:c|cc|cpp|cxx|h|hpp|hxx|py|js|ts|tsx|jsx|go|rs|java|cs|rb|php|swift|kt|m|mm)$/i, "");
+				}
+				text = text.replace(/\(.*$/, "").trim();
+				var pieces = text.split(/[.:>]/).filter(function (part) { return part !== ""; });
+				return (pieces.pop() || "").trim();
+			}
+
+			function derivedTitle(values) {
+				var short = caseFunctionShortName(values && values.subjectFunction);
+				var meta = values && TEST_TYPES[values.testType] ? TEST_TYPES[values.testType] : null;
+				if (!short || meta === null) return "";
+				return short + "-" + meta.label;
+			}
 			var initial = props.record || {};
 			var state = useState(function () {
 				return {
@@ -3425,8 +3491,10 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 
 			function submit(event) {
 				if (event) event.preventDefault();
-				if (!values.title.trim()) {
-					setLocalError("用例名称不能为空");
+				// 能派生就以派生名为准；派生不出来（没填被测函数）时沿用已有名字，与服务端一致。
+				var title = derivedTitle(values) || String(values.title || "").trim();
+				if (!title) {
+					setLocalError("请先填写被测函数与测试类型，用例名称会自动生成");
 					return;
 				}
 				if (TEST_TYPE_KEYS.indexOf(values.testType) === -1) {
@@ -3434,7 +3502,8 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 					return;
 				}
 				setLocalError("");
-				props.onSubmit(values);
+				// 标题不以面板输入为准：带上派生值，服务端也会再按同一规则定稿。
+				props.onSubmit(Object.assign({}, values, { title: title }));
 			}
 
 			var error = localError || props.error || "";
@@ -3454,14 +3523,19 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			},
 				h("form", { className: "dp-form", onSubmit: submit },
 					error ? h("div", { className: "dp-alert" }, error) : null,
-					h(Field, { label: "用例名称", required: true, full: true },
+					// 用例名称由「被测函数 + 测试类型」自动派生，不再让人手填 T001。
+					h(Field, {
+						label: "用例名称（自动生成）",
+						full: true,
+						hint: "= 函数短名 + 中文测试类型（如 addLine-边界测试）。填了被测函数就按规则定稿，写别的也不会生效。",
+					},
 						h("input", {
 							ref: firstRef,
 							className: "dp-input",
-							value: values.title,
+							value: derivedTitle(values) || String(values.title || ""),
 							maxLength: 200,
-							placeholder: "例如：T001（详细场景填写在测试说明）",
-							onChange: function (event) { set("title", event.target.value); }
+							readOnly: true,
+							placeholder: "填写被测函数与测试类型后自动生成",
 						})
 					),
 					h(Field, { label: "用例标识", hint: "留空会自动生成一个 TC-xxxxxxxx。" },

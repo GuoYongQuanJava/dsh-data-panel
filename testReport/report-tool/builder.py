@@ -35,6 +35,8 @@ v2 结构与模板约定
 """
 import re
 
+from datetime import datetime
+
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -659,10 +661,118 @@ def _fill_doc_overview(body_els: list, data: Dict[str, Any], proto_body) -> None
     return
 
 
-def _fill_scope_section(body_els: list, data: Dict[str, Any], proto_body, sid_h2: str) -> None:
-    """3.4 测试范围与排除：把本次冻结的 testScope 写成正文。
+def _scope_text_lines(source: Dict[str, Any]) -> List[str]:
+    """把 sourceScope 整理成一组可读段落。
 
-    只列已提供的真实清单；没有清单时如实说明“无范围清单”，不声称覆盖全工程。
+    主报告摘要与附件正文共用这一份文案，避免两处口径不一致。
+    没有范围清单时只返回原因，**不**编造规模数字。
+    """
+    if not source.get('available'):
+        # 原因照实转述，但必须带上“不能据此声称覆盖全工程”这句，避免被当成完整覆盖。
+        reason = str(source.get('reason') or '本次执行没有范围清单')
+        if '不能据此声称' not in reason:
+            reason = f"{reason}。不能据此声称覆盖整个工程。"
+        return [reason]
+
+    lines: List[str] = []
+    roots = '、'.join(source.get('sourceRoots') or []) or '未记录'
+    summary = source.get('summary') or {}
+    lines.append(
+        f"本次扫描根：{roots}。共扫描 {summary.get('scannedFiles', 0)} 个源码文件："
+        f"纳入测试 {summary.get('testedFiles', 0)} 个，排除 {summary.get('excludedFiles', 0)} 个，"
+        f"仅声明 {summary.get('declarationFiles', 0)} 个，未处理 {summary.get('deferredFiles', 0)} 个；"
+        f"共枚举 {summary.get('declaredFunctions', 0)} 个函数，"
+        f"其中 {summary.get('linkedFunctions', 0)} 个已关联到本次用例。")
+
+    files = source.get('files') or []
+    tested = [f for f in files if f.get('status') == 'tested']
+    if tested:
+        names = '、'.join(f"{f.get('path')}（{f.get('functionCount', 0)} 个函数）" for f in tested)
+        lines.append(f"纳入测试的源码文件：{names}。")
+
+    excluded = [f for f in files if f.get('status') == 'excluded']
+    if excluded:
+        lines.append('排除的源码文件（含理由与证据）：')
+        for item in excluded:
+            proof = ''
+            if item.get('exitCode') is not None:
+                proof = f"（独立编译探针退出码 {item['exitCode']}，日志 {item.get('logFile') or '未记录'}）"
+            lines.append(
+                f"  - {item.get('path')}。理由：{item.get('reason') or '未说明'} {proof}".strip())
+    else:
+        lines.append('本次没有排除任何源码文件。')
+
+    decl = [f for f in files if f.get('status') == 'declaration']
+    if decl:
+        lines.append('仅声明、无逻辑的文件：' + '、'.join(f.get('path', '') for f in decl) + '。')
+
+    pending = [f for f in files if f.get('status') not in ('tested', 'excluded', 'declaration')]
+    if pending:
+        lines.append('尚未纳入或验证的源码：' + '、'.join(
+            f"{f.get('path')}（{f.get('reason') or '未说明'}）" for f in pending) + '。')
+
+    warnings = source.get('warnings') or []
+    if warnings:
+        shown = '；'.join(warnings[:10])
+        more = f"；另有 {len(warnings) - 10} 条同类告警，详见本次 scope.json" if len(warnings) > 10 else ''
+        lines.append(f"范围校验告警：{shown}{more}。")
+    return lines
+
+
+def scope_document_path(out_path, scope_out: Optional[str] = None) -> Path:
+    """「测试范围与排除」附件文档的落盘路径。
+
+    默认与报告同目录、同名前缀：`<报告名>-测试范围与排除.docx`。
+    """
+    if scope_out:
+        return Path(scope_out)
+    report = Path(out_path)
+    # 放子目录而不是报告同层：面板会把 reports/<runId>/ 里排序第一个 .docx 当作“正式报告”，
+    # 附件名 `-测试范围与排除` 会排到 `测试报告.docx` 前面，平铺会被误认成报告。
+    return report.parent / 'attachments' / f"{report.stem}-测试范围与排除.docx"
+
+
+def _write_scope_document(data: Dict[str, Any], path: Path) -> Path:
+    """把「测试范围与排除」写成一份独立 docx。
+
+    为什么单独成文：这份清单用来自查“哪些文件没测、为什么”，长度不稳定（几十到几百行），
+    塞进正式报告会把 3.4 节撑得很长。主报告只引用本文件，证据原文仍全部保留在这里。
+    """
+    meta = data.get('meta') or {}
+    prov = data.get('provenance') or {}
+    source = (data.get('scope') or {}).get('sourceScope') or {}
+
+    doc = Document()
+    # 中文字体：不用模板时默认字体是 Calibri，中文会走回退字体，读起来不统一。
+    try:
+        normal = doc.styles['Normal']
+        normal.font.name = 'SimSun'
+        normal.element.get_or_add_rPr().rFonts.set(qn('w:eastAsia'), 'SimSun')
+    except Exception:
+        pass
+
+    doc.add_heading('测试范围与排除', level=1)
+    doc.add_paragraph(f"项目：{meta.get('project') or '未提供'}")
+    doc.add_paragraph(f"执行编号：{prov.get('runId') or '未提供'}")
+    doc.add_paragraph(f"用例快照：{prov.get('casesSnapshot') or '不可用'}")
+    doc.add_paragraph(f"生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    doc.add_paragraph(
+        '本文档是单元测试报告的附件：报告 3.4 节只引用本文件，测试范围、排除项与排除理由以本文件为准。')
+
+    for text in _scope_text_lines(source):
+        doc.add_paragraph(text)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    doc.save(str(path))
+    return path
+
+
+def _fill_scope_section(body_els: list, data: Dict[str, Any], proto_body, sid_h2: str,
+                        scope_doc: Optional[Path] = None) -> None:
+    """3.4 测试范围与排除：只写一行规模摘要 + 附件路径。
+
+    明细（纳入文件、排除项及理由、探针证据、告警）全部在独立附件里。
+    附件没生成成功时退回把明细写进正文，保证信息不丢。
     """
     if proto_body is None:
         return
@@ -681,47 +791,13 @@ def _fill_scope_section(body_els: list, data: Dict[str, Any], proto_body, sid_h2
         _append_after(previous, p)
         previous = p
 
-    if not source.get('available'):
-        add(str(source.get('reason') or '本次执行没有范围清单，不能据此声称覆盖整个工程。'))
+    lines = _scope_text_lines(source)
+    add(lines[0])
+    if scope_doc is not None:
+        add(f"完整的测试范围与排除清单（含每个文件的排除理由与探针证据）见：{scope_doc}")
         return
-
-    roots = '、'.join(source.get('sourceRoots') or []) or '未记录'
-    summary = source.get('summary') or {}
-    add(f"本次扫描根：{roots}。共扫描 {summary.get('scannedFiles', 0)} 个源码文件："
-        f"纳入测试 {summary.get('testedFiles', 0)} 个，排除 {summary.get('excludedFiles', 0)} 个，"
-        f"仅声明 {summary.get('declarationFiles', 0)} 个，未处理 {summary.get('deferredFiles', 0)} 个；"
-        f"共枚举 {summary.get('declaredFunctions', 0)} 个函数，"
-        f"其中 {summary.get('linkedFunctions', 0)} 个已关联到本次用例。")
-
-    files = source.get('files') or []
-    tested = [f for f in files if f.get('status') == 'tested']
-    if tested:
-        names = '、'.join(f"{f.get('path')}（{f.get('functionCount', 0)} 个函数）" for f in tested)
-        add(f"纳入测试的源码文件：{names}。")
-
-    excluded = [f for f in files if f.get('status') == 'excluded']
-    if excluded:
-        for item in excluded:
-            proof = ''
-            if item.get('exitCode') is not None:
-                proof = f"（独立编译探针退出码 {item['exitCode']}，日志 {item.get('logFile') or '未记录'}）"
-            add(f"排除：{item.get('path')}。理由：{item.get('reason') or '未说明'} {proof}".strip())
-    else:
-        add('本次没有排除任何源码文件。')
-
-    decl = [f for f in files if f.get('status') == 'declaration']
-    if decl:
-        add('仅声明、无逻辑的文件：' + '、'.join(f.get('path', '') for f in decl) + '。')
-
-    pending = [f for f in files if f.get('status') not in ('tested', 'excluded', 'declaration')]
-    if pending:
-        add('尚未纳入或验证的源码：' + '、'.join(f"{f.get('path')}（{f.get('reason') or '未说明'}）" for f in pending) + '。')
-
-    warnings = source.get('warnings') or []
-    if warnings:
-        shown = '；'.join(warnings[:10])
-        more = f"；另有 {len(warnings) - 10} 条同类告警，详见本次 scope.json" if len(warnings) > 10 else ''
-        add(f"范围校验告警：{shown}{more}。")
+    for text in lines[1:]:
+        add(text)
 
 
 def _move_regressions(body_els: list, data: Dict[str, Any], proto_body,
@@ -1155,10 +1231,13 @@ def build(
     out_path: str,
     skill_path: Optional[str] = None,
     refresh_toc: bool = True,
+    scope_out: Optional[str] = None,
 ) -> Path:
     """生成报告并返回输出路径。
 
     *skill_path* 仅为兼容旧调用保留，v2 不再使用（数据自包含）。
+    *scope_out* 指定「测试范围与排除」附件文档路径；不传就放在报告同目录，
+    命名为 `<报告名>-测试范围与排除.docx`。报告正文 3.4 只引用这份附件。
     """
     data = validate(data)
 
@@ -1222,8 +1301,14 @@ def build(
     _fill_doc_overview(body_els, data, proto_body)
     _fill_chapter2(body_els, meta, proto_body)
     _fill_chapter3(body_els, data, proto_body)
-    # 3.4 测试范围与排除：把本次冻结的源码范围与排除证据写进报告
-    _fill_scope_section(body_els, data, proto_body, sid_h2)
+    # 3.4 测试范围与排除：明细单独成文，报告里只写一行摘要 + 附件路径。
+    scope_path = scope_document_path(out_path, scope_out)
+    try:
+        _write_scope_document(data, scope_path)
+    except Exception:
+        # 附件写不出来时不能静默丢证据：置空后退回把明细写进正文（旧行为）。
+        scope_path = None
+    _fill_scope_section(body_els, data, proto_body, sid_h2, scope_path)
 
     # 先把模板里会被重新生成的样例段落删掉（3.1 样例正文、圈复杂度说明段）
     _strip_template_samples(body_els)

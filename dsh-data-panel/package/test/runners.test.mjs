@@ -585,7 +585,8 @@ test('查看测试代码明确区分缺测试文件与缺目标', async () => {
   write(join(project, '.dsh', 'test-sessions', 's1', 'tests', 'test_generated.py'), 'def test_other():\n    pass\n')
   await assert.rejects(
     () => __test.resolveTestCode({ sessionId: 's1', cwd: project, caseId: 'TC-1', store }),
-    /找不到目标 test_real/,
+    // 新口径：定位失败要明说「测试映射已失效」，且不得回退到第 1 行/注册表。
+    /测试映射已失效：.*找不到测试声明 test_real/,
   )
 })
 
@@ -653,7 +654,9 @@ test('非 PATH 的 Go 工具路径写入本次执行命令', async () => {
 test('GoogleTest 允许 preCommand 先生成 binary，未配置构建时要求 binary 已存在', async () => {
   const project = makeDir('panel-gtest-build-')
   const root = join(project, '.dsh', 'test-sessions', 'gtest-build-test')
-  const profile = { preset: 'gtest', binary: 'project:build/generated_test', preCommand: [process.execPath, '--version'] }
+  // coverageRequired:false 显式关掉覆盖率自动升级：这个用例只验证 preCommand 与 binary 规则，
+  // 不能因为本机恰好装了 VS 采集器就变成 batch+cov。
+  const profile = { preset: 'gtest', coverageRequired: false, binary: 'project:build/generated_test', preCommand: [process.execPath, '--version'] }
   write(join(root, 'runner.json'), JSON.stringify(profile))
   write(join(project, 'tests', 'generated_test.cpp'), 'TEST(Suite, Works) {}\n')
   const store = { records: [makeRecord({ code: 'TEST(Suite, Works) {}' })] }
@@ -694,8 +697,10 @@ test('resolveRunner：项目没标记但已有本会话测试文件时，按文�
 test('gtest 链路：per-case 用 --gtest_filter 逐条执行', { skip: process.platform !== 'win32' }, async () => {
   const project = makeDir('panel-gtest-')
   const root = join(project, '.dsh', 'test-sessions', 'session-gtest')
+  // 本用例验证 per-case 的 --gtest_filter 行为，显式关掉覆盖率自动升级。
   write(join(root, 'runner.json'), JSON.stringify({
     preset: 'gtest',
+    coverageRequired: false,
     testFile: 'tests/test_generated.cpp',
     binary: 'project:fake_gtest.cmd',
     shell: true,
@@ -779,4 +784,68 @@ test('runner.json 的 timeoutSec 限制执行时长', async () => {
   const result = JSON.parse(readFileSync(join(root, 'runs', prep.runId, 'result.json'), 'utf8'))
   assert.equal(result.status, 'timeout')
   assert.match(result.note, /超过 1 秒/)
+})
+
+test('C++/GoogleTest：本机有 VS 采集器时，第一次 prepareRun 就升级成 gtest-batch-cov', async () => {
+  const project = makeDir('panel-e2e-cov-')
+  const sessionId = 'test-session-cov'
+  const root = join(project, '.dsh', 'test-sessions', sessionId)
+  mkdirSync(join(root, 'tests'), { recursive: true })
+  const testFile = join(root, 'tests', 'test_generated.cpp')
+  write(testFile, 'TEST(AddTest, Zero) {\n}\n')
+  // 故意用普通 gtest：它**不声明** codecoverage，正是「首跑不采覆盖率」的根因。
+  write(join(root, 'runner.json'), JSON.stringify({
+    preset: 'gtest',
+    testFile: 'tests/test_generated.cpp',
+    binary: 'project:build/test_generated',
+  }, null, 2))
+  write(join(project, 'build', 'test_generated.exe'), 'stub')
+  write(join(project, 'build', 'test_generated.pdb'), 'stub')
+  // 项目自维护的覆盖率配置（面板会优先用它，而不是采集器自带配置）。
+  write(join(project, 'testReport', 'coverage.config'), '<Results/>')
+  const tool = join(project, 'CodeCoverage.exe')
+  write(tool, 'stub')
+
+  const previous = process.env.DSH_CODECOVERAGE_PATH
+  process.env.DSH_CODECOVERAGE_PATH = tool
+  try {
+    const store = {
+      records: [makeRecord({
+        caseId: 'TC-C1',
+        title: 'addLine-边界测试',
+        testFunc: 'AddTest.Zero',
+        testLocation: { file: testFile, line: 1, column: 1, fileSha256: '' },
+      })],
+    }
+    const prep = await __test.prepareRun({
+      sessionId, cwd: project, scope: 'case', caseId: 'TC-C1', store,
+    })
+
+    // 关键断言：一次就选对 preset，不需要后续对话手改 runner.json。
+    assert.equal(prep.frameworkId, 'gtest-batch-cov')
+    assert.equal(prep.runnerMode, 'batch')
+    assert.equal(prep.coveragePlan.presetId, 'gtest-batch-cov')
+    assert.equal(prep.coveragePlan.required, true)
+    assert.equal(prep.coveragePlan.available, true, prep.coveragePlan.reason)
+    assert.equal(prep.coveragePlan.targetCount, 1)
+    assert.equal(prep.coveragePlan.tool.path, tool)
+
+    const request = JSON.parse(readFileSync(join(root, 'runs', prep.runId, 'request.json'), 'utf8'))
+    // request.json 第一轮就必须带完整覆盖率配置与命令。
+    assert.equal(request.runner.coverageRequired, true)
+    assert.equal(request.runner.coverage.format, 'vs-codecoverage-xml')
+    const collect = request.runner.coverage.command.join(' ')
+    const analyze = request.runner.coverage.postCommand.join(' ')
+    assert.ok(collect.includes('collect'), collect)
+    assert.ok(collect.includes(tool), collect)
+    // 目标筛选保留占位符：执行时 runner 会用它自己那批目标展开（与 targets 完全一致）。
+    assert.ok(collect.includes('--gtest_filter={targets}'), collect)
+    assert.ok(analyze.includes('analyze'), analyze)
+    assert.match(request.coveragePlan.rawFile, /run\.coverage$/)
+    assert.match(request.coveragePlan.reportFile, /coverage\.xml$/)
+    assert.equal(request.coveragePlan.targetCount, request.targets.length)
+  } finally {
+    if (previous === undefined) delete process.env.DSH_CODECOVERAGE_PATH
+    else process.env.DSH_CODECOVERAGE_PATH = previous
+  }
 })

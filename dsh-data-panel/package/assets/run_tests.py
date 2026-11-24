@@ -699,6 +699,37 @@ def collect_coverage(cfg, *, spec: dict, targets: list, run_dir: Path, project: 
         "durationMs": int((time.time() - started) * 1000),
     }
 
+def collect_coverage_safely(cfg, *, spec: dict, targets: list, run_dir: Path, project: Path,
+                             cwd, env, use_shell: bool, log_file, say) -> dict:
+    """跑一次覆盖率采集并吞掉异常：覆盖率永远不能把一次执行搞崩。"""
+    try:
+        return collect_coverage(cfg, spec=spec, targets=targets, run_dir=run_dir, project=project,
+                                cwd=cwd, env=env, use_shell=use_shell, log_file=log_file, say=say)
+    except Exception as error:  # noqa: BLE001 —— 这里就是要接住所有异常
+        return {"available": False, "reason": f"覆盖率采集异常：{error}"}
+
+
+def coverage_status_of(coverage, required: bool) -> str:
+    """覆盖率状态：collected / failed / skipped。
+
+    注意：它不回写 result.status。测试本身跑完了就是 passed，覆盖率没采到是
+    “测试完成、覆盖率未完成”，两件事分开记，避免把覆盖率问题误报成用例失败。
+    """
+    if isinstance(coverage, dict) and coverage.get("available"):
+        return "collected"
+    return "failed" if required else "skipped"
+
+
+def write_coverage_attempt(run_dir: Path, coverage: dict, extra: dict) -> str:
+    """把一次采集过程写进 `coverage-attempts/attempt-NN.json`，保留原始证据链。"""
+    attempts = run_dir / "coverage-attempts"
+    attempts.mkdir(parents=True, exist_ok=True)
+    index = len(list(attempts.glob("attempt-*.json"))) + 1
+    path = attempts / f"attempt-{index:02d}.json"
+    payload = {"attempt": index, "at": now_iso(), **extra, "coverage": coverage}
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return str(path)
+
 def main() -> int:
     import argparse
 
@@ -707,6 +738,8 @@ def main() -> int:
     parser.add_argument("--root", help="会话资产目录")
     parser.add_argument("--run-id", help="本次执行编号")
     parser.add_argument("--check-actual-json", help="只检查生成后序列化自测的输出日志，不运行测试或写结果")
+    parser.add_argument("--coverage-only", action="store_true",
+                        help="只重采覆盖率：沿用本次 run 冻结的快照与目标，不重新跑用例")
     parser.add_argument("--cases", help="JSON 自检的用例清单（可选）")
     parser.add_argument("--timeout", type=int, default=None, help="覆盖 runner.json 的超时秒数")
     args = parser.parse_args()
@@ -767,6 +800,9 @@ def main() -> int:
     cwd = str(project)
     env = dict(os.environ)
     use_shell = False
+    # finish() 里的覆盖率逻辑会读 request；缺 request.json 时它必须已存在且为空对象，
+    # 否则早退路径会抛 NameError。
+    request = {}
 
     def say(line: str = "") -> None:
         print(line)
@@ -797,14 +833,19 @@ def main() -> int:
                     say(f"[实际输出 JSON 告警] {issue.get('caseId') or '未关联用例'}：{issue['reason']}")
             except Exception as error:
                 result["actualOutputValidation"] = {"valid": False, "issues": [{"reason": f"无法完成实际输出核验：{error}"}]}
-        # ── 覆盖率（可选）：作为“额外证据”采集，失败不影响本次执行结论 ──
-        if "coverage" not in result and status in ("passed", "partial", "failed"):
+        # ── 覆盖率：作为额外证据采集 ──
+        # coverageRequired=true 时，“采不到”是必须报出来的事实，但不改测试结论（status）：
+        # 结果是「测试完成、覆盖率未完成」，用 coverageStatus 单独表达。
+        coverage_required = bool((request.get("runner") or {}).get("coverageRequired"))
+        result["coverageRequired"] = coverage_required
+        if "coverage" not in result:
+            coverage_cfg = None
             try:
                 coverage_cfg = (request.get("runner") or {}).get("coverage")
             except Exception:
                 coverage_cfg = None
-            try:
-                result["coverage"] = collect_coverage(
+            if status in ("passed", "partial", "failed"):
+                result["coverage"] = collect_coverage_safely(
                     coverage_cfg,
                     spec=spec,
                     targets=targets,
@@ -816,10 +857,24 @@ def main() -> int:
                     log_file=log_file,
                     say=say,
                 )
-            except Exception as error:  # 覆盖率永远不能把一次执行搞崩
-                result["coverage"] = {"available": False, "reason": f"覆盖率采集异常：{error}"}
-        elif "coverage" not in result:
-            result["coverage"] = {"available": False, "reason": f"执行状态为 {status}，未采集覆盖率"}
+            else:
+                result["coverage"] = {
+                    "available": False,
+                    "reason": f"执行状态为 {status}，未采集覆盖率",
+                }
+        result["coverageStatus"] = coverage_status_of(result["coverage"], coverage_required)
+        if coverage_required and result["coverageStatus"] != "collected":
+            reason = str((result.get("coverage") or {}).get("reason") or "未知原因")
+            say(f"[覆盖率] 本次要求采集覆盖率，但未完成：{reason}")
+            result["note"] = (result.get("note", "") + ("；" if result.get("note") else "")) \
+                + f"测试完成、覆盖率未完成：{reason}"
+            # 失败也留证据，供后续用 --coverage-only 沿用同一快照补采。
+            result["coverageAttempt"] = write_coverage_attempt(run_dir, result["coverage"], {
+                "runId": args.run_id,
+                "mode": "run",
+                "targets": [t.get("caseId", "") for t in targets],
+                "coveragePlan": request.get("coveragePlan"),
+            })
         result_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
         try:
             log_file.close()
@@ -883,6 +938,43 @@ def main() -> int:
         "mode": spec.get("mode", ""),
         "source": spec.get("source", ""),
     }
+
+    # ── 补采模式：只重采覆盖率 ──
+    # 沿用本次 run 的冻结快照与目标，不重新生成用例/测试代码，也不重跑用例；
+    # 每次采集都写 coverage-attempts/，报告引用最终有效的那一次。
+    if args.coverage_only:
+        coverage_required = bool(spec.get("coverageRequired"))
+        say("补采模式：沿用本次 run 的冻结快照与目标，只重新采集覆盖率，不重新跑用例。")
+        coverage = collect_coverage_safely(
+            spec.get("coverage"), spec=spec, targets=targets, run_dir=run_dir, project=project,
+            cwd=cwd, env=env, use_shell=use_shell, log_file=log_file, say=say,
+        )
+        attempt = write_coverage_attempt(run_dir, coverage, {
+            "runId": args.run_id,
+            "mode": "coverage-only",
+            "targets": [t.get("caseId", "") for t in targets],
+            "coveragePlan": request.get("coveragePlan"),
+        })
+        status = coverage_status_of(coverage, coverage_required)
+        previous = {}
+        if result_path.is_file():
+            try:
+                previous = read_json(result_path)
+            except Exception:
+                previous = {}
+        previous.update({
+            "coverage": coverage,
+            "coverageRequired": coverage_required,
+            "coverageStatus": status,
+            "coverageAttempt": attempt,
+        })
+        attempts_dir = run_dir / "coverage-attempts"
+        previous["coverageAttempts"] = sorted(p.name for p in attempts_dir.glob("attempt-*.json"))
+        result_path.write_text(json.dumps(previous, ensure_ascii=False, indent=2), encoding="utf-8")
+        say(f"[覆盖率] 补采结果：{coverage.get('reason') or coverage.get('source') or status}")
+        say(f"[覆盖率] 证据：{attempt}")
+        log_file.close()
+        return 0 if coverage.get("available") else 2
 
     test_file = Path(request.get("testFile") or (root / "tests" / "test_generated.py"))
     # 执行仍在原位置：不把测试文件换地方（那样会改变 conftest / import 路径等行为）。

@@ -48,7 +48,9 @@ def build_report(tmp_path, case, test):
     }
     result_path = run_dir / "result.json"
     result_path.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
-    proc = subprocess.run([sys.executable, str(BRIDGE), "--run", str(result_path)], capture_output=True, text=True)
+    # 子进程输出统一按 UTF-8 解：Windows 上默认按 cp936 读，会抛 UnicodeDecodeError 线程告警。
+    proc = subprocess.run([sys.executable, str(BRIDGE), "--run", str(result_path)],
+                          capture_output=True, text=True, encoding="utf-8", errors="replace")
     assert proc.returncode == 0, proc.stderr
     payload = json.loads((tmp_path / "reports" / "run-1" / "report-data.json").read_text(encoding="utf-8"))
     validate(payload)
@@ -70,7 +72,8 @@ def build_scope_report(tmp_path, test_scope):
     }
     result_path = run_dir / "result.json"
     result_path.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
-    proc = subprocess.run([sys.executable, str(BRIDGE), "--run", str(result_path)], capture_output=True, text=True)
+    proc = subprocess.run([sys.executable, str(BRIDGE), "--run", str(result_path)],
+                          capture_output=True, text=True, encoding="utf-8", errors="replace")
     assert proc.returncode == 0, proc.stderr
     payload = json.loads((tmp_path / "reports" / "run-1" / "report-data.json").read_text(encoding="utf-8"))
     validate(payload)
@@ -93,14 +96,18 @@ def test_named_values_follow_runtime_evidence(tmp_path):
     assert output["status"] == "failed"
 
 
-def test_legacy_text_does_not_become_fake_variables(tmp_path):
+def test_legacy_text_goes_to_its_own_column_not_description(tmp_path):
+    """缺结构化变量时，原始文本进各自的表格列；测试说明里不得混入输入/输出。"""
     case = {"caseId": "TC-2", "title": "旧用例", "testType": "api", "testFunc": "test_api",
             "input": "请求体为 {}", "expected": "HTTP 200"}
     test = {"caseId": "TC-2", "func": "test_api", "outcome": "passed", "actual": "HTTP 200"}
     output = build_report(tmp_path, case, test)
-    assert output["inputs"] == [] and output["outputs"] == []
-    assert "输入条件（原始记录）：请求体为 {}" in output["description"]
-    assert "实际输出（原始记录）：HTTP 200" in output["description"]
+    # 输入进「输入」列，预期 + 实际进同一行的「预期 / 实际」列。
+    assert output["inputs"] == [["原始输入", "请求体为 {}"]]
+    assert output["outputs"] == [["预期结果", "HTTP 200", "HTTP 200"]]
+    # 测试说明只放场景说明，不再拼「（原始记录）」字样。
+    assert "输入条件（原始记录）" not in output["description"]
+    assert "实际输出（原始记录）" not in output["description"]
 
 
 def test_missing_named_actual_is_not_copied_from_expected(tmp_path):

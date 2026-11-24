@@ -209,7 +209,11 @@ if (Test-Path -LiteralPath $configFile) {
 这是一份插件通用数据约定，适用于本 workflow 和用户自定义 Skill。用例层级由记录中的该字段自动聚合；不要再调用旧分类 API 建立层级。
 
 **一条用例只验证一个具体场景：** 同一形参的候选值 `1/0/-1` 表示三个独立场景时，拆成三条用例，每条都有确定输入和对应预期，不能在一条记录或一个测试函数中循环跑完再只记一个结果。多个形参共同组成一次调用可以放在一条用例中；数组、集合、路径、除法表达式本身是合法的单个输入，不因包含 `/` 或多个元素机械拆分。多步操作共同验证一个状态场景也可保留为一条，不为凑数量做无意义的全排列。参数化框架只有在每个参数实例有独立 `caseId`、准确可筛选的 `testFunc` 和逐条证据时才可使用。
-GD:**名称与编号：** title 仅使用函数组内的短编号 T001、T002，每个函数从 T001 开始；详细文字全部放 description，说明前置状态、调用动作、具体输入、验证目标及预期行为。相同函数内编号不重复，新增时接着编号，编辑后不重排已有编号。caseId 是会话内唯一、稳定的关联 ID，格式为 `<类型缩写>-<projectPackage>-<函数分类名>-T<序号>.CTD`：类型缩写取测试类型首字母（功能→GN、接口→JK、边界→BJ、逻辑→LJ、性能→XN），projectPackage 来自项目配置文件，函数分类名来自 Step 1 分析结果（如 RINGBUFFER、push），序号每个函数分类从 T001 起（例如 BJ-ZZKZ-RINGBUFFER-T002.CTD）。不同函数可复用名称 T001，但不能复用 caseId，也不要把 testFunc 改成显示编号。
+**名称与编号：** `title` 从生成时就写成「函数短名-中文测试类型」，例如 `addLine-功能测试`、`addLine-边界测试`、`subtotal-边界测试`、`payable-功能测试`。函数短名取 `subjectFunction` 最后一段（`src/order.cpp::Order::addLine` → `addLine`），中文类型取 `functional→功能测试 / api→接口测试 / boundary→边界测试 / logic→逻辑测试 / performance→性能测试`。**禁止**把 `T001`、`T002` 或 `BJ-PDGW-ADD_LINE-T003.CTD` 当作 title：编号只用于 `sequence`、`caseId` 和函数内排序。详细文字全部放 `description`，说明前置状态、调用动作、验证目标及预期行为。
+
+同一函数同一类型的多条用例允许同名（名称不承担唯一性）；唯一性由 `caseId` 保证。面板与报告按 `caseId` / `sequence` 区分行，不要在 title 里再拼序号。能派生标准名时，面板保存会**以派生名为准**；派生不出来（没填 `subjectFunction`）时仍拒绝纯编号。
+
+`caseId` 是会话内唯一、稳定的关联 ID，格式为 `<类型缩写>-<projectPackage>-<函数分类名>-T<序号>.CTD`：类型缩写取测试类型首字母（功能→GN、接口→JK、边界→BJ、逻辑→LJ、性能→XN），projectPackage 来自项目配置文件，函数分类名来自 Step 1 分析结果（如 RINGBUFFER、push），序号每个函数分类从 T001 起（例如 BJ-ZZKZ-RINGBUFFER-T002.CTD）。**caseId 里的 T003 必须保留**，它是执行记录、快照与报告排序的依据；但不要把 testFunc 改成显示编号。
 
 生成后按 `subjectFunction` 验收：纳入测试的 10 个函数应形成 10 个函数组，每组包含该函数的拆分场景；同名异类、异文件函数不能合并。以查询面板 API 后的实际记录和组内数量为准，不仅核对聊天中的清单。没有可生成用例的函数单独说明，不用假用例凑组。
 
@@ -318,6 +322,35 @@ echo "$DSH_SESSION_ID"                                       # bash
 - 其他：按框架实际的可筛选名字
 
 `testFunc` 可以写进 `<会话资产>/cases.json` 的对应用例；面板导出时会按 `caseId` 保留它。没写时面板会按运行器声明的 `targetExtract` 从用例 `code` 里推断。
+
+**Step 3 必须一次做完定位，不要等执行或出报告：**
+
+1. 生成实际测试文件；
+2. 每条用例对应一个**独立**测试项（C++/GoogleTest 就是一条一个 `TEST(Suite, Name) {…}`，**不要**用统一注册表 + 循环跑全部用例，否则无法逐条定位与逐条取证）；
+3. 把真实注册名写进该用例的 `testFunc`；
+4. 算出该测试声明的**文件、行号、列号**，并把测试文件 SHA256 一起写进 `testLocation`：
+
+```json
+"testLocation": {"file": "<测试文件绝对路径>", "line": 42, "column": 1, "fileSha256": "<sha256>"}
+```
+
+5. 同步写进面板记录与 `cases.json`（两边都要）；
+6. 写完后**立即可用**「查看测试代码」：不需要先执行、不需要先生成 Word。
+
+C++ 例：
+
+```cpp
+TEST(OrderAddLineTest, AddLine_ZeroQuantityThrows) {
+    // 本条用例的测试代码
+}
+```
+
+若确实用参数化测试（`TEST_P` / `INSTANTIATE_TEST_SUITE_P`），必须保证：每个参数实例有独立 `caseId`、可筛选的 `testFunc`、能定位到该实例对应的数据行，且执行结果能逐条对应；做不到就改回一条用例一个声明。
+
+定位规则（面板侧）：优先用已验证的 `testLocation`（文件 SHA256 仍一致且该行确实是目标声明）；失败时用 `testFunc` + 运行器的 `targetDeclare` 重新定位并回写；仍找不到就明确报「测试映射已失效」。**禁止**回退到文件第 1 行、注册表、映射表或被测源码。
+
+
+缺 `testLocation` 时面板只能靠 `testFunc` 重新定位；连 `testFunc` 都对不上就会直接报「测试映射已失效」，这条用例点「查看测试代码」会失败（不会静默跳到第 1 行）。所以 Step 3 必须把位置写完整。
 
 **写完测试代码后核对目标关联，再进入人工审查：**
 
@@ -565,10 +598,12 @@ if (-not (Test-Path -LiteralPath $template -PathType Leaf)) {
 | 项 | 值 |
 | --- | --- |
 | 报告文件 | `reports/<runId>/<项目名>-测试报告.docx` |
+| 测试范围与排除 | `reports/<runId>/attachments/<项目名>-测试报告-测试范围与排除.docx`（**独立附件**；报告 3.4 节只写规模摘要 + 本文件路径。放 attachments/ 子目录，避免被面板当成正式报告） |
 | 覆盖 runId | `<runId>`（只含这一次真实执行） |
 | 报告摘要 | 人员 <designer/reviewer/tester>；阶段 <n> 个；用例 <N> 条（通过 <p>/失败 <f>） |
 | 中间文件 | `report-data.json`、`report-plan.json`、`report-notes.json`（同目录） |
 | 一致性核对 | <未发现明显差异 / 逐条 caseId 差异 / 未能确认> |
+> 「测试范围与排除」不再写进报告正文：3.4 节只写一行规模摘要（扫描/纳入/排除个数）加附件路径，逐文件明细、排除理由与探针证据全在附件里。`cmd.py` 会在标准输出回显 `测试范围与排除：<路径>`，引用这个实际路径，不要自己拼。
 
 **B. 已知问题**（有才写）
 
@@ -586,7 +621,9 @@ if (-not (Test-Path -LiteralPath $template -PathType Leaf)) {
 ```json
 {
   "caseId": "GN-<projectPackage>-<函数分类名>-T001.CTD",
-  "title": "T001",
+  "sequence": "T001",
+  // 从生成时就写「函数短名-中文测试类型」；同一函数同类型多条可以同名，唯一性靠 caseId。
+  "title": "calculateDiscount-边界测试",
   "testType": "functional|api|boundary|logic|performance",
   "testTypes": ["functional"],
   "description": "测试说明",
@@ -597,6 +634,8 @@ if (-not (Test-Path -LiteralPath $template -PathType Leaf)) {
   "codeRef": "测试文件绝对路径#L行号",
   "code": "测试代码内容",
   "testFunc": "测试函数名或测试名",
+  // Step 3 写好的真实声明位置；跳转与报告都读它，不要再从 codeRef 猜行号。
+  "testLocation": {"file": "测试文件绝对路径", "line": 42, "column": 1, "fileSha256": "…"},
   "subjectFunction": "src/order.ts::Order.calculateDiscount",
   "status": "pending"
 }
