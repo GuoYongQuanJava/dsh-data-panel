@@ -6583,7 +6583,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 					"## 硬性约束",
 					"- **测试代码是内部产物**：面板、API、报告里只出现步骤，不出现测试函数名、代码片段、codeRef。",
 					"- 步骤格式：{ no, action, operation, expected, target, channel }。",
-					"  channel 说明这一步走哪条通道：界面操作用 cua，跑测试代码用 runner。",
+					"  channel 说明这一步走哪条通道：runner=调工装测试函数（主力），cmd=构建门/环境检查，uia=读控件树断言界面（仅必须时）。",
 					"- 本次新建一个步骤版本，**不要覆盖已有版本**；旧版本保留。",
 					"- 步骤版本要记 sourceCaseVersion = " + version + "。",
 					"- 强度测试不做。",
@@ -7004,7 +7004,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 				}
 				var typeLabel = (IT_TYPES[record.type] && IT_TYPES[record.type].label) || record.type || "—";
 				var promptSteps = steps.map(function (item) {
-					var channel = item.channel === "cua" ? "界面操作（CUA）" : (item.channel === "runner" ? "测试代码（runner）" : "未标注");
+					var channel = item.channel === "runner" ? "测试函数（runner）" : (item.channel === "cmd" ? "命令步骤（cmd）" : (item.channel === "uia" ? "界面断言（uia）" : (item.channel === "cua" ? "界面操作（历史 cua）" : "未标注")));
 					return [
 						"  第 " + (item.no || 0) + " 步",
 						"    动作：" + (item.action || "—"),
@@ -7032,13 +7032,12 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 					"",
 					"## 执行要求",
 					"1. 严格按上面列出的步骤执行，**只认步骤版本冻结的用例快照**，不读当前用例版本。",
-					"2. 标注为界面操作（CUA）的步骤，自己直接调 mcp__cua__* 工具执行，不要回来问我。",
-					"3. 标注为测试代码（runner）的步骤，走 run_tests.py。",
-					"4. 这是**单步执行**：结果写到测试步骤页这条用例的子表里，",
+					"2. 按步骤的 channel 执行：runner=调工装测试函数走 run_tests.py，cmd=跑构建门/环境检查，uia=用 UI Automation 读控件树断言界面。自己直接执行，不要回来问我。",
+					"3. 这是**单步执行**：结果写到测试步骤页这条用例的子表里，",
 					"   **不产生报告版本、不进测试报告页**。",
 					"   （每次执行对这条用例只追加一条执行记录。）",
 					"",
-					"5. **执行记录必须标 source = \"step\"**（表示这是单步执行）。",
+					"4. **执行记录必须标 source = \"step\"**（表示这是单步执行）。",
 					"   面板靠它区分：单步记录只留在步骤页子表，**不会出现在测试报告页**。",
 					"   记录字段：{ runId, at, result, durationMs, source }。",
 					"",
@@ -7095,12 +7094,11 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 					"",
 					"## 执行要求",
 					"1. 严格按步骤版本执行，**只认 cases.snapshot.json 冻结的用例**，不读当前用例版本。",
-					"2. 功能测试（functional）走 CUA 桌面 MCP（mcp__cua__*），自己直接调用，不要回来问我。",
-					"3. 其余类型走 run_tests.py。两条通道并存是正常的，分别记录、分别标来源。",
-					"4. 执行记录要挂到测试步骤页主表每一行下面的子表里（每次一键执行对每条用例只加一条）。",
+					"2. 按步骤的 channel 执行：runner=调工装测试函数走 run_tests.py，cmd=跑构建门/环境检查，uia=用 UI Automation 读控件树断言界面。自己直接执行，三种并存是正常的，分别记录、分别标来源。",
+					"3. 执行记录要挂到测试步骤页主表每一行下面的子表里（每次一键执行对每条用例只加一条）。",
 					"   **每条记录必须标 source = \"all\"**（表示这是一键执行），否则报告页看不到它：",
 					"   面板靠 source 区分「单步执行（step，只在步骤页）」和「一键执行（all，进报告页）」。",
-					"5. 报告分两类，**排版方式完全不同，不要混用**（见下「报告要出什么」）。",
+					"4. 报告分两类，**排版方式完全不同，不要混用**（见下「报告要出什么」）。",
 					"",
 					"## ★ 报告要出什么（两类，别混淆）",
 					"",
