@@ -53,15 +53,37 @@ const complete = { runId: 'new', status: 'passed', finishedAt: '2026-11-17T00:00
 const active = { ...complete, status: 'running', finishedAt: '' }
 const ids = h => Array.from(h.runs, run => run.runId)
 
-test('执行等待期间读取旧记录一次，不监听会话也不启动轮询', async () => {
+test('执行等待期间：只读一次历史，不起会话订阅，只挂一个有界自动刷新定时器', async () => {
   const h = harness(); h.render()
   assert.equal(h.requests.length, 1)
   assert.equal(h.listeners.size, 0)
-  assert.equal(h.timers.size, 0)
+  // 改造成：执行结束后自动刷新，所以等待期间会有一个（且只有一个）轮询定时器；
+  // 它不是无上限轮询，也不监听对话。
+  assert.equal(h.timers.size, 1)
   await h.answer([complete, old])
+  // 这次 run 还没落盘（pendingRunId='new' 不在结果里）→ 旧记录照常展示。
   assert.deepEqual(ids(h), ['old'])
   h.render()
   assert.equal(h.requests.length, 0)
+  h.dispose()
+})
+
+test('轮询看到这次 run 已结束就自动刷新一次并停掉定时器', async () => {
+  const h = harness(); h.render()
+  const [timer] = Array.from(h.timers)
+  assert.ok(timer)
+  await h.answer([active, old])
+  assert.deepEqual(ids(h), ['old'])
+  // 模拟 3 秒后轮询：这次 run 已完成。
+  // 模拟 3 秒后轮询：这次 run 已经结束。
+  timer()
+  await h.answer([complete, old])
+  // 结束后自动重读一次记录（reloadTick +1 触发上面的读取 effect）。
+  h.render()
+  await h.answer([complete, old])
+  assert.deepEqual(ids(h), ['new', 'old'])
+  // 定时器被清掉，不会持续轮询。
+  assert.equal(h.timers.size, 0)
   h.dispose()
 })
 

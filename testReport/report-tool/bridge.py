@@ -4,7 +4,8 @@ v2 变化：
 - 按阶段（phase）→ 函数（function）→ 用例（case）组织，替代旧的 modules（按测试类型）
 - 新增 provenance、scope、coverage、reviews、issues、consistency、regressions 顶层字段
 - 覆盖率标签修正：行 -L（旧版错误地用了 -S），语句 -S，分支 -B，块 -BK
-- 阶段划分：按被测函数随机分配到 3-4 个阶段，用例数尽量平衡（贪心）
+- 阶段划分：函数按**冻结用例里的首次出现顺序**连续分段（确定性）；旧版随机计划（planVersion<2）丢弃重建
+- 报告顺序：functionOrder → sequenceNumber（数字比较）→ caseId；同一函数连续、函数内 T001→T002→T003
 
 用法:
     python bridge.py --cases <会话>/cases.json \
@@ -26,7 +27,6 @@ v2 变化：
 import argparse
 import hashlib
 import json
-import random
 import re
 import sys
 import xml.etree.ElementTree as ET
@@ -48,7 +48,8 @@ TYPE_MAP = {
     "性能测试": "性能测试",
 }
 
-BRIDGE_VERSION = "2.0.0"
+# 2.1.0：确定性阶段计划（planVersion 2）+ 全类型变量取值 + 输入输出分栅 + 字段完整性统计。
+BRIDGE_VERSION = "2.1.0"
 COVERAGE_UNAVAILABLE = "未采集"
 
 STATUS_TEXT = {
@@ -144,16 +145,51 @@ def build_test_index(result: dict) -> tuple:
     return by_id, by_func
 
 
+def display_value(value: object) -> str:
+    """把任意 JSON 值转成报告里的显示文本。
+
+    规则（与 Skill 约定一致）：字符串用原值；数字转十进制文本；布尔 true/false；
+    null 写 null；数组/对象用 JSON 文本。
+
+    为什么必须在这里统一做：以前只接受字符串，输入值 0、false、null 和数组/对象会被
+    静默丢掉，报告里就变成了「未提供」—— 那是最容易失真的地方。
+    """
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, (list, dict)):
+        try:
+            return json.dumps(value, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return str(value)
+    return str(value)
+
+
 def named_values(value: object) -> list:
-    """只接受用例里明确声明的变量名和值，不从自由文本猜测。"""
+    """只接受用例里明确声明的变量名和值（不从自由文本猜测），值统一转成显示文本。"""
     if not isinstance(value, list):
         return []
-    return [[item["name"], item["value"]] for item in value
-            if isinstance(item, dict) and isinstance(item.get("name"), str)
-            and item["name"] and isinstance(item.get("value"), str)]
+    out: list = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        if "value" not in item:
+            continue
+        out.append([name, display_value(item.get("value"))])
+    return out
 
 
 def actual_outputs(case: dict, evidence: dict | None) -> list:
+
+
     """构建 [[name, expected, actual], ...] 输出变量列表。"""
     expected = named_values(case.get("expectedOutputs"))
     values = evidence.get("actualOutputs") if isinstance(evidence, dict) else None
@@ -162,12 +198,13 @@ def actual_outputs(case: dict, evidence: dict | None) -> list:
     if isinstance(values, list):
         actual_map = {name: value for name, value in named_values(values)}
     elif isinstance(values, dict):
-        actual_map = {name: value for name, value in values.items()
-                      if isinstance(name, str) and isinstance(value, str)}
+        actual_map = {name: display_value(value) for name, value in values.items()
+                      if isinstance(name, str)}
     # 旧 ACTUAL 标记只是一条未命名原始值；仅当用例明确只有一个输出变量时才能对应。
     if len(expected) == 1 and expected[0][0] not in actual_map and evidence and isinstance(evidence.get("actual"), str):
         actual_map = {**actual_map, expected[0][0]: evidence["actual"]}
-    return [[name, wanted, actual_map[name] if isinstance(actual_map.get(name), str) else "未采集"]
+    # 实际输出缺失就写「未采集」：那是缺失项，不能用手填值或预期值冒充。
+    return [[name, wanted, actual_map.get(name, "未采集")]
             for name, wanted in expected]
 
 
@@ -327,100 +364,123 @@ def group_cases_by_function(cases: list) -> dict:
     return groups
 
 
-def generate_phase_plan(function_groups: dict, phase_count: int, seed: int) -> dict:
-    """贪心算法：把函数（按用例数降序）轮流分到用例数最少的阶段。
+# 阶段计划版本：1 = 旧版（随机阶段），2 = 确定性排序。旧版本一律丢弃重建。
+PHASE_PLAN_VERSION = 2
 
-    function_groups: {functionName: [case, ...], ...}
-    phase_count: 目标阶段数
-    seed: 随机种子（用于确定 phase_count 和函数排序内的平局）
+_SEQUENCE_RE = re.compile(r"-T(\d+)", re.IGNORECASE)
+
+
+def case_sequence_number(case: dict) -> int:
+    """用例在函数内的数字序号：优先 `sequence` 字段（T003），其次 caseId 里的 `-T003`。
+
+    必须按**数字**比较：字符串排序会把 T010 排到 T002 前面。
+    解不出来返回 0（排在可解析的后面，最终仍用 caseId 兜底）。
     """
-    rng = random.Random(seed)
+    raw = str(case.get("sequence") or "").strip()
+    match = re.fullmatch(r"[Tt]?(\d+)", raw) if raw else None
+    if match is None:
+        match = _SEQUENCE_RE.search(str(case.get("caseId") or ""))
+    if match is None:
+        return 0
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return 0
 
-    # 按用例数降序排列；用例数相同时按函数名字典序（稳定）
-    sorted_funcs = sorted(
-        function_groups.items(),
-        key=lambda kv: (-len(kv[1]), kv[0])
+
+def sort_function_cases(cases: list) -> list:
+    """函数内排序：sequenceNumber（数字）→ caseId。"""
+    return sorted(cases, key=lambda case: (case_sequence_number(case), str(case.get("caseId") or "")))
+
+
+def ordered_functions(function_groups: dict) -> list:
+    """函数顺序：显式 functionOrder → 冻结用例里的首次出现顺序。"""
+    entries = list(function_groups.items())
+    explicit_any = any(
+        isinstance(case.get("functionOrder"), int)
+        for cases in function_groups.values()
+        for case in cases
     )
+    if not explicit_any:
+        # dict 保留插入顺序 = 用例在快照里第一次出现的顺序，直接用它。
+        return [name for name, _ in entries]
 
-    # 初始化阶段
+    def key(pair):
+        _name, cases = pair
+        explicit = min(
+            (case["functionOrder"] for case in cases if isinstance(case.get("functionOrder"), int)),
+            default=None,
+        )
+        # 没有显式顺序的排后面，但仍按首次出现顺序（sorted 稳定）。
+        return (0, explicit) if explicit is not None else (1, 0)
+
+    return [name for name, _ in sorted(entries, key=key)]
+
+
+def build_phase_plan(function_groups: dict) -> dict:
+    """确定性阶段计划：函数连续分段，绝不把同一个函数拆到多个 Sprint。
+
+    旧实现按用例数贪心装桶 + 随机 seed，导致同一份快照两次生成报告顺序不同。
+    现在只依赖冻结用例的首次出现顺序，结果完全可复现。
+    """
+    names = ordered_functions(function_groups)
+    count = len(names)
+    if count <= 4:
+        phase_count = 1
+    else:
+        # 与模板“Sprint1..3”一致，且完全确定。
+        phase_count = min(3, count)
+    chunks: list[list[str]] = [[] for _ in range(phase_count)]
+    for index, name in enumerate(names):
+        chunk = min(index * phase_count // max(count, 1), phase_count - 1)
+        chunks[chunk].append(name)
     phases = [
-        {"case_count": 0, "functions": []}
-        for _ in range(phase_count)
+        {
+            "phaseId": f"phase-{i + 1}",
+            "name": f"Sprint{i + 1}",
+            "order": i + 1,
+            "functionIds": chunk,
+        }
+        for i, chunk in enumerate(chunks)
+        if chunk
     ]
-
-    for func_name, func_cases in sorted_funcs:
-        # 找到当前用例数最少的阶段；平局时随机打破
-        min_count = min(p["case_count"] for p in phases)
-        candidates = [i for i, p in enumerate(phases) if p["case_count"] == min_count]
-        chosen = candidates[0] if len(candidates) == 1 else rng.choice(candidates)
-        phases[chosen]["case_count"] += len(func_cases)
-        phases[chosen]["functions"].append(func_name)
-
     return {
         "schemaVersion": "2.0",
+        "planVersion": PHASE_PLAN_VERSION,
         "generatedAt": datetime.now(timezone.utc).isoformat(),
-        "seed": seed,
-        "phaseCount": phase_count,
-        "phases": [
-            {
-                "phaseId": f"phase-{i + 1}",
-                "name": f"Sprint{i + 1}",
-                "order": i + 1,
-                "functionIds": phases[i]["functions"],
-            }
-            for i in range(phase_count)
-            if phases[i]["functions"]  # 跳过空阶段
-        ],
+        "phaseCount": len(phases),
+        # 冻结函数顺序：下次只有它没变时才复用这份计划。
+        "functionOrder": names,
+        "phases": phases,
     }
 
 
 def load_or_create_phase_plan(
     function_groups: dict, run_path: Path, session_root: Path
 ) -> tuple:
-    """加载已有的 report-plan.json，不存在则生成新的。
+    """加载或生成阶段计划（确定性）。
 
-    返回 (plan_dict, plan_path, seed)。
-    保存到 reports/<runId>/report-plan.json。
+    复用条件：planVersion 匹配且冻结的函数顺序没变。旧版随机计划（planVersion<2）、
+    函数集合变化的计划，一律丢弃重建 —— 旧随机结果不得继续控制新报告。
+    返回 (plan_dict, plan_path, plan_version)。
     """
     run_id = run_path.parent.name
     plan_dir = session_root / "reports" / run_id
     plan_path = plan_dir / "report-plan.json"
+    names = ordered_functions(function_groups)
 
     if plan_path.is_file():
         try:
             plan = json.loads(plan_path.read_text(encoding="utf-8"))
-            seed = plan.get("seed", 0)
-            # 旧版计划里的阶段名是「第N阶段」，统一成客户模板要求的 SprintN（不改阶段分配）
-            changed = False
-            for item in plan.get("phases") or []:
-                name = str(item.get("name") or "")
-                if name.startswith("第") and name.endswith("阶段"):
-                    item["name"] = f"Sprint{item.get('order') or 0}"
-                    changed = True
-            if changed:
-                plan_path.write_text(
-                    json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
-            return plan, plan_path, seed
+            if plan.get("planVersion") == PHASE_PLAN_VERSION and plan.get("functionOrder") == names:
+                return plan, plan_path, PHASE_PLAN_VERSION
         except Exception:
-            pass  # 损坏了就重新生成
+            pass  # 损坏了就重建
 
-    # 生成新的
-    func_count = len(function_groups)
-    if func_count <= 1:
-        phase_count = 1
-    elif func_count == 2:
-        phase_count = 2
-    else:
-        rng = random.Random()
-        phase_count = rng.randint(3, min(4, func_count))
-
-    seed = random.randint(0, 2**31 - 1)
-    plan = generate_phase_plan(function_groups, phase_count, seed)
-
+    plan = build_phase_plan(function_groups)
     plan_dir.mkdir(parents=True, exist_ok=True)
     plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    return plan, plan_path, seed
+    return plan, plan_path, PHASE_PLAN_VERSION
 
 
 
@@ -667,7 +727,7 @@ def main() -> int:
         print(f"   函数级覆盖率：读到 {len(function_coverage)} 个函数别名")
 
     # ── 加载或生成阶段计划 ──
-    phase_plan, plan_path, plan_seed = load_or_create_phase_plan(
+    phase_plan, plan_path, plan_version = load_or_create_phase_plan(
         function_groups, run_path, session_root
     )
 
@@ -694,6 +754,15 @@ def main() -> int:
 
     # 收集所有 sourceFile
     source_files: list[str] = []
+    # 字段完整性统计：缺结构化输入/预期/实际各多少条，多少条被误写进测试说明。
+    # 报告可以出，但必须把这些缺失项明明白白列出来，不能静默错位。
+    completeness = {
+        "total": 0,
+        "missingInputs": 0,
+        "missingOutputs": 0,
+        "missingActual": 0,
+        "leakedIntoDescription": 0,
+    }
 
     for func_name, func_cases in function_groups.items():
         phase_order = func_to_phase.get(func_name, last_order)
@@ -709,7 +778,8 @@ def main() -> int:
         cases_out = []
         func_total = func_passed = func_failed = func_not_run = func_unconfirmed = 0
 
-        for case in func_cases:
+        # 函数内按 sequenceNumber（数字）→ caseId 排序：T001 → T002 → T003，不能按字符串排。
+        for case in sort_function_cases(func_cases):
             case_id = str(case.get("caseId") or "")
             test_func = str(case.get("testFunc") or "")
             func_total += 1
@@ -749,33 +819,59 @@ def main() -> int:
             else:
                 func_not_run += 1
 
-            # 构建输入/输出
-            inputs = named_values(case.get("inputVariables"))
+            # ── 输入 / 预期 / 实际：各放各自的表格列，绝不塞进测试说明 ──
+            structured_inputs = named_values(case.get("inputVariables"))
+            structured_outputs = named_values(case.get("expectedOutputs"))
+            inputs = list(structured_inputs)
             outputs = actual_outputs(case, evidence if case_id in executed and status != "notRun" else None)
             if status == "notRun":
                 for output in outputs:
                     output[2] = "未执行"
 
-            notes = [str(case.get("description") or "")]
-            if not inputs and case.get("input"):
-                notes.append("输入条件（原始记录）：" + str(case["input"]))
-            if not outputs and case.get("expected"):
-                notes.append("预期结果（原始记录）：" + str(case["expected"]))
-            if not outputs and evidence and evidence.get("actual") and status != "notRun":
-                notes.append("实际输出（原始记录）：" + str(evidence["actual"]))
+            raw_input = str(case.get("input") or "").strip()
+            raw_expected = str(case.get("expected") or "").strip()
+            if not inputs and raw_input:
+                # 缺结构化输入：原始输入进「输入」栅，不追加到测试说明。
+                inputs = [["原始输入", raw_input]]
+            if not outputs and raw_expected:
+                outputs = [["预期结果", raw_expected, "未执行" if status == "notRun" else "未采集"]]
+            elif not outputs and evidence and evidence.get("actual") and status != "notRun":
+                outputs = [["实际输出", "", display_value(evidence["actual"])]]
+            # 有原始实际输出但没有结构化变量：填进同一行的「实际输出」列，而不是写进说明。
+            if status != "notRun" and isinstance(evidence, dict) and evidence.get("actual"):
+                if len(outputs) == 1 and outputs[0][0] == "预期结果" and outputs[0][2] == "未采集":
+                    outputs[0][2] = display_value(evidence["actual"])
+
             # 额外实际输出：新格式为 [{name,value}] 列表，旧格式为字典，两种都兼容
             actual_extra = evidence.get("actualOutputs") if isinstance(evidence, dict) else None
             if status != "notRun" and actual_extra:
                 if isinstance(actual_extra, list):
                     extra_pairs = named_values(actual_extra)
                 elif isinstance(actual_extra, dict):
-                    extra_pairs = [(k, v) for k, v in actual_extra.items() if isinstance(v, str)]
+                    extra_pairs = [[name, display_value(value)] for name, value in actual_extra.items()
+                                   if isinstance(name, str)]
                 else:
                     extra_pairs = []
-                extra_actuals = {name: value for name, value in extra_pairs
-                                 if name not in {output[0] for output in outputs}}
-                if extra_actuals:
-                    notes.append("其他实际输出（运行记录）：" + json.dumps(extra_actuals, ensure_ascii=False))
+                known_names = {output[0] for output in outputs}
+                for name, value in extra_pairs:
+                    if name not in known_names:
+                        outputs.append([name, "", value])
+
+            # 测试说明只放场景说明：输入 / 预期 / 实际一律不进这里。
+            notes = [str(case.get("description") or "")]
+
+            # ── 字段完整性统计：报告要能明确列出缺失项，而不是静默错位 ──
+            completeness["total"] += 1
+            if not structured_inputs:
+                completeness["missingInputs"] += 1
+            if not structured_outputs:
+                completeness["missingOutputs"] += 1
+            if any(len(output) >= 3 and output[2] in ("未采集", "未执行") for output in outputs):
+                completeness["missingActual"] += 1
+            if any(token in "\n".join(notes) for token in (
+                "输入条件（原始记录）", "预期结果（原始记录）", "其他实际输出（运行记录）",
+            )):
+                completeness["leakedIntoDescription"] += 1
 
             # 测试类型
             raw_type = case.get("testType", "")
@@ -804,6 +900,9 @@ def main() -> int:
 
             cases_out.append({
                 "id": case_id,
+                # 函数内编号（T001）：Word 里与名称分开显示，排序也靠它。
+                "sequence": str(case.get("sequence") or ""),
+                "sequenceNumber": case_sequence_number(case),
                 "name": case.get("title", case_id),
                 "type": ctype,
                 "description": "\n".join(part for part in notes if part) or "未提供测试说明",
@@ -947,7 +1046,7 @@ def main() -> int:
             "casesSnapshot": compute_sha256(cases_path) if cases_path.is_file() else "不可用",
             "resultSource": str(run_path.resolve()),
             "phasePlanGenerated": phase_plan.get("generatedAt", ""),
-            "phasePlanSeed": plan_seed,
+            "phasePlanVersion": plan_version,
             "bridgeVersion": BRIDGE_VERSION,
         },
         "scope": {
@@ -972,6 +1071,9 @@ def main() -> int:
             "skipRate": round(not_run_count / total * 100, 1) if total > 0 else 0.0,
             "totalDurationMs": result.get("durationMs", 0),
         },
+        # 字段完整性统计：缺结构化输入/预期/实际多少条、被误写进说明多少条。
+        # 报告可以出，但必须把这些缺失项列出来（不能静默错位）。
+        "completeness": completeness,
         "phases": phase_list,
         "coverage": build_coverage_object(result),
         "reviews": {
@@ -1023,6 +1125,11 @@ def main() -> int:
     print(f"   runId={run_id} status={STATUS_TEXT.get(overall_status, overall_status)}")
     print(f"   phases={len(phase_list)}  functions={len(function_groups)}  cases={total}  "
           f"passed={passed}  failed={failed}  notRun={not_run_count}  unconfirmed={unconfirmed}")
+    if completeness["missingInputs"] or completeness["missingOutputs"] or completeness["missingActual"]:
+        print(f"   字段完整性：用例 {completeness['total']} 条；缺结构化输入 {completeness['missingInputs']}；"
+              f"缺结构化预期输出 {completeness['missingOutputs']}；"
+              f"缺实际输出 {completeness['missingActual']}；"
+              f"被错误写入测试说明 {completeness['leakedIntoDescription']}")
     if result.get("note"):
         print(f"   注意：{result['note']}")
     for phase in phase_list:

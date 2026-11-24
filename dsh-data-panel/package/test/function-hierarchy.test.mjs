@@ -15,7 +15,8 @@ test('双类型兼容旧主类型，限制无效/过多类型，修改主类型�
   const saved = api.normalizePatch({ ...base, testTypes: ['functional', 'api', 'api'] }, base)
   assert.deepEqual(saved.testTypes, ['functional', 'api'])
   assert.equal(saved.testType, 'functional')
-  assert.deepEqual(api.normalizePatch({ ...base, title: 'T001' }, saved).testTypes, ['functional', 'api'])
+  // 纯编号（T001）已不再接受；标题由「被测函数+类型」派生，这里只验证类型合并。
+  assert.deepEqual(api.normalizePatch({ ...base, title: '边界输入' }, saved).testTypes, ['functional', 'api'])
   assert.deepEqual(api.normalizePatch({ ...base, testType: 'boundary' }, base).testTypes, ['boundary'])
   assert.deepEqual(api.normalizePatch({ ...base, testTypes: ['functional'] }, saved).testTypes, ['functional'])
   assert.throws(() => api.normalizePatch({ ...base, testTypes: ['functional', 'api', 'boundary'] }, base), /最多选择两种/)

@@ -1,8 +1,9 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -59,8 +60,32 @@ async function makeProject(count) {
   return { root, sessionId, reports, out, paths }
 }
 
+// 默认优先 DSH 自带 Python：PATH 上的 `python` 可能是 2.7，既没 python-docx 也没有 UTF-8 管道。
+// 注意用 homedir 而不用 DSH_HOME：文件开头已经把 DSH_HOME 指向临时目录了。
+const BUNDLED_PYTHON = join(
+  homedir(), '.dsh', 'dsh-runtimes', 'dsh-primary-runtime', 'dependencies', 'python',
+  process.platform === 'win32' ? 'python.exe' : 'python3',
+)
+const PYTHON = (() => {
+  const explicit = (process.env.DSH_PYTHON_PATH || '').trim()
+  if (explicit !== '') return explicit
+  return existsSync(BUNDLED_PYTHON) ? BUNDLED_PYTHON : 'python'
+})()
+// 本用例把 DSH_HOME 指到了临时目录，插件内部的 resolveTool('python') 因此找不到 DSH 自带运行时，
+// 会回落到 PATH（本机是 Python 2.7）—— 显式告诉插件用哪个 Python，导出/合并才能真跑起来。
+process.env.DSH_PYTHON_PATH = PYTHON
+/**
+ * 子进程统一用 UTF-8 管道：Windows 上 Python 默认按控制台代码页（cp936）写 stderr，
+ * 直接用 utf8 解码会得到乱码，断言 /用法/ 会假失败。
+ */
+const PYTHON_ENV = { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' }
+
+function runMerge(args) {
+  return spawnSync(PYTHON, args, { encoding: 'utf8', env: PYTHON_ENV })
+}
+
 async function hasPython() {
-  const r = spawnSync(process.env.DSH_PYTHON_PATH || 'python', ['-c', 'import docx'], { encoding: 'utf8' })
+  const r = runMerge(['-c', 'import docx'])
   return r.status === 0
 }
 
@@ -111,11 +136,7 @@ test('合并脚本本身：表数正确、标题只出现一次、表间有分�
   const { paths, out } = await makeProject(3)
   const target = join(out, 'merged.docx')
 
-  const result = spawnSync(
-    process.env.DSH_PYTHON_PATH || 'python',
-    [MERGE_SCRIPT, '--template', TEMPLATE, '--out', target, ...paths],
-    { encoding: 'utf8' },
-  )
+  const result = runMerge([MERGE_SCRIPT, '--template', TEMPLATE, '--out', target, ...paths])
   assert.equal(result.status, 0, result.stderr)
   assert.match(result.stdout, /^OK /)
 
@@ -138,15 +159,17 @@ print('adjacent=' + str(sum(1 for i in range(len(seq)-1) if seq[i] == 'tbl' and 
 `
   const probeFile = join(out, 'probe.py')
   await writeFile(probeFile, probe, 'utf8')
-  const outText = execFileSync(process.env.DSH_PYTHON_PATH || 'python', [probeFile, target], { encoding: 'utf8' })
+  const outText = execFileSync(PYTHON, [probeFile, target],
+    { encoding: 'utf8', env: PYTHON_ENV })
   assert.match(outText, /tbl=3/, '应有 3 张表')
   assert.match(outText, /pb=2/, '3 张表之间应有 2 个分页符')
   assert.match(outText, /title=1/, '文档标题只能出现一次')
   assert.match(outText, /adjacent=0/, '相邻表格之间必须有段落，否则 Word 会并成一张表')
 })
 
-test('合并脚本拒绝空输入', async () => {
-  const r = spawnSync(process.env.DSH_PYTHON_PATH || 'python', [MERGE_SCRIPT, '--template', TEMPLATE, '--out', join(tmpdir(), 'x.docx')], { encoding: 'utf8' })
+test('合并脚本拒绝空输入', async (t) => {
+  if (!(await hasPython())) return t.skip('缺少 python-docx')
+  const r = runMerge([MERGE_SCRIPT, '--template', TEMPLATE, '--out', join(tmpdir(), 'x.docx')])
   assert.notEqual(r.status, 0)
   assert.match(r.stderr, /用法/)
 })

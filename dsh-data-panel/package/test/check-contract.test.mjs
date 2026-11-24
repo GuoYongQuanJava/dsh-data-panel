@@ -5,12 +5,20 @@ import { mkdir, mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { __test } from '../lib/index.js'
 
 const SCRIPT = fileURLToPath(new URL('../assets/report/check_contract.py', import.meta.url))
-const PY = process.env.DSH_PYTHON_PATH || 'python'
+// 与面板实际执行链路使用同一套 Python 解析规则，避免 Windows 上 PATH 里的
+// 旧版 Python 2 抢在 DSH 自带 Python 3 之前，导致契约脚本连中文源码都无法解析。
+const PY = __test.pythonPath()
 
 function run(root) {
-  const r = spawnSync(PY, [SCRIPT, '--root', root], { encoding: 'utf8' })
+  const r = spawnSync(PY, [SCRIPT, '--root', root], {
+    encoding: 'utf8',
+    // Windows 下 Python 输出到管道时可能沿用 GBK；测试按 UTF-8 解码会得到乱码，
+    // 进而让所有中文契约断言误失败。固定子进程输出编码即可。
+    env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
+  })
   return { status: r.status, out: (r.stdout || '') + (r.stderr || '') }
 }
 

@@ -215,16 +215,32 @@ $py '<插件>/skills/cpp-test/make_vs_coverage_config.py' `
 3. **不要先用 vsinstr 插桩**。旧版动态采集直接跑原始可执行文件即可；
    被其他分析工具插桩过的程序可能被跳过。
 
-### 3. runner.json 选带覆盖率的 preset
+### 3. runner.json 选带覆盖率的 preset（满足条件时**必须**）
+
+**硬规则：** 语言 C/C++ + 框架 GoogleTest + Windows + 本机能找到可用的 `CodeCoverage.exe` → **第一次写 `runner.json` 就必须用 `gtest-batch-cov` + `"coverageRequired": true`**，不允许先跑一轮普通 `gtest`（或 `gtest-batch`）再等模型在后续对话里发现“没采到覆盖率”然后手改。
 
 ```json
 {
   "preset": "gtest-batch-cov",
+  "coverageRequired": true,
   "testFile": "project:tests/test_generated.cpp",
   "binary": "project:build/Debug/test_generated.exe",
   "preCommand": ["cmake", "--build", "{project}/build", "--config", "Debug"]
 }
 ```
+
+采集器先探测再用（命中即停，不写死盘符）：
+探测是**独立**做的：即使 `runner.json` 写的是普通 `gtest` / `gtest-batch`（它们不声明 `codecoverage`），面板也会自己去找采集器，找到了就直接升级成 `gtest-batch-cov` 并重新解析运行配置。不需要先跑一轮再回来改。
+
+唯一例外：`runner.json` 里显式写了 `"coverageRequired": false`，表示“本项目不采覆盖率”，面板不会自动升级（固定跑普通 gtest 时用这个开关，不要依赖本机恰好没装 VS）。
+
+
+1. `DSH_CODECOVERAGE_PATH` 显式指定；
+2. VS 实例目录（`%ProgramData%\Microsoft\VisualStudio\Packages\_Instances\*\state.json` 的 `installationPath`）下的 `Team Tools\Dynamic Code Coverage Tools\amd64\CodeCoverage.exe`；
+3. PATH；
+4. 常见安装根限深扫描 `Dynamic Code Coverage Tools`。
+
+探到了就把它当成本次**唯一指定**的覆盖率工具（绝对路径冻结进 `request.json.coveragePlan`）；探不到、或找到了但基座不完整（没有配置/没有 PDB），按下面「采不到」处理 —— **降级不硬失败**，不允许因此把整个测试跑不下去。
 
 `gtest-batch-cov` 会做两步：
 
@@ -234,6 +250,15 @@ CodeCoverage.exe analyze /output:coverage.xml run.coverage
 ```
 
 报告格式是 `vs-codecoverage-xml`（runner 已支持）。
+配置优先用项目里的 `<项目根>/testReport/coverage.config`，没有才用工具自带配置。
+
+**覆盖率目标必须等于本次执行选中的 `testFunc`**：`prepareRun` 会把本次目标数量写进 `coveragePlan.targetCount`，collect 的 `--gtest_filter` 用的就是同一批目标；不允许为单条执行采整个工程，也不允许拿别的批次的目标充数。
+
+**采不到覆盖率时**（工具不在、配置缺失、PDB 缺失、collect/analyze 非 0、报告为空）：
+
+- 测试结果照常保留，`status` 不被覆盖率影响；
+- `result.json` 会写 `coverageStatus: "failed"`，`note` 里是「测试完成、覆盖率未完成：<原因>」，报告里显示「未采集（原因）」；
+- 同一 `runId` 下会落 `coverage-attempts/attempt-01.json`；用 `run_tests.py --coverage-only` 可沿同一快照、同一批目标补采（不重跑用例、不重新生成用例与代码），补采过程追加 `attempt-02.json` 等，报告引用最终有效的那一次。
 配置优先用项目里的 `<项目根>/testReport/coverage.config`，没有才用工具自带配置。
 
 ### 4. 前置条件与产物口径

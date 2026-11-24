@@ -413,6 +413,15 @@ def validate(raw: Any, skill_meta: Optional[Dict[str, str]] = None) -> Dict[str,
         v = data.get(sec)
         if v is not None:
             result[sec] = v
+    # 字段完整性统计（bridge.py 产出）：原样透传。它是「报告里缺了什么」的声明，
+    # 不参与正文排版，但必须跟着 report-data.json 一起走，不能被 schema 默默丢掉。
+    completeness = data.get("completeness")
+    if isinstance(completeness, dict):
+        result["completeness"] = {
+            key: completeness.get(key)
+            for key in ("total", "missingInputs", "missingOutputs", "missingActual", "leakedIntoDescription")
+            if isinstance(completeness.get(key), int)
+        }
     # ── 模型分析字段（report-notes.json 合并而来），原样透传给 builder ──
     for key in ("overallAssessment", "environmentImpact", "improvements",
                 "staticItems", "staticMetrics"):

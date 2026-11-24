@@ -21,7 +21,19 @@ import { existsSync, readFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { PRESET_TOOLS, PRESETS, detectPreset, renderRunnerSpec, resolveRunner, targetDeclared, targetLine, targetOf } from './runners.js'
+import {
+  PRESET_TOOLS,
+  PRESETS,
+  describeCoveragePlan,
+  detectPreset,
+  loadProfile,
+  renderRunnerSpec,
+  resolveRunner,
+  targetDeclareLocation,
+  targetDeclared,
+  targetOf,
+  upgradeCoveragePreset,
+} from './runners.js'
 import { resolveSpecs, resolveTool, resolveTools, searchLayers } from './toolchain.js'
 import { assessScope } from './scope.js'
 import { KINDS, createVersion, integrationRoot, readAll, readIndex, readVersion, saveVersion, setActiveVersion, versionValue } from './integration-store.js'
@@ -55,10 +67,110 @@ const MAX_CODE_REF = 200
 /** 用例层级（分类）名长度上限；空串表示「默认」层级。 */
 const MAX_CATEGORY = 60
 const MAX_SUBJECT_FUNCTION = 240
+/** 真实测试名（框架注册名，如 `OrderAddLineTest.AddLine_Zero`）；跳转与执行共用。 */
+const MAX_TEST_FUNC = 200
+/** 函数内编号（T001）：只用于排序与报告，不当作 title。 */
+const MAX_SEQUENCE = 20
 /** 内置层级名：固定存在、含全部用例，不能改名/删除。 */
 const DEFAULT_CATEGORY = '默认'
 
 const TEST_TYPES = new Set(['functional', 'api', 'boundary', 'logic', 'performance'])
+
+/** 测试类型的中文名：用例标题按「函数短名 + 中文类型」生成，面板与报告共用同一份映射。 */
+const TEST_TYPE_LABELS = Object.freeze({
+  functional: '功能测试',
+  api: '接口测试',
+  boundary: '边界测试',
+  logic: '逻辑测试',
+  performance: '性能测试',
+})
+
+/** 「函数短名」长度上限，避免超长函数名把用例标题撑爆。 */
+const MAX_FUNCTION_SHORT = 80
+
+/**
+ * 从 `subjectFunction` 取函数短名。
+ *
+ * 值形如 `src/order.cpp::Order::addLine`、`Order.discount` 或 `src/pay.cpp::payable`；
+ * 取最后一段标识符（类名/文件名之后的部分），去掉参数表和扩展名。
+ * 取不到时返回空串，由调用方决定是否无法派生标准名。
+ */
+function functionShortName(subjectFunction) {
+  let text = String(subjectFunction || '').trim()
+  if (text === '') return ''
+  if (text.includes('::')) {
+    text = text.split('::').filter(Boolean).pop() || ''
+  } else {
+    // 没有 `::` 时可能是 `Order.discount`，也可能是文件路径；先去掉目录再判断。
+    text = text.split(/[\\/]/).filter(Boolean).pop() || ''
+    // `Order.discount` 是「类.方法」，`order.cpp` 是文件名：只对已知源码扩展名去后缀。
+    text = text.replace(/\.(?:c|cc|cpp|cxx|h|hpp|hxx|py|js|ts|tsx|jsx|go|rs|java|cs|rb|php|swift|kt|m|mm)$/i, '')
+  }
+  text = text.replace(/\(.*$/, '').trim()
+  const parts = text.split(/[.:>]/).filter(Boolean)
+  const name = (parts.pop() || '').trim()
+  return name.length > MAX_FUNCTION_SHORT ? name.slice(0, MAX_FUNCTION_SHORT) : name
+}
+
+/**
+ * 用例标准名：`函数短名-中文测试类型`（如 `addLine-边界测试`）。
+ *
+ * 任一侧不可确定都返回空串 —— 那种情况无法校验，也不能编一个名字出来。
+ */
+function standardCaseTitle(subjectFunction, testType) {
+  const short = functionShortName(subjectFunction)
+  const label = TEST_TYPE_LABELS[testType] || ''
+  if (short === '' || label === '') return ''
+  const title = `${short}-${label}`
+  return title.length > MAX_TITLE ? title.slice(0, MAX_TITLE) : title
+}
+
+/** 只由编号构成的标题（`T001`、`T0001`）是旧数据形态，新写入一律不接受。 */
+const CODE_LIKE_TITLE = /^T\d+$/i
+
+/**
+ * 落库前定稿用例标题。
+ *
+ * 规则：能从 subjectFunction + testType 派生时**以规则为准**（派生名即标准名，忽略传入值，
+ * 保证面板列表、执行记录、快照、报告里都是同一个名字）；派生不出来时才沿用传入值，
+ * 但仍拒绝纯编号或直接拿 caseId 当名字 —— 那等于没写名字。
+ */
+function resolveCaseTitle({ title, caseId, subjectFunction, testType }) {
+  const derived = standardCaseTitle(subjectFunction, testType)
+  if (derived !== '') return derived
+  const raw = text(title, MAX_TITLE)
+  if (raw === '') throw bad(400, '用例名称不能为空')
+  const normalizedId = text(caseId, MAX_CASE_ID)
+  if (CODE_LIKE_TITLE.test(raw) || (normalizedId !== '' && raw === normalizedId)) {
+    throw bad(
+      400,
+      `用例名称不能只用编号「${raw}」，请写成「函数名-测试类型」（如 addLine-边界测试）；`
+      + '无法确定被测函数时，先填写被测函数再保存。',
+    )
+  }
+  return raw
+}
+
+/**
+ * 测试代码声明位置：`{ file, line, column, fileSha256 }`。
+ *
+ * 只在测试代码真的生成/核对过之后写入；`fileSha256` 用来在跳转前判断文件是否已被改过。
+ * 不合法时返回 null（明确表示「没有可信位置」），而不是编一个第 1 行。
+ */
+function normalizeTestLocation(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
+  const file = text(value.file, 400)
+  if (file === '') return null
+  const line = Number.isInteger(value.line) && value.line > 0 ? value.line : 0
+  const column = Number.isInteger(value.column) && value.column > 0 ? value.column : 1
+  const rawSha = typeof value.fileSha256 === 'string' ? value.fileSha256.trim().toLowerCase() : ''
+  return {
+    file,
+    line,
+    column,
+    fileSha256: /^[0-9a-f]{64}$/.test(rawSha) ? rawSha : '',
+  }
+}
 
 /** 会话资产（用例 / 测试代码 / 日志 / 报告）在项目内的位置。 */
 const SESSION_ASSET_DIR = join('.dsh', 'test-sessions')
@@ -251,16 +363,54 @@ function seedRecords() {
   return [];
 }
 
+/**
+ * 结构化变量值（inputVariables / expectedOutputs 的 value）。
+ *
+ * 字符串、数字、布尔、null、数组、对象都要原样保留：以前这里只收字符串，
+ * 导致 0 / false / null 在落库时就被静默丢掉，报告里只能写「未提供」。
+ * 显示转换（十进制文本 / true/false / null / JSON）交给报告侧统一处理。
+ *
+ * 返回 undefined 表示「不可保存」（undefined / 函数 / 循环引用对象）。
+ */
+function storeValue(value) {
+  if (typeof value === 'string') return value.slice(0, 2000)
+  if (typeof value === 'number' || typeof value === 'boolean') return value
+  if (value === null) return null
+  if (Array.isArray(value) || typeof value === 'object') {
+    try {
+      const json = JSON.stringify(value)
+      // 序列化不了（循环引用、BigInt 等）就不存，避免落盘后变成坏数据。
+      return typeof json === 'string' ? value : undefined
+    } catch {
+      return undefined
+    }
+  }
+  return undefined
+}
+
 function namedValues(value, valueKey) {
   if (!Array.isArray(value)) return []
   return value.slice(0, 50).flatMap((item) => {
     if (!item || typeof item !== 'object' || Array.isArray(item)) return []
     const name = text(item.name, 120)
-    if (!name || typeof item[valueKey] !== 'string') return []
-    return [{ name, [valueKey]: item[valueKey].slice(0, 2000) }]
+    if (!name) return []
+    const stored = storeValue(item[valueKey])
+    if (stored === undefined) return []
+    return [{ name, [valueKey]: stored }]
   })
 }
 
+
+/**
+ * 构造要落盘的 `testLocation` 字段。
+ *
+ * 只有位置合法（有文件、有行号）时才带上这个键；`null` 表示「没有可信位置」，
+ * 不写字段也不会伪造一个位置 —— 跳转侧会据此重新按 testFunc 定位或明确报错。
+ */
+function testLocationField(value) {
+  const location = normalizeTestLocation(value)
+  return location === null ? {} : { testLocation: location }
+}
 function normalizeStored(input) {
   if (input === null || typeof input !== 'object' || typeof input.id !== 'string' || input.id === '') return null
   return {
@@ -276,9 +426,14 @@ function normalizeStored(input) {
     expected: text(input.expected, MAX_EXPECTED),
     ...(Array.isArray(input.inputVariables) ? { inputVariables: namedValues(input.inputVariables, 'value') } : {}),
     ...(Array.isArray(input.expectedOutputs) ? { expectedOutputs: namedValues(input.expectedOutputs, 'value') } : {}),
+    // 测试代码声明位置（Step 3 生成后写入）；null/非法值不落库，绝不编造第 1 行。
+    ...testLocationField(input.testLocation),
     code: text(input.code, MAX_CODE),
     codeRef: text(input.codeRef, MAX_CODE_REF),
     subjectFunction: text(input.subjectFunction, MAX_SUBJECT_FUNCTION),
+    // 真实测试名与函数内编号：Skill 在 Step 3 写回后必须落库，不能只靠用例代码去猜。
+    testFunc: text(input.testFunc, MAX_TEST_FUNC),
+    sequence: text(input.sequence, MAX_SEQUENCE),
     // 保留旧分类数据与兼容接口，不再用于函数层级。
     category: text(input.category, MAX_CATEGORY),
     demo: input.demo === true,
@@ -295,8 +450,7 @@ function normalizeSubjectFunction(value) {
 }
 
 function normalizePatch(input, existing) {
-  const title = text(input.title, MAX_TITLE)
-  if (!title) throw bad(400, '用例名称不能为空')
+  // 标题不在这里取：它由「被测函数 + 测试类型」派生，见下方 resolveCaseTitle。
   if (!TEST_TYPES.has(input.testType)) throw bad(400, '测试类型只能是功能、接口、边界、逻辑或性能测试')
   const suppliedTypes = input.testTypes === undefined
     ? (existing?.testTypes || []).filter((type) => type !== existing?.testType || type === input.testType)
@@ -306,10 +460,24 @@ function normalizePatch(input, existing) {
   }
   const testTypes = [...new Set([input.testType, ...suppliedTypes])]
   if (testTypes.length > 2) throw bad(400, '一条用例最多选择两种测试类型；独立场景请拆分')
+  const subjectFunction = normalizeSubjectFunction(
+    input.subjectFunction === undefined ? existing?.subjectFunction : input.subjectFunction,
+  )
+  const caseId = text(input.caseId, MAX_CASE_ID)
+  // 标题由「被测函数 + 测试类型」定稿：能派生就以派生名为准，派生不出来才用传入值（仍拒绝纯编号）。
+  const title = resolveCaseTitle({
+    title: input.title,
+    caseId: caseId || existing?.caseId || '',
+    subjectFunction,
+    testType: input.testType,
+  })
   return {
     ...existing,
-    subjectFunction: normalizeSubjectFunction(input.subjectFunction === undefined ? existing?.subjectFunction : input.subjectFunction),
-    caseId: text(input.caseId, MAX_CASE_ID),
+    subjectFunction,
+    caseId,
+    // 真实测试名与函数内编号：Skill 写回后必须落库（否则跳转只能靠代码文本猜）。
+    testFunc: text(input.testFunc, MAX_TEST_FUNC),
+    sequence: text(input.sequence, MAX_SEQUENCE),
     title,
     testType: input.testType,
     testTypes,
@@ -318,6 +486,8 @@ function normalizePatch(input, existing) {
     expected: text(input.expected, MAX_EXPECTED),
     ...(Array.isArray(input.inputVariables) ? { inputVariables: namedValues(input.inputVariables, 'value') } : {}),
     ...(Array.isArray(input.expectedOutputs) ? { expectedOutputs: namedValues(input.expectedOutputs, 'value') } : {}),
+    // 测试代码声明位置（Step 3 写入）：跳转与报告都读它。
+    ...testLocationField(input.testLocation),
     code: text(input.code, MAX_CODE),
     codeRef: text(input.codeRef, MAX_CODE_REF),
     category: text(input.category, MAX_CATEGORY),
@@ -822,6 +992,10 @@ async function exportCases(store, file, runner) {
       code: record.code,
       codeRef: record.codeRef,
       subjectFunction: text(record.subjectFunction, MAX_SUBJECT_FUNCTION),
+      // 测试代码声明位置：Step 3 生成测试代码后就有值，报告与“查看测试代码”都读它。
+      ...testLocationField(record.testLocation),
+      // 函数内编号（T001）：报告排序与序号列用它；title 不再携带序号。
+      sequence: text(record.sequence, MAX_SEQUENCE),
       // 测试函数名：**当前用例代码推导优先**，推导不出才用旧值。
       // 反过来的话，把 test_old 改名成 test_new 后，仍会去跑已经不存在的 test_old。
       testFunc: testFuncOf(record, runner) || ((old && typeof old.testFunc === 'string') ? old.testFunc.trim() : ''),
@@ -962,6 +1136,29 @@ async function readSnapshotCase(root, runId, caseId) {
     return hit || null
   } catch {
     return null
+  }
+}
+
+/** `result.cases`（本次真正跑到的 caseId 列表）里是否包含这条用例。 */
+function containsCaseId(value, caseId) {
+  if (!Array.isArray(value) || caseId === '') return false
+  return value.some((item) => String(item || '') === String(caseId))
+}
+
+/**
+ * 本次 run 冻结的目标里是否包含这条用例。
+ *
+ * 为什么要读 request.json：批量执行时如果逐条结果缺失（构建失败、中断、框架没产出 JUnit），
+ * result.tests 可能是空的，但只要目标冻结过，这条用例就确实属于这次 run。
+ */
+async function runTargetsCase(root, runId, caseId) {
+  try {
+    const file = join(root, 'runs', runId, 'request.json')
+    const parsed = JSON.parse(await readFile(file, 'utf8'))
+    return Array.isArray(parsed?.targets)
+      && parsed.targets.some((item) => item && String(item.caseId || '') === String(caseId))
+  } catch {
+    return false
   }
 }
 
@@ -1115,6 +1312,47 @@ async function nearbySessionProjects(cwd, sessionId) {
   return found
 }
 
+/**
+ * 本机真的探到 VS 覆盖率工具时，把普通 gtest 运行器升级成带覆盖率的 preset。
+ *
+ * 为什么必须在「选运行器」这一步做：以前首次执行只会跑普通 gtest，覆盖率要等模型在
+ * 后续对话里发现没采到、再手改 runner.json 才采得到。现在条件满足就直接选对。
+ * 升级只换 preset（mode / command / coverage 是一整套），不改用户文件；探不到工具就保持原样，
+ * 降级而不硬失败，原因由覆盖率计划说明。
+ */
+function upgradeRunnerForCoverage({ project, root, runner }) {
+  // 采集器必须**独立探测**，不能看当前运行器声明的 tools：
+  // 普通 gtest / gtest-batch 根本没声明 codecoverage，靠它探就永远升不上去（首跑不采覆盖率的老问题）。
+  // 显式路径 DSH_CODECOVERAGE_PATH 优先，其次才是 VS 安装目录/PATH/常见目录，全部在 resolveTool 里。
+  // 显式「不采」优先：runner.json 里写了 "coverageRequired": false 就是明确关闭，不再自动升级
+  // （用户或测试要固定跑普通 gtest 时用这个开关，而不是依赖本机恰好没装 VS）。
+  let explicitOff = false
+  try {
+    const raw = loadProfile(root)
+    explicitOff = raw !== null && Object.hasOwn(raw, 'coverageRequired') && raw.coverageRequired === false
+  } catch {
+    explicitOff = false
+  }
+  if (explicitOff) return runner
+  const coverageTool = resolveTool('codecoverage', { project })
+  if (coverageTool === '') return runner
+  const upgraded = upgradeCoveragePreset({
+    presetId: runner.id,
+    language: runner.language,
+    tools: { codecoverage: coverageTool },
+  })
+  if (upgraded === '') return runner
+  try {
+    const profile = loadProfile(root)
+    const next = resolveRunner({ project, root, profile: { ...(profile || {}), preset: upgraded } })
+    // 既然本机有采集器，本次就按「必须采」执行：采不到要明确报未完成，而不是静默当成功。
+    return { ...next, coverageRequired: true }
+  } catch {
+    // 升级解析失败不阻断执行：保留原运行器，覆盖率计划里会写明原因。
+    return runner
+  }
+}
+
 /** 查看代码与执行准备共用同一个项目和运行器选择规则。 */
 async function resolveProjectRunner({ sessionId, cwd, scope, caseId, store }) {
   const preferred = resolve(cwd)
@@ -1123,7 +1361,8 @@ async function resolveProjectRunner({ sessionId, cwd, scope, caseId, store }) {
   const examine = (project) => {
     const root = sessionAssetRoot(project, sessionId)
     try {
-      const runner = resolveRunner({ project, root })
+      const base = resolveRunner({ project, root })
+      const runner = upgradeRunnerForCoverage({ project, root, runner: base })
       if (!existsSyncSafe(runner.testFile)) throw new Error(`预期测试文件不存在：${runner.testFile}。请检查 runner.json 的 testFile。`)
       return { project, root, runner }
     } catch (error) {
@@ -1159,7 +1398,49 @@ async function resolveProjectRunner({ sessionId, cwd, scope, caseId, store }) {
   throw bad(400, lastError instanceof Error ? lastError.message : '无法识别本会话的测试框架')
 }
 
-/** 与执行准备使用同一运行器来定位真实测试文件和目标。只读，不导出或改写用例。 */
+/**
+ * 判断某一行是不是目标测试声明。
+ *
+ * 用运行器自己的 targetDeclare 判定，而不是「名字在本行出现过」：后者会把注册表、
+ * 映射表、注释、字符串里的名字都当成命中，跳过去就是假的。
+ */
+function rowDeclaresTarget(row, target, runner) {
+  if (!row || !target || !runner || !runner.targetDeclare) return false
+  const escape = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const replacement = runner.targetDotted
+    ? String(target).split('.').map((part) => escape(part)).join('\\s*,\\s*')
+    : escape(target)
+  const pattern = runner.targetDeclare.split('{target}').join(replacement)
+  try {
+    return new RegExp(pattern).test(row)
+  } catch {
+    return false
+  }
+}
+
+/** 比较两个路径是否指向同一个文件（Windows 不区分大小写）。 */
+function sameFileStrict(left, right) {
+  const normalize = (value) => {
+    const raw = String(value || '').trim()
+    if (raw === '') return ''
+    const full = resolve(raw)
+    return process.platform === 'win32' ? full.toLowerCase() : full
+  }
+  const a = normalize(left)
+  return a !== '' && a === normalize(right)
+}
+
+/**
+ * 定位「查看测试代码」要打开的真实测试声明。
+ *
+ * 优先级（不跳级、不兜底）：
+ *   ① 用例上已验证的 `testLocation` —— 同一文件且 SHA256 未变、行号仍指向真实声明；
+ *   ② 用 `testFunc` + 运行器的 `targetDeclare` 在真实测试文件里重新定位；
+ *   ③ 以上都失败 → 明确报「测试映射已失效」。
+ *
+ * 绝不回退到测试文件第 1 行、注册表、映射表或被测源码：那会让用户以为定位成功了。
+ * 重新定位成功而旧位置已失效时，把新位置写回该用例（报告与下次跳转都受益）。
+ */
 async function resolveTestCode({ sessionId, cwd, caseId, store }) {
   const record = store.records.find((item) => item.caseId === caseId && item.demo !== true)
   if (!record) throw bad(404, `本会话找不到用例 ${caseId}`)
@@ -1168,20 +1449,91 @@ async function resolveTestCode({ sessionId, cwd, caseId, store }) {
     throw bad(400, `预期测试文件不存在：${runner.testFile}。请检查 runner.json 的 testFile。`)
   }
   const target = testFuncOf(record, runner) || await savedTestFunc(root, caseId)
-  if (!target) throw bad(400, `用例 ${caseId} 未关联测试函数或测试名，请补充 testFunc。`)
-  const testText = await readFile(runner.testFile, 'utf8')
-  if (!targetDeclared(testText, target, runner)) {
-    throw bad(400, `测试文件 ${runner.testFile} 中找不到目标 ${target}。请核对用例与测试代码的关联。`)
+  const testBytes = await readFile(runner.testFile)
+  const testFileSha256 = createHash('sha256').update(testBytes).digest('hex')
+  const testText = testBytes.toString('utf8')
+
+  // ── ① 已验证的位置 ──
+  const stored = normalizeTestLocation(record.testLocation)
+  let location = null
+  let locatedBy = ''
+  if (stored !== null && stored.line > 0 && sameFileStrict(stored.file, runner.testFile)) {
+    const fresh = stored.fileSha256 === '' || stored.fileSha256 === testFileSha256
+    const row = testText.split('\n')[stored.line - 1] || ''
+    if (fresh && rowDeclaresTarget(row, target, runner)) {
+      location = { line: stored.line, column: stored.column || 1 }
+      locatedBy = 'testLocation'
+    }
   }
-  const line = targetLine(testText, target, runner) || 1
+
+  // ── ② 按 testFunc 重新定位（不兜底到第 1 行） ──
+  if (location === null) {
+    if (target === '') {
+      throw bad(400, `用例 ${caseId} 未关联测试函数或测试名，请补充 testFunc。`)
+    }
+    if (!targetDeclared(testText, target, runner)) {
+      throw bad(
+        400,
+        `测试映射已失效：${runner.testFile} 里找不到测试声明 ${target}。`
+        + '请重新生成测试代码（Step 3），或核对用例的 testFunc。',
+      )
+    }
+    location = targetDeclareLocation(testText, target, runner)
+    if (location === null) {
+      throw bad(
+        400,
+        `测试映射已失效：能匹配声明规则但定位不到 ${target} 的具体行。请重新生成测试代码。`,
+      )
+    }
+    locatedBy = 'testFunc'
+  }
+
+  // 位置变了就写回用例：下次直接命中 ①，报告也能引用。写失败不影响本次跳转。
+  const moved = stored === null
+    || stored.line !== location.line
+    || stored.column !== (location.column || 1)
+    || stored.fileSha256 !== testFileSha256
+  if (moved) {
+    try {
+      await serial(async () => {
+        const next = await readStore(sessionId)
+        const index = next.records.findIndex((item) => item.id === record.id)
+        if (index === -1) return
+        const previous = next.records[index]
+        next.records[index] = {
+          ...previous,
+          testLocation: {
+            file: runner.testFile,
+            line: location.line,
+            column: location.column || 1,
+            fileSha256: testFileSha256,
+          },
+          // 不改 updatedAt：刷新一个跳转位置不应该把用例顶到列表最前。
+          updatedAt: previous.updatedAt,
+        }
+        await persist(next.records, next.seeded, sessionId, next.categories)
+      })
+    } catch {
+      // 写回失败不影响定位结果。
+    }
+  }
+
   const refPath = String(record.codeRef || '').trim().replace(/#L\d+(?:[-~]\d+)?$/, '').replace(/:\d+(?::\d+)?$/, '')
   const refFile = refPath ? (isAbsolute(refPath) ? resolve(refPath) : resolve(project, refPath)) : ''
   return {
     caseId,
     testFile: runner.testFile,
     testFunc: target,
-    line,
-    warning: refFile && refFile !== runner.testFile
+    line: location.line,
+    column: location.column || 1,
+    locatedBy,
+    testLocation: {
+      file: runner.testFile,
+      line: location.line,
+      column: location.column || 1,
+      fileSha256: testFileSha256,
+    },
+    warning: refFile && !sameFileStrict(refFile, runner.testFile)
       ? `原 codeRef 指向 ${refPath}；已按实际测试文件打开。`
       : '',
   }
@@ -1200,6 +1552,41 @@ async function handleTestCode(req, res) {
     send(res, Number.isInteger(error?.status) ? error.status : 500,
       { ok: false, error: error instanceof Error ? error.message : '服务内部错误' })
   }
+}
+
+/**
+ * 组装覆盖率计划，并把「东西齐不齐」检查集中在这里。
+ *
+ * 检查项：采集器、配置文件、测试程序、PDB。缺东西不让准备直接失败（否则本来能跑的项目
+ * 会完全跑不动），而是把 available 置 false 并给出原因：执行仍会跑测试，结果标为
+ * 「测试完成、覆盖率未完成」。
+ */
+function buildCoveragePlan({ runner, coverage, tools, targetCount }) {
+  const plan = describeCoveragePlan({
+    coverage,
+    tools,
+    targetCount,
+    required: runner.coverageRequired === true,
+    presetId: runner.id,
+  })
+  if (!plan.available) return plan
+  const problems = []
+  const configFile = String(plan.configFile || '')
+  if (configFile === '' || !existsSyncSafe(configFile)) {
+    problems.push(`覆盖率配置文件不存在或不可读：${configFile || '未配置'}`)
+  }
+  const binary = String(runner.binary || '')
+  if (binary !== '' && !existsSyncSafe(binary)) {
+    problems.push(`测试程序不存在：${binary}（构建后再执行）`)
+  } else if (binary !== '' && !existsSyncSafe(binary.replace(/\.exe$/i, '.pdb'))) {
+    problems.push(`测试程序缺少 PDB：${binary.replace(/\.exe$/i, '.pdb')}（无 PDB 时 VS 覆盖率拿不到函数级数据）`)
+  }
+  if (String(plan.format || '') === 'vs-codecoverage-xml' && (!plan.tool || !plan.tool.path)) {
+    problems.push('覆盖率格式是 VS CodeCoverage XML，但本机没探到可用的 CodeCoverage.exe')
+  }
+  if (problems.length === 0) return { ...plan, warnings: [] }
+  // 计划不完整：保留已经冻结的路径与命令（便于排查），但明确标不可用。
+  return { ...plan, available: false, reason: problems[0], warnings: problems }
 }
 
 async function prepareRun({ sessionId, cwd, scope, caseId, caseIds, store }) {
@@ -1332,6 +1719,13 @@ async function prepareRun({ sessionId, cwd, scope, caseId, caseIds, store }) {
     runDir,
     tools: toolStatus.resolved,
   })
+  // ── 覆盖率计划：首跑就在准备阶段冻结，写进 request.json 供 runner 与报告共用 ──
+  const coveragePlan = buildCoveragePlan({
+    runner,
+    coverage: runnerSpec.coverage,
+    tools: toolStatus.resolved,
+    targetCount: targets.length,
+  })
   // 冻结本次输入：执行与报告都只看 snapshot/ 里的副本。
   const request = {
     runId,
@@ -1353,6 +1747,8 @@ async function prepareRun({ sessionId, cwd, scope, caseId, caseIds, store }) {
     targets,
     notRun,
     runner: runnerSpec,
+    // 覆盖率采集计划（工具 / 配置 / 原始 .coverage / 导出 XML / 目标数 / 实际命令）。
+    coveragePlan,
     createdAt: new Date().toISOString(),
   }
   await writeTextFile(join(runDir, 'request.json'), JSON.stringify(request, null, 2))
@@ -1381,6 +1777,7 @@ async function prepareRun({ sessionId, cwd, scope, caseId, caseIds, store }) {
     notRun,
     framework: runner.label,
     frameworkId: runner.id,
+    coveragePlan,
     runnerMode: runner.mode,
     scopeWarnings: testScope.warnings,
     language: runner.language,
@@ -1489,44 +1886,73 @@ async function handleRunList(req, res) {
         if (run.result === null) continue
         // 同一个 runId 可能在多个资产根里都能看到，只取一份。
         if (seen.has(run.runId)) continue
+        const result = run.result
+        const tests = Array.isArray(result.tests) ? result.tests : []
+        // ── 这条用例是否属于本次 run ──
+        // 单条（case）、执行选中（cases）、全部执行（all）都要纳入。判定顺序：
+        //   ① result.tests[].caseId  ② result.cases  ③ request.json targets[].caseId
+        //   ④ 本次快照的 cases.json
+        // 只有真实包含这条用例的 run 才生成记录；不属于的整条跳过。
         if (query.scope === 'case') {
-          // 单条用例的执行记录只收单条执行；批量执行只在工具栏的总报告 / 总日志里看。
-          if (run.result.scope !== 'case') continue
-          if (String(run.result.caseId || '') !== caseId) continue
-        } else if (run.result.scope === 'case') {
+          const belongs = tests.some((item) => item && String(item.caseId || '') === caseId)
+            || containsCaseId(result.cases, caseId)
+            || await runTargetsCase(root, run.runId, caseId)
+            || (await readSnapshotCase(root, run.runId, caseId)) !== null
+          if (!belongs) continue
+        } else if (result.scope === 'case') {
           continue
         }
         seen.add(run.runId)
-        const result = run.result
-        const tests = Array.isArray(result.tests) ? result.tests : []
-        const matchingTest = query.scope === 'case'
-          ? tests.find((item) => item && String(item.caseId || '') === caseId)
+        const matchingTest = tests.find((item) => item && String(item.caseId || '') === caseId) || null
+        // 逐条证据优先。找不到这条用例的逐条结果时**不得**用整体运行状态代替：
+        // 整体通过不等于这条通过（可能压根没跑），统一记 unknown（面板显示「未确认」）。
+        const notRunEntry = Array.isArray(result.notRun)
+          ? result.notRun.find((item) => item && String(item.caseId || '') === caseId) || null
           : null
-        const caseOutcome = matchingTest && typeof matchingTest.outcome === 'string'
-          ? matchingTest.outcome
-          : (result.status === 'passed' ? 'passed' : 'failed')
+        let caseOutcome = ''
+        if (matchingTest && typeof matchingTest.outcome === 'string') {
+          caseOutcome = matchingTest.outcome
+        } else if (query.scope === 'case') {
+          caseOutcome = 'unknown'
+        } else {
+          // 工具栏的总记录列表不是“某条用例”的记录，这里才允许用整体状态。
+          caseOutcome = result.status === 'passed' ? 'passed' : 'failed'
+        }
+        const caseMessage = matchingTest && typeof matchingTest.message === 'string'
+          ? matchingTest.message
+          : (notRunEntry && typeof notRunEntry.reason === 'string' ? notRunEntry.reason : '')
+        // 耗时也只看这条用例自己的；没有逐条证据时写 0，不拿整个 run 的时间充数。
         const caseDuration = matchingTest && typeof matchingTest.durationMs === 'number'
           ? matchingTest.durationMs
-          : (typeof result.durationMs === 'number' ? result.durationMs : 0)
-        // 输入 / 预期输出取“那次执行冻结的快照”，不是用例当前值。
-        const snapshotCase = query.scope === 'case'
-          ? await readSnapshotCase(root, run.runId, caseId)
-          : null
+          : (query.scope === 'case' ? 0 : (typeof result.durationMs === 'number' ? result.durationMs : 0))
+        // 输入 / 预期输出取“那次执行冻结的快照”，不是用例当前值；批量 run 也一样。
+        const snapshotCase = await readSnapshotCase(root, run.runId, caseId)
+        const actualOutputs = matchingTest && Array.isArray(matchingTest.actualOutputs)
+          ? matchingTest.actualOutputs
+            .filter((item) => item && typeof item === 'object' && typeof item.name === 'string')
+            .map((item) => ({ name: item.name, value: item.value }))
+          : []
         runs.push({
           runId: run.runId,
+          caseId,
+          // 这条记录是哪一种执行产生的：单条 / 选中多选 / 全部。
+          source: result.scope === 'case' ? 'case' : result.scope === 'cases' ? 'cases' : 'all',
           // 只回传列表需要的摘要字段；完整结果仍走 /result，避免列表过重。
           status: typeof result.status === 'string' ? result.status : '',
           passed: typeof result.passed === 'number' ? result.passed : 0,
           failed: typeof result.failed === 'number' ? result.failed : 0,
           errors: typeof result.errors === 'number' ? result.errors : 0,
           skipped: typeof result.skipped === 'number' ? result.skipped : 0,
+          outcome: caseOutcome,
           caseOutcome,
-          message: matchingTest && typeof matchingTest.message === 'string' ? matchingTest.message : '',
+          testFunc: matchingTest && typeof matchingTest.func === 'string' ? matchingTest.func : '',
+          message: caseMessage,
           actual: matchingTest && typeof matchingTest.actual === 'string' ? matchingTest.actual : '',
+          actualOutputs,
           // 执行当时的输入 / 预期输出（快照冻结值）。
           input: snapshotCase && typeof snapshotCase.input === 'string' ? snapshotCase.input : '',
           expected: snapshotCase && typeof snapshotCase.expected === 'string' ? snapshotCase.expected : '',
-          durationMs: query.scope === 'case' ? caseDuration : (typeof result.durationMs === 'number' ? result.durationMs : 0),
+          durationMs: caseDuration,
           startedAt: typeof result.startedAt === 'string' ? result.startedAt : '',
           finishedAt: typeof result.finishedAt === 'string' ? result.finishedAt : '',
           note: typeof result.note === 'string' ? result.note : '',

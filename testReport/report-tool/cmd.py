@@ -17,7 +17,7 @@ import json
 import sys
 from pathlib import Path
 
-from builder import BuilderError, build
+from builder import BuilderError, build, scope_document_path
 from schema import SchemaError
 
 
@@ -76,6 +76,12 @@ def main(argv: list = None):
         default="report.docx",
         type=Path,
         help="output .docx path（默认 report.docx）",
+    )
+    parser.add_argument(
+        "--scope-out",
+        default=None,
+        type=Path,
+        help="「测试范围与排除」附件文档路径（默认写到报告同目录的 attachments/<报告名>-测试范围与排除.docx）",
     )
     parser.add_argument(
         "--no-toc-refresh",
@@ -219,8 +225,14 @@ def main(argv: list = None):
             out_path=str(args.out.resolve()),
             skill_path=str(args.skill) if args.skill else None,
             refresh_toc=not args.no_toc_refresh,
+            scope_out=str(args.scope_out.resolve()) if args.scope_out else None,
         )
         print(f"报告已生成：{out_path}")
+        # 「测试范围与排除」是独立附件：报告 3.4 只引用它，这里把路径回显给调用方。
+        scope_path = scope_document_path(args.out.resolve(),
+                                        str(args.scope_out.resolve()) if args.scope_out else None)
+        if scope_path.is_file():
+            print(f"测试范围与排除：{scope_path}")
     except SchemaError as exc:
         print(f"输入数据不符合约定：{exc}", file=sys.stderr)
         sys.exit(2)

@@ -521,8 +521,10 @@ function stringMap(value, field) {
  * @returns 规范化后的描述；`testFile` 已是绝对路径。
  * @throws 没有可用运行器、或 runner.json 不合法时，抛出带中文说明的 Error。
  */
-export function resolveRunner({ project, root }) {
-  const profile = loadProfile(root)
+export function resolveRunner({ project, root, profile: profileOverride }) {
+  // `profile` 允许调用方传入覆盖值（例如把普通 gtest 升级成带覆盖率的 preset），
+  // 不传就读会话资产目录里的 runner.json。
+  const profile = profileOverride === undefined ? loadProfile(root) : profileOverride
   let presetId = ''
   if (profile !== null) {
     if (profile.preset !== undefined) {
@@ -642,6 +644,9 @@ export function resolveRunner({ project, root }) {
     tools: toolSpecs(merged.tools, 'tools'),
     // 覆盖率采集（可选）：一条命令 + 一个报告文件 + 解析格式。没有就是“不采集”。
     coverage: normalizeCoverage(merged.coverage),
+    // 覆盖率是否“必须”：true 时首跑就得采（有 VS 采集器时不允许静默跑普通 gtest），
+    // 采不到要报“测试完成、覆盖率未完成”，而不当作完整成功。
+    coverageRequired: merged.coverageRequired === true,
     source: profile !== null ? 'runner.json' : (`auto:${presetId}`),
   }
 }
@@ -706,6 +711,34 @@ export function targetLine(testText, target, runner) {
   }
 }
 
+/**
+ * 目标声明在测试文件里的准确位置：`{ line, column }`；定位不到返回 `null`。
+ *
+ * 与 `targetLine` 的区别：这里**没有**「0 / 第 1 行」这种兜底值。调用方必须把 null
+ * 当成「测试映射已失效」处理（提示重新生成或核对 testFunc），不能静默跳到文件开头、
+ * 注册表或被测源码 —— 那会让「查看测试代码」变成一个假动作。
+ */
+export function targetDeclareLocation(testText, target, runner) {
+  const line = targetLine(testText, target, runner)
+  if (!line) return null
+  const rows = String(testText ?? '').split('\n')
+  const row = rows[line - 1] || ''
+  let column = 1
+  if (runner && runner.targetDeclare) {
+    const replacement = runner.targetDotted
+      ? String(target).split('.').map((part) => escapeRegExp(part)).join('\\s*,\\s*')
+      : escapeRegExp(target)
+    const pattern = runner.targetDeclare.split('{target}').join(replacement)
+    try {
+      const match = new RegExp(pattern).exec(row)
+      if (match) column = match.index + 1
+    } catch {
+      column = 1
+    }
+  }
+  return { line, column }
+}
+
 export function targetDeclared(testText, target, runner) {
   if (!runner.targetDeclare) return true
   const replacement = runner.targetDotted
@@ -728,6 +761,81 @@ function fillPlaceholders(value, ctx) {
 
 function fillList(list, ctx) {
   return list.map((item) => fillPlaceholders(item, ctx))
+}
+
+/**
+ * 能「首跑就采覆盖率」的组合：普通 gtest preset → 带覆盖率的 batch preset。
+ *
+ * 只对 Windows + C++ 生效：VS CodeCoverage.exe 只在 Windows 上有。
+ */
+const AUTO_COVERAGE_PRESETS = Object.freeze({
+  gtest: 'gtest-batch-cov',
+  'gtest-batch': 'gtest-batch-cov',
+})
+
+/**
+ * 按「本机真的有什么」决定首跑用哪个 preset。
+ *
+ * 这是「第一次跑就能采到覆盖率」的确定性规则：不再靠模型在后续对话里发现并改
+ * runner.json。条件全部满足才升级，否则返回空串（保持原 preset，不硬失败）：
+ * 语言 cpp + 平台 win32 + 本机探到可用的 VS CodeCoverage.exe。
+ */
+export function upgradeCoveragePreset({ presetId, language, platform, tools }) {
+  const target = AUTO_COVERAGE_PRESETS[String(presetId || '')] || ''
+  if (target === '') return ''
+  if (String(language || '').toLowerCase() !== 'cpp') return ''
+  if (String(platform || process.platform) !== 'win32') return ''
+  const exe = tools && typeof tools.codecoverage === 'string' ? tools.codecoverage.trim() : ''
+  return exe === '' ? '' : target
+}
+
+/**
+ * 把渲染好的覆盖率配置摘成「准备阶段就能看懂的覆盖率计划」。
+ *
+ * 冻结内容：用的工具、配置文件、原始 `.coverage`、导出 XML、本次目标数量、实际命令。
+ * 不在这里做文件存在性检查（那是宿主的事），只保证字段齐全且语义明确。
+ *
+ * `available=false` 不代表执行失败：没采集器时降级为「测试完成、覆盖率未完成」，
+ * 由 required 和 reason 告诉用户差什么。
+ */
+export function describeCoveragePlan({ coverage, tools, targetCount, required, presetId }) {
+  const requiredFlag = required === true
+  const exe = tools && typeof tools.codecoverage === 'string' ? tools.codecoverage.trim() : ''
+  if (!coverage) {
+    return {
+      presetId: String(presetId || ''),
+      required: requiredFlag,
+      available: false,
+      source: 'none',
+      tool: null,
+      configFile: '',
+      rawFile: '',
+      reportFile: '',
+      format: '',
+      targetCount: Number.isInteger(targetCount) ? targetCount : 0,
+      command: [],
+      postCommand: [],
+      reason: requiredFlag
+        ? '本次要求采集覆盖率，但当前运行器没有覆盖率配置（runner.coverage 为空）。'
+        : '当前运行器不采集覆盖率。',
+    }
+  }
+  const usesVs = String(coverage.format || '') === 'vs-codecoverage-xml'
+  return {
+    presetId: String(presetId || ''),
+    required: requiredFlag,
+    available: true,
+    source: usesVs ? 'vs-codecoverage' : 'runner.json',
+    tool: usesVs && exe !== '' ? { id: 'codecoverage', path: exe } : null,
+    configFile: String(coverage.configFile || ''),
+    rawFile: String(coverage.rawFile || ''),
+    reportFile: String(coverage.file || ''),
+    format: String(coverage.format || ''),
+    targetCount: Number.isInteger(targetCount) ? targetCount : 0,
+    command: [...(coverage.command || [])],
+    postCommand: [...(coverage.postCommand || [])],
+    reason: '',
+  }
 }
 
 /**
@@ -839,6 +947,8 @@ export function renderRunnerSpec(runner, ctx) {
     binary,
     preCommand: renderedPreCommand,
     coverage,
+    // 覆盖率是否“必须”：runner 用它区分「采不到就报未完成」与「不采也无所谓」。
+    coverageRequired: runner.coverageRequired === true,
     source: runner.source || '',
   }
 }
