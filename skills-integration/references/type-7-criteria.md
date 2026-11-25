@@ -1,6 +1,15 @@
 # 7 类判定标准
 
-Step 2 生成用例时阅读。**枚举固定，不能自造类型。**
+**Step 1 生成用例前必读**——`type` 字段就是在这里决定的。
+**只在 Step 2（人工审查）复查分布，不要等到那时才想类型。**
+
+> ⚠️ **历史坑（2026-11-24 实测）**：本文件以前写的是「Step 2 生成用例时阅读」，
+> 但**生成用例发生在 Step 1，Step 2 只是人工审查**。于是模型整个 Step 1
+> 都没读本文件，手上只有主 Skill 一句「`type` 是 7 类之一」，
+> 结果**所有用例都是 `functional`**，`api` / `security` / `boundary` / `margin` 全为 0。
+> 光有枚举、没有「每类去哪找」的推导路径，模型不可能自动分出六类。
+
+**枚举固定，不能自造类型。**
 
 ```js
 functional   / 功能测试
@@ -11,6 +20,82 @@ stress       / 强度测试   ← 本轮不测，禁止生成
 security     / 安全性测试
 margin       / 余量测试
 ```
+
+## ★★ 五类用例从源码哪里挖（**这是「用例生成少」的真正解法**）
+
+**光给枚举没用。** 功能测试靠读业务流程就能写出来，但 `api` / `security` / `boundary` /
+`performance` / `margin` 这五类**在源码里有固定的富矿位置**，不按位置去挖就永远挖不到。
+生成用例前，逐类按下面的线索在源码里搜一遍，**每类都要给出「查到什么 / 出了几条用例 / 为什么是 0」**。
+
+> **硬要求**：五类里任何一类最终是 0 条，必须在 `coverage.json` 里写
+> **可复核的理由**（指明搜了哪里、为什么本系统不涉及），不许不声不响地跳过。
+> 理由写法与 `excluded[]` 同级别要求。
+
+### `api` / 接口测试 —— 挖「端点清单」
+
+| 去哪找 | 具体线索 |
+|---|---|
+| 后端路由表 | Spring：`@GetMapping` / `@PostMapping` / `@RequestMapping`；Express：`router.get` / `app.post`；.NET：`[HttpGet]` / `[Route]` / `MapGet`；Flask：`@app.route` |
+| 前端调用点 | `axios.get/post`、`fetch(`、`request(`、API 封装目录（`api/` / `services/`） |
+| 契约文件 | `openapi.yaml` / `swagger.json` / `*.proto` / `*.graphql` |
+| 文档 | 接口文档、Postman 集合（`.json`） |
+
+**做法**：**先把端点逐个列出来**（`METHOD /path` 一行一个），再逐条决定
+「出接口用例 / 归到功能用例里一起验 / 排除并写理由」。
+**不许只看几个显眼的端点就开始写。** 列出总数，汇报时给 `已出用例 X / 端点总数 N`。
+
+**典型该出的 `api` 用例**：必填字段缺失、类型错误、错误码与文案、分页参数越界、
+幂等性（重复提交）、HTTP 状态码与业务码是否一致。
+
+### `security` / 安全性测试 —— 挖「鉴权与信任边界」
+
+| 去哪找 | 具体线索 |
+|---|---|
+| 鉴权中间件 / 过滤器 | `[Authorize]`、`UseAuthentication`、`@PreAuthorize`、`middleware/auth`、`jwt`、`session`、拦截器配置 |
+| 权限注解 / 角色判断 | `HasRole`、`isAdmin`、`role ===`、`permission`、`@RequiresPermissions` |
+| 信任边界的输入 | 拼接 SQL 的地方（`+ "WHERE"`、`f"SELECT"`、`string.Format`）、`exec(`、`eval(`、反序列化入口 |
+| 敏感数据 | 日志里打印密码/token、返回值里带 `password` / `salt` / `idCard` / 完整手机号 |
+| 配置 | CORS 是否 `*`、cookie 是否 `HttpOnly`/`Secure`、默认口令、硬编码密钥 |
+
+**典型该出的 `security` 用例**：未登录访问受保护端点、横向越权（A 用户读 B 用户数据）、
+纵向越权（普通用户调后台接口）、注入尝试、敏感字段是否泄露、token 失效后是否拒绝。
+**几乎每个有登录/权限的系统都至少该有几条 —— 一条都没有基本可以判定是漏了。**
+
+### `boundary` / 边界测试 —— 挖「字段约束」
+
+| 去哪找 | 具体线索 |
+|---|---|
+| DTO / 入参校验注解 | `@NotNull` / `@Size` / `@Length` / `@Max` / `@Min` / `@Pattern` / `[Required]` / `[StringLength]` / `[Range]` |
+| 数据库列定义 | 建表 SQL / migration / Entity 里的 `NVARCHAR(n)`、`DECIMAL(p,s)`、`NOT NULL`、`UNIQUE` |
+| 枚举与状态机 | 枚举类取值个数、状态流转的合法迁移表 |
+| 分页 / 上传 | `pageSize` 上限、文件大小上限、超时秒数 |
+
+**做法**：**把有长度/范围约束的字段列出来**，每个字段至少考虑「边界值 / 越界值 / 空值」三档。
+**字段清单就是边界用例的来源，不是凭感觉想几个。**
+
+### `performance` / 性能测试 —— 挖「有没有明确指标」
+
+| 去哪找 | 具体线索 |
+|---|---|
+| 需求 / 合同里的 SLA | 「响应时间 ≤ 2s」「支持 100 并发」 |
+| 超时与重试配置 | `timeout`、`maxRetries`、`circuitBreaker`、`HttpClient.Timeout` |
+| 索引与慢查询 | 慢查询日志、缺失索引提示、`EXPLAIN` |
+| 已有压测脚本 | `jmeter` / `k6` / `locust` / `wrk` / `benchmark` |
+
+**没有可判定指标就不要生成**。本类允许为 0，但要在 `coverage.json` 写「本项目无书面性能指标」。
+
+### `margin` / 余量测试 —— 挖「承载上限配置」
+
+| 去哪找 | 具体线索 |
+|---|---|
+| 连接池 | `MaximumPoolSize`、`maxPoolSize`、`connectionLimit`、`Max Pool Size=` |
+| 队列 / 缓存 | `queue` 容量、`maxmemory`、`bufferSize`、`channel` 深度 |
+| 速率 / 限流 | `RateLimit`、`QPS`、`threadPool` 核心数与最大数、`maxConcurrent` |
+| 线程 / 进程 | `MaxDegreeOfParallelism`、worker 数 |
+
+**判据**：配置里这个上限值是真实存在的 → 有测的余地；全是框架默认值且没人关心 → 排除要写理由。
+
+---
 
 ## 先分清最容易混的三组
 

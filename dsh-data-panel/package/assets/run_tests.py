@@ -1097,6 +1097,30 @@ def main() -> int:
             return finish(3, "timeout", f"超过 {timeout_sec} 秒")
         if run["interrupted"]:
             return finish(130, "interrupted", "执行被中断")
+
+        # ★ 真实输出缺失告警（2026-11-24 事故的守门）
+        # 通过的步骤如果一条 ACTUAL 都没打印，报告里「实际测试结果」列
+        # 只能是空的（显示「未记录实际值」）。以前这里静默，执行者根本不知道，
+        # 于是有人用「断言全部通过（接口返回与落库字段均符合预期）」这类
+        # 固定话术去填 —— 243 步里 180 步一模一样，验收方无法判断测了什么。
+        # 这里明确吼一声，让人在生成报告前就回去补 ACTUAL 打印。
+        passed_no_actual = [
+            item for item in result["tests"]
+            if item.get("outcome") == "passed" and not (item.get("actual") or "").strip()
+        ]
+        if passed_no_actual:
+            say("")
+            say("[告警] %d 条通过的用例没有打印 ACTUAL 标记，报告里它们的"
+                "「实际测试结果」会是空的。" % len(passed_no_actual))
+            say("       请让测试代码在断言前后打印真实返回值：")
+            say('       print(f"ACTUAL[{case_id}]: {value!r}")   # Python')
+            say('       console.log(`ACTUAL[${caseId}]:`, JSON.stringify(value))  # JS')
+            say("       不要用「断言全部通过」这类固定话术代替真实数据。")
+            result["actualMissing"] = [
+                {"caseId": item.get("caseId") or "", "func": item.get("func") or ""}
+                for item in passed_no_actual
+            ]
+
         code = run["code"]
         result["command"] = argv
         if code == 0:

@@ -706,6 +706,14 @@ window.__ModuleLoader__.load({
 /* 已筛选提示条：一条浅蓝底 + 可点的「清除筛选」，放在表格上方 */
 .it-filter-bar { display: flex; align-items: center; gap: 10px; margin-bottom: 9px; padding: 7px 11px; border-radius: 8px; background: color-mix(in srgb, var(--dp-brand) 9%, transparent); color: var(--dp-text); font-size: 12.5px; }
 .it-filter-bar b { color: var(--dp-brand); font-weight: 600; }
+/*
+ * 步骤孤岛提示：steps.json 有步骤、但没有一条能挂到用例上。
+ * 用警示黄，和「筛选条」的品牌蓝区分开 —— 这是数据问题，不是筛选状态。
+ */
+.it-orphan-hint { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 9px; padding: 9px 11px; border: 1px solid color-mix(in srgb, var(--dp-warning) 40%, transparent); border-radius: 8px; background: color-mix(in srgb, var(--dp-warning) 10%, transparent); color: var(--dp-text2); font-size: 12px; line-height: 1.65; }
+.it-orphan-hint b { color: var(--dp-warning); font-weight: 650; }
+.it-orphan-hint code { padding: 1px 5px; border-radius: 4px; background: var(--dp-bg3); color: var(--dp-text); font-size: 11.5px; }
+.it-orphan-icon { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; width: 16px; height: 16px; margin-top: 2px; border-radius: 50%; background: var(--dp-warning); color: var(--dp-bg); font-size: 11px; font-weight: 700; }
 /* 主表上方的小工具条：左边说明标签，右边「筛选」，整行浅底以便和表格分开 */
 .it-subbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 9px; padding: 6px 4px 6px 10px; border-radius: 9px; background: var(--dp-bg2); }
 .it-subbar-label { color: var(--dp-text2); font-size: 12.5px; font-weight: 600; }
@@ -6110,6 +6118,14 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			var stepPageState = useState(1);
 			var stepPage = stepPageState[0];
 			var setStepPage = stepPageState[1];
+			/*
+			 * 步骤孤岛：steps.json 里有步骤、但没有任何用例的 caseId 与之匹配。
+			 * { count: 孤岛步骤数, sample: 前几个对不上的 caseId }
+			 * 只用于步骤页顶部提示，不参与业务判断。
+			 */
+			var stepOrphanState = useState({ count: 0, sample: [] });
+			var stepOrphan = stepOrphanState[0];
+			var setStepOrphan = stepOrphanState[1];
 			var reportPageState = useState(1);
 			var reportPage = reportPageState[0];
 			var setReportPage = reportPageState[1];
@@ -6399,6 +6415,32 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 							});
 						})();
 						var list = normalizeCaseList(rawList, featureName, stepByCaseId, execByCaseId);
+						/*
+						 * ★ 步骤孤岛检测：steps.json 里有步骤，但一条都挂不到用例上。
+						 *
+						 * 最典型的成因是 caseId 前缀与步骤版本对不上：
+						 *   用例 V0_0_1-IT-001，步骤却写成 V0_0_01-IT-001 / V0.0.1-IT-001 / V1-IT-001
+						 * 面板按 caseId 精确匹配，对不上就是「步骤页该行『输入步骤』『预期结果』
+						 * 两列全是破折号」，而且**不报任何错** —— 用户只会以为是模型没生成步骤，
+						 * 回头重新生成一遍，问题照样存在。
+						 *
+						 * 这里把「有步骤但一条都对不上」算出来，交给步骤页顶部提示，
+						 * 让用户一眼看到真实原因（而不是去猜）。
+						 */
+						var orphanStepCount = 0;
+						var orphanSample = [];
+						var caseIds = new Set();
+						(Array.isArray(rawList) ? rawList : []).forEach(function (item) {
+							if (item && typeof item.caseId === "string" && item.caseId !== "") caseIds.add(item.caseId);
+						});
+						Object.keys(stepByCaseId).forEach(function (caseId) {
+							var arr = Array.isArray(stepByCaseId[caseId]) ? stepByCaseId[caseId] : [];
+							if (arr.length === 0) return;
+							if (caseIds.has(caseId)) return;
+							orphanStepCount += arr.length;
+							if (orphanSample.length < 3) orphanSample.push(caseId);
+						});
+						setStepOrphan({ count: orphanStepCount, sample: orphanSample });
 						setRemote({ kinds: kinds, features: features });
 						/*
 						 * 显式功能项清单进状态：侧栏的「新建功能项」要往这份清单里加，
@@ -7339,16 +7381,22 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 					"",
 					"### ★ 报告版本号：必须向面板要，不许自己写死（用户踩过的坑）",
 					"",
-					"**每次一键执行都要新建一个报告版本**，第二次执行是 V0.0.2、第三次 V0.0.3……",
+					"**每次一键执行都要新建一个报告版本，而且只新建一次。**",
+					"第 1 次执行 = V0.0.1，第 2 次 = V0.0.2，第 3 次 = V0.0.3……",
 					"绝不能在脚本里写死 `V0.0.1`，也绝不能整体覆盖 `report-versions/index.json`。",
-					"**必须**在生成报告之前，先向面板要版本号：",
+					"**必须在生成报告之前，向面板要版本号，且一次一键执行只调一次：**",
 					"",
 					"```",
 					"POST /data-panel/integration",
 					'{ "sessionId": "<当前会话>", "kind": "report", "op": "createVersion",',
 					'  "runId": "<本次 runId>", "sourceStepVersion": "<步骤版本>" }',
-					"→ { ok: true, name: \"V0.0.2\", index: {...} }",
+					"→ { ok: true, name: \"V0.0.1\", index: {...} }",
 					"```",
+					"",
+					"**★ 只调一次，不要为「试探」或「预检」再调第二次。**",
+					"面板是从 `index.json` 当前最大值 +1 分配版本号的，每调一次就真的多出一个版本。",
+					"典型错误：先调一次看能不能通、再调一次当正式版本 → 第一次执行就变成 V0.0.2。",
+					"**调用前先看返回的 `name` 是否已经是你要的那个**——它就是本次报告的版本号，直接用。",
 					"",
 					"拿返回的 `name` 去命名 docx 与 `report-versions/<name 换下划线>/report.json`：",
 					"  · `report.json` 里写 `reportVersion: <name>`、`runId`、`stepVersion`、`caseVersion`；",
@@ -8061,6 +8109,35 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 									filterParts.button
 								),
 							filterParts.bar,
+							/*
+							 * ★ 步骤孤岛提示：steps.json 里有步骤，但没有一条能挂到用例上。
+							 *
+							 * 这时表格里每行的「输入步骤 / 预期结果」都是破折号，而界面不会报错 ——
+							 * 用户只会以为模型没生成步骤，回去重生成一遍，问题原样存在。
+							 * 这里把真实原因（caseId 前缀对不上）直接摆出来，并给出正确写法示例。
+							 */
+							stepOrphan.count > 0
+								? h("div", { className: "it-orphan-hint", "data-it": "steps-orphan-hint" },
+									h("span", { className: "it-orphan-icon" }, "!"),
+									h("span", null,
+										"检测到 ",
+										h("b", null, String(stepOrphan.count)),
+										" 条步骤，但没有任何用例的 caseId 与之匹配，所以下面每行的「输入步骤 / 预期结果」都是空的。",
+										h("br"),
+										"常见原因：",
+										h("b", null, "caseId 前缀与版本号格式不一致"),
+										stepOrphan.sample.length > 0
+											? h(React.Fragment, null,
+												"步骤里写的是 ",
+												h("code", null, stepOrphan.sample.join("、")),
+												"，应为 ",
+												h("code", null, String(stepOrphan.sample[0]).replace(/^[Vv](\d+)_0?(\d+)_0?(\d+)-/, "V$1_$2_$3-")),
+												" 这种形式（版本号里的点换成下划线，数字不补零）。"
+											)
+											: null
+									)
+								)
+								: null,
 							/* 表格 + 分页条包在卡片里，与单元测试同构 */
 							h("div", { className: "it-card" },
 								h("div", { className: "it-table-wrap", "data-it": "steps-table" },
@@ -8101,7 +8178,6 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 												h("th", { style: { width: stepMultiSelect ? "170px" : "210px" } }, "测试用例标识"),
 												h("th", { style: { width: "17%" } }, "用例名称"),
 												h("th", { style: { width: "90px" } }, "测试类型"),
-												h("th", { style: { width: "90px" } }, "测试方法"),
 												h("th", null, "输入步骤"),
 												h("th", null, "预期结果"),
 												h("th", { style: { width: "80px" } }, "执行结果"),
@@ -8168,7 +8244,6 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 															}, String(itRunCount(record)))
 															: null
 													),
-													h("td", null, (first && first.action) || "—"),
 													h("td", null, itTypePill(record.type)),
 													h("td", { className: "it-left" }, stepLines(record, "operation") || h("span", { className: "it-muted" }, "—")),
 													h("td", { className: "it-left" }, stepLines(record, "expected") || h("span", { className: "it-muted" }, "—")),
@@ -8202,7 +8277,6 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 																			h("th", { style: { width: "190px" } }, "测试用例标识"),
 																			h("th", null, "测试用例名称"),
 																			h("th", { style: { width: "86px" } }, "测试类型"),
-																			h("th", { style: { width: "96px" } }, "测试方法"),
 																			h("th", { style: { width: "72px" } }, "执行结果"),
 																			h("th", { style: { width: "96px" } }, "测试时间"),
 																			h("th", { style: { width: "86px" } }, "操作")
@@ -8241,7 +8315,6 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 																				h("td", null, h("span", { className: "it-case-id" }, caseLabel(record))),
 																				h("td", { className: "it-left" }, record.title || "—"),
 																				h("td", null, itTypePill(record.type)),
-																				h("td", null, (first && first.action) || "—"),
 																				h("td", null, h("span", { className: "it-pill", "data-tone": runMeta.tone }, runMeta.label)),
 																				h("td", null, itTime(run.at)),
 																				h("td", null,
@@ -8500,7 +8573,6 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 														h("th", { style: { width: "210px" } }, "测试用例标识"),
 														h("th", null, "用例名称"),
 														h("th", { style: { width: "86px" } }, "测试类型"),
-														h("th", { style: { width: "96px" } }, "测试方法"),
 														h("th", { style: { width: "72px" } }, "执行结果"),
 														h("th", { style: { width: "96px" } }, "测试时间"),
 														h("th", { style: { width: "78px" } }, "操作")
@@ -8544,7 +8616,6 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 															}, record.title || "—")
 														),
 														h("td", null, itTypePill(record.type)),
-														h("td", null, (first && first.action) || "—"),
 														h("td", null, h("span", { className: "it-pill", "data-tone": meta.tone }, meta.label)),
 														h("td", null, itDate(shownRun ? shownRun.at : record.lastRunAt)),
 														h("td", null,

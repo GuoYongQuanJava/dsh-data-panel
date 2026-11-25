@@ -49,9 +49,11 @@ import importlib.util
 import json
 import os
 import random
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from xml.etree import ElementTree as ET
 
 # 集成测试的测试类型 → 报告里的中文名（与 SKILL.md 的 7 类枚举一致）
 TYPE_LABELS = {
@@ -80,6 +82,74 @@ CHANNEL_TEXT = {
 }
 
 DEFAULT_PEOPLE = "admin"
+
+# ─────────────────────────────────────────────────────────────
+#  真实值判定：识别并拒绝「固定话术」式的假观察
+# ─────────────────────────────────────────────────────────────
+
+# 这些是「断言通过/失败」的通用描述，**不含任何真实数据**。
+# 报告要的是「读到了什么」，不是「断言结果如何」—— 后者已经由结论列表达。
+#
+# 2026-11-24 实测事故：模型自写的一次性转换脚本把 243 步里的 180 步
+# `observed` 全写成「断言全部通过（接口返回与落库字段均符合预期）」，
+# 报告「实际测试结果」列于是 180 行一模一样，验收方无法判断测了什么。
+_boilerplate_patterns = (
+    r"^断言全部通过",
+    r"^断言未通过[：:]\s*$",
+    r"断言?结果(?:与预期)?(?:一致|不符|不符合|符合预期)",
+    r"^与预期(?:一致|不符|不符合)",
+    r"^实际结果与预期(?:结果)?(?:一致|不符|不符合)",
+    r"^符合预期$",
+    r"^测试通过$",
+    r"^通过$",
+    r"^未记录实际值$",
+    r"^实际与预期不符$",
+    r"^实际结果与预期不符$",
+    r"^执行成功$",
+    r"^无异常$",
+    r"^一切正常$",
+)
+
+
+def is_boilerplate_observed(text: str) -> bool:
+    """判断一段 `observed` 是不是「不含真实数据的固定话术」。
+
+    只做两件事：命中白名单话术、或整段没有任何 ASCII 可见内容以外的
+    字段/数值线索时，视为无效。宁可留空（显示「未记录实际值」），
+    也不让套话冒充实际结果 —— 留空至少能暴露问题，套话会掩盖问题。
+    """
+    value = str(text or "").strip()
+    if value == "":
+        return False  # 空值由调用方单独处理
+    for pattern in _boilerplate_patterns:
+        if re.search(pattern, value):
+            return True
+    return False
+
+
+def first_line(text) -> str:
+    """取多行文本的第一行非空内容（断言消息常带堆栈，只取首行）。"""
+    for line in str(text or "").splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return ""
+
+
+_STEP_NO_IN_FUNC = re.compile(r"step[_-]?(\d+)\s*$", re.IGNORECASE)
+
+
+def step_no_from_func(func: str):
+    """从测试函数名反推步骤号：`test_v0_0_1_it003_step2` → 2。
+
+    `assets/run_tests.py` 的 `tests[]` 只有 `func`，没有 `stepNo`；
+    而 bridge 的定位键是 `caseId|stepNo`。不反推的话所有步骤都会
+    取到 `None` 挤到同一个键上（就是 SKILL 里记的那个「173 步只剩 74 条证据」的坑）。
+    """
+    match = _STEP_NO_IN_FUNC.search(str(func or "").strip())
+    if match:
+        return int(match.group(1))
+    return None
 
 
 # ─────────────────────────────────────────────────────────────
@@ -137,12 +207,434 @@ def load_steps(session_root: Path, step_version: str = "") -> tuple:
 
 
 def load_run(run_dir: Path) -> tuple:
-    """读一次执行的结果与观察记录。"""
+    """读一次执行的结果与观察记录。
+
+    ★ 顺带读 `junit.xml` / `run.log` 里的 `ACTUAL[...]` 标记作为**补充证据**：
+      `assets/run_tests.py` 会把测试代码打印的 `ACTUAL[<caseId>]: <值>`
+      收进 `result.json` 的 `tests[].actual` 与 `tests[].actualOutputs`，
+      但**只有走 runner 那条链路时才有**；模型自己拼 result.json 时常常丢掉。
+      真实输出已经在日志里时，从日志捞一遍比重跑测试便宜得多。
+    """
     result = read_json(run_dir / "result.json", {})
     observations = read_json(run_dir / "observations.json", {})
     if not result:
         raise SystemExit("执行结果缺失或为空：%s" % (run_dir / "result.json"))
+
+    actuals = collect_actuals(run_dir)
+    if actuals:
+        result = dict(result)
+        result["_actuals"] = actuals
     return result, observations
+
+
+# 测试代码约定打印 `ACTUAL[<caseId>]: <值>` / `ACTUAL[<func>]: <值>`
+_ACTUAL_LINE = re.compile(r"ACTUAL\[([^\]]+)\]\s*[:：]\s*(.+)$")
+
+
+def read_log_text(path: Path) -> str:
+    """读日志文本，自动识别编码。
+
+    ★ 踩过的坑：`run_tests.py` 在 Windows 上写出的 `run.log` 是 **UTF-16LE**
+      （带 BOM），直接用 `utf-8` 读会得到满屏 `F . . . .` 的乱码 ——
+      看起来像「日志里没有真实输出」，实际是编码没认对。
+    """
+    if not path.is_file():
+        return ""
+    try:
+        raw = path.read_bytes()
+    except Exception:
+        return ""
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        try:
+            return raw.decode("utf-16")
+        except Exception:
+            pass
+    if raw[:3] == b"\xef\xbb\xbf":
+        try:
+            return raw.decode("utf-8-sig")
+        except Exception:
+            pass
+    for encoding in ("utf-8", "gbk"):
+        try:
+            return raw.decode(encoding)
+        except Exception:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def collect_actuals(run_dir: Path) -> dict:
+    """从本次执行的日志与 junit 里收集 `ACTUAL[<key>]: <值>`。
+
+    返回 `{ key: 值 }`，key 可以是 `caseId`、`caseId|stepNo` 或测试函数名。
+    这条路径**只做补充**：`result.json` 里已经有 `actual` 时以它为准。
+    """
+    found = {}
+
+    # ① run.log（就是测试进程的完整 stdout）
+    text = read_log_text(run_dir / "run.log")
+    for line in text.splitlines():
+        match = _ACTUAL_LINE.search(line)
+        if not match:
+            continue
+        key = match.group(1).strip()
+        value = match.group(2).strip()
+        if key and value:
+            found[key] = value
+
+    # ② junit.xml 的 failure/error 正文里也可能有（pytest -s 之外的场景）
+    junit_path = run_dir / "junit.xml"
+    if junit_path.is_file():
+        try:
+            tree = ET.parse(junit_path)
+            for case in tree.iter("testcase"):
+                name = (case.get("name") or "").strip()
+                for child in case:
+                    for line in (child.text or "").splitlines():
+                        match = _ACTUAL_LINE.search(line)
+                        if not match:
+                            continue
+                        key = match.group(1).strip()
+                        value = match.group(2).strip()
+                        if key and value:
+                            found.setdefault(key, value)
+                        elif name and value:
+                            found.setdefault(name, value)
+        except Exception:
+            pass
+
+    return found
+
+
+# ─────────────────────────────────────────────────────────────
+#  软件信息自动探测（软件规模 / 编程语言 / 开发环境 / 运行环境）
+# ─────────────────────────────────────────────────────────────
+
+# 为什么要有这一段（2026-11-24 实测事故）：
+#   `meta` 里那几个字段原本只能靠 `--software-scale` / `--language` /
+#   `--dev-env` / `--run-env` 显式传入，Skill 的调用示例又没列这几个参数，
+#   于是模型每次照抄示例 → 报告表头「软件规模/编程语言/开发环境/运行环境」
+#   四格全是「未采集」。
+#
+#   但**这些信息本来就在被测项目里**：`package.json` / `*.csproj` /
+#   `requirements.txt` / `.csproj` 的 TargetFramework 就是现成的答案。
+#   用户的原话：「正常来说读取代码后这几个信息应该都可以读到吧」——
+#   是的，所以这里改成自动探测，探测不到才退回命令行参数。
+#
+# 原则：**只报能证实的东西**。探测不到就留空（显示「未采集」），
+# 绝不猜测版本号或编造环境描述。
+
+# 语言识别：扩展名 → 语言名
+_LANG_BY_SUFFIX = {
+    ".cs": "C#",
+    ".java": "Java",
+    ".py": "Python",
+    ".ts": "TypeScript",
+    ".tsx": "TypeScript",
+    ".js": "JavaScript",
+    ".jsx": "JavaScript",
+    ".go": "Go",
+    ".rs": "Rust",
+    ".cpp": "C++",
+    ".cc": "C++",
+    ".c": "C",
+    ".kt": "Kotlin",
+    ".swift": "Swift",
+    ".php": "PHP",
+    ".rb": "Ruby",
+    ".vue": "Vue",
+}
+
+# 扫描时要跳过的目录（依赖、构建产物、版本库）
+_SKIP_DIRS = {
+    "node_modules", ".git", ".svn", "bin", "obj", "dist", "build",
+    "target", "out", ".venv", "venv", "__pycache__", ".dsh", ".next",
+    "coverage", ".idea", ".vs", "packages", "vendor",
+}
+
+# 统计规模时最多扫多少个源文件（防止大仓库卡住）
+_MAX_SCAN_FILES = 4000
+
+
+def detect_languages(project_root: Path):
+    """按源码文件数量识别编程语言，返回 [(语言, 文件数), ...] 降序。"""
+    if not project_root or not project_root.is_dir():
+        return []
+    counts = {}
+    scanned = 0
+    for dirpath, dirnames, filenames in os.walk(project_root):
+        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+        for name in filenames:
+            suffix = Path(name).suffix.lower()
+            language = _LANG_BY_SUFFIX.get(suffix)
+            if not language:
+                continue
+            counts[language] = counts.get(language, 0) + 1
+            scanned += 1
+        if scanned >= _MAX_SCAN_FILES:
+            break
+    return sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
+
+
+def detect_scale(project_root: Path, languages) -> str:
+    """软件规模：按真实文件统计，不写形容词。
+
+    能算的才算：源码文件数、（若有）后端 Controller/Service 个数。
+    算不出来就返回空串，让 meta 显示「未采集」。
+    """
+    if not project_root or not project_root.is_dir():
+        return ""
+    if not languages:
+        return ""
+
+    total = sum(count for _, count in languages)
+    parts = ["源码文件 %d 个" % total]
+
+    # 后端分层计数（.NET / Java 常见命名），只在真扫到对应文件时才写
+    layers = []
+    for pattern, label in (
+        ("*Controller.cs", "Controller"),
+        ("*Service.cs", "Service"),
+        ("*Repository.cs", "Repository"),
+    ):
+        hits = []
+        for path in project_root.rglob(pattern):
+            if any(part in _SKIP_DIRS for part in path.parts):
+                continue
+            hits.append(path)
+            if len(hits) > 500:
+                break
+        if hits:
+            layers.append("%d 个 %s" % (len(hits), label))
+    if layers:
+        parts.append("后端 " + "、".join(layers))
+
+    return "；".join(parts)
+
+
+def _find_first(project_root: Path, name: str):
+    """在项目里找第一个匹配的文件（跳过依赖/构建目录）。找不到返回 None。"""
+    if not project_root or not project_root.is_dir():
+        return None
+    for path in project_root.rglob(name):
+        if any(part in _SKIP_DIRS for part in path.parts):
+            continue
+        if path.is_file():
+            return path
+    return None
+
+
+def detect_dev_env(project_root: Path) -> str:
+    """开发环境：从项目配置里读出真实的 SDK / 运行时版本。
+
+    只从**项目自身配置文件**取：`*.csproj` 的 TargetFramework、
+    `package.json` 的 engines、`.nvmrc`、`pyproject.toml`、`global.json`。
+    取不到就不写。
+
+    ★ 配置文件常在子目录里（如 `node端/package.json`、`api/xxx.csproj`），
+      所以**必须递归找**，不能只看项目根 —— 只看根会让前端/后端版本全丢。
+    """
+    if not project_root or not project_root.is_dir():
+        return ""
+    found = []
+
+    # .NET：TargetFramework（如 net10.0）
+    frameworks = set()
+    for path in project_root.rglob("*.csproj"):
+        if any(part in _SKIP_DIRS for part in path.parts):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        for match in re.finditer(r"<TargetFrameworks?>([^<]+)</TargetFrameworks?>", text):
+            for item in match.group(1).split(";"):
+                item = item.strip()
+                if item:
+                    frameworks.add(item)
+        if len(frameworks) >= 4:
+            break
+    if frameworks:
+        found.append(".NET " + " / ".join(sorted(frameworks)))
+
+    # Node：package.json 的 engines.node，其次 .nvmrc
+    node_versions = []
+    for path in project_root.rglob("package.json"):
+        if any(part in _SKIP_DIRS for part in path.parts):
+            continue
+        try:
+            pkg = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        node_version = str((pkg.get("engines") or {}).get("node") or "").strip()
+        if node_version and node_version not in node_versions:
+            node_versions.append(node_version)
+    if node_versions:
+        found.append("Node " + " / ".join(node_versions))
+    else:
+        nvmrc = _find_first(project_root, ".nvmrc")
+        if nvmrc is not None:
+            try:
+                value = nvmrc.read_text(encoding="utf-8").strip()
+                if value:
+                    found.append("Node %s" % value)
+            except Exception:
+                pass
+
+    # Python：pyproject 的 requires-python，其次 requirements.txt 的实际内容
+    pyproject = _find_first(project_root, "pyproject.toml")
+    if pyproject is not None:
+        try:
+            text = pyproject.read_text(encoding="utf-8", errors="replace")
+            match = re.search(r'requires-python\s*=\s*"([^"]+)"', text)
+            if match:
+                found.append("Python %s" % match.group(1))
+        except Exception:
+            pass
+
+    # 前端框架：从 package.json 的 dependencies 取**主框架**版本（只取认识的那几个）
+    # 没有 `engines.node` 的项目很多，但 `dependencies.vue` 一定在 —— 这是能证实的。
+    framework_keys = (
+        ("vue", "Vue"), ("react", "React"), ("@angular/core", "Angular"),
+        ("uni-app", "uni-app"), ("express", "Express"), ("koa", "Koa"),
+    )
+    framework_hits = []
+    for path in project_root.rglob("package.json"):
+        if any(part in _SKIP_DIRS for part in path.parts):
+            continue
+        try:
+            pkg = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        deps = dict(pkg.get("dependencies") or {})
+        deps.update(pkg.get("devDependencies") or {})
+        for dep_key, label in framework_keys:
+            version = str(deps.get(dep_key) or "").strip()
+            if version:
+                item = "%s %s" % (label, version)
+                if item not in framework_hits:
+                    framework_hits.append(item)
+    if framework_hits:
+        found.append(" / ".join(framework_hits[:4]))
+
+    return " / ".join(found)
+
+
+def detect_run_env(project_root: Path) -> str:
+    """运行环境：从启动配置里读真实的监听地址/数据库。
+
+    只认**能证实**的：`launchSettings.json` 的 applicationUrl、
+    `appsettings*.json` 的连接字符串主机名与库名。
+
+    ★ 与 `detect_dev_env` 同理：这些文件在 `api/Properties/`、`api/` 等子目录里，
+      必须递归找。
+    """
+    if not project_root or not project_root.is_dir():
+        return ""
+    found = []
+
+    urls = set()
+    for path in project_root.rglob("launchSettings.json"):
+        if any(part in _SKIP_DIRS for part in path.parts):
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        for profile in (data.get("profiles") or {}).values():
+            for url in str(profile.get("applicationUrl") or "").split(";"):
+                url = url.strip()
+                if url:
+                    urls.add(url)
+        if urls:
+            break
+    if urls:
+        found.append("监听 " + "、".join(sorted(urls)))
+
+    # 数据库：appsettings 里的连接字符串，只取 Server/Database 两段
+    for path in project_root.rglob("appsettings*.json"):
+        if any(part in _SKIP_DIRS for part in path.parts):
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        conn = str((data.get("ConnectionStrings") or {}).get("Default") or "")
+        if not conn:
+            continue
+        server = re.search(r"(?:Server|Data Source)\s*=\s*([^;]+)", conn, re.IGNORECASE)
+        database = re.search(r"(?:Database|Initial Catalog)\s*=\s*([^;]+)", conn, re.IGNORECASE)
+        pieces = []
+        if server:
+            pieces.append(server.group(1).strip())
+        if database:
+            pieces.append("库 " + database.group(1).strip())
+        if pieces:
+            found.append("SQL Server " + " ".join(pieces))
+            break
+
+    return "；".join(found)
+
+
+def detect_meta(project_root: Path, runner: dict | None = None) -> dict:
+    """一次性探测全部软件信息，返回可直接合并进 meta_overrides 的字典。
+
+    `runner` 来自 `result.json` 的 `runner` 字段（如 `{"language": "javascript"}`），
+    作为语言探测的补充证据 —— 它记录的是**这次实际跑测试用的运行时**。
+    """
+    info = {
+        "language": "",
+        "software_scale": "",
+        "dev_env": "",
+        "run_env": "",
+        "runner_language": "",
+    }
+    if not project_root or not project_root.is_dir():
+        return info
+
+    languages = detect_languages(project_root)
+    if languages:
+        # 只报占比最高的前 3 种，避免列成清单
+        top = languages[:3]
+        info["language"] = " + ".join(
+            "%s（%d 文件）" % (name, count) for name, count in top
+        )
+        info["software_scale"] = detect_scale(project_root, languages)
+
+    info["dev_env"] = detect_dev_env(project_root)
+    info["run_env"] = detect_run_env(project_root)
+
+    runner_lang = str((runner or {}).get("language") or "").strip()
+    if runner_lang:
+        info["runner_language"] = runner_lang
+
+    return info
+
+
+def resolve_project_root(session_root: Path, result: dict, explicit: str = "") -> Path | None:
+    """定位被测项目根目录。
+
+    顺序：命令行显式指定 → `result.json` 的 `project` → 从会话根往上推。
+    `result.json` 的 `project` 是 `assets/run_tests.py` 写进去的，最可信。
+    """
+    candidates = []
+    if explicit:
+        candidates.append(Path(explicit))
+    project = str(result.get("project") or "").strip()
+    if project:
+        candidates.append(Path(project))
+    # `<项目>/.dsh/test-sessions/<sid>/integration` 往上 4 层就是项目根
+    try:
+        candidates.append(session_root.parent.parent.parent.parent)
+    except Exception:
+        pass
+
+    for candidate in candidates:
+        try:
+            if candidate.is_dir():
+                return candidate.resolve()
+        except Exception:
+            continue
+    return None
 
 
 # ─────────────────────────────────────────────────────────────
@@ -153,15 +645,26 @@ def load_run(run_dir: Path) -> tuple:
 def build_evidence_index(result: dict, observations: dict) -> dict:
     """建立 步骤定位键 → 该步骤的执行证据。
 
-    一键执行的证据分散在两处，必须合并：
-      · result.json 的 `steps[]`：runner 通道逐步骤结果
-      · observations.json 的 `items[]`：CUA 通道逐步骤观察
+    一键执行的证据分散在**三处**，必须合并（优先级从高到低）：
+      · observations.json 的 `items[]`：模型回写的逐步骤观察（最具体）
+      · result.json 的 `steps[]`：逐步骤结果（含 observed）
+      · result.json 的 `tests[]`：runner 原生逐测试函数结果（含 `actual`）
 
     定位键用 `caseId|stepNo`，与面板子表的键一致，避免只靠序号错位。
 
     ★ 字段名是 `stepNo`（不是 `no`）。踩过：写成 `no` 会让所有步骤都取到
       `None` 而挤到同一个键上，表现为「173 个步骤只有 74 条证据、结论全 notRun」。
       这里同时兼容 `stepNo` / `no` / `step` 三种写法，免得旧数据对不上。
+
+    ★ 为什么要读 `tests[]`（2026-11-24 实测事故）：
+      `assets/run_tests.py` 产出的是 `tests[]`（`func` / `outcome` / `actual`），
+      **从不产出 `steps[]`**。只读 `steps[]` 时整次执行会变成「一条证据都没有」，
+      逼得执行者自己写脚本转换 result.json —— 那次就把 `observed` 全写成了
+      「断言全部通过（接口返回与落库字段均符合预期）」这种固定话术（243 步里 180 步）。
+      所以这里直接兼容 `tests[]`，并从 `actual` / `message` / `detail` 取真实值。
+
+    ★ 绝不让固定话术进报告：`observed` 若命中 `BANNED_OBSERVED`，视为「没有记录」，
+      继续往下找真实值；全都没有才留空（生成器会显示「未记录实际值」）。
     """
     index = {}
 
@@ -175,6 +678,16 @@ def build_evidence_index(result: dict, observations: dict) -> dict:
     def key_of(case_id: str, step_no) -> str:
         return "%s|%s" % (case_id, step_no)
 
+    def meaningful(text) -> str:
+        """过滤掉固定话术与空串，只留真实记录。"""
+        value = str(text or "").strip()
+        if value == "":
+            return ""
+        if is_boilerplate_observed(value):
+            return ""
+        return value
+
+    # ① steps[]：逐步骤结果（最直接的来源）
     for item in result.get("steps") or []:
         if not isinstance(item, dict):
             continue
@@ -183,12 +696,46 @@ def build_evidence_index(result: dict, observations: dict) -> dict:
             continue
         index[key_of(case_id, step_no_of(item))] = {
             "outcome": str(item.get("outcome") or "notRun"),
-            "observed": str(item.get("observed") or ""),
+            "observed": meaningful(item.get("observed")),
             "reason": str(item.get("reason") or ""),
             "channel": str(item.get("channel") or "runner"),
             "durationMs": item.get("durationMs") or 0,
         }
 
+    # ② tests[]：runner 原生结果，靠 `func` 里的 stepN 反推步骤号
+    for item in result.get("tests") or []:
+        if not isinstance(item, dict):
+            continue
+        case_id = str(item.get("caseId") or "")
+        if case_id == "":
+            continue
+        step_no = step_no_of(item)
+        if step_no is None:
+            step_no = step_no_from_func(item.get("func") or "")
+        if step_no is None:
+            continue
+        k = key_of(case_id, step_no)
+        if k in index and index[k].get("observed"):
+            continue  # steps[] 已经给了真实观察，不覆盖
+        # 真实值的优先级：actual（测试代码打印的实际输出）> message（断言消息）
+        # > detail（失败正文）。message/detail 只在失败时才有意义。
+        outcome = str(item.get("outcome") or "notRun")
+        observed = meaningful(item.get("actual"))
+        if observed == "" and outcome in ("failed", "error", "unknown"):
+            observed = meaningful(first_line(item.get("message")))
+        if observed == "" and outcome in ("failed", "error", "unknown"):
+            observed = meaningful(first_line(item.get("detail")))
+        merged = index.get(k, {})
+        merged.update({
+            "outcome": merged.get("outcome") or outcome,
+            "observed": merged.get("observed") or observed,
+            "reason": merged.get("reason") or str(item.get("message") or ""),
+            "channel": merged.get("channel") or str(item.get("channel") or "runner"),
+            "durationMs": merged.get("durationMs") or item.get("durationMs") or 0,
+        })
+        index[k] = merged
+
+    # ③ observations[]：模型回写的观察，优先级最高（能覆盖前面两步）
     for item in observations.get("items") or []:
         if not isinstance(item, dict):
             continue
@@ -199,12 +746,44 @@ def build_evidence_index(result: dict, observations: dict) -> dict:
         merged = index.get(k, {})
         merged.update({
             "outcome": str(item.get("outcome") or merged.get("outcome") or "notRun"),
-            "observed": str(item.get("observed") or merged.get("observed") or ""),
+            "observed": meaningful(item.get("observed")) or merged.get("observed") or "",
             "reason": str(item.get("reason") or merged.get("reason") or ""),
-            "channel": str(item.get("channel") or merged.get("channel") or "cua"),
+            "channel": str(item.get("channel") or merged.get("channel") or "runner"),
             "durationMs": item.get("durationMs") or merged.get("durationMs") or 0,
         })
         index[k] = merged
+
+    # ④ `_actuals`：从 run.log / junit 里捞到的 `ACTUAL[...]` 标记
+    #    优先级**高于** tests[] 的 actual（日志是测试进程原样输出，最接近真相），
+    #    但低于 observations.json（那是模型逐步骤确认过的）。
+    #    key 可能是 `caseId`、`caseId|stepNo` 或测试函数名，三种都要试。
+    actuals = result.get("_actuals") or {}
+    if actuals:
+        for item in result.get("tests") or []:
+            if not isinstance(item, dict):
+                continue
+            case_id = str(item.get("caseId") or "")
+            func = str(item.get("func") or "")
+            if case_id == "":
+                continue
+            step_no = step_no_of(item)
+            if step_no is None:
+                step_no = step_no_from_func(func)
+            if step_no is None:
+                continue
+            value = (
+                actuals.get("%s|%s" % (case_id, step_no))
+                or actuals.get(func)
+                or actuals.get(case_id)
+                or ""
+            )
+            value = meaningful(value)
+            if value == "":
+                continue
+            k = key_of(case_id, step_no)
+            merged = index.get(k, {})
+            merged["observed"] = value
+            index[k] = merged
 
     return index
 
@@ -353,10 +932,13 @@ def case_payload(case: dict, evidence: dict, step_rows: list) -> dict:
         ev = evidence.get("%s|%s" % (case_id, no), {})
         outcome = ev.get("outcome") or "notRun"
         observed = ev.get("observed") or ""
-        if outcome == "notRun" and observed == "":
-            observed = "未执行"
-        if outcome in ("failed", "error") and observed == "":
-            observed = ev.get("reason") or "实际结果与预期不符"
+        if observed == "":
+            # 找不到真实记录时**留空**，交给生成器统一显示「未记录实际值」。
+            # 绝不在这里写「实际结果与预期不符」这类套话 —— 那会让验收方
+            # 以为「读到了但不对」，而真相是「根本没记录」。空值可被排查，
+            # 套话会永久掩盖问题（2026-11-24 事故的教训）。
+            if outcome == "notRun":
+                observed = "未执行（本次未执行该步）"
 
         steps.append({
             "no": no,
@@ -440,10 +1022,23 @@ def build_data(snapshot: dict, steps_doc: dict, evidence: dict, plan: dict,
                 if payload["outcome"] == "failed":
                     failed_steps = [s for s in payload["steps"]
                                     if s["outcome"] in ("failed", "error")]
-                    desc = "；".join(
-                        "第 %s 步：%s" % (s["no"], s["observed"] or s["expected"] or "实际与预期不符")
-                        for s in failed_steps
-                    ) or payload["title"]
+                    # 「问题现象描述」的素材：**只写真实观察**。
+                    # 观察为空时明确写「未采集到实际数据」并带上预期值 ——
+                    # 这比「实际与预期不符」有用：读者知道该去哪里补证据，
+                    # 而不是以为「读到了但不对」（2026-11-24 事故的教训）。
+                    parts = []
+                    for s in failed_steps:
+                        observed = (s.get("observed") or "").strip()
+                        if observed:
+                            parts.append("第 %s 步：%s" % (s["no"], observed))
+                        else:
+                            expected = (s.get("expected") or "").strip()
+                            parts.append(
+                                "第 %s 步：未采集到实际数据（预期 %s）"
+                                % (s["no"], expected) if expected
+                                else "第 %s 步：未采集到实际数据" % s["no"]
+                            )
+                    desc = "；".join(parts) or payload["title"]
                     stage_issues.append({
                         "title": "%s：%s" % (payload["caseCode"] or cid, payload["title"]),
                         "desc": desc[:800],
@@ -730,6 +1325,9 @@ def main(argv) -> int:
     parser.add_argument("--step-version", default="",
                         help="步骤版本（缺省取 index.json 的 activeVersion）")
     parser.add_argument("--project-code", default="", help="项目缩写，用于用例标识，如 JYSG")
+    parser.add_argument("--project-root", default="",
+                        help="被测项目根目录。缺省从 result.json 的 project 字段推断，"
+                             "用于自动探测软件规模/编程语言/开发环境/运行环境")
     parser.add_argument("--source", default="DM", choices=["DM", "SRS"],
                         help="需求来源：DM=按代码归纳，SRS=有需求文档")
     parser.add_argument("--software-name", default="")
@@ -776,7 +1374,7 @@ def main(argv) -> int:
     case_version = read_json(session_root / "case-versions" / "index.json", {}).get(
         "activeVersion") or ""
 
-    print("[3/5] 生成/复用报告编排计划…")
+    print("[3/6] 生成/复用报告编排计划…")
     plan, plan_path = load_or_create_plan(snapshot, args.run_id, report_dir)
     print("      阶段 %d 个：%s"
           % (plan.get("phaseCount") or 0,
@@ -784,16 +1382,38 @@ def main(argv) -> int:
     for note in plan.get("notes") or []:
         print("      注意：" + note)
 
-    print("[4/5] 组装 report-data.json…")
+    print("[3/5] 探测软件信息（软件规模 / 编程语言 / 开发环境 / 运行环境）…")
+    project_root = resolve_project_root(session_root, result, args.project_root)
+    detected = detect_meta(project_root, result.get("runner")) if project_root else {
+        "language": "", "software_scale": "", "dev_env": "", "run_env": "",
+        "runner_language": "",
+    }
+    if project_root:
+        print("      被测项目根：%s" % project_root)
+        for label, key in (("编程语言", "language"), ("软件规模", "software_scale"),
+                           ("开发环境", "dev_env"), ("运行环境", "run_env")):
+            value = detected.get(key) or ""
+            print("      %s：%s" % (label, value if value else "未采集（项目里找不到可证实的来源）"))
+    else:
+        print("      ⚠️ 定位不到被测项目根目录，软件信息只能靠命令行参数。")
+
+    # 探测值优先，命令行显式参数作为覆盖 —— 用户显式传的就按用户说的来。
+    def pick(explicit_value, detected_key):
+        explicit = str(explicit_value or "").strip()
+        if explicit:
+            return explicit
+        return str(detected.get(detected_key) or "").strip()
+
+    print("[5/6] 组装 report-data.json…")
     data = build_data(snapshot, steps_doc, evidence, plan, args.run_id, {
         "project_code": args.project_code,
         "source": args.source,
         "software_name": args.software_name,
         "software_version": args.software_version or step_version,
-        "software_scale": args.software_scale,
-        "language": args.language,
-        "dev_env": args.dev_env,
-        "run_env": args.run_env,
+        "software_scale": pick(args.software_scale, "software_scale"),
+        "language": pick(args.language, "language"),
+        "dev_env": pick(args.dev_env, "dev_env"),
+        "run_env": pick(args.run_env, "run_env"),
         "importance": args.importance,
         "vendor": args.vendor,
         "test_start_date": args.test_start_date,
@@ -815,10 +1435,10 @@ def main(argv) -> int:
         data_path = write_report_data(report_dir, data, {}, None, args.run_id,
                                       step_version, case_version)
         print("OK report-data.json -> %s" % data_path)
-        print("[5/5] 已跳过 docx 生成（--no-docx）")
+        print("[6/6] 已跳过 docx 生成（--no-docx）")
         return 0
 
-    print("[5/5] 调生成器出 docx…")
+    print("[6/6] 调生成器出 docx…")
     module, script_path = load_generator()
     template = find_template(script_path.parent, args.template)
 

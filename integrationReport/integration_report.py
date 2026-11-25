@@ -696,7 +696,13 @@ def fill_case_table(
     for offset, step in enumerate(steps):
         row = table.rows[row_start + offset]
         step_status = step.get("outcome") or status
-        observed = step.get("observed") or ("未记录实际值" if step_status != "notRun" else "未执行")
+        # 「实际测试结果」列只放**真实观察**。
+        #   · 未执行 → 明确标「未执行」，与「跑了没问题」区分开
+        #   · 跑了但没采集到 → 「未记录实际值（测试代码未打印 ACTUAL）」
+        #     **不要**填任何断言结论式的套话，那会掩盖「没采集」这个事实
+        observed = str(step.get("observed") or "").strip()
+        if not observed:
+            observed = "未执行" if step_status == "notRun" else "未记录实际值（测试代码未打印 ACTUAL）"
         set_cell_text(row.cells[0], str(step.get("no", offset + 1)))
         set_cell_text(row.cells[1], step.get("operation") or step.get("action") or "")
         set_cell_text(row.cells[3], step.get("expected") or "")
@@ -710,16 +716,28 @@ def fill_case_table(
     set_cell_text(table.rows[note_row].cells[2], case.get("note") or "无")
 
     # 异常现象描述 + 软件问题单编号
+    #   素材只取**真实观察**（observed）。观察为空时明确写「未采集到实际数据」，
+    #   不写「实际结果与预期不符」—— 后者会让人以为「读到了但不对」，
+    #   而真相是根本没记录（2026-11-24 事故：整列 180 行套话）。
     issue_row = note_row + 1
     issue = case.get("issue")
     if status == "notRun" and case.get("notRunReason"):
         issue = "未执行：" + case["notRunReason"]
     failed_steps = [s for s in steps if (s.get("outcome") or status) in ("failed", "error")]
     if not issue and failed_steps:
-        issue = "；".join(
-            "第 %s 步：%s" % (s.get("no", "?"), s.get("observed") or s.get("expected") or "实际结果与预期不符")
-            for s in failed_steps
-        )
+        parts = []
+        for step in failed_steps:
+            step_no = step.get("no", "?")
+            observed = str(step.get("observed") or "").strip()
+            if observed:
+                parts.append("第 %s 步：%s" % (step_no, observed))
+            else:
+                expected = str(step.get("expected") or "").strip()
+                parts.append(
+                    "第 %s 步：未采集到实际数据（预期 %s）" % (step_no, expected)
+                    if expected else "第 %s 步：未采集到实际数据" % step_no
+                )
+        issue = "；".join(parts)
     set_cell_text(table.rows[issue_row].cells[2], issue or "无")
     # 软件问题单编号：暂定写「无」（用户要求：有规范了再说）
     set_cell_text(table.rows[issue_row].cells[4], case.get("bugId") or "无")
