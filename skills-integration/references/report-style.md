@@ -330,7 +330,10 @@ console.log(`ACTUAL[${caseId}]:`, JSON.stringify(result));
 
 1. **不要只写执行的那一步**。整条用例的步骤都要列出来，未执行的写 `notRun` 并注明原因。
 2. 未执行步骤的 `observed` 写「未执行（本次只执行第 N 步）」，不要留空，也不要写「通过」。
-3. `outcome` 取值：`passed` / `failed` / `error` / `notRun`（未执行）。
+3. `outcome` 取值：`passed` / `failed` / `error` / `notRun`（未执行）/ `unconfirmed`（未确认）
+   / `blocked`（界面上不可观测）/ `unknown`（找不到证据）。
+   **完整合法值以 `bridge.py` 的 `OUTCOME_CONCLUSION` 与 `check_contract.py` 的
+   `VALID_OUTCOMES` 为准**；不存在的值是 `pass`、`skipped`。
 4. 报告里**不出现测试代码、测试函数名、codeRef**。
 5. 单用例表是模板表4（**5 列 16 行**），步骤行按实际步骤数**自动增删**（4 步→17 行，2 步→15 行）。
 
@@ -425,6 +428,65 @@ console.log(`ACTUAL[${caseId}]:`, JSON.stringify(result));
 **一个阶段可以包含多个功能项**（如 sprint1 含「用户注册与登录」「商品浏览」）。
 
 > 阶段必须在**生成用例时**就定好（`features[].stage`），报告侧只做归组，**绝不重新划分**。
+
+### 5.8 ★★ 标题必须能被 Word 导航窗格识别（`outlineLvl`）
+
+**用户明确要求（2026-11-20，2026-11-25 复现）**：报告打开后，Word 左侧「导航窗格」
+要能看到完整的章节树，点一下就能跳转。
+
+**做法**：不给标题套 Word 内置「标题 1/2/3」样式，而是**直接给段落写 `w:outlineLvl`**
+—— 因为模板全是 `Normal` 样式，一挂内置标题会带出 `numbering.xml` 的
+`numId=3` 自动编号，章节号变成 `1.`、`1.1`、`1.1.1` 的双重编号。
+
+```
+一级标题（1.范围 / 附录A…）  →  <w:outlineLvl w:val="0"/>
+二级标题（1.1标识）          →  <w:outlineLvl w:val="1"/>
+三级标题（4.1.1测试结果总结） →  <w:outlineLvl w:val="2"/>
+```
+
+#### ★ 极易踩的坑：`w:pPr` 子元素顺序错了，`outlineLvl` 会被 Word **静默忽略**
+
+**2026-11-25 实测事故**：报告里 53 个标题段落**都写了** `<w:outlineLvl>`，
+但 Word 导航窗格**一个标题都不显示**。查下来是 `pPr` 里元素顺序违反 OOXML schema。
+
+```
+❌ 错误顺序（python-docx 的 makeelement + append 总是追加到末尾）：
+   <w:jc>  <w:rPr>…</w:rPr>  <w:spacing>  <w:outlineLvl>
+
+✅ 正确顺序（CT_PPr 规定的相对次序）：
+   <w:spacing>  <w:jc>  <w:outlineLvl>  <w:rPr>…
+```
+
+**Word 对顺序错误不报错、不提示，直接忽略后面的元素。** 这就是为什么
+「XML 里明明有 outlineLvl，界面上却没有目录」。
+
+**修法**：每次改完 `pPr` 后**统一按 schema 重排一遍**（生成器的
+`_reorder_ppr()` 已实现），不要靠「记住往哪插」。
+
+**本节相关元素的正确相对顺序**（从前往后）：
+
+```
+pStyle → keepNext → keepLines → pageBreakBefore → widowControl → numPr
+  → pBdr → shd → tabs → spacing → ind → contextualSpacing → jc
+  → outlineLvl → rPr → sectPr → pPrChange
+```
+
+#### 怎么验证真的生效（**别只看 XML**）
+
+**读 XML 里有没有 `<w:outlineLvl>` 是不够的** —— 顺序错了它也在。要用 Word 实际解析：
+
+```powershell
+$word = New-Object -ComObject Word.Application
+$word.Visible = $false
+$d = $word.Documents.Open($path, [ref]$false, [ref]$true)
+# ★ 读 Range.ParagraphFormat.OutlineLevel，不是 Style.ParagraphFormat
+$d.Paragraphs.Item($i).Range.ParagraphFormat.OutlineLevel
+$d.Close([ref]$false); $word.Quit()
+```
+
+- 返回值 **1/2/3** = 对应级别标题（`10` = 正文，导航窗格不显示）
+- **不要读 `Style.ParagraphFormat.OutlineLevel`** —— 那是样式的级别，
+  我们没改样式，它永远是 `10`（正文），会误判成「没生效」
 > 生成用例时没写 `stage`，整份报告只能退化成「全是第一阶段」，**事后无法补救**。
 
 ---

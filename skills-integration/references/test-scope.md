@@ -54,6 +54,15 @@ manual 空项 = 用户手建，允许 caseIds 为空，模型不动
       "typeCoverage": ["functional", "boundary", "api"]
     }
   ],
+  "typeGaps": [
+    {
+      "type": "security",
+      "caseCount": 0,
+      "searched": "五侧源码全搜 [Authorize] / @PreAuthorize / JwtBearer / 鉴权中间件 / 权限注解",
+      "reason": "ZZKZ 是内网封闭的仿真服务群（MM/SS/TDM/SAR 四服务 + DDS），服务间靠 UDP 组播互信，源码中不存在登录态与权限模型，无安全属性可断言",
+      "recheck": "若后续接入真实装备或开放网络，必须重新评估并补安全性用例"
+    }
+  ],
   "excluded": [
     {
       "code": "F-002",
@@ -81,6 +90,46 @@ manual 空项 = 用户手建，允许 caseIds 为空，模型不动
 | **`caseIds` 允许为空（`source` 是 `manual` 时）** | 用户手建的，尊重原样，不要删也不要报错 |
 | `typeCoverage` 必须非空（`caseIds` 非空时） | 与 `caseIds` 对应；为空说明数据矛盾 |
 | 每个 `features[].id` 都必须出现在 `items[]` 里 | 漏了就是隐藏缺口（`manual` 的也要登记，只是 `caseIds` 可为空） |
+
+## `typeGaps[]` —— 某个测试类型为 0 时的唯一合法交代方式
+
+**这是 2026-11-24 事故后新增的必填段。** 判据很简单：
+
+```
+api / security / boundary / performance / margin 五类里，
+任何一类在全项目用例中的条数为 0  →  必须在 typeGaps[] 里有一条记录
+```
+
+**为什么单独开一段，而不是塞进 `excluded[]`**：`excluded[]` 装的是**功能项**
+（例：某个业务能力本轮不测）；`typeGaps[]` 装的是**测试类型**
+（例：安全性测试这一类整个系统都不涉及）。两者粒度不同，混在一起会让
+「哪些能力没测」和「哪些类型的视角完全缺失」分不开。
+
+> 对 ZZKZ 来说：`excluded[]` 里的典型条目是「F1-14 长时运行退化本轮不测」这类
+> **具体可测点/功能项**；而 `security` 为 0 是**整类视角缺失**，属于 `typeGaps[]`。
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `type` | ✅ | 五类之一：`api` / `security` / `boundary` / `performance` / `margin` |
+| `caseCount` | ✅ | 必须是 `0`（非 0 就不该出现在这里） |
+| `searched` | ✅ | **你搜了哪些关键词/文件**，要能被第三方照着复现 |
+| `reason` | ✅ | 为什么本系统不涉及，**可复核**，不许写「太复杂」「没时间」 |
+| `recheck` | 建议 | 什么情况下需要重新评估，便于下一轮判断 |
+
+**不合格的写法**：
+
+```
+❌ { "type": "security", "caseCount": 0, "reason": "本系统不需要安全测试" }
+   —— 没写搜了哪里，无法复核
+❌ 类型为 0 但 typeGaps[] 里一条都没有
+   —— 等于静默跳过，正是这次要堵的洞
+```
+
+**合格的写法**（对照上面 JSON 示例里那条 `security`）：说清搜了什么、
+为什么没有可断言的属性、什么条件下要重估。
+
+> `typeGaps[]` **不影响报告数字**，它是交付前的自查凭据。
+> 面板不读这个字段，但用户审查时你要能把它逐条讲清楚。
 
 ## `excluded[]` 的硬约束
 

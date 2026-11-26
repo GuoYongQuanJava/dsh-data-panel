@@ -610,21 +610,174 @@ def detect_meta(project_root: Path, runner: dict | None = None) -> dict:
     return info
 
 
+# 判断「这一层像不像项目根」：有这些文件/目录之一基本就是
+_PROJECT_MARKERS = (
+    # 通用
+    "package.json", "pyproject.toml", "requirements.txt", "setup.py",
+    "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle",
+    "go.mod", "Cargo.toml", "CMakeLists.txt", "Makefile",
+    "composer.json", "Gemfile", "mix.exs",
+    # .NET
+    "global.json",
+)
+_PROJECT_SUFFIXES = (".sln", ".csproj", ".vbproj", ".fsproj")
+
+
+def looks_like_project_root(path: Path, depth: int = 0) -> bool:
+    """这一层目录看起来是不是「被测项目根」。
+
+    判据（命中任一即可）：
+      ① 有构建/依赖清单（package.json / pom.xml / go.mod / *.csproj …）
+      ② 其**子目录**里有这些清单，且子目录不只是 .dsh 这类工具目录
+
+    ★ 为什么必须有 ②（2026-11-25 实测）：
+        真实项目的根目录常常**只有文档**，源码在子目录里：
+            myproject/
+              REASONIX.md  README.md  design.txt     ← 外层只有文档
+              node端/package.json                    ← 代码在这
+              web/pom.xml                            ← 另一个模块在这
+        只认 ① 会把这种根判成「不是项目」→ 探测全空 → 报告四格「未采集」，
+        但代码明明是能读到的。
+
+    `depth` 限制递归层数（默认只看 1 层子目录），避免误把盘符根当项目根。
+    """
+    try:
+        if not path.is_dir():
+            return False
+    except Exception:
+        return False
+
+    # ① 自己就是项目根
+    for name in _PROJECT_MARKERS:
+        try:
+            if (path / name).exists():
+                return True
+        except Exception:
+            continue
+    try:
+        for child in path.iterdir():
+            if child.is_file() and child.suffix.lower() in _PROJECT_SUFFIXES:
+                return True
+    except Exception:
+        pass
+
+    if depth <= 0:
+        return False
+
+    # ② 子目录里有工程（多模块 / 前后端分离项目的常见布局）
+    try:
+        children = [
+            child for child in path.iterdir()
+            if child.is_dir() and child.name not in _SKIP_DIRS
+            and not child.name.startswith(".")
+        ]
+    except Exception:
+        return False
+    for child in children[:50]:  # 防止超大目录拖慢
+        for name in _PROJECT_MARKERS:
+            try:
+                if (child / name).exists():
+                    return True
+            except Exception:
+                continue
+        try:
+            for sub in child.iterdir():
+                if sub.is_file() and sub.suffix.lower() in _PROJECT_SUFFIXES:
+                    return True
+        except Exception:
+            pass
+    return False
+
+
+def _find_project_root_by_markers(path: Path, max_up: int = 6):
+    r"""从 path 往上逐层找，返回**第一个像项目根的目录**。
+
+    ★ 为什么不能「固定往上推 4 层」（2026-11-25 实测事故）：
+        `<项目>/.dsh/test-sessions/<sid>/integration` 往上 4 层确实是项目根，
+        但这个结构**不是唯一的**：
+          · 有的项目把 .dsh 放在子目录（如 `D:\pj\newzzkz\.dsh\...`）
+          · 有的会话目录不在项目内
+          · 模型可能把 sessionRoot 指向别的层级
+
+        固定层数在这些情况下会推到一个**完全无关的目录**（甚至盘符根），
+        探测自然全是「未采集」，而且**看起来像「代码里读不到」**，
+        实际是「根本没去对的地方找」。
+
+        所以改成**逐层验证**：往上走，第一个带源码标记的目录就是它。
+
+    ★ 判据什么时候放宽到「子目录里有工程」（depth=1）：
+        真实项目常是「外层只有文档、里层才放代码」——
+            myproject/
+              README.md  design.txt          ← 外层只有文档
+              node端/package.json            ← 代码在这
+
+        但这种放宽**只在能确认「这一层就是 .dsh 的宿主目录」时才用**，
+        否则一路往上会认到盘符根（兄弟目录有工程也算命中）。
+        判定 `.dsh` 宿主：本层的 `.dsh` 子目录里能找到通往当前会话的路径。
+    """
+    current = path
+    for _ in range(max_up + 1):
+        # 只有「这一层就是 .dsh 宿主」才允许「子目录有工程」的宽松判据
+        relaxed = _hosts_dsh_for(current, path)
+        if looks_like_project_root(current, depth=1 if relaxed else 0):
+            return current
+        parent = current.parent
+        if parent == current:  # 到根了
+            break
+        current = parent
+    return None
+
+
+def _hosts_dsh_for(candidate: Path, session_path: Path) -> bool:
+    """`candidate` 是不是当前会话所在 `.dsh` 的宿主目录。
+
+    判据：`candidate/.dsh` 存在，且 `session_path` 在它下面。
+    这样能精确锁定「项目根」，不会把无关的上级目录误认成项目。
+    """
+    try:
+        dsh = candidate / ".dsh"
+        if not dsh.is_dir():
+            return False
+        return dsh in session_path.parents or dsh == session_path
+    except Exception:
+        return False
+
+
 def resolve_project_root(session_root: Path, result: dict, explicit: str = "") -> Path | None:
     """定位被测项目根目录。
 
-    顺序：命令行显式指定 → `result.json` 的 `project` → 从会话根往上推。
-    `result.json` 的 `project` 是 `assets/run_tests.py` 写进去的，最可信。
+    顺序（前三个命中即用，第四个兜底）：
+      1. 命令行显式指定 `--project-root`
+      2. `result.json` 的 `project` 字段（`run_tests.py` 会写，最可信）
+      3. 从 `session_root` 往上**逐层找**第一个带源码标记的目录
+      4. 老逻辑：固定往上 4 层（`<项目>/.dsh/test-sessions/<sid>/integration`）
+          —— 只在第 3 步找不到时用，且**要求它确实像项目根**
+
+    ★ 2026-11-25 实测事故：只有「固定往上 4 层」时，一旦项目的 `.dsh`
+      嵌在子目录里，就会推到一个无关目录，报告表头四格全是「未采集」，
+      但代码其实完全能读到 —— 是**找错了地方**，不是读不到。
     """
     candidates = []
+
+    # ① 显式指定最优先
     if explicit:
         candidates.append(Path(explicit))
+
+    # ② result.json 里的 project
     project = str(result.get("project") or "").strip()
     if project:
         candidates.append(Path(project))
-    # `<项目>/.dsh/test-sessions/<sid>/integration` 往上 4 层就是项目根
+
+    # ③ 逐层向上找源码标记 —— 这一步能覆盖绝大多数真实布局
+    by_markers = _find_project_root_by_markers(session_root)
+    if by_markers is not None:
+        candidates.append(by_markers)
+
+    # ④ 兜底：固定往上 4 层（仅当它像项目根时才用）
     try:
-        candidates.append(session_root.parent.parent.parent.parent)
+        legacy = session_root.parent.parent.parent.parent
+        if looks_like_project_root(legacy):
+            candidates.append(legacy)
     except Exception:
         pass
 
@@ -1390,12 +1543,35 @@ def main(argv) -> int:
     }
     if project_root:
         print("      被测项目根：%s" % project_root)
+        missing = []
         for label, key in (("编程语言", "language"), ("软件规模", "software_scale"),
                            ("开发环境", "dev_env"), ("运行环境", "run_env")):
             value = detected.get(key) or ""
-            print("      %s：%s" % (label, value if value else "未采集（项目里找不到可证实的来源）"))
+            if value:
+                print("      %s：%s" % (label, value))
+            else:
+                missing.append(label)
+                print("      %s：未采集" % label)
+        if missing:
+            # 只在这个目录**确实没有源码**时才提示「可能找错地方」
+            if not looks_like_project_root(project_root, depth=1):
+                print("      ⚠️ 这个目录下（含 1 层子目录）没找到任何源码标记"
+                      "（package.json / *.csproj / pom.xml / go.mod / pyproject.toml …）")
+                print("         很可能**不是真正放源码的目录**。若被测项目在别处，请加参数：")
+                print("         --project-root <被测项目根目录>")
+            else:
+                print("      ⚠️ 源码目录已找到，但以下项在其中没有可证实的来源：%s"
+                      % "、".join(missing))
+                print("         这属于「确实读不到」（例如没有 SLA 文档、没有连接串配置），"
+                      "不是找错了目录。")
+            print("         需要写进报告时，用参数显式指定：")
+            print("         --software-scale \"…\" --language \"…\" --dev-env \"…\" --run-env \"…\"")
     else:
-        print("      ⚠️ 定位不到被测项目根目录，软件信息只能靠命令行参数。")
+        print("      ⚠️ 定位不到被测项目根目录 —— 软件信息四格会全是「未采集」。")
+        print("         最常见原因：`result.json` 里没有 `project` 字段，"
+              "且从会话目录往上找不到源码标记。")
+        print("         解决：① 在 `result.json` 里写 `\"project\": \"<源码根目录>\"`（推荐）")
+        print("               ② 或生成报告时加 `--project-root <被测项目根目录>`。")
 
     # 探测值优先，命令行显式参数作为覆盖 —— 用户显式传的就按用户说的来。
     def pick(explicit_value, detected_key):

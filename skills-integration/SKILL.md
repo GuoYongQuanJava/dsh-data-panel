@@ -179,6 +179,31 @@ python <插件包>/assets/report/check_contract.py --root <项目>/.dsh/test-ses
 主 Skill 负责六步流程、功能项、用例与步骤数据、版本规则、执行、证据链和报告；
 专项 Skill 只补充「这一类被测对象怎么执行和取证」，**不另起流程、不重复要求审查确认、不改变数据契约**。
 
+### ★★ 执行出问题时的分支：批量「未确认」/家族性失败
+
+Step 5 执行完之后，**先看一眼结论分布再决定下一步**：
+
+| 现象 | 动作 |
+|---|---|
+| 正常通过/失败，失败是零散的、各有各的原因 | 按正常流程进 Step 6 |
+| **`unconfirmed` 成片出现**，或同一前置相关的用例**集体**失败/卡住 | ⛔ **停下来，读 [异常处置分支](references/troubleshooting.md)** |
+| 某门控/进入类断言**连续多轮恒 0 或恒 1**，单步重跑也不变 | ⛔ 同上 |
+| 「注入正常发出、被测侧无反应」，且**某用例跑过后其它才开始坏** | ⛔ 同上 |
+
+**硬规则：`unconfirmed` 家族 ≥ 3 条时，禁止直接重跑交差。**
+重跑一次结果一样，只是白跑一轮。必须按那份文件的 §3 走第 0-5 步判定并留证据链。
+
+> **为什么单独开一份文件而不是写进这里**：这套判定是**异常处置流程**，
+> 只在命中上面那张表时用；写进主流程会让每次执行都多读几十行无关内容。
+>
+> 那份文件覆盖四类根因：环境性断链（feed 收敛）/ 测试状态残留（前置自复位）/
+> 工装注入自身缺陷 / 预期结果误读源码，以及工装冷启动与事件窗口类偶发。
+>
+> **它还包含一条版本例外**（§4.2）：**还没「落地」的这一轮**（结果里还有成片
+> `unconfirmed`、正在修工装与前置、没形成正式结论）返工**不建新版本**，
+> 沿用同一 `runId` 原地覆盖；**修好并出报告、交付的那一刻才算落地**。
+> **落地之后再要动，一律按主 Skill 的「绝不覆盖旧版本」执行。**
+
 专项 Skill 是随本 Skill 一起部署的子目录，按当前文件实际路径解析相对链接。**若文件缺失，明确报告部署不完整，不能声称已读取或猜测其内容。**
 
 ## 进度：用 `todo_write` 固定在输入框上方
@@ -346,7 +371,7 @@ major * 1000000 + minor * 1000 + patch
 
 **版本可以切换查看**：工具栏版本下拉按**数字倒序**（最新在上），当前版本带「当前」标签，列表超过 5 条后滚动。
 
-数据结构：
+数据结构（**字段名是面板契约，逐字照抄**）：
 
 ```json
 {
@@ -355,9 +380,16 @@ major * 1000000 + minor * 1000 + patch
     { "name": "V0.0.1", "at": "2026-11-16T09:00:00", "status": "archived" }
   ],
   "activeVersion": "V0.0.1",
-  "byVersion": { "V0.0.1": [ ... ], "V0.0.2": [ ... ] }
+  "byVersion": {
+    "V0.0.1": { "features": "V0_0_1/features.json", "cases": "V0_0_1/cases.json" },
+    "V0.0.2": { "features": "V0_0_2/features.json", "cases": "V0_0_2/cases.json" }
+  }
 }
 ```
+
+> ★ **`versions[].name` 不是 `versions[].version`**，`activeVersion` 不是 `active`。
+> 写成后两种，面板读取时会当成「没有版本」→ **整页空白且不报错**。
+> 详见 [存储结构 § 三个 index.json 的字段是面板契约](#-三个-indexjson-的字段是面板契约写错页面就空白)。
 
 **新建版本后旧版本不删除**，切回去仍然看得到它自己的数据。
 
@@ -541,6 +573,24 @@ POST /data-panel/integration
 
 - 版本号由面板分配（`versions[]` 尾部 +1），**不要自己猜或写死**。
 - 每次「生成用例」「生成测试步骤」「一键执行」都**新建**一个版本，绝不覆盖旧版本。
+
+  > **★ 唯一的例外：还没「落地」的这一轮，返工不建新版本。**
+  >
+  > **落地 = 这一轮形成了正式结论、可以交给验收方了**
+  > （报告已生成并交付 / 用户已确认这版结果可用）。
+  >
+  > **没落地时**（执行刚跑完还有成片 `unconfirmed`、正在修工装与前置、用例步骤还在调）：
+  > 这批结果本来就不能用，只能返工 —— 直接用
+  > [异常处置分支 §3](references/troubleshooting.md) 的方法修，修完**沿用同一 `runId`
+  > 原地覆盖，不建新版本**。修好、结论齐了、报告出了，**这一刻才落地**。
+  >
+  > **落地之后再要动 → 一律新建版本，绝不覆盖。**
+  > （被测软件改版、用户加用例、步骤重新生成，都算新的一轮）
+  >
+  > **一句话判据：这一轮的结果有没有被当成正式结论交付出去？**
+  > 没有 → 不建版本；有了 → 必须新版本。详见
+  > [异常处置分支 §4.2](references/troubleshooting.md)。
+
 - **`caseId` 带用例版本前缀**，三段式的点换成下划线：`V0_0_2-IT-001`。
 
   ```
@@ -661,8 +711,14 @@ margin       / 余量测试
 | `performance` | 找书面指标（SLA / 超时配置 / 压测脚本） | 找到什么指标；没有就明说「无书面指标」 |
 | `margin` | 找承载上限配置（连接池 / 队列 / 限流 / 线程池） | 上限项清单；为 0 要写理由 |
 
-**任何一类最终是 0 条，都必须在 `coverage.json` 里写可复核理由**（指明搜了哪里、
-为什么本系统不涉及），写法与 `excluded[]` 同级别要求。**不许只字不提。**
+**任何一类最终是 0 条，都必须在 `coverage.json` 的 `typeGaps[]` 里写一条**
+（`type` / `caseCount: 0` / `searched` / `reason` / `recheck`，格式见
+[功能项覆盖清单 § typeGaps](references/test-scope.md)）。**不许只字不提。**
+
+> **为什么单独开 `typeGaps[]` 而不是塞进 `excluded[]`**：`excluded[]` 装的是
+> **功能项**（「订单退款这个能力本轮不测」），`typeGaps[]` 装的是**测试类型**
+> （「整个系统都没有安全性视角」）。粒度不同，混在一起就分不清
+> 「哪些能力没测」和「哪一类视角完全缺失」。
 
 > 这一条不能靠「感觉够了」交付。判据是：**每类都能说出「我搜了哪里」**，
 > 而不是「我写了多少条」。
@@ -914,6 +970,45 @@ F6 前置条件矩阵：目录列 21 个可测点，本版覆盖 9 个，其余 
 - 步骤三元组：`action`（动作）/ `operation`（输入步骤）/ `expected`（预期结果）
 - **对应的测试代码**（模型内部产物，界面不显示）
 
+#### ★★ 三条必做（不做的话执行阶段必然出一批「未确认」）
+
+**① 预期含「自动 / 超时 / 恢复」语义时，必须附被测源码调用点**
+
+凡是步骤的 `expected` 写了「自动清除 / 超时自动重提 / 恢复后自动复位 / 到点自动退出」
+这类语义，**必须在被测源码里找到确切的调用点，并把 `文件:行号` 记进该步骤的备注**。
+
+```
+✅ expected: "30s 后自动确认"    备注: MM `SceneEntry.cpp:412` SetTimer(SCENE_ACK, 30000)
+❌ expected: "30s 后自动确认"    备注: （无）
+```
+
+**找不到调用点，就把预期改成「不自动清除，需 X 操作清除」。**
+
+> **为什么这条是硬的**（实测）：最典型的误读是把**相近机制的定时器张冠李戴** ——
+> 把 A 流程的超时定时器当成 B 提示的重发机制，预期就与真实语义相反。
+> 这类步骤跑出来永远是「未确认」，而且看起来像被测软件的缺陷。
+> 详见 [异常处置分支 §3 第 4 步](references/troubleshooting.md)。
+
+**② 前置条件必须复位被测侧「跨用例常驻」的状态**
+
+读被测源码时留意**规则库 / 配置缓存 / 加载结果 / 进入标志**这类
+「直到下次重新加载才复位」的变量。**只要某条用例依赖它，
+这条用例的 `precondition` 里就必须写明「先复位到已知基线」**，
+测试代码的 `setup` 也要真的做复位。
+
+```
+❌ 依赖默认规则库，但前置只写「服务已启动」
+✅ 依赖默认规则库，前置写「启动后重新加载默认规则库到基线」+ setup 里真的重新加载
+```
+
+**绝不允许假设用例执行顺序**。见 [异常处置分支 §3 第 2 步](references/troubleshooting.md)。
+
+**③ 工装要内置 per-topic 帧计数器**
+
+总线形态下，工装订阅表**每条目挂帧计数器**，并在步骤断言证据里输出 `TOPIC.cnt`。
+没有它就无法区分「topic 没到」「字段恒 0」「门控条件不满足」这三种完全不同的情况 ——
+**而三者的修法完全相反**。详见 [zzkz-sim/observation.md](zzkz-sim/observation.md)。
+
 #### 步骤与测试函数一一映射
 
 一个步骤 = 一个测试函数（例 `test_v0_0_1_it001_step1`）。这样才能单步执行。
@@ -1129,14 +1224,42 @@ python <插件包>/assets/report/check_contract.py --root <项目>/.dsh/test-ses
 ```
 本轮执行摘要
 - runId：<runId>
-- 用例总数：N（通过 X / 未通过 Y / 未执行 Z）
+- 用例总数：N（通过 X / 未通过 Y / 未执行 Z / 未确认 W）
 - 记录条数：N（去重后）
 - 不变量校验：4/4 通过
+- 未确认分布：<按 topic/前置归组的条数；没有就写「无」>
 - 报告位置：<overallDocx 路径>
 ```
 
 **为什么要求附这个**：用户不可能去翻 JSON 文件核对，摘要就是他唯一的验收依据。
 没有这段摘要，等于让用户凭空相信「跑完了」。
+
+> **「未确认」必须单独列出来，不能并进「未通过」。**
+> `unconfirmed` 是「跑了但没取到证」，**不是失败也不是跳过** ——
+> 把它算进失败会冤枉被测软件，算进通过会造假。
+> **下一节就是针对它的处置入口。**
+
+#### ★★ 摘要里「未确认」成片时：转异常处置分支
+
+对照上一节的摘要，按这张表决定去向：
+
+| 摘要里的表现 | 动作 |
+|---|---|
+| 未确认 0~2 条，且各有各的独立原因（偶发、环境缺失等） | 写清原因，进 Step 6 |
+| **未确认 ≥ 3 条且成家族**（同一前置/同一场景/同一 topic） | ⛔ **停下来读 [异常处置分支](references/troubleshooting.md)**，按 §3 的 0-5 步判定 |
+| 未通过+未确认**集中在同一上游依赖**上 | ⛔ 同上 |
+| 某门控/进入类断言**连续多轮恒 0 或恒 1**，单步重跑也不变 | ⛔ 同上 |
+| 「注入正常发出、被测侧无反应」，且**某用例跑过后其它才开始坏** | ⛔ 同上（大概率是状态残留） |
+
+**禁止**：看到成片未确认就直接重跑交差。**结果一样，只是白跑一轮。**
+
+> 那份分支文件管四类根因：**环境性断链**（feed 收敛）/
+> **测试状态残留**（前置自复位）/ **工装注入自身缺陷** / **预期结果误读源码**，
+> 以及工装冷启动与事件窗口类偶发。
+>
+> 它还给了一条**版本例外**（§4.2）：**还没「落地」的这一轮**
+> （结果成片 `unconfirmed`、正在返工、没形成正式结论）返工不建新版本，
+> 沿用同一 `runId` 原地覆盖；**修好并交付那一刻才算落地**，之后一律新版本。
 
 #### 四个 channel，一套执行链路
 
@@ -1257,6 +1380,40 @@ console.log(`ACTUAL[${caseId}]:`, JSON.stringify(value));   // JS / TS
 
 > 生成器路径优先用面板回传的 `reportScript`，**不要写死绝对路径**。
 > 生成器缺失要明确报错，**不许自己写个简单版降级**。
+
+#### ★★ 报告生成后必须验证「面板里真的能看到」
+
+**docx 生成了 ≠ 面板里有报告。** 这两件事的数据来源完全不同：
+
+| 你看到的 | 数据来自 | 缺了会怎样 |
+|---|---|---|
+| 磁盘上的 `集成测试报告-xxx.docx` | 生成器直接写文件 | 有文件 |
+| **报告页里那一行** | `step-versions/<V>/exec-records.json` | **文件在、页面空** |
+
+**2026-11-25 实测事故**：报告 docx 生成成功、`report-versions/index.json` 也写了，
+但面板顶部显示「测试步骤 0 / 测试报告 0」——**两个页面全空**。两个根因：
+
+1. **`step-versions/index.json` 手写时用了 `active` / `versions[].version`**，
+   面板只认 `versions[].name` + `activeVersion` → 解析不到活动版本 → 数据返回 `null`；
+2. **`exec-records.json` 从未生成**，而报告页的行数据正是从它读的。
+
+**所以 Step 6 收尾必须自检这四项**（顺序不能省）：
+
+```
+① step-versions/index.json   有 versions[].name + activeVersion
+② step-versions/<V>/exec-records.json  存在，且 { "V0.0.1": { "caseId": [记录] } } 形态
+③ report-versions/index.json 有 versions[].name + activeVersion + runId
+④ 每条入选用例在 exec-records 里都有一条本轮 runId 的记录
+```
+
+**最省事的做法：不要手写 `index.json`。**
+「生成用例 / 生成测试步骤 / 一键执行」这三个动作，**面板自己会建版本并写好 index**；
+你只写版本目录里的内容文件。只有面板没自动建版本时（补历史数据）才手写，
+此时**逐字照抄「存储结构」一节里的 `index.json` 形态**。
+
+> **验证方式**：生成报告后**让用户刷新面板看一眼**
+> （用例 / 步骤 / 报告三个数字对不对），再宣布完成。
+> **不要只报「报告已生成 <路径>」就当交付** —— 用户看的是面板，不是磁盘。
 
 #### 报告工具部署检查（先做，缺就明说）
 
@@ -1609,19 +1766,21 @@ GN-651-JYSG_SRS_AUTH_LOGIN-1-T001.CTD
   "caseId": "V0_0_1-IT-001",
   "stepNo": 1,
   "target": "test_v0_0_1_it001_step1",
-  "outcome": "passed | failed | error | skipped | notRun | unknown",
+  "outcome": "passed | failed | error | notRun | unconfirmed | blocked | unknown",
   "durationMs": 123,
   "startedAt": "2026-11-19T09:00:00+08:00",
-  "observed": "页面加载完成，标题「无线蓝牙耳机」，价格 ¥299",
-  "evidence": ["runs/<runId>/shots/step-1.png"],
+  "observed": "HTTP 200，code=0，data.id=1379，data.phone=199****8888",
+  "evidence": ["runs/<runId>/result.json#caseId=V0_0_1-IT-001&stepNo=1"],
   "evidenceSource": "runner+model | model"
 }
 ```
 
 **`outcome` 只认硬证据**：`runner+model` 来自 `result.json` 的逐条结果、总线抓到的帧、或测试可执行体读到的字段值；`model` 仅用于模型肉眼补充的描述性观察或历史数据。找不到证据就标 `unknown`/`未确认`，**绝不用整体状态推断通过**。
 
-> ★ 注意 `outcome` 的合法值是 **`passed` / `failed` / `error` / `notRun` / `unconfirmed`**（来自 `bridge.py` 的 `OUTCOME_CONCLUSION`）。
-> 不是 `pass`，也不是 `skipped`。写错报告会取不到结论。
+> ★ 注意 `outcome` 的合法值是 **`passed` / `failed` / `error` / `notRun` / `unconfirmed` / `blocked` / `unknown`**
+> （`passed`~`unconfirmed` 来自 `bridge.py` 的 `OUTCOME_CONCLUSION`；
+> `blocked` / `unknown` 是 `check_contract.py` 额外允许的「界面上不可观测」与「找不到证据」两态）。
+> **不是 `pass`，也不是 `skipped`**。写错会被契约校验器拦下，或报告里取不到结论。
 
 ### `runner.json`（有 `runner` / `cmd` / `code` 步骤时必须写）
 
@@ -1651,6 +1810,7 @@ GN-651-JYSG_SRS_AUTH_LOGIN-1-T001.CTD
   "runId": "run_20261120_1852_all",
   "stepVersion": "V0_0_1",
   "caseVersion": "V0_0_1",
+  "project": "D:/work/myproject",
   "startedAt": "2026-11-20T18:52:00+08:00",
   "steps": [
     {
@@ -1660,12 +1820,31 @@ GN-651-JYSG_SRS_AUTH_LOGIN-1-T001.CTD
       "channel": "runner",
       "outcome": "passed",
       "durationMs": 1200,
-      "observed": "登录页渲染完成",
+      "observed": "HTTP 200，code=0，data.id=1379",
       "reason": ""
     }
   ]
 }
 ```
+
+**★★ 必须写 `project`（被测项目根目录的绝对路径）。**
+
+这是报告里「软件规模 / 编程语言 / 开发环境 / 运行环境」四格的**唯一可靠来源**。
+不写它，`bridge.py` 只能靠「从会话目录往上猜」来找源码 —— 一旦项目布局不是
+`<项目>/.dsh/test-sessions/…` 这个标准形态，就会猜错，**四格全变「未采集」**。
+
+```json
+"project": "D:/work/myproject"      // ✅ 被测源码的根目录
+"project": "D:\\\\work\\\\myproject"  // ✅ Windows 反斜杠也行（JSON 里要转义）
+// ❌ 不写  → 只能靠猜，容易失败
+// ❌ 写错成会话目录 / .dsh 目录 → 找不到源码
+```
+
+> **2026-11-25 实测事故**：报告四格全是「未采集」。
+> 查下来 `result.json` 里**没有 `project`**，`bridge.py` 按「固定往上 4 层」猜，
+> 而有的项目把 `.dsh` 嵌在子目录（`D:\pj\newzzkz\.dsh\…`），
+> 一猜就落到无关目录 → 探测全空。
+> **代码本来完全能读到，只是没去对的地方找。**
 
 **★★ 必须是 `steps[]`，不能是 `tests[]`。**
 
@@ -1691,15 +1870,15 @@ GN-651-JYSG_SRS_AUTH_LOGIN-1-T001.CTD
 ```
 <项目>/.dsh/test-sessions/<sessionId>/integration/
   case-versions/                 # 用例页
-    index.json                   # { versions: [{ name, at, status }], activeVersion }
+    index.json                   # { versions: [{ name, at, status }], activeVersion, byVersion }
     V0_0_1/ features.json  cases.json
     V0_0_1/ coverage.json        # ★ 覆盖清单：items[] 立项功能项 / excluded[] 本轮不测的能力
   step-versions/                 # 步骤页（独立编号）
-    index.json                   # { versions: [{ name, sourceCaseVersion }], activeVersion }
+    index.json                   # { versions: [{ name, at, status, sourceCaseVersion }], activeVersion, byVersion }
     V0_0_1/ steps.json  cases.snapshot.json   # ★ 快照冻结
     V0_0_1/ exec-records.json    # ★ 该版本下每条用例的执行记录（多次一键执行累积）
   report-versions/               # 报告页（独立编号）
-    index.json                   # { versions: [{ name, sourceStepVersion, runId }], activeVersion }
+    index.json                   # { versions: [{ name, at, status, sourceStepVersion, runId }], activeVersion, byVersion }
     V0_0_1/ report.json
   tests/                         # 测试代码（内部产物，界面不展示）
   runs/<runId>/
@@ -1710,6 +1889,89 @@ GN-651-JYSG_SRS_AUTH_LOGIN-1-T001.CTD
     run.log
   reports/<runId>/ *.docx
 ```
+
+### ★★ 三个 `index.json` 的字段是**面板契约**，写错页面就空白
+
+**这是 2026-11-25 实测最惨的一次**：报告出来了，但**测试步骤页和测试报告页都是空的**，
+面板顶部显示「测试步骤 0 / 测试报告 0」。查下来是模型手写的 `index.json`
+用了自己想的字段名（`active` / `versions[].version`），面板读不出来。
+
+面板 `integration-store.js` 的 `readIndex()` 只认这三个字段，**字段名差一个字就整页空白，
+而且不报任何错**：
+
+| 字段 | 类型 | 必须 | 缺失后果 |
+|---|---|---|---|
+| `versions[]` | 数组 | ✅ | 不是数组 → **整个 index 被丢弃**，返回 `{versions:[], activeVersion:'', byVersion:{}}` |
+| `versions[].name` | 字符串 | ✅ | 面板靠它拼目录名（`V0.0.1` → `V0_0_1/`）。**写成 `version` 就找不到目录** |
+| `activeVersion` | 字符串 | ✅ | 缺失时回退取 `versions[0].name`；若 `name` 也错，**没有活动版本 → 数据返回 null** |
+| `byVersion` | 对象 | 建议 | 面板实际按 `activeVersion` 拼路径读盘，这个字段只作索引；但**手动改 index 时务必保留**，否则易被误当权威 |
+
+**正确形态（三个页面同一套）**：
+
+```json
+{
+  "versions": [
+    { "name": "V0.0.1", "at": "2026-11-25T10:00:00", "status": "current" }
+  ],
+  "activeVersion": "V0.0.1",
+  "byVersion": {
+    "V0.0.1": { "steps": "V0_0_1/steps.json" }
+  }
+}
+```
+
+**❌ 这三种写法会让页面空白**（都实测踩过）：
+
+```json
+{ "active": "V0.0.1", "versions": [{ "version": "V0.0.1" }] }   // 字段名全错
+{ "versions": [{ "version": "V0.0.1" }], "activeVersion": "V0.0.1" }  // name 写成 version
+{ "activeVersion": "V0.0.1" }                                    // 没有 versions 数组
+```
+
+> **最好的做法：不要手写 `index.json`。**
+> 「生成用例 / 生成测试步骤 / 一键执行」这三个动作，面板自己会建版本、写 index。
+> 你只需要**写版本目录里的内容文件**（`features.json` / `cases.json` / `steps.json` / `exec-records.json`）。
+>
+> **只有面板没有自动建版本时才手写**（例如补历史数据），此时**逐字照抄上面的形态**。
+
+### ★★ `exec-records.json`：报告页「有一行」的必要条件
+
+**报告页的行数据不是从 `report.json` 读的，是从 `step-versions/<V>/exec-records.json` 读的。**
+只生成 docx 和 `report.json`、不写 `exec-records.json`，
+报告页就是空的 —— 顶部显示「报告 0 份」，尽管磁盘上 docx 已经存在。**这是第二个空白根因。**
+
+**位置**：`step-versions/<步骤版本>/exec-records.json`（挂在**步骤**版本下，不是报告版本下）
+
+**结构**：`{ 步骤版本: { caseId: [记录...] } }`，记录**只存四个字段**：
+
+```json
+{
+  "V0.0.1": {
+    "V0_0_1-IT-001": [
+      { "runId": "run_20261125_1015_all", "at": "2026-11-25T10:20:00", "result": "pass", "durationMs": 4820 }
+    ],
+    "V0_0_1-IT-002": [
+      { "runId": "run_20261125_1015_all", "at": "2026-11-25T10:21:00", "result": "unconfirmed", "durationMs": 6300 }
+    ]
+  }
+}
+```
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| 外层键 | ✅ | **步骤版本号**（`V0.0.1`，带点）。面板用它挑「当前步骤版本」那一组 |
+| `caseId` | ✅ | 必须是当版 `cases.json` 里真实存在的值 |
+| `runId` | ✅ | 对应 `runs/<runId>/`，面板靠它关联详细结果 |
+| `at` | ✅ | ISO 时间。面板**按它倒序**排，`records[0]` 就是「最新一次」 |
+| `result` | ✅ | `pass` / `fail` / `error` / `unconfirmed`（面板判 `=== "pass"` 为通过） |
+| `durationMs` | 建议 | 耗时 |
+
+> **一条用例一次执行 = 一条记录**。同一次 `runId` 在一条用例下**只能有一条**
+> （去重规则见 Step 5「一键执行后的强制断言」第 1 条）。
+>
+> **报告页只显示 `source: "all"` 的记录**：一键执行写 `source: "all"`，
+> 单步执行写 `source: "step"`（只留在步骤页，不进报告页）。漏写这个字段，
+> 一键执行的记录可能进不了报告页。
 
 **执行记录挂在哪（关键）**：
 

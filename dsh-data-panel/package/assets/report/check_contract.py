@@ -62,8 +62,11 @@ RECORD_ALLOWED = ["runId", "at", "result", "durationMs", "source"]
 # 铁律：界面/API/报告只出现步骤，不出现测试函数名与代码文件
 FORBIDDEN_IN_STEPS = ["func", "codeFile", "codeRef", "code", "testFunc"]
 
-VALID_TYPES = {"functional", "performance", "boundary", "api", "security", "margin", "logic"}
+VALID_TYPES = {"functional", "performance", "boundary", "api", "security", "margin"}
 BANNED_TYPES = {"stress"}
+# ★ 集成测试的枚举固定是 7 类（`stress` 本轮禁止），**不能混入单元测试的 `logic`**。
+#   踩过：这里以前写成 {..., "logic"}，于是把单元测试类型写进集成用例也能 PASS，
+#   7 类判定标准形同虚设。集成测试只有这 6 类可用（stress 走 BANNED_TYPES 单独拦）。
 
 # ★ outcome / result 的合法值都来自**代码**，不是想象：
 #   · bridge.py 的 OUTCOME_CONCLUSION：passed / failed / error / notRun / unconfirmed
@@ -354,6 +357,22 @@ def check_result(doc, case_ids, step_case_index, report):
     for key in ("runId", "stepVersion"):
         if key not in doc:
             report.warn(where, "缺少顶层字段 %s" % key)
+
+    # ★ project：报告「软件规模/编程语言/开发环境/运行环境」的唯一可靠来源。
+    #   缺了 bridge.py 只能从会话目录往上猜，项目布局一旦不是
+    #   `<项目>/.dsh/test-sessions/…` 就会猜错 → 报告四格全「未采集」。
+    project = str(doc.get("project") or "").strip()
+    if project == "":
+        report.fail(where, "缺少 `project`（被测项目根目录）—— 报告里软件规模/编程语言/"
+                           "开发环境/运行环境会全是「未采集」。请填源码根目录的绝对路径")
+    else:
+        try:
+            if not Path(project).is_dir():
+                report.warn(where, "`project` 指向的目录不存在：%s（软件信息探测会失败）" % project)
+            else:
+                report.ok("project 字段已写且目录存在：%s" % project)
+        except Exception:
+            report.warn(where, "`project` 路径无法解析：%s" % project)
     steps = doc.get("steps")
     if not isinstance(steps, list):
         report.fail(where, "steps 必须是数组")
@@ -419,6 +438,166 @@ def check_report_version(root, report, run_id):
         report.fail(where, "报告版本号有重复")
 
 
+def check_panel_index(root, kind, report):
+    """检查某个页面的 index.json 字段名是否符合面板契约。
+
+    ★ 2026-11-25 实测事故：报告 docx 生成成功，但测试步骤页、测试报告页全空，
+    面板顶部显示「测试步骤 0 / 测试报告 0」。根因是手写的 index.json 用了
+    自己想的字段名（`active` / `versions[].version`），而面板只认
+    `versions[].name` + `activeVersion` —— 解析不到活动版本，数据返回 null。
+
+    面板侧 `integration-store.js` 的 `readIndex()` 的行为：
+      · `versions` 不是数组 → 整个 index 被丢弃，返回空结构
+      · `activeVersion` 缺失   → 回退取 `versions[0].name`
+      · `versions[].name` 缺失 → 拼不出目录名，该版本读不到数据
+
+    这些错误**面板不报任何错，只是页面空白**，所以必须在这里拦住。
+    """
+    where = "%s/index.json" % kind
+    index_path = Path(root) / kind / "index.json"
+    if not index_path.is_file():
+        report.warn(where, "还没有 index.json（面板没建过版本？）")
+        return
+
+    index = load_json(index_path, report, where)
+    if not isinstance(index, dict):
+        report.fail(where, "index.json 顶层必须是对象")
+        return
+
+    versions = index.get("versions")
+    if not isinstance(versions, list):
+        report.fail(where, "`versions` 必须是数组 —— 面板读不到版本，整页会空白")
+        return
+    if not versions:
+        report.warn(where, "versions 为空")
+        return
+
+    # ① versions[].name —— 最容易写错成 version
+    bad_name = []
+    for item in versions:
+        if not isinstance(item, dict):
+            bad_name.append("(非对象)")
+            continue
+        if not isinstance(item.get("name"), str) or not item.get("name"):
+            # 给出诊断：是不是写成了 version？
+            if "version" in item:
+                bad_name.append("%s(写成了 `version`，应为 `name`)" % item.get("version"))
+            else:
+                bad_name.append("(缺 name)")
+    if bad_name:
+        report.fail(where, "`versions[].name` 缺失或写错：%s —— 面板拼不出目录名，该版本读不到数据"
+                    % ", ".join(bad_name[:5]))
+
+    # ② activeVersion —— 写错成 active 时能否兜底
+    active = index.get("activeVersion")
+    if not isinstance(active, str) or not active:
+        if "active" in index:
+            report.fail(where, "`activeVersion` 写成了 `active` —— 字段名不符，面板会当成没有活动版本")
+        else:
+            report.warn(where, "缺 `activeVersion`（面板会回退取 versions[0].name，但建议显式写上）")
+    else:
+        names = [item.get("name") for item in versions if isinstance(item, dict)]
+        if active not in names:
+            report.fail(where, "`activeVersion=%s` 不在 versions[].name 里（可选值：%s）"
+                        % (active, ", ".join(str(n) for n in names[:5])))
+
+    report.ok("%s 字段名符合面板契约（versions[].name + activeVersion）" % where)
+
+
+def check_exec_records(root, step_version, case_ids, run_id, report):
+    """检查 exec-records.json —— **报告页能出一行的必要条件**。
+
+    报告页的行数据不是读 `report.json`，而是读
+    `step-versions/<V>/exec-records.json`（结构 `{ 步骤版本: { caseId: [记录] } }`，
+    按 runId 关联 run 目录）。
+
+    ★ 2026-11-25 实测事故：只生成了 docx 和 report.json，没生成 exec-records.json，
+    报告页就是空的（顶部「报告 0 份」），尽管磁盘上 docx 已经存在。
+    """
+    where = "step-versions/%s/exec-records.json" % step_version if step_version else "step-versions/exec-records.json"
+    if not step_version:
+        return
+    path = Path(root) / "step-versions" / step_version.replace(".", "_") / "exec-records.json"
+    if not path.is_file():
+        report.fail(where, "文件不存在 —— 报告页的行数据来自它，缺了报告页会空白（即使 docx 已生成）")
+        return
+
+    data = load_json(path, report, where)
+    if not isinstance(data, dict) or isinstance(data, list):
+        report.fail(where, "顶层必须是对象 { 步骤版本: { caseId: [记录] } }")
+        return
+
+    # 优先取当前步骤版本那一组。
+    # ★ 键的写法有两种：`V0.0.1`（点，面板用 activeVersion 取值）
+    #   与 `V0_0_1`（下划线，目录名）。step_version 可能是任一种形态，
+    #   所以**两种写法都要试**，不能只按一种去匹配。
+    candidates = [step_version, step_version.replace(".", "_"), step_version.replace("_", ".")]
+    group = None
+    for key in candidates:
+        value = data.get(key)
+        if isinstance(value, dict):
+            group = value
+            break
+    if not isinstance(group, dict):
+        # 摊平所有组
+        merged = {}
+        for value in data.values():
+            if isinstance(value, dict):
+                for cid, arr in value.items():
+                    if isinstance(arr, list):
+                        merged.setdefault(cid, []).extend(arr)
+        group = merged
+        if group:
+            report.warn(where, "没有 `%s` 这一组，已摊平其他组（面板同样会摊平，但建议按版本分组）" % step_version)
+    if not group:
+        report.fail(where, "没有任何执行记录 —— 报告页会空白")
+        return
+
+    # 每条记录必须有 runId/at/result；同 runId 在一条用例下只能一条
+    missing_field = []
+    dup_run = []
+    for cid, arr in group.items():
+        if not isinstance(arr, list):
+            continue
+        run_ids = []
+        for item in arr:
+            if not isinstance(item, dict):
+                continue
+            for key in ("runId", "at", "result"):
+                if not item.get(key):
+                    missing_field.append("%s 缺 %s" % (cid, key))
+            if item.get("runId"):
+                run_ids.append(item["runId"])
+        repeated = [r for r in set(run_ids) if run_ids.count(r) > 1]
+        if repeated:
+            dup_run.append("%s(%s)" % (cid, ",".join(repeated[:2])))
+
+    if missing_field:
+        report.fail(where, "记录缺少必填字段：%s（面板靠 runId 关联 runs/，靠 at 排序）"
+                    % ", ".join(missing_field[:5]))
+    if dup_run:
+        report.fail(where, "同一次 runId 在一条用例下出现多条记录：%s（应去重，一用例一条）"
+                    % ", ".join(dup_run[:5]))
+
+    # 本轮 runId 是否落进了记录
+    if run_id:
+        hit = any(
+            isinstance(item, dict) and item.get("runId") == run_id
+            for arr in group.values() if isinstance(arr, list)
+            for item in arr
+        )
+        if not hit:
+            report.fail(where, "本轮 runId(%s) 没有进 exec-records —— 报告页看不到这次执行" % run_id)
+
+    covered = {cid for cid, arr in group.items() if isinstance(arr, list) and arr}
+    missing_cases = [cid for cid in (case_ids or []) if cid not in covered]
+    if missing_cases:
+        report.warn(where, "%d 条用例没有执行记录（如 %s）—— 面板子表会是空的"
+                    % (len(missing_cases), ", ".join(missing_cases[:3])))
+    else:
+        report.ok("exec-records 覆盖全部 %d 条用例，字段合规" % len(covered))
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="集成测试数据契约校验")
     parser.add_argument("--root", required=True, help="会话集成根目录（.../integration）")
@@ -480,6 +659,18 @@ def main(argv=None):
         report.warn("step-versions", "还没有步骤版本（Step 3 尚未执行）")
 
     check_runner(load_json(root / "runner.json", report, "runner.json"), report)
+
+    # ★ 面板契约：三个 index.json 的字段名（写错页面会空白）
+    for kind in ("case-versions", "step-versions", "report-versions"):
+        if (root / kind / "index.json").is_file():
+            check_panel_index(root, kind, report)
+
+    # ★ 报告页能出一行的必要条件：exec-records.json
+    #   ⚠️ 只在**已经有执行记录（run）**时才要求它 ——
+    #   Step 1/Step 3 阶段还没跑过测试，此时没有 exec-records 是正常的，
+    #   不能判 FAIL（会误伤用例/步骤阶段的自检）。
+    if step_ver and run_id:
+        check_exec_records(root, step_ver, case_ids, run_id, report)
 
     if run_id:
         check_snapshot(root, run_id, report)

@@ -1284,6 +1284,43 @@ def build_environment_section(doc, meta: dict) -> None:
     set_para_text(Paragraph(items[idx][1]._p, doc), text)
 
 
+def _reorder_ppr(p_pr) -> None:
+    """按 OOXML schema 规定的顺序重排 `w:pPr` 的子元素。
+
+    ★ 为什么必须有这个（2026-11-25 实测事故）：
+        `w:pPr` 的子元素**有严格顺序**，Word 遇到顺序不符时会**静默忽略**
+        不合规位置的元素。踩到的现象是：`<w:outlineLvl>` 明明写了，
+        Word 导航窗格却一个标题都不显示 —— 因为它被排到了 `<w:rPr>` 后面。
+
+        错误的顺序（makeelement + append 的默认行为，总是追加到末尾）：
+            jc → rPr → spacing → outlineLvl
+        正确顺序（CT_PPr 定义的相对次序）：
+            spacing → outlineLvl → rPr
+
+    只对已知的这几个元素排序，其余元素先按「未知元素保持原相对位置」处理，
+    避免误伤模板里本来正确的部分。
+    """
+    # CT_PPr 里与本函数相关的相对次序（数字越小越靠前）
+    order = {
+        "pStyle": 10, "keepNext": 20, "keepLines": 30, "pageBreakBefore": 40,
+        "widowControl": 60, "numPr": 70, "pBdr": 90, "shd": 100, "tabs": 110,
+        "spacing": 220, "ind": 230, "contextualSpacing": 240, "jc": 280,
+        "outlineLvl": 330, "rPr": 350, "sectPr": 360, "pPrChange": 370,
+    }
+    children = list(p_pr)
+    if not children:
+        return
+
+    def rank(node):
+        tag = node.tag.split("}")[-1]
+        return order.get(tag, 999)  # 未知元素排最后，保持相对顺序
+
+    # sorted 是稳定排序：未知元素之间的相对次序不变
+    for node in sorted(children, key=rank):
+        p_pr.remove(node)
+        p_pr.append(node)
+
+
 def apply_heading_style(paragraph, level: int) -> None:
     """把段落设成第 level 级标题（1/2/3），格式按用户 2026-11-20 定的规则。
 
@@ -1299,8 +1336,16 @@ def apply_heading_style(paragraph, level: int) -> None:
         numbering.xml 有 numId=3，一挂上标题样式章节号就会变成 1.、1.1、1.1.1
         的双重编号）。所以这里**直接改段落自身的格式**，不换样式、不碰自动编号。
 
-    @param paragraph: 目标段落
-    @param level: 1 / 2 / 3（目前只用于语义标注，格式三者相同）
+    ★★ pPr 子元素顺序必须符合 OOXML schema（2026-11-25 实测事故）：
+        `w:pPr` 里子元素**是有规定顺序的**，不是随便排。
+        Word 遇到顺序错误时**静默忽略**后面的元素 —— 表现为
+        「明明写了 `<w:outlineLvl>`，导航窗格却不出目录」。
+
+        踩过的错序：`<w:jc>` … `<w:rPr>` … `<w:spacing>` … `<w:outlineLvl>`
+        正确顺序：`<w:spacing>` → `<w:outlineLvl>` → `<w:rPr>`
+
+        修法是**每次插入后统一按 schema 重排**（见 `_reorder_ppr`），
+        而不是记住「往哪插」—— 因为 makeelement+append 总是加到末尾。
     """
     p_pr = paragraph._p.get_or_add_pPr()
 
@@ -1354,6 +1399,11 @@ def apply_heading_style(paragraph, level: int) -> None:
                 node = r_pr.makeelement(qn(tag), {})
                 r_pr.append(node)
             node.set(qn("w:val"), "0")
+
+    # ── ④ 按 schema 重排 pPr 子元素 ──
+    #     上面每步都用 makeelement+append（总是加到末尾），顺序必然是错的。
+    #     不重排的话 Word 会忽略 outlineLvl → 导航窗格没有目录。
+    _reorder_ppr(p_pr)
 
 
 def center_paragraph(paragraph) -> None:

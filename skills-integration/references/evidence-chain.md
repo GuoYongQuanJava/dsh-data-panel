@@ -72,9 +72,15 @@ observations 里的步骤号 = [1, 3]
 | `passed` | 断言成立 | runner 逐条结果、总线帧字段值、进程端点状态满足断言 |
 | `failed` | 断言不成立 | 必须有失败原因原文 |
 | `error` | 执行本身出错（崩溃、超时、环境缺依赖） | 必须有错误原文 |
-| `skipped` | 明确跳过 | 写明跳过原因 |
 | `notRun` | 本次没有执行这一步（单步执行时其余步骤） | `observed` 写「未执行（本次只执行第 N 步）」 |
+| `unconfirmed` | 跑了但证据不足，不能判通过也不能判失败 | 说明缺什么证据 |
+| `blocked` | 该行为只有界面能观测，按硬边界不测 | 写明「界面上不可观测 + 为什么不能在接口层验证」 |
 | `unknown` | 找不到证据 | 不能猜 |
+
+> **别写 `skipped`**：它不在合法值里（合法值是 `passed` / `failed` / `error` /
+> `notRun` / `unconfirmed` / `blocked` / `unknown`，以 `check_contract.py` 的
+> `VALID_OUTCOMES` 为准）。想表达「跳过」用 `notRun` 或 `blocked`，
+> 写 `skipped` 会被契约校验器拦下。
 
 **编译错误、依赖缺失、环境问题视为执行失败，不是通过。**
 

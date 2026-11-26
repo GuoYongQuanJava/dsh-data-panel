@@ -61,10 +61,20 @@ async function makeValid() {
   await writeJson(join(root, 'runner.json'), {
     preset: 'pytest', testFile: 'root:integration/tests/test_x.py', mode: 'batch',
   })
+  // 报告页的行数据来自 exec-records.json（不是 report.json），契约要求它存在
+  await writeJson(join(root, 'step-versions', 'V0_0_1', 'exec-records.json'), {
+    'V0.0.1': {
+      'V0_0_1-IT-001': [
+        { runId: 'run_1', at: '2026-11-20T11:00:00Z', result: 'pass', durationMs: 10, source: 'all' },
+      ],
+    },
+  })
   await writeJson(join(root, 'runs', 'run_1', 'snapshot', 'steps.json'), { cases: [] })
   await writeJson(join(root, 'runs', 'run_1', 'snapshot', 'cases.snapshot.json'), [])
   await writeJson(join(root, 'runs', 'run_1', 'result.json'), {
     runId: 'run_1', stepVersion: 'V0.0.1', caseVersion: 'V0.0.1',
+    // project 是软件信息探测的唯一可靠来源，契约要求必填
+    project: root,
     startedAt: '2026-11-20T11:00:00Z',
     steps: [{ caseId: 'V0_0_1-IT-001', stepNo: 1, target: 't1', channel: 'cua', outcome: 'passed' }],
   })

@@ -208,7 +208,8 @@ SUMMARY|total=<n>|passed=<n>|failed=<n>|blocked=<n>
 - 逐条用例按**冻结步骤表**跑；单步超时（按项目定，历史用 180s / 整体 2400s）；
   **无 `RESULT` 行 = FAIL**（挂死不是跳过）。
 - `junit.xml` 的 `<testcase name>` 必须**等于登记在面板的函数字符串**；
-  `<skipped>` → `skipped`；进程退出码非 0 → 整个 run 标 `failed`。
+  `<skipped>` 映射成 **`notRun`**（不要写 `skipped`，那不是 step 级合法值）；
+  进程退出码非 0 → 整个 run 标 `failed`。
 - 每步产出 `evidence.json` 记录（`stepId` / `result` / `durationMs` / `channel` / `kv` / `observed` 原始串）
   —— 这是**回写观察值的唯一事实源**。
 - 依赖前序步 `blocked` 的后续步**在同一用例内级联记 `blocked`**，不许「顺手补测」。
