@@ -69,6 +69,19 @@ async function makeValid() {
       ],
     },
   })
+  // 可测点清单：Step 1 必须穷尽枚举，用例数量以它为依据
+  await writeJson(join(root, 'case-versions', 'V0_0_1', 'measurable-points.json'), {
+    caseVersion: 'V0.0.1',
+    generatedAt: '2026-11-20T10:00:00Z',
+    scanBasis: {
+      endpoints: 1, constrainedFields: 1, errorBranches: 1,
+      businessChecks: 1, stateValues: 1, authPoints: 1,
+    },
+    points: [
+      { id: 'M-A-001', dimension: 'endpoint', featureId: 'ft_001',
+        desc: 'GET /api/demo 正常访问', caseIds: ['V0_0_1-IT-001'] },
+    ],
+  })
   await writeJson(join(root, 'runs', 'run_1', 'snapshot', 'steps.json'), { cases: [] })
   await writeJson(join(root, 'runs', 'run_1', 'snapshot', 'cases.snapshot.json'), [])
   await writeJson(join(root, 'runs', 'run_1', 'result.json'), {

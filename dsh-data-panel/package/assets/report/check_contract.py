@@ -556,6 +556,7 @@ def check_exec_records(root, step_version, case_ids, run_id, report):
     # 每条记录必须有 runId/at/result；同 runId 在一条用例下只能一条
     missing_field = []
     dup_run = []
+    bad_source = []
     for cid, arr in group.items():
         if not isinstance(arr, list):
             continue
@@ -566,6 +567,13 @@ def check_exec_records(root, step_version, case_ids, run_id, report):
             for key in ("runId", "at", "result"):
                 if not item.get(key):
                     missing_field.append("%s 缺 %s" % (cid, key))
+            # ★ source 必须是 all / step —— 报告页只认 "all"，写成别的值
+            #   （实测有人写成 "run"）记录会被静默筛掉，报告页空白也无报错。
+            src = item.get("source")
+            if src is None:
+                bad_source.append("%s(缺 source)" % cid)
+            elif src not in ("all", "step"):
+                bad_source.append("%s(source=%r)" % (cid, src))
             if item.get("runId"):
                 run_ids.append(item["runId"])
         repeated = [r for r in set(run_ids) if run_ids.count(r) > 1]
@@ -578,6 +586,11 @@ def check_exec_records(root, step_version, case_ids, run_id, report):
     if dup_run:
         report.fail(where, "同一次 runId 在一条用例下出现多条记录：%s（应去重，一用例一条）"
                     % ", ".join(dup_run[:5]))
+    if bad_source:
+        report.fail(where, "`source` 不合规：%s —— 报告页**只认 `\"all\"`**（一键执行），"
+                           "`\"step\"` 只留在步骤页。写成别的值（如 `\"run\"`）"
+                           "记录会被静默筛掉，报告页空白且不报错"
+                    % ", ".join(bad_source[:5]))
 
     # 本轮 runId 是否落进了记录
     if run_id:
@@ -596,6 +609,113 @@ def check_exec_records(root, step_version, case_ids, run_id, report):
                     % (len(missing_cases), ", ".join(missing_cases[:3])))
     else:
         report.ok("exec-records 覆盖全部 %d 条用例，字段合规" % len(covered))
+
+
+def check_measurable_points(root, case_version, case_ids, report):
+    """检查可测点清单 —— **决定用例数量的唯一依据**。
+
+    ★ 2026-11-25 实测事故：同一类项目反复只出 38-42 条用例，
+    而按源码逐项枚举其实有 1000+ 个可测点。根因是从没要求过枚举 ——
+    模型凭「读完代码的印象」写用例，只写得出主流程那十几条。
+
+    所以现在强制：Step 1 必须产出 `measurable-points.json`，
+    六个维度（端点/字段约束/错误分支/业务校验/状态机/鉴权）都要有实际扫描数字。
+    """
+    where = "measurable-points.json"
+    if not case_version:
+        return
+    path = Path(root) / "case-versions" / case_version.replace(".", "_") / "measurable-points.json"
+    if not path.is_file():
+        report.fail(where, "不存在 —— Step 1 必须穷尽枚举可测点。"
+                           "没有它就无法判断用例数是不是「分析出来多少」，"
+                           "也就无法证明没有漏测。见 SKILL.md「★ 1-1.2 先穷尽枚举可测点」")
+        return
+
+    doc = load_json(path, report, where)
+    if not isinstance(doc, dict):
+        report.fail(where, "顶层必须是对象")
+        return
+
+    basis = doc.get("scanBasis")
+    if not isinstance(basis, dict):
+        report.fail(where, "缺 `scanBasis` —— 要记录六个维度各扫出多少条，"
+                           "否则无法核对是否真的扫过")
+        basis = {}
+
+    DIMENSIONS = [
+        ("endpoints", "端点"),
+        ("constrainedFields", "受限字段"),
+        ("errorBranches", "错误分支"),
+        ("businessChecks", "业务校验"),
+        ("stateValues", "状态值"),
+        ("authPoints", "鉴权点"),
+    ]
+    missing_dims = []
+    zero_dims = []
+    for key, label in DIMENSIONS:
+        value = basis.get(key)
+        if value is None:
+            missing_dims.append(label)
+        elif not isinstance(value, int) or value == 0:
+            zero_dims.append(label)
+    if missing_dims:
+        report.fail(where, "scanBasis 缺少维度：%s（六个维度都要扫）"
+                    % ", ".join(missing_dims))
+    if zero_dims:
+        # 某一维为 0 是可能的（如无鉴权点的 CLI 工具），但必须显式声明
+        report.warn(where, "这些维度扫出来是 0：%s —— 确认系统里确实没有，"
+                           "并在 coverage.json 说明" % ", ".join(zero_dims))
+
+    points = doc.get("points")
+    if not isinstance(points, list) or not points:
+        report.fail(where, "`points[]` 为空 —— 至少应该枚举出端点级的可测点")
+        return
+
+    # 每个点必须归属功能项、且要么被覆盖、要么标记不测
+    no_feature = []
+    no_case = []
+    covered_ids = set()
+    for item in points:
+        if not isinstance(item, dict):
+            continue
+        pid = str(item.get("id") or "?")
+        if not str(item.get("featureId") or "").strip():
+            no_feature.append(pid)
+        ids = item.get("caseIds")
+        if isinstance(ids, list) and ids:
+            covered_ids.update(str(x) for x in ids if x)
+        else:
+            no_case.append(pid)
+
+    if no_feature:
+        report.fail(where, "%d 个可测点没有 featureId（无法归组）：%s"
+                    % (len(no_feature), ", ".join(no_feature[:5])))
+
+    total = len([p for p in points if isinstance(p, dict)])
+    if no_case:
+        report.warn(where, "%d/%d 个可测点还没被用例覆盖（如 %s）—— "
+                           "每个都要么补用例，要么在 coverage.json 给不测理由"
+                    % (len(no_case), total, ", ".join(no_case[:5])))
+    else:
+        report.ok("可测点 %d 个，全部有用例覆盖" % total)
+
+    # 反向核对：用例数 vs 可测点数 —— 少于可测点数说明有合并或漏测
+    n_cases = len([c for c in (case_ids or [])])
+    if n_cases and total:
+        if n_cases < total * 0.5:
+            report.warn(where, "用例数(%d) 不到可测点数(%d) 的一半 —— "
+                               "确认是「合并成参数化用例」而不是漏测；"
+                               "合并的要在 description 里写明覆盖了哪几个可测点"
+                        % (n_cases, total))
+        else:
+            report.ok("用例 %d 条 / 可测点 %d 个，比例合理" % (n_cases, total))
+
+    # 用例能否追溯到可测点
+    if case_ids:
+        orphan = [cid for cid in case_ids if cid not in covered_ids]
+        if orphan:
+            report.warn(where, "%d 条用例在可测点清单里找不到出处（如 %s）—— "
+                               "追溯不到的用例可能是凑数" % (len(orphan), ", ".join(orphan[:3])))
 
 
 def main(argv=None):
@@ -664,6 +784,9 @@ def main(argv=None):
     for kind in ("case-versions", "step-versions", "report-versions"):
         if (root / kind / "index.json").is_file():
             check_panel_index(root, kind, report)
+
+    # ★★ 可测点清单：用例数量的唯一依据（防「只出几十条就交差」）
+    check_measurable_points(root, case_ver, case_ids, report)
 
     # ★ 报告页能出一行的必要条件：exec-records.json
     #   ⚠️ 只在**已经有执行记录（run）**时才要求它 ——

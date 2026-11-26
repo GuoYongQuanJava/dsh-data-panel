@@ -8098,13 +8098,18 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 								: h("div", { className: "it-subbar", "data-it": "steps-subbar" },
 									h("div", { className: "it-subbar-left" },
 										h("span", { className: "it-subbar-label" }, "测试步骤"),
-										h("button", {
-											type: "button",
-											className: "it-multi-enter",
-											"data-it": "steps-multi-enter",
-											title: "进入多选，可批量导出报告",
-											onClick: function () { setStepMultiSelect(true); }
-										}, "多选")
+										/*
+										 * ⏸ 暂时注释掉「多选」按钮（2026-11-25 用户要求）。
+										 * 批量导出这一套先不用，以后要恢复就把下面这段的
+										 * 注释符号去掉即可（多选态的渲染逻辑都还在，没删）。
+										 */
+										// h("button", {
+										// 	type: "button",
+										// 	className: "it-multi-enter",
+										// 	"data-it": "steps-multi-enter",
+										// 	title: "进入多选，可批量导出报告",
+										// 	onClick: function () { setStepMultiSelect(true); }
+										// }, "多选")
 									),
 									filterParts.button
 								),
@@ -8503,13 +8508,17 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 									h("span", { key: "fail" }, "未通过 ", h("b", null, String(allRuns.filter(function (run) { return run.result !== "pass"; }).length)), " 条")
 								];
 							})(),
-							// 「多选」是文字按钮，点开才进入多选态（对齐原型）
-							h("button", {
-								type: "button",
-								className: "it-multi-enter",
-								"data-it": "multi-enter",
-								onClick: function () { setMultiSelect(true); }
-							}, "多选")
+							/*
+							 * ⏸ 暂时注释掉「多选」按钮（2026-11-25 用户要求）。
+							 * 批量导出这一套先不用，以后要恢复就把下面这段的
+							 * 注释符号去掉即可（多选态的渲染逻辑都还在，没删）。
+							 */
+							// h("button", {
+							// 	type: "button",
+							// 	className: "it-multi-enter",
+							// 	"data-it": "multi-enter",
+							// 	onClick: function () { setMultiSelect(true); }
+							// }, "多选")
 						),
 					groups.length === 0
 						? h("div", { className: "it-empty" },

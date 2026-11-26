@@ -420,7 +420,7 @@ test('默认进入测试用例页', () => {
   assert.equal(find(tree, 'multi-enter'), undefined, '默认不应停在测试报告页')
 })
 
-test('报告页多选：进入、全选、清空、退出都真实生效', () => {
+test('报告页多选：进入、全选、清空、退出都真实生效', { skip: '多选按钮 2026-11-25 暂时注释掉，恢复按钮后去掉 skip' }, () => {
   const h = harness(), render = () => h.render(h.api.IntegrationPanel, { sessionId: 'a', initialSeed: h.TEST_SEED })
   // 默认页是测试用例，先切到测试报告页
   find(render(), 'tab-reports').props.onClick()
@@ -977,7 +977,7 @@ test('步骤页子表的导出图标调导出接口', async () => {
   assert.equal(urls.some(u => u.includes('/data-panel/open')), false, '导出不能变成「打开文件」')
 })
 
-test('报告页「导出已选报告」是真实导出，不再是空壳', async () => {
+test('报告页「导出已选报告」是真实导出，不再是空壳', { skip: '多选按钮 2026-11-25 暂时注释掉，恢复按钮后去掉 skip' }, async () => {
   const h = exportHarness()
   const seed = {
     versions: [{ name: 'V0.0.1', at: '2026-11-17T09:00:00Z', status: 'current' }],

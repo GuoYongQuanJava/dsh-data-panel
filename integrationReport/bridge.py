@@ -1469,6 +1469,123 @@ def render_docx(module, template: Path, data: dict, report_dir: Path,
 # ─────────────────────────────────────────────────────────────
 
 
+def write_exec_records(session_root: Path, step_version: str, run_id: str,
+                       result: dict) -> Path | None:
+    """生成/合并 `step-versions/<V>/exec-records.json` —— **报告页能显示的唯一前提**。
+
+    ★★ 为什么必须有这一步（2026-11-25 实测事故）：
+        报告 docx 生成成功、`report-versions/index.json` 也写了，
+        但面板「测试报告」页依旧空白，只显示「当前还没有测试报告」。
+        而「测试步骤」页是正常的 —— 两页用**完全不同的数据源**：
+
+            测试步骤页  ←  step-versions/<V>/steps.json       （有，所以能显示）
+            测试报告页  ←  step-versions/<V>/exec-records.json （没有，所以空白）
+
+        面板 `client.js` 的 `reportsView()` 判定条件（两条都必须满足）：
+            ① 每条用例的 `records[]` 里必须有 `source === "all"` 的记录
+            ② 该记录的 `runId` 还必须等于「当前报告版本」的 `runId`
+
+        `bridge.py` 以前**完全不写这个文件**，报告页就永远是空的，
+        而且不报任何错 —— 用户只会以为报告没生成。
+
+    写入规则（与面板约定一致）：
+      · 结构 `{ 步骤版本: { caseId: [记录] } }`
+      · 一条用例一次执行 = 一条记录，存 `runId`/`at`/`result`/`durationMs`/`source`
+      · 同一 `runId` 在一条用例下**只能有一条**（按 runId 去重，重跑不堆叠）
+      · 已存在的其他 run 记录**保留**（多次一键执行累积）
+
+    返回写入路径；没有可写记录时返回 None。
+    """
+    steps = result.get("steps") or []
+    if not isinstance(steps, list) or not steps:
+        return None
+
+    version_dir = session_root / "step-versions" / step_version.replace(".", "_")
+    if not version_dir.is_dir():
+        return None
+    path = version_dir / "exec-records.json"
+
+    existing = read_json(path, {})
+    if not isinstance(existing, dict):
+        existing = {}
+
+    # 外层键用带点的版本号（面板拿 activeVersion 去取）
+    group = existing.get(step_version)
+    if not isinstance(group, dict):
+        group = existing.get(step_version.replace(".", "_"))
+    if not isinstance(group, dict):
+        group = {}
+
+    # 按 caseId 聚合本次 run 的步骤结论
+    per_case = {}
+    for item in steps:
+        if not isinstance(item, dict):
+            continue
+        case_id = str(item.get("caseId") or "")
+        if case_id == "":
+            continue
+        per_case.setdefault(case_id, []).append(str(item.get("outcome") or "unconfirmed"))
+    if not per_case:
+        return None
+
+    def case_result(outcomes):
+        """用例级结论：任一步未通过 → fail；全通过 → pass；其余 unconfirmed。"""
+        if any(o in ("failed", "error") for o in outcomes):
+            return "fail"
+        if outcomes and all(o == "passed" for o in outcomes):
+            return "pass"
+        if outcomes and all(o == "notRun" for o in outcomes):
+            return "fail"
+        return "unconfirmed"
+
+    at = str(result.get("finishedAt") or result.get("startedAt")
+             or datetime.now(timezone.utc).isoformat())
+
+    duration_of = {}
+    for item in steps:
+        if isinstance(item, dict) and item.get("caseId"):
+            duration_of[item["caseId"]] = duration_of.get(item["caseId"], 0) + float(
+                item.get("durationMs") or 0)
+
+    for case_id, outcomes in per_case.items():
+        arr = group.get(case_id)
+        arr = list(arr) if isinstance(arr, list) else []
+        # ★ 同 runId 去重：重跑同一 run 时不堆叠
+        arr = [r for r in arr if not (isinstance(r, dict) and r.get("runId") == run_id)]
+        arr.insert(0, {
+            "runId": run_id,
+            "at": at,
+            "result": case_result(outcomes),
+            "durationMs": int(duration_of.get(case_id, 0)),
+            "source": "all",
+        })
+        arr.sort(key=lambda r: str((r or {}).get("at") or ""), reverse=True)
+        group[case_id] = arr
+
+    # ★ 顺手清掉「source 非法」的历史记录（2026-11-25 实测）：
+    #   有的执行者手写 exec-records 时把 source 写成 "run"，
+    #   这类记录**永远显示不出来**（报告页只认 "all"），留着只会让
+    #   契约校验器一直 FAIL，也让人误以为「跑过但没显示」。
+    #   它们本来就没有展示价值，直接丢弃。
+    dropped = 0
+    for case_id, arr in list(group.items()):
+        if not isinstance(arr, list):
+            continue
+        kept = [r for r in arr
+                if isinstance(r, dict) and r.get("source") in ("all", "step")]
+        dropped += len(arr) - len(kept)
+        group[case_id] = kept
+
+    # 写回：外层统一成带点的版本号，并清掉可能存在的下划线写法
+    existing.pop(step_version.replace(".", "_"), None)
+    existing[step_version] = group
+    path.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
+    if dropped:
+        print("      已清掉 %d 条 source 非法的历史记录（写成 \"run\" 这类，报告页永远显示不出来）"
+              % dropped)
+    return path
+
+
 def main(argv) -> int:
     parser = argparse.ArgumentParser(
         description="集成测试报告数据转换（把一次执行转成生成器要的 data）")
@@ -1611,6 +1728,9 @@ def main(argv) -> int:
         data_path = write_report_data(report_dir, data, {}, None, args.run_id,
                                       step_version, case_version)
         print("OK report-data.json -> %s" % data_path)
+        rec_path = write_exec_records(session_root, step_version, args.run_id, result)
+        if rec_path:
+            print("OK exec-records.json -> %s（报告页靠它显示）" % rec_path)
         print("[6/6] 已跳过 docx 生成（--no-docx）")
         return 0
 
@@ -1637,6 +1757,16 @@ def main(argv) -> int:
     print("OK 总体报告 -> %s" % overall)
     print("OK 单条报告 %d 份 -> %s" % (len(made), report_dir / "cases"))
     print("OK report-data.json -> %s" % data_path)
+
+    # ★★ 报告页的数据源：没有 exec-records.json，「测试报告」页就是空白。
+    #    这一步不能省，也不能指望「面板自己会写」—— 面板只在用户手动
+    #    增删执行记录时才写它，一键执行后不会自动补。
+    rec_path = write_exec_records(session_root, step_version, args.run_id, result)
+    if rec_path:
+        print("OK exec-records.json -> %s（报告页靠它显示）" % rec_path)
+    else:
+        print("      ⚠️ 没有写出 exec-records.json（本次 result.json 里没有 steps[]）")
+        print("         报告页会是空白，尽管 docx 已生成。")
     return 0
 
 
