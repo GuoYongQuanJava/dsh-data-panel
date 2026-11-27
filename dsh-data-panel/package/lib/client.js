@@ -726,6 +726,24 @@ window.__ModuleLoader__.load({
 .it-toolbar .it-version,
 .it-toolbar .it-result-filter { flex: 0 0 auto; }
 .it-toolbar-actions { display: flex; align-items: center; gap: 6px; margin-left: auto; flex: 0 0 auto; }
+/*
+ * ★ 2026-11-25 用户要求的三处「互换位置」：用 order 调视觉顺序，
+ *   **不动 JSX 结构**（版本切换是一大段 IIFE，挪动代码风险高、收益低）。
+ *
+ * 目标顺序（按子页）：
+ *   测试用例：刷新 → 新增用例 → 切换用例版本
+ *   测试步骤：一键执行 → 刷新 → 切换用例版本
+ *   测试报告：总体报告 → 刷新 → 导出 → 切换报告版本
+ *
+ * 数值约定：主操作/动作 10~30，版本切换 90（永远最后）。
+ */
+.it-toolbar-actions > .it-version { order: 90; }
+.it-toolbar-actions > [data-it="run-steps"] { order: 10; }
+.it-toolbar-actions > [data-it="overview"] { order: 10; }
+.it-toolbar-actions > [data-it="refresh"] { order: 20; }
+.it-toolbar-actions > [data-it="generate-steps"] { order: 30; }
+.it-toolbar-actions > [data-it="overview-export"] { order: 40; }
+.it-toolbar-actions > [data-it="add-case"] { order: 50; }
 .it-toolbar .it-version-btn { height: 36px; border-radius: 10px; padding: 0 10px; }
 .it-toolbar .it-switch-btn { height: 36px; }
 .it-toolbar .dp-btn { flex: 0 0 auto; }
@@ -798,19 +816,22 @@ window.__ModuleLoader__.load({
 /* 整页撑满：shell 变弹性列，看板占据剩余高度，卡片在其中铺满。 */
 .it-root .dp-shell { display: flex; flex-direction: column; height: 100%; min-height: 0; box-sizing: border-box; }
 /*
- * ★ 报告页专用：解除「整页定高 + 卡内滚动」，改成内容自然撑开、外层整页滚动。
+ * ★ 报告页布局：与步骤页一致 —— 卡片定高 + 组内滚动 + 分页贴底（2026-11-25 恢复）。
  *
- * 原因（2026-11-24 实修）：报告页有「组内每页条数」原生 <select> 下拉。
- * 定高布局下 .it-card / .it-report-group 都是 overflow:hidden + 内部滚动容器，
- * 下拉选项被裁掉且滚不到 —— 表现为「只会挤压不会展开，超出的部分看不到」。
+ * 历史：
+ *   · 2026-11-24 为修「组内每页条数下拉被裁」，把这里改成「整页滚动」（height:auto）。
+ *     代价是表头和分页条都跟着页面滚走 —— 滚动时上下不固定，翻页要一路往下滚。
+ *   · 2026-11-25 用户要求报告页与步骤页同效：滚动时上下固定、翻页始终在底部。
+ *     所以恢复定高布局，滚动收回到 .it-report-groups 内部 ——
+ *     表头 sticky 和分页条 fixed 只有在「真正的滚动容器」里才生效。
  *
- * 现在：dp-shell 不再定高，高度由内容决定；滚动交给最外层 .it-root.dp-root（它本来就有 overflow-y:auto）。
- * 其他两个 tab（用例 / 步骤）保持原来的定高 + 表头吸顶 + 分页贴底，不受影响。
+ * 下拉被裁的处理：.it-report-group 保持 overflow:visible，
+ * 原生 select 的选项由浏览器绘制，不受祖先 overflow 裁剪。
  */
-.it-root.is-report-tab .dp-shell { height: auto; min-height: 100%; }
-.it-root.is-report-tab .it-board { flex: 0 0 auto; }
-.it-root.is-report-tab .it-main { flex: 0 0 auto; min-height: 0; }
-.it-root.is-report-tab .it-card { flex: 0 0 auto; }
+.it-root.is-report-tab .dp-shell { height: 100%; }
+.it-root.is-report-tab .it-board { flex: 1 1 auto; min-height: 0; }
+.it-root.is-report-tab .it-main { flex: 1 1 auto; min-height: 0; }
+.it-root.is-report-tab .it-card { flex: 1 1 auto; min-height: 0; }
 .it-root .it-board { flex: 1 1 auto; min-height: 0; align-items: stretch; }
 .it-root .it-main { display: flex; flex-direction: column; min-height: 0; }
 .it-root .it-card { flex: 1 1 auto; min-height: 0; }
@@ -880,7 +901,25 @@ window.__ModuleLoader__.load({
 .it-pill[data-tone="error"] { background: color-mix(in srgb, var(--dp-warning) 15%, transparent); color: var(--dp-warning); }
 .it-pill[data-tone="idle"] { background: var(--dp-bg3); color: var(--dp-text3); }
 .it-pill[data-tone="brand"] { background: color-mix(in srgb, var(--dp-brand) 12%, transparent); color: var(--dp-brand); }
-/* 测试类型胶囊：中性灰蓝，和「执行结果」的红绿黄区分开，一眼能分「类型」和「结果」 */
+/*
+ * 测试类型胶囊：按类型分色（2026-11-25 用户要求，对齐单元测试的观感）。
+ *
+ * 之前所有类型都用同一个中性灰蓝（data-tone="type"），七类看起来一模一样，
+ * 扫表时分不出哪条是接口、哪条是边界。现在每类一个色相：
+ *   functional 蓝 / api 青 / boundary 橙 / performance 紫
+ *   security 红 / margin 绿 / stress 灰
+ *
+ * 用 data-type 而不是 data-tone：tone 表示「语义强弱」（ok/bad/error），
+ * type 是另一个维度，混用会让选择器没法区分「执行结果」和「测试类型」。
+ */
+.it-type-pill[data-type="functional"] { background: color-mix(in srgb, #4d6bfe 12%, transparent); color: #4d6bfe; }
+.it-type-pill[data-type="api"] { background: color-mix(in srgb, #0891b2 13%, transparent); color: #0e7490; }
+.it-type-pill[data-type="boundary"] { background: color-mix(in srgb, #ea580c 13%, transparent); color: #c2410c; }
+.it-type-pill[data-type="performance"] { background: color-mix(in srgb, #7c3aed 13%, transparent); color: #6d28d9; }
+.it-type-pill[data-type="security"] { background: color-mix(in srgb, #dc2626 12%, transparent); color: #b91c1c; }
+.it-type-pill[data-type="margin"] { background: color-mix(in srgb, #16a34a 13%, transparent); color: #15803d; }
+.it-type-pill[data-type="stress"] { background: var(--dp-bg3); color: var(--dp-text3); }
+/* 兜底：类型缺失或不在 7 类里时仍用中性色，不要变成透明 */
 .it-pill[data-tone="type"] { background: color-mix(in srgb, #64748b 13%, transparent); color: #8b93a1; }
 .it-ops { display: flex; justify-content: center; gap: 1px; }
 .it-empty { padding: 34px 16px; color: var(--dp-text3); font-size: 12.5px; text-align: center; }
@@ -973,33 +1012,44 @@ window.__ModuleLoader__.load({
  */
 .it-report-groups { display: flex; flex-direction: column; gap: 9px; }
 /*
- * ★ 报告卡片：**不用卡内滚动，改成整页滚动**（2026-11-24 修）。
+ * ★ 报告卡片：与步骤页同构 —— 卡片定高，**组内区域滚动**，分页条贴卡片底。
  *
- * 原来这里是 flex: 1 1 auto; min-height: 0; overflow-y: auto，配合 .it-card 的
- * overflow: hidden，形成两层裁切上下文。后果：
- *   · 组内「每页 N 条」是原生 <select>，展开的选项被 .it-report-groups 裁掉，
- *     看起来「只会挤压不会自然展开」；
- *   · 内容超出卡片高度时既滚不到、也看不到，页面上半截被定死。
+ * 2026-11-25 改回定高布局（此前是 height:auto 的整页滚动）：
+ *   · 整页滚动时，组内的表头会跟着滚走，看不到列名；
+ *   · 分页条用 sticky bottom 贴在视口底，但它同时在文档流里 ——
+ *     滚到卡片末尾时会被内容顶一下，观感不稳定。
  *
- * 现在：卡片高度由内容撑开（height: auto），滚动交给最外层页面；
- * 底部翻页条用 sticky 贴视口底，滚到哪都能翻页。
+ * 定高后：
+ *   · .it-report-groups 成为真正的滚动容器 → 组内表头 sticky 生效；
+ *   · 分页条 flex: 0 0 auto 固定在卡片底部 → 滚到哪都能翻页，位置不动。
+ *
+ * 下拉不被裁：.it-report-group 保持 overflow:visible（原生 select 由浏览器绘制）。
  */
-.it-card > .it-report-groups { flex: 0 0 auto; min-height: 0; overflow: visible; padding: 10px; }
-/* 报告卡片本身不再裁切内容：下拉/悬浮层要能溢出到卡片外 */
-.it-card.is-report { overflow: visible; height: auto; flex: 0 0 auto; }
-/* 翻页条：贴视口底部（sticky 而不是 fixed，不会脱离卡片宽度） */
+.it-card > .it-report-groups { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 10px; }
+/* 报告卡片本身不裁切内容：下拉/悬浮层要能溢出到卡片外 */
+.it-card.is-report { overflow: visible; height: auto; flex: 1 1 auto; min-height: 0; }
+/* 翻页条：固定在卡片底部（与步骤页 .it-card > .it-pager 同一套做法） */
 .it-card.is-report > .dp-pager.it-pager {
 	flex: 0 0 auto;
-	position: sticky;
-	bottom: 0;
+	position: relative;
+	bottom: auto;
 	z-index: 3;
 	background: var(--dp-bg);
-	box-shadow: 0 -1px 0 var(--dp-border);
+	border-top: 1px solid var(--dp-border);
+	box-shadow: none;
 }
 /* 组卡片同理：不要裁掉下拉选项 */
 .it-report-group { border: 1px solid var(--dp-border); border-radius: 11px; background: var(--dp-bg); overflow: visible; }
 /* 组内表格自己带一层边框，和卡片边框叠在一起会显粗，这里让表格贴边无框 */
 .it-report-group .it-table-wrap { border: 0; border-radius: 0; }
+/*
+ * ★ 组内表头吸顶（2026-11-25）：.it-report-groups 现在是滚动容器，
+ *   表头 sticky 在它里面才生效 —— 滚长表时列名不会跟着走。
+ *   z-index 要低于分组标题行（.it-report-head 是 4），避免盖住它。
+ */
+.it-report-group .it-table thead th { position: sticky; top: 0; z-index: 2; background: var(--dp-bg2); }
+/* 分组标题行：滚动时也贴住顶部，让人知道当前看的是哪个功能项 */
+.it-report-group .it-report-head { position: sticky; top: 0; z-index: 4; }
 .it-report-head { display: flex; align-items: center; gap: 7px; width: 100%; padding: 9px 11px; border-bottom: 1px solid var(--dp-border); background: var(--dp-bg2); color: var(--dp-text); font: inherit; text-align: left; transition: background .12s; }
 /* 折叠按钮本身只包箭头 + 名称 + 徽标，右侧「通过/失败」不属于点击区 */
 .it-report-toggle { display: inline-flex; align-items: center; gap: 7px; padding: 0; border: 0; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
@@ -1425,14 +1475,20 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 		}
 
 		/**
-		 * 测试类型单元格：一个浅色胶囊，和「执行结果」的 it-pill 同族但不同色。
+		 * 测试类型单元格：一个浅色胶囊，**按类型分色**（2026-11-25）。
 		 *
-		 * 用 data-tone="type" 区分语义色，避免各表自己写颜色。
+		 * 之前统一用 data-tone="type" 的中性色，七类看起来一模一样。
+		 * 现在把类型本身放进 data-type，由 CSS 按类型给色相；
+		 * 同时保留 data-tone="type" 作为兜底（类型缺失时仍显示中性色）。
 		 */
 		function itTypePill(type) {
 			var label = itTypeLabel(type);
 			if (label === "—") return "—";
-			return h("span", { className: "it-pill it-type-pill", "data-tone": "type" }, label);
+			return h("span", {
+				className: "it-pill it-type-pill",
+				"data-tone": "type",
+				"data-type": String(type || "")
+			}, label);
 		}
 
 		var IT_STATUS = {
@@ -6513,10 +6569,14 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 						 * 用户反馈「点刷新没反应」：数据没变化时界面本来就一样，
 						 * 不给一句话就分不清是「刷新了但没变」还是「点了没生效」。
 						 * 这里只在**手动刷新**（keepVersion=true）时提示，首次加载不打扰。
+						 *
+						 * ★ 2026-11-25：提示只写「已刷新」。
+						 *   原来写的是「已刷新：当前版本 V0.0.1 共 N 条用例」——
+						 *   三个页面（用例/步骤/报告）共用这段逻辑，导致在报告页刷新
+						 *   也提示「共 N 条用例」，数字和页面内容对不上。
 						 */
 						if (keepVersion === true) {
-							var total = Array.isArray(list) ? list.length : 0;
-							setNotice("已刷新：当前版本 " + (caseKind.activeVersion || "V0.0.1") + " 共 " + total + " 条用例。");
+							setNotice("已刷新");
 						}
 					})
 					.catch(function (error) {
@@ -8773,6 +8833,21 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 							label: "搜索集成测试用例",
 							placeholder: "搜索标识、名称、说明或场景"
 						}),
+						/*
+						 * ★ 2026-11-25：把「全部类型」筛选挪到子页切换**左边**（用户要求）。
+						 * 顺序变成：搜索 → 全部类型 → 测试用例/步骤/报告
+						 */
+						h("select", {
+							className: "dp-select",
+							value: type,
+							onChange: function (event) { setType(event.target.value); resetPages(); },
+							"aria-label": "按测试类型筛选"
+						},
+							h("option", { value: "all" }, "全部类型"),
+							IT_TYPE_KEYS.map(function (key) {
+								return h("option", { key: key, value: key }, IT_TYPES[key].label);
+							})
+						),
 						h("div", { className: "it-switch", "data-dropdown": "switch" },
 							h("button", {
 								type: "button",
@@ -8816,22 +8891,57 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 								})
 							)
 						),
-						h("select", {
-							className: "dp-select",
-							value: type,
-							onChange: function (event) { setType(event.target.value); resetPages(); },
-							"aria-label": "按测试类型筛选"
-						},
-							h("option", { value: "all" }, "全部类型"),
-							IT_TYPE_KEYS.map(function (key) {
-								return h("option", { key: key, value: key }, IT_TYPES[key].label);
-							})
-						),
 						h("div", { className: "it-toolbar-actions" },
+							/*
+							 * ★ 2026-11-25 按用户要求互换位置（只调顺序，逻辑不变）：
+							 *
+							 *   测试用例：生成测试步骤 ↔ 刷新   互换 → 刷新在左、生成测试步骤在右
+							 *             切换用例版本 ↔ 新增用例 互换
+							 *   测试步骤：一键执行 放到 刷新 左边
+							 *   测试报告：刷新 ↔ 总体报告      互换 → 总体报告在左、刷新在右
+							 *             切换报告版本 ↔ 导出     互换
+							 */
+
+							/* ① 测试步骤页：一键执行在刷新左边 */
+							tab === "steps"
+								? h(Button, {
+									variant: "ghost",
+									"data-it": "run-steps",
+									onClick: function () { runAllIntegrationPrompt(); }
+								}, "一键执行")
+								: null,
+							/* ② 测试报告页：总体报告在刷新左边（与刷新互换） */
+							tab === "reports"
+								? h(Button, {
+									variant: "ghost",
+									"data-it": "overview",
+									/*
+									 * 「总体报告」直接开 tab 页展示整项目那份 Word 报告。
+									 *
+									 * 用户的要求是「打开一个 tab 页」，不是在弹窗里看一份 HTML 汇总：
+									 * 真正的总体报告是按配置项测试模板整体排版、含所有用例步骤表汇总的
+									 * 那份 docx，只有打开它才能看到完整内容。
+									 *
+									 * 弹窗（IntegrationOverview）保留为「选择纳入范围」的辅助入口，
+									 * 但主入口直接开报告。
+									 */
+									onClick: function () { openOverallReport(records); }
+								}, "总体报告")
+								: null,
+
+							/* ③ 刷新 */
 							h(Button, { variant: "ghost", "data-it": "refresh", onClick: refresh },
 								h(Icon, { name: "refresh", size: 15 }),
 								"刷新"
 							),
+							/* ④ 测试用例页：生成测试步骤（在刷新右边） */
+							tab === "cases"
+								? h(Button, {
+									variant: "ghost",
+									"data-it": "generate-steps",
+									onClick: function () { generateSteps(); }
+								}, "生成测试步骤")
+								: null,
 							// 版本切换：放在操作区，作为「当前查看的数据范围」。
 							/*
 							 * 三个子页的版本**不是同一套编号**：
@@ -8915,40 +9025,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 									)
 								);
 							})(),
-							/*
-							 * 主操作按子页给不同的东西：
-							 *   测试用例 —— 新增用例（primary，唯一的颜色强调）+ 生成测试步骤
-							 *   测试步骤 —— 一键执行
-							 *   测试报告 —— 总体报告（汇总视图）
-							 */
-							tab === "reports"
-								? h(Button, {
-									variant: "ghost",
-									"data-it": "overview",
-									/*
-									 * 「总体报告」直接开 tab 页展示整项目那份 Word 报告。
-									 *
-									 * 用户的要求是「打开一个 tab 页」，不是在弹窗里看一份 HTML 汇总：
-									 * 真正的总体报告是按配置项测试模板整体排版、含所有用例步骤表汇总的
-									 * 那份 docx，只有打开它才能看到完整内容。
-									 *
-									 * 弹窗（IntegrationOverview）保留为「选择纳入范围」的辅助入口，
-									 * 但主入口直接开报告。
-									 */
-									onClick: function () { openOverallReport(records); }
-								}, "总体报告")
-								: null,
-							/*
-							 * 总体报告的「导出」：常驻在「总体报告」右边。
-							 *
-							 * 一开始做成了「点过总体报告才出现」，但那是错的：
-							 * 点「总体报告」会把 PDF 开在**主区域的新 tab**，主面板被切走，
-							 * 用户根本看不到这个按钮（2026-11-20 用户截图反馈）。
-							 * 所以改成常驻 —— 什么时候切回主面板，它都在那儿。
-							 *
-							 * 导出的是**整项目那一份** docx（kind === "overall"），
-							 * 不是某条用例的单条报告。
-							 */
+							/* ⑤ 测试报告页：导出 */
 							tab === "reports"
 								? h(Button, {
 									variant: "ghost",
@@ -8959,20 +9036,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 									"导出"
 								)
 								: null,
-							tab === "cases"
-								? h(Button, {
-									variant: "ghost",
-									"data-it": "generate-steps",
-									onClick: function () { generateSteps(); }
-								}, "生成测试步骤")
-								: null,
-							tab === "steps"
-								? h(Button, {
-									variant: "ghost",
-									"data-it": "run-steps",
-									onClick: function () { runAllIntegrationPrompt(); }
-								}, "一键执行")
-								: null,
+							/* ⑥ 测试用例页：新增用例（primary，唯一的颜色强调） */
 							tab === "cases"
 								? h(Button, {
 									variant: "primary",
