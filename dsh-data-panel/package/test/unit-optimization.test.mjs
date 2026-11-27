@@ -245,6 +245,16 @@ async function runList({ sessionId, cwd, caseId }) {
   return body.runs
 }
 
+async function runSummary({ sessionId, cwd }) {
+  const req = Readable.from([])
+  req.method = 'GET'
+  req.url = `/data-panel/run/summary?sessionId=${sessionId}&cwd=${encodeURIComponent(cwd)}`
+  let body = null
+  await api.handleRunSummary(req, { writeHead() {}, end(raw) { body = JSON.parse(raw) } })
+  assert.equal(body.ok, true, body.error)
+  return body.byCase
+}
+
 test('全部执行 / 执行选中产生的 run 都会回写到每条用例，且刷新不重复', async () => {
   const project = mkdtempSync(join(tmpdir(), 'dsh-unit-runs-'))
   const root = makeRoot('s1', project)
@@ -311,6 +321,13 @@ test('全部执行 / 执行选中产生的 run 都会回写到每条用例，且
   assert.deepEqual(again.map((run) => run.runId), bRuns.map((run) => run.runId))
   const unique = new Set(again.map((run) => `${run.runId}|${run.caseId}`))
   assert.equal(unique.size, again.length)
+
+  const summary = await runSummary({ sessionId: 's1', cwd: project })
+  for (const [caseId, runs] of [[caseA, aRuns], [caseB, bRuns],
+    [caseC, await runList({ sessionId: 's1', cwd: project, caseId: caseC })]]) {
+    assert.equal(summary[caseId].count, runs.length)
+    assert.equal(summary[caseId].latestOutcome, runs[0].caseOutcome)
+  }
 })
 
 test('不属于该用例的 run 不会产生记录', async () => {
@@ -353,6 +370,32 @@ test('批量 run 整体通过、但这条用例没有逐条结果时，记为未
   // 未执行原因透传出来，而不是把整批的耗时/通过状态当成本条结果。
   assert.match(runs[0].message, /没有关联测试函数/)
   assert.equal(runs[0].durationMs, 0)
+  const summary = await runSummary({ sessionId: 's3', cwd: project })
+  assert.deepEqual(summary[caseA], {
+    count: 1, latestOutcome: 'unknown', latestRunId: '20261123-100000-000-eeeeee',
+  })
+})
+
+test('千条用例八次执行通过一次摘要请求得到计数和最新状态', async () => {
+  const project = mkdtempSync(join(tmpdir(), 'dsh-unit-summary-'))
+  try {
+    const root = makeRoot('large-summary', project)
+    const ids = Array.from({ length: 1000 }, (_, i) => `TC-${i}`)
+    for (let run = 0; run < 8; run++) {
+      writeRun(root, `run-${run}`, {
+        scope: 'all', status: 'passed', cases: ids,
+        note: 'x'.repeat(800 * 1024),
+        tests: ids.map((caseId) => ({ caseId, outcome: run === 7 && caseId === 'TC-3' ? 'failed' : 'passed' })),
+      }, ids.map((caseId) => ({ caseId })), ids)
+    }
+    const summary = await runSummary({ sessionId: 'large-summary', cwd: project })
+    assert.equal(Object.keys(summary).length, 1000)
+    assert.equal(summary['TC-3'].count, 8)
+    assert.equal(summary['TC-3'].latestOutcome, 'failed')
+    assert.equal(summary['TC-999'].latestOutcome, 'passed')
+  } finally {
+    rmSync(project, { recursive: true, force: true })
+  }
 })
 
 // ── 通过真实面板 API 写入 → 读取 → 精确跳转 ──────────────────────────

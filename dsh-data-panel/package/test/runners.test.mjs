@@ -478,6 +478,12 @@ test('日志读取分离模型分析，保留真实异常原文，缺分析时�
   assert.equal(response.content, original)
   assert.match(response.analysis, /原因尚未确认/)
   assert.equal(readFileSync(join(runDir, 'run.log'), 'utf8'), original)
+
+  write(join(runDir, 'run.log'), 'x'.repeat(5 * 1024 * 1024))
+  const limited = await readLog()
+  assert.equal(limited.truncated, true)
+  assert.ok(limited.content.length < 4 * 1024 * 1024 + 100)
+  assert.match(limited.content, /仅显示前 4 MB/)
 })
 
 test('gtest batch 与覆盖率重放共用本次筛选，VS Cobertura 解析不冒充 MC/DC', () => {

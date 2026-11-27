@@ -2143,9 +2143,16 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			var budget = typeof timeoutMs === "number" && timeoutMs > 0 ? timeoutMs : 8000;
 			var timer = controller !== null ? setTimeout(function () { controller.abort(); }, budget) : null;
 			var options = init || {};
+			var externalSignal = options.signal;
+			var abortForCaller = function () { if (controller !== null) controller.abort(); };
+			if (externalSignal && controller !== null) {
+				if (externalSignal.aborted) controller.abort();
+				else externalSignal.addEventListener("abort", abortForCaller, { once: true });
+			}
 			if (controller !== null) options = Object.assign({}, options, { signal: controller.signal });
 			function clearTimer() {
 				if (timer !== null) { clearTimeout(timer); timer = null; }
+				if (externalSignal) externalSignal.removeEventListener("abort", abortForCaller);
 			}
 			return fetch(path, options).then(function (response) {
 				return response.json().catch(function () { return {}; }).then(function (data) {
@@ -2220,6 +2227,16 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			params.set("scope", scope);
 			if (scope === "case") params.set("caseId", caseId || "");
 			return callApi("/data-panel/run/list?" + params.toString(), { method: "GET", headers: { accept: "application/json" } });
+		}
+
+		/** 整张用例面板的执行次数和最新状态，只读取一次会话执行目录。 */
+		function fetchRunSummary(sessionId, signal) {
+			var params = new URLSearchParams();
+			params.set("sessionId", sessionId);
+			params.set("cwd", cwdOf(sessionId));
+			return callApi("/data-panel/run/summary?" + params.toString(), {
+				method: "GET", headers: { accept: "application/json" }, signal: signal
+			}, 30000);
 		}
 
 		/** 删除某次执行记录（只删 runs/<runId>/，不动用例）。 */
@@ -3783,31 +3800,35 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			var setCaseStatuses = caseStatusesState[1];
 			var summaryRecordsKey = runSummaryKey(records);
 
-			// 首次加载时批量拉取所有用例的执行计数和最新状态。
+			// 首次加载时一次取得所有用例的执行计数和最新状态。
 			useEffect(function () {
 				var sessionId = panelSessionId(props);
-				if (!sessionId || records.length === 0) return;
+				if (!sessionId || records.length === 0) {
+					setRunCounts({});
+					setCaseStatuses({});
+					return;
+				}
 				var active = true;
-				var promises = records.map(function (r) {
-					return fetchRunList(sessionId, "case", r.caseId).then(function (data) {
-						var runs = (data && data.runs) || [];
-						var latest = runs[0];
-						return { id: r.id, count: runs.length, status: latest ? (latest.caseOutcome || latest.status || "") : "" };
-					}).catch(function () { return { id: r.id, count: 0, status: "" }; });
-				});
-				Promise.all(promises).then(function (results) {
+				setRunCounts({});
+				setCaseStatuses({});
+				var controller = typeof AbortController === "function" ? new AbortController() : null;
+				fetchRunSummary(sessionId, controller ? controller.signal : undefined).then(function (data) {
 					if (!active) return;
+					var byCase = data && data.byCase ? data.byCase : {};
 					var counts = {};
 					var statuses = {};
-					results.forEach(function (r) {
-						counts[r.id] = r.count;
-						if (r.status) statuses[r.id] = r.status;
+					records.forEach(function (record) {
+						var row = byCase[record.caseId];
+						counts[record.id] = row ? row.count : 0;
+						if (row && row.latestOutcome) statuses[record.id] = row.latestOutcome;
 					});
 					setRunCounts(counts);
 					setCaseStatuses(statuses);
+				}).catch(function () {
+					if (active) { setRunCounts({}); setCaseStatuses({}); }
 				});
-				return function () { active = false; };
-			}, [summaryRecordsKey, panelSessionId(props)]);
+				return function () { active = false; if (controller) controller.abort(); };
+			}, [summaryRecordsKey, panelSessionId(props), runRefreshTick]);
 			// 正在查看的那次执行（{ record, run }）。
 			var runViewState = useState(null);
 			var runView = runViewState[0];

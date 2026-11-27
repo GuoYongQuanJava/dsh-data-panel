@@ -16,7 +16,7 @@
  */
 import { createHash, randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
-import { copyFile, mkdir, readFile, readdir, rename, rm, stat, unlink, writeFile } from 'node:fs/promises'
+import { copyFile, mkdir, open, readFile, readdir, rename, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import { existsSync, readFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
@@ -178,6 +178,7 @@ const RUN_PREPARE_PATH = '/data-panel/run/prepare'
 const TEST_CODE_PATH = '/data-panel/test-code'
 const RUN_LATEST_PATH = '/data-panel/run/latest'
 const RUN_LIST_PATH = '/data-panel/run/list'
+const RUN_SUMMARY_PATH = '/data-panel/run/summary'
 const RUN_LOG_PATH = '/data-panel/run/log'
 const RUN_RESULT_PATH = '/data-panel/run/result'
 const RUN_REPORT_PATH = '/data-panel/run/report'
@@ -1121,6 +1122,78 @@ async function listRuns(root) {
   return runs
 }
 
+/** Read one run's case identities once for the whole board, without retaining its full result. */
+async function runCaseSummary(root, runId) {
+  const dir = join(root, 'runs', runId)
+  let result
+  try {
+    result = JSON.parse(await readFile(join(dir, 'result.json'), 'utf8'))
+  } catch {
+    return null
+  }
+  if (result === null || typeof result !== 'object') return null
+  const outcomes = new Map()
+  const ids = new Set()
+  for (const test of Array.isArray(result.tests) ? result.tests : []) {
+    const id = typeof test?.caseId === 'string' ? test.caseId : ''
+    if (id === '') continue
+    ids.add(id)
+    if (!outcomes.has(id)) outcomes.set(id, typeof test.outcome === 'string' ? test.outcome : 'unknown')
+  }
+  for (const id of Array.isArray(result.cases) ? result.cases : []) {
+    if (typeof id === 'string' && id !== '') ids.add(id)
+  }
+  for (const [file, key] of [['request.json', 'targets'], [join('snapshot', 'cases.json'), 'cases']]) {
+    try {
+      const data = JSON.parse(await readFile(join(dir, file), 'utf8'))
+      for (const item of Array.isArray(data?.[key]) ? data[key] : []) {
+        if (typeof item?.caseId === 'string' && item.caseId !== '') ids.add(item.caseId)
+      }
+    } catch { /* Older or interrupted runs may not have these files. */ }
+  }
+  return { ids, outcomes }
+}
+
+/** One board request: each run is parsed once, regardless of the number of cases. */
+async function handleRunSummary(req, res) {
+  try {
+    if (req.method !== 'GET') {
+      send(res, 405, { ok: false, error: '仅支持 GET' })
+      return
+    }
+    const query = runQueryOf(req)
+    if (query.sessionId === '') throw bad(400, '缺少会话 ID')
+    const byCase = Object.create(null)
+    const seen = new Map()
+    for (const root of await resolveReadRoots(query.sessionId, query.cwd)) {
+      let names
+      try { names = await readdir(join(root, 'runs')) } catch { continue }
+      for (const runId of names) {
+        if (req.aborted || res.destroyed) return
+        const run = await runCaseSummary(root, runId)
+        if (run === null) continue
+        for (const id of run.ids) {
+          let seenRuns = seen.get(id)
+          if (seenRuns === undefined) { seenRuns = new Set(); seen.set(id, seenRuns) }
+          if (seenRuns.has(runId)) continue
+          seenRuns.add(runId)
+          const row = byCase[id] ?? { count: 0, latestOutcome: '', latestRunId: '' }
+          row.count += 1
+          if (runId > row.latestRunId) {
+            row.latestRunId = runId
+            row.latestOutcome = run.outcomes.get(id) || 'unknown'
+          }
+          byCase[id] = row
+        }
+      }
+    }
+    send(res, 200, { ok: true, byCase })
+  } catch (error) {
+    const status = Number.isInteger(error?.status) ? error.status : 500
+    send(res, status, { ok: false, error: error instanceof Error ? error.message : '服务内部错误' })
+  }
+}
+
 /**
  * 读某次执行快照里冻结的用例（输入 / 预期输出）。
  * 为什么要看快照：用例事后被改过时，历史记录必须显示“当时跑的那份”，
@@ -1981,15 +2054,28 @@ async function handleRunLog(req, res) {
     const file = await findInRoots(roots, 'runs', runId, 'run.log')
     let content = ''
     let logStat = null
+    let truncated = false
     try {
-      content = await readFile(file, 'utf8')
-      logStat = await stat(file)
+      const handle = await open(file, 'r')
+      try {
+        logStat = await handle.stat()
+        const bytes = Buffer.allocUnsafe(MAX_RUN_LOG)
+        let offset = 0
+        while (offset < bytes.length) {
+          const read = await handle.read(bytes, offset, bytes.length - offset, offset)
+          if (read.bytesRead === 0) break
+          offset += read.bytesRead
+        }
+        content = bytes.subarray(0, offset).toString('utf8')
+        truncated = logStat.size > offset
+      } finally {
+        await handle.close()
+      }
     } catch {
       send(res, 200, { ok: true, exists: false })
       return
     }
-    const truncated = content.length > MAX_RUN_LOG
-    if (truncated) content = content.slice(0, MAX_RUN_LOG) + '\n\n…(日志过长，仅显示前 4 MB)'
+    if (truncated) content += '\n\n…(日志过长，仅显示前 4 MB)'
     // 模型分析是旁注，绝不改写执行器的原始日志或结构化结果。
     let analysis = ''
     try {
@@ -3136,6 +3222,7 @@ export function apply(ctx) {
     [RUN_PREPARE_PATH, handleRunPrepare, 'dsh-data-panel: run prepare'],
     [RUN_LATEST_PATH, handleRunLatest, 'dsh-data-panel: run latest'],
     [RUN_LIST_PATH, handleRunList, 'dsh-data-panel: run list'],
+    [RUN_SUMMARY_PATH, handleRunSummary, 'dsh-data-panel: run summary'],
     [RUN_LOG_PATH, handleRunLog, 'dsh-data-panel: run log'],
     [RUN_RESULT_PATH, handleRunResult, 'dsh-data-panel: run result'],
     [RUN_REPORT_PATH, handleRunReport, 'dsh-data-panel: run report'],
@@ -3216,6 +3303,7 @@ export const __test = {
   resolveExportDirectory,
   listRuns,
   handleRunList,
+  handleRunSummary,
   handleRunLog,
   handleRunDelete,
   handleIntegration,
