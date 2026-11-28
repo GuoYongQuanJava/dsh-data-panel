@@ -2236,6 +2236,22 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 						commit(snapshot.records.filter(function (record) { return record.demo !== true; }));
 					}, forcedSessionId);
 				},
+				/**
+				 * 删除「按被测函数」分组 = 连同它下面的用例一起删。
+				 *
+				 * 函数分组是 `subjectFunction` 字段自动聚合的，**没有显式清单**，
+				 * 所以「删分组」就是把归到它下面的用例全删掉（用户 2026-11-28 明确要求）。
+				 * 走一次性接口而不是前端循环调 `remove`，避免中途失败留下半删状态。
+				 */
+				deleteFunction: function (subjectFunction, forcedSessionId) {
+					return mutate({ op: "deleteFunction", subjectFunction: subjectFunction }, function (data) {
+						var target = subjectFunctionOf({ subjectFunction: subjectFunction });
+						commit(snapshot.records.filter(function (record) {
+							return subjectFunctionOf(record) !== target;
+						}));
+						return data;
+					}, forcedSessionId);
+				},
 				/** 先建层级（不要求先有勾选）；建完再挑用例放进去。 */
 				createCategory: function (category, forcedSessionId) {
 					return mutate({ op: "createCategory", category: category }, function (data) {
@@ -3767,14 +3783,22 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 									}
 								];
 							}
-							// 函数组是自动聚合的，没有「删除」概念（删记录等于删用例），
-							// 所以只给重命名。
+							// 函数组：删除 = 连同它下面的用例一起删（用户 2026-11-28 要求）。
+							//   与层级删除不同 —— 层级只是解散分组、用例退回默认层；
+							//   函数分组没有独立清单可解散，只能删用例本身。
 							return [
 								{
 									key: "rename", label: "重命名", icon: "edit",
 									testId: "cat-ctx-rename",
 									onSelect: function () {
 										if (typeof props.onRenameRow === "function") props.onRenameRow(target);
+									}
+								},
+								{
+									key: "delete", label: "删除", icon: "trash", danger: true,
+									testId: "cat-ctx-delete",
+									onSelect: function () {
+										if (typeof props.onDeleteRow === "function") props.onDeleteRow(target);
 									}
 								}
 							];
@@ -4544,6 +4568,15 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 							setPage(1);
 						}
 					});
+				} else if (confirm.kind === "deleteFunction") {
+					// 函数分组没有独立清单，删除 = 连它下面的用例一起删（用户明确要求）。
+					action = store.deleteFunction(confirm.subjectFunction).then(function () {
+						// 正在看这个函数分组的话，删完是空表，切回全部用例。
+						if (activeCategory === confirm.subjectFunction) {
+							setActiveCategory("");
+							setPage(1);
+						}
+					});
 				} else {
 					action = store.remove(confirm.record.id);
 				}
@@ -4832,6 +4865,24 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 								kind: row.kind === "function" ? "function" : "layer",
 								// 函数组的校验与层级不同（不占层级名，也不禁用「默认」）
 								title: row.kind === "function" ? "重命名被测函数" : "重命名层级"
+							});
+						},
+						/*
+						 * 函数组的删除：连它下面的用例一起删（用户 2026-11-28 要求）。
+						 * 与层级删除不同 —— 层级只是解散分组，函数分组没有独立清单，
+						 * 删分组等于删用例，所以确认框文案要写明条数。
+						 */
+						onDeleteRow: function (row) {
+							if (!row || row.value === "" || row.value === null || row.value === undefined) return;
+							if (row.kind !== "function") {
+								// 层级行仍走原来的解散语义
+								deleteLayer(row.value);
+								return;
+							}
+							setConfirm({
+								kind: "deleteFunction",
+								subjectFunction: row.value,
+								count: typeof row.count === "number" ? row.count : 0
 							});
 						},
 						onDelete: deleteLayer
@@ -5125,20 +5176,29 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 						? "清空示例用例？"
 						: (confirm.kind === "deleteCategory"
 							? "删除层级「" + confirm.category + "」？"
-							: "删除这条用例？"),
+							: (confirm.kind === "deleteFunction"
+								? "删除函数分组「" + confirm.subjectFunction + "」？"
+								: "删除这条用例？")),
 					message: confirm.kind === "clearDemo"
 						? "只会移除标记为示例的用例，你后来新建或编辑过的内容会保留。"
 						: (confirm.kind === "deleteCategory"
 							? "层级会消失，里面的用例退回「默认」层，一条都不会被删。"
-							: "删除后无法恢复，右侧已打开的详情页也会变为空。"),
+							: (confirm.kind === "deleteFunction"
+								// 函数分组是字段聚合出来的，没有独立清单 — 只能删用例本身。
+								? "它下面的 " + (confirm.count || 0) + " 条用例会一并删除，无法恢复。"
+								: "删除后无法恢复，右侧已打开的详情页也会变为空。")),
 					detail: confirm.kind === "delete"
 						? h("span", null, "即将删除：", h("b", null, confirm.record.title))
 						: (confirm.kind === "deleteCategory"
 							? h("span", null, "解散层级：", h("b", null, confirm.category), "（用例保留，退回默认层）")
-							: null),
+							: (confirm.kind === "deleteFunction"
+								? h("span", null, "删除用例：", h("b", null, confirm.subjectFunction), " 分组下的全部用例")
+								: null)),
 					confirmLabel: confirm.kind === "clearDemo"
 						? "清空示例"
-						: (confirm.kind === "deleteCategory" ? "删除层级" : "删除"),
+						: (confirm.kind === "deleteCategory"
+							? "删除层级"
+							: (confirm.kind === "deleteFunction" ? "删除函数分组和用例" : "删除")),
 					busy: busy,
 					onCancel: function () { if (!busy) setConfirm(null); },
 					onConfirm: confirmAction

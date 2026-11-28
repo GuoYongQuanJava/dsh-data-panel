@@ -771,6 +771,32 @@ async function handle(req, res) {
       return
     }
 
+    /*
+     * 删除「按被测函数」分组 = 连同它下面的用例一起删。
+     *
+     * 为什么需要单独的接口而不是前端循环调 delete：
+     *   1. 前端逐条删是 N 次请求，中途失败会留下半删状态，界面上看着「删了一半」；
+     *   2. 一次请求内改完再落盘，才不会出现「删了 3 条、剩 2 条」的中间态。
+     *
+     * 函数分组是 `subjectFunction` 字段自动聚合出来的，**没有显式清单可删**，
+     * 所以「删除分组」的唯一实现就是删掉归到它下面的那些用例。
+     */
+    if (op === 'deleteFunction') {
+      if (typeof body.subjectFunction !== 'string') throw bad(400, '请提供被测函数名')
+      const target = normalizeSubjectFunction(body.subjectFunction)
+      if (target === '') throw bad(400, '被测函数名不能为空')
+      const removed = await serial(async () => {
+        const store = await readStore(sessionId)
+        const next = store.records.filter((item) => normalizeSubjectFunction(item.subjectFunction) !== target)
+        const count = store.records.length - next.length
+        if (count === 0) throw bad(404, `找不到被测函数「${target}」下的用例`)
+        await persist(next, store.seeded, sessionId, store.categories)
+        return count
+      })
+      send(res, 200, { ok: true, removed, subjectFunction: target })
+      return
+    }
+
     // 所有生成 Skill 共用此接口，业务函数独立于 Skill 名称与测试入口。
     if (op === 'assignFunction') {
       const ids = Array.isArray(body.ids) ? [...new Set(body.ids.filter(id => typeof id === 'string' && id !== ''))] : []
