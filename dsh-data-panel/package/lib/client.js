@@ -2491,7 +2491,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 		}
 
 		function Pager(props) {
-			var sizes = [5, 10, 20, 50];
+			var sizes = [10, 20, 50, 100, 200];
 			var atFirst = props.page <= 1;
 			var atLast = props.page >= props.pageCount;
 			return h("div", { className: "dp-pager" },
@@ -3761,7 +3761,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			var pageState = useState(1);
 			var page = pageState[0];
 			var setPage = pageState[1];
-			var pageSizeState = useState(5);
+			var pageSizeState = useState(10);
 			var pageSize = pageSizeState[0];
 			var setPageSize = pageSizeState[1];
 			var codeState = useState(null);
@@ -7816,7 +7816,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 								setPageValue(1);
 							},
 							"aria-label": "每页条数"
-						}, [5, 10, 15, 20, 50].map(function (option) {
+						}, [10, 15, 20, 50, 100, 200].map(function (option) {
 							return h("option", { key: option, value: String(option) }, option + " 条");
 						}))
 					),
