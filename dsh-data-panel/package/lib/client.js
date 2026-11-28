@@ -72,6 +72,8 @@ window.__ModuleLoader__.load({
 .dp-root ::-webkit-scrollbar { width: 10px; height: 10px; }
 .dp-root ::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--dp-text3) 28%, transparent); border: 3px solid transparent; border-radius: 999px; background-clip: padding-box; }
 .dp-root ::-webkit-scrollbar-track { background: transparent; }
+.dp-root:not(.it-root) { height: 100%; min-height: 0; }
+.dp-root:not(.it-root) .dp-shell { display: flex; flex-direction: column; height: 100%; min-height: 0; box-sizing: border-box; }
 .dp-shell { max-width: 1180px; margin: 0 auto; padding: 26px 30px 16px; }
 /* 右侧栏里的面板：容器窄，收紧留白并让工具栏折行，表格靠 .dp-card-scroll 横向滚动。 */
 .dp-root.dp-docked .dp-shell { max-width: none; padding: 14px 12px 12px; }
@@ -128,7 +130,7 @@ window.__ModuleLoader__.load({
 /* 卡片限高 + 弹性列：表头吸顶、分页贴底，只有中间表格区滚动。 */
 /* 卡片限高 + 弹性列：表头吸顶、分页贴底，只有中间表格区滚动。
    max-height 不在 CSS 里写死（vh - 固定值 换分辨率就错位），由 JS 实测后设 inline style。 */
-.dp-card { position: relative; display: flex; flex-direction: column; border: 1px solid var(--dp-border); border-radius: 14px; background: var(--dp-bg); }
+.dp-card { position: relative; display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; border: 1px solid var(--dp-border); border-radius: 14px; background: var(--dp-bg); }
 .dp-card-scroll { flex: 1 1 auto; min-height: 0; overflow-x: auto; overflow-y: auto; }
 .dp-table { width: 100%; min-width: 720px; border-collapse: collapse; table-layout: fixed; }
 .dp-table th { padding: 11px 12px; border-bottom: 1px solid var(--dp-border); background: var(--dp-bg2); color: var(--dp-text3); font-size: 11px; font-weight: 600; letter-spacing: .05em; text-align: center; white-space: nowrap; }
@@ -240,7 +242,7 @@ window.__ModuleLoader__.load({
  * max-height 由 JS 量出来写进 style（见 CategorySidebar），这里只给一个兜底值。
  * 底部固定一条 .dp-cat-pager，列表区自己滚动，两者互不影响。
  */
-.dp-board { display: flex; align-items: flex-start; gap: 12px; margin-top: 4px; }
+.dp-board { display: flex; align-items: stretch; gap: 12px; margin-top: 4px; flex: 1 1 auto; min-height: 0; }
 /* 左右两栏之间的拖拽调宽手柄：正好盖住两栏间距，平时不可见，悬停/拖动时显形。 */
 .dp-resizer { position: relative; flex: 0 0 auto; align-self: stretch; width: 12px; margin: 0 -12px; cursor: col-resize; touch-action: none; }
 .dp-root.dp-docked .dp-resizer { width: 8px; margin: 0 -8px; }
@@ -250,13 +252,13 @@ window.__ModuleLoader__.load({
 .dp-board.is-resizing,
 .dp-board.is-resizing * { cursor: col-resize !important; user-select: none; }
 .dp-board.is-resizing .dp-sidebar { transition: none; }
-.dp-sidebar { display: flex; flex-direction: column; flex: 0 0 auto; width: 128px; max-height: 62vh; padding: 8px 6px; border: 1px solid var(--dp-border); border-radius: 12px; background: var(--dp-bg); transition: width .16s ease, padding .16s ease; }
+.dp-sidebar { display: flex; flex-direction: column; flex: 0 0 auto; width: 128px; min-height: 0; padding: 8px 6px; border: 1px solid var(--dp-border); border-radius: 12px; background: var(--dp-bg); transition: width .16s ease, padding .16s ease; }
 /* 层级列表：唯一可滚动区，撑满除表头/分页外的剩余高度。 */
 /* 层级列表：行保持正常行高，不拉伸；条目多时自己滚动。 */
 .dp-cat-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; }
 /* 表头：固定高度，不参与行拉伸。 */
 .dp-sidebar-head { display: flex; flex: 0 0 auto; align-items: center; justify-content: space-between; gap: 6px; margin-bottom: 4px; }
-.dp-main { flex: 1 1 auto; min-width: 0; }
+.dp-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; min-height: 0; }
 .dp-sidebar-title { color: var(--dp-text3); font-size: 11px; font-weight: 650; letter-spacing: .08em; text-transform: uppercase; white-space: nowrap; }
 .dp-sidebar-tools { display: flex; align-items: center; gap: 2px; }
 /* 表头「+」按钮：与行内操作图标同尺寸（20px），不抢标题的位置。 */
@@ -495,7 +497,7 @@ window.__ModuleLoader__.load({
 .dp-skeleton { height: 12px; border-radius: 6px; background: linear-gradient(90deg, var(--dp-bg2) 25%, var(--dp-bg3) 37%, var(--dp-bg2) 63%); background-size: 400% 100%; animation: dp-shimmer 1.35s ease infinite; }
 @keyframes dp-shimmer { 0% { background-position: 100% 0; } 100% { background-position: 0 0; } }
 .dp-foot { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-top: 10px; color: var(--dp-text3); font-size: 11px; }
-.dp-card-foot { display: flex; justify-content: flex-end; padding: 10px 16px 11px; border-top: 1px solid var(--dp-border); background: var(--dp-bg); }
+.dp-card-foot { display: flex; justify-content: flex-end; flex: 0 0 auto; padding: 10px 16px 11px; border-top: 1px solid var(--dp-border); background: var(--dp-bg); }
 .dp-pager { display: flex; align-items: center; justify-content: flex-end; gap: 14px; color: var(--dp-text2); font-size: 12.5px; letter-spacing: .03em; }
 .dp-pager-total { color: var(--dp-text3); letter-spacing: .05em; }
 .dp-pager-btn { display: inline-flex; align-items: center; justify-content: center; min-width: 74px; height: 32px; padding: 0 14px; border: 1px solid var(--dp-border); border-radius: 9px; background: var(--dp-bg); color: var(--dp-text); font: inherit; font-size: 12.5px; letter-spacing: .06em; cursor: pointer; transition: background .12s, border-color .12s, color .12s; }
@@ -3932,7 +3934,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			// 卡片内容少时高度也跟着矮，左栏层级就被切成一页只放两三层，整个目录缩在顶部。
 			// 现在两栏统一用「窗口可用高度」，不随表格内容多少变。
 
-			// 可用高度 = 窗口高度 - 卡片顶边（实测，不用 vh - 固定值，换分辨率/缩放都对）。
+			// 高度交给 CSS flex 逐层撑满（与集成测试同一套机制），JS 只读取实际高度供分页反算。
 			// 卡片用 height 撑满（不是 max-height）：左边层级栏和右边表格等高，页码永远贴底，
 			// 用例多少都不会把左栏缩上去。
 			useEffect(function () {
@@ -3942,12 +3944,8 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 					frame = 0;
 					var node = boardRef.current;
 					if (!node) return;
-					var top = node.getBoundingClientRect().top;
-					if (!(top > 0)) return;
-					var avail = Math.round(window.innerHeight - top - 16);
-					if (avail < 240) avail = 240;
-					node.style.height = avail + "px";
-					setBoardHeight(avail);
+					var h = Math.Round(node.getBoundingClientRect().height);
+					if (h > 0) setBoardHeight(h);
 				}
 				function schedule() {
 					if (frame) return;
