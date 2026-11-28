@@ -91,7 +91,11 @@ window.__ModuleLoader__.load({
 .dp-title { margin: 5px 0 5px; font-size: 24px; font-weight: 650; letter-spacing: -.015em; line-height: 1.25; }
 .dp-subtitle { margin: 0; max-width: 620px; color: var(--dp-text2); font-size: 13px; }
 .dp-stats { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; min-width: 0; max-width: 100%; margin-left: auto; }
-.dp-stat { min-width: 76px; padding: 10px 14px; border: 1px solid var(--dp-border); border-radius: 12px; background: var(--dp-bg); }
+.dp-stat { min-width: 76px; padding: 10px 14px; border: 1px solid var(--dp-border); border-radius: 12px; background: var(--dp-bg); font: inherit; color: inherit; text-align: left; cursor: pointer; appearance: none; transition: border-color .12s, background .12s, color .12s; }
+.dp-stat:hover { border-color: color-mix(in srgb, var(--dp-brand) 22%, var(--dp-border)); }
+.dp-stat.is-active:hover { border-color: transparent; }
+div.dp-stat { cursor: default; }
+div.dp-stat:hover { border-color: color-mix(in srgb, var(--dp-brand) 4%, var(--dp-border)); }
 .dp-stat b { display: block; font-size: 20px; font-weight: 650; line-height: 1.2; letter-spacing: -.01em; }
 .dp-stat span { display: block; margin-top: 1px; color: var(--dp-text3); font-size: 11px; }
 .dp-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 22px 0 12px; }
@@ -1207,15 +1211,13 @@ window.__ModuleLoader__.load({
 	border-radius: 8px;
 	box-shadow: var(--dp-control-shadow);
 }
-.dp-stat:first-child {
+.dp-stat.is-active {
 	border-color: transparent;
 	background: color-mix(in srgb, var(--dp-brand) 9%, var(--dp-bg));
 }
-.dp-stat:first-child b { color: var(--dp-brand); }
-.dp-stat:first-child span { color: color-mix(in srgb, var(--dp-brand) 72%, var(--dp-text2)); }
+.dp-stat.is-active b { color: var(--dp-brand); }
+.dp-stat.is-active span { color: color-mix(in srgb, var(--dp-brand) 72%, var(--dp-text2)); }
 .dp-stat b { font-weight: 600; }
-.dp-root:not(.it-root) .dp-stats .dp-stat:nth-child(6) b,
-.dp-root:not(.it-root) .dp-stats .dp-stat:nth-child(6) span { color: var(--dp-warning); }
 .dp-search input {
 	border-color: color-mix(in srgb, var(--dp-brand) 36%, var(--dp-border));
 	border-radius: 6px;
@@ -4441,12 +4443,24 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 							h(TestModeTabs, { mode: "unit", onChange: props.onModeChange })
 						),
 						h("div", { className: "dp-stats" },
-							h("div", { className: "dp-stat" },
+							h("button", {
+								key: "all",
+								type: "button",
+								className: cn("dp-stat", type === "all" ? "is-active" : ""),
+								title: "只看全部用例",
+								onClick: function () { setType("all"); setPage(1); }
+							},
 								h("b", null, String(records.length)),
 								h("span", null, "全部用例")
 							),
 							TEST_TYPE_KEYS.map(function (key) {
-								return h("div", { key: key, className: "dp-stat" },
+								return h("button", {
+									key: key,
+									type: "button",
+									className: cn("dp-stat", type === key ? "is-active" : ""),
+									title: "只看" + TEST_TYPES[key].label,
+									onClick: function () { setType(key); setPage(1); }
+								},
 									h("b", null, String(typeCounts[key])),
 									h("span", null, TEST_TYPES[key].label)
 								);
@@ -8813,12 +8827,24 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 						),
 						// 右侧看板：与单元测试同位置、同视觉、同样一行放得下。
 						h("div", { className: "dp-stats" },
-							h("div", { className: "dp-stat" },
+							h("button", {
+								key: "all",
+								type: "button",
+								className: cn("dp-stat", type === "all" ? "is-active" : ""),
+								title: "只看全部用例",
+								onClick: function () { setType("all"); resetPages(); }
+							},
 								h("b", null, String(records.length)),
 								h("span", null, "全部用例")
 							),
 							IT_TYPE_KEYS.map(function (key) {
-								return h("div", { key: key, className: "dp-stat" },
+								return h("button", {
+									key: key,
+									type: "button",
+									className: cn("dp-stat", type === key ? "is-active" : ""),
+									title: "只看" + IT_TYPES[key].label,
+									onClick: function () { setType(key); resetPages(); }
+								},
 									h("b", null, String(typeCounts[key] || 0)),
 									h("span", null, IT_TYPES[key].label)
 								);
