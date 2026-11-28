@@ -15,7 +15,7 @@
  *     step-versions/   index.json + V0_0_1/{steps,cases.snapshot,exec-records}.json
  *     report-versions/ index.json + V0_0_1/report.json
  */
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 
@@ -117,18 +117,56 @@ async function writeJson(file, value) {
  *
  * 目录不存在时返回空索引而不是报错 —— 集成测试在用户第一次生成用例之前
  * 就是没有数据的，这不是错误。
+ *
+ * ★ 2026-11-28：index.json 缺失或写坏时**扫描版本目录兜底**。
+ *
+ * 实测故障：模型把 steps.json 写全了，唯独没写 step-versions/index.json
+ * （SKILL.md 里写着「不要手写 index.json，面板自己会建版本」）。
+ * 原实现只认 index.json，于是 activeVersion=''、data=null，
+ * 测试步骤页「输入步骤/预期结果」两列恒为「—」——而磁盘上明明有步骤。
+ * 更隐蔽的是用例页正常（它的 index 存在），用户只会觉得「步骤页坏了」。
+ *
+ * 文件格式是面板的契约，**契约不该因为少一个索引文件就整体失效**。
+ * 这里按目录实际内容重建索引：目录名 V0_0_1 → 版本名 V0.0.1，
+ * 取版本号最大的那个当 activeVersion（与 nextVersionName 的语义一致）。
  */
 export async function readIndex(sessionRoot, kind) {
   const dir = kindRoot(sessionRoot, kind)
   const index = await readJsonSafe(join(dir, 'index.json'), null)
-  if (index && Array.isArray(index.versions)) {
+  if (index && Array.isArray(index.versions) && index.versions.length > 0) {
     return {
       versions: index.versions,
       activeVersion: typeof index.activeVersion === 'string' ? index.activeVersion : (index.versions[0]?.name || ''),
       byVersion: index.byVersion && typeof index.byVersion === 'object' ? index.byVersion : {},
     }
   }
-  return { versions: [], activeVersion: '', byVersion: {} }
+  return scanVersionDirs(dir)
+}
+
+/** index.json 不可用时，按磁盘目录重建索引（只读，不写盘）。 */
+async function scanVersionDirs(dir) {
+  let names = []
+  try {
+    const entries = await readdir(dir, { withFileTypes: true })
+    names = entries
+      .filter((item) => item.isDirectory())
+      // V0_0_1 → V0.0.1；不合规的目录名直接跳过（防止把垃圾目录当版本）
+      .map((item) => item.name.replace(/^[Vv]?/, '').replace(/_/g, '.'))
+      .filter((name) => /^V?\d{1,3}(\.\d{1,3}){0,2}$/.test('V' + name))
+      .map((name) => 'V' + name)
+  } catch {
+    return { versions: [], activeVersion: '', byVersion: {} }
+  }
+  if (names.length === 0) return { versions: [], activeVersion: '', byVersion: {} }
+  // 版本号按数字段排序（V0.0.10 晚于 V0.0.9），最大的当活动版本。
+  names.sort((a, b) => versionValue(a) - versionValue(b))
+  const versions = names.map((name, i) => ({
+    name,
+    at: '',
+    status: i === names.length - 1 ? 'current' : 'archived',
+    scanned: true,
+  }))
+  return { versions, activeVersion: names[names.length - 1], byVersion: {} }
 }
 
 /**

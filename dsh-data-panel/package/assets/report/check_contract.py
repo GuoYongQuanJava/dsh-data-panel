@@ -48,6 +48,13 @@ CASE_OPTIONAL = ["id", "caseCode", "description", "precondition", "expectedResul
 STEP_REQUIRED = ["no", "action", "operation", "expected"]
 STEP_OPTIONAL = ["target", "channel"]
 
+# channel 合法值：cua 是主力（界面点击），runner/cmd 是代码链路，uia 是 CUA 不可用时的兜底
+VALID_CHANNELS = {"cua", "runner", "cmd", "uia"}
+# 历史值：旧数据里可能遇到，不报 FAIL，只提示
+LEGACY_CHANNELS = {"code", "service"}
+# 界面类通道：这些 step 必须写 target（点哪个控件），否则只能靠截图猜坐标
+UI_CHANNELS = {"cua", "uia"}
+
 # runner.json：跑测试代码的那 5 类必须有
 RUNNER_REQUIRED_ANY = [["preset"], ["testFile", "command"]]
 
@@ -281,6 +288,9 @@ def check_steps(doc, case_ids, report):
     leaked = set()
     record_violations = []
     step_missing = []
+    channel_bad = []
+    channel_legacy = []
+    target_missing = []
     for case in cases:
         if not isinstance(case, dict):
             continue
@@ -296,6 +306,16 @@ def check_steps(doc, case_ids, report):
             for key in STEP_REQUIRED:
                 if step.get(key) in ("", None):
                     step_missing.append("%s#%s 缺 %s" % (case.get("caseId"), step.get("no"), key))
+            # channel：四值校验 + 界面步骤必须写 target
+            ch = step.get("channel")
+            if ch not in ("" , None):
+                if ch not in VALID_CHANNELS:
+                    if ch in LEGACY_CHANNELS:
+                        channel_legacy.append("%s#%s channel=%s" % (case.get("caseId"), step.get("no"), ch))
+                    else:
+                        channel_bad.append("%s#%s channel=%s" % (case.get("caseId"), step.get("no"), ch))
+                elif ch in UI_CHANNELS and step.get("target") in ("", None):
+                    target_missing.append("%s#%s channel=%s" % (case.get("caseId"), step.get("no"), ch))
         # 执行记录：字段白名单 + 粒度（每个 runId 只能一条）
         records = case.get("records") or []
         run_ids = []
@@ -319,6 +339,19 @@ def check_steps(doc, case_ids, report):
         report.ok("steps.json 未暴露测试函数名/代码字段")
     if step_missing:
         report.fail(where, "步骤缺必填字段：%s" % "; ".join(step_missing[:5]))
+    if channel_bad:
+        report.fail(where, "channel 非法（只允许 %s）：%s"
+                    % ("/".join(sorted(VALID_CHANNELS)), "; ".join(channel_bad[:5])))
+    else:
+        report.ok("channel 取值合法（%s）" % "/".join(sorted(VALID_CHANNELS)))
+    if channel_legacy:
+        report.warn(where, "channel 用了历史值（%s），建议改成 cua/runner/cmd/uia：%s"
+                    % ("/".join(sorted(LEGACY_CHANNELS)), "; ".join(channel_legacy[:5])))
+    if target_missing:
+        report.fail(where, "★ 界面步骤缺 target（点哪个控件）：%s —— 没 target 只能靠截图猜坐标，是假证据"
+                    % "; ".join(target_missing[:5]))
+    else:
+        report.ok("界面步骤（cua/uia）都写了 target")
     if record_violations:
         report.fail(where, "执行记录不合契约：%s" % "; ".join(record_violations[:5]))
     else:

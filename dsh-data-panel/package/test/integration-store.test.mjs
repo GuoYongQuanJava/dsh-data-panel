@@ -555,3 +555,97 @@ test('readAll 带上所有版本的内容，切版本不需要依赖对话', asy
     rmSync(base, { recursive: true, force: true })
   }
 })
+
+/*
+ * ★ index.json 缺失 / 写坏时，必须按目录扫描兜底。
+ *
+ * 用户 2026-11-28 实测：对话框里已经把测试步骤写完了，测试步骤页
+ * 「输入步骤 / 预期结果」两列全是「—」，点刷新也不出来；而用例页正常。
+ *
+ * 根因：模型只写了 step-versions/V0_0_1/steps.json，没写
+ * step-versions/index.json（Skill 里写着「不要手写 index.json，
+ * 面板自己会建版本」，但面板三个按钮只往对话框填话术，从不建版本）。
+ * readIndex 只认 index.json → activeVersion='' → data=null → 步骤全丢。
+ *
+ * 契约文件写全了就该显示，不能因为少一个索引就整页「—」。
+ */
+test('step-versions/index.json 缺失时，按目录扫描兜底，步骤照样能读到', async () => {
+  const { base, sessionRoot } = makeSessionRoot()
+  try {
+    const dir = join(sessionRoot, 'integration', 'step-versions', 'V0_0_1')
+    mkdirSync(dir, { recursive: true })
+    // 只写 steps.json，故意不写 index.json
+    writeJsonFile(join(dir, 'steps.json'), {
+      stepVersion: 'V0.0.1',
+      cases: [{ caseId: 'V0_0_1-IT-001', steps: [{ no: 1, action: 'A', operation: 'O', expected: 'E' }] }],
+    })
+
+    const index = await readIndex(sessionRoot, 'step')
+    assert.deepEqual(index.versions.map((item) => item.name), ['V0.0.1'], '目录要能被扫成版本')
+    assert.equal(index.activeVersion, 'V0.0.1', '扫出来的最大版本当 activeVersion')
+
+    const data = await readVersion(sessionRoot, 'step', 'V0.0.1')
+    assert.equal(data.cases.length, 1, 'scanned 之后步骤内容要读得出来')
+    assert.equal(data.cases[0].steps.length, 1)
+  } finally {
+    rmSync(base, { recursive: true, force: true })
+  }
+})
+
+test('index.json 字段名写错（version / active）也要兜底，不能整页空白', async () => {
+  const { base, sessionRoot } = makeSessionRoot()
+  try {
+    const root = join(sessionRoot, 'integration', 'step-versions')
+    const dir = join(root, 'V0_0_1')
+    mkdirSync(dir, { recursive: true })
+    writeJsonFile(join(dir, 'steps.json'), {
+      stepVersion: 'V0.0.1',
+      cases: [{ caseId: 'V0_0_1-IT-001', steps: [{ no: 1, action: 'A', operation: 'O', expected: 'E' }] }],
+    })
+    // 两种实测踩过的写错方式
+    for (const bad of [
+      { versions: [{ version: 'V0.0.1' }], activeVersion: 'V0.0.1' },
+      { versions: [{ name: 'V0.0.1' }], active: 'V0.0.1' },
+      { versions: [], activeVersion: 'V0.0.1' },
+      { versions: 'V0.0.1', activeVersion: 'V0.0.1' },
+    ]) {
+      writeJsonFile(join(root, 'index.json'), bad)
+      const all = await readAll(sessionRoot)
+      assert.equal(all.step.activeVersion, 'V0.0.1',
+        'index 写坏时要扫目录兜底，实际拿到 ' + JSON.stringify(bad))
+      assert.ok(all.step.data && all.step.data.cases.length === 1,
+        '写坏的 index 不能导致步骤页空白')
+    }
+  } finally {
+    rmSync(base, { recursive: true, force: true })
+  }
+})
+
+test('扫目录兜底不会把非法目录名当版本', async () => {
+  const { base, sessionRoot } = makeSessionRoot()
+  try {
+    const root = join(sessionRoot, 'integration', 'step-versions')
+    mkdirSync(join(root, 'V0_0_1'), { recursive: true })
+    mkdirSync(join(root, 'backup-temp'), { recursive: true })
+    mkdirSync(join(root, '__pycache__'), { recursive: true })
+    const index = await readIndex(sessionRoot, 'step')
+    assert.deepEqual(index.versions.map((item) => item.name), ['V0.0.1'], '垃圾目录要被忽略')
+  } finally {
+    rmSync(base, { recursive: true, force: true })
+  }
+})
+
+test('扫目录兜底按数字段排序：V0.0.10 是 active，不是 V0.0.9', async () => {
+  const { base, sessionRoot } = makeSessionRoot()
+  try {
+    const root = join(sessionRoot, 'integration', 'step-versions')
+    for (const name of ['V0_0_9', 'V0_0_10', 'V0_0_2']) {
+      mkdirSync(join(root, name), { recursive: true })
+      writeJsonFile(join(root, name, 'steps.json'), { cases: [] })
+    }
+    const index = await readIndex(sessionRoot, 'step')
+    assert.equal(index.activeVersion, 'V0.0.10', '按数字段比，不是字符串序')
+  } finally {
+    rmSync(base, { recursive: true, force: true })
+  }
+})

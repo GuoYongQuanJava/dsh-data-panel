@@ -938,6 +938,70 @@ def build_evidence_index(result: dict, observations: dict) -> dict:
             merged["observed"] = value
             index[k] = merged
 
+    # ⑤ 截图证据：`evidence[]` 是逐步骤的截图相对路径（runs/<runId>/shots/xxx.png）。
+    #    报告「备注信息」要把每一步的截图贴进去，所以得把这批路径带出到 case_payload。
+    #
+    #    三种来源都收（优先级从低到高，与 observed 一致）：
+    #      · result.json 的 steps[] .evidence
+    #      · result.json 的 tests[]  .evidence
+    #      · observations.json 的 items[] .evidence
+    #    路径可能是相对 `runs/<runId>/`、相对 session_root、或绝对路径，
+    #    这里只做「原样收纳」，解析成真实文件由生成器负责（它知道 run_dir）。
+    def absorb_evidence(item: dict, base: dict) -> dict:
+        files = item.get("evidence")
+        if isinstance(files, str):
+            files = [files]
+        if not isinstance(files, list):
+            return base
+        clean = []
+        for f in files:
+            text = str(f or "").strip()
+            if text == "":
+                continue
+            if text not in clean:
+                clean.append(text)
+        if not clean:
+            return base
+        # 后来的来源覆盖前面的（observations 最可信），但保留已有顺序去重
+        merged_files = list(clean)
+        for old in base.get("evidence") or []:
+            if old not in merged_files:
+                merged_files.append(old)
+        base["evidence"] = merged_files
+        return base
+
+    for item in result.get("steps") or []:
+        if not isinstance(item, dict):
+            continue
+        case_id = str(item.get("caseId") or "")
+        if case_id == "":
+            continue
+        k = key_of(case_id, step_no_of(item))
+        index[k] = absorb_evidence(item, index.get(k, {}))
+
+    for item in result.get("tests") or []:
+        if not isinstance(item, dict):
+            continue
+        case_id = str(item.get("caseId") or "")
+        if case_id == "":
+            continue
+        step_no = step_no_of(item)
+        if step_no is None:
+            step_no = step_no_from_func(item.get("func") or "")
+        if step_no is None:
+            continue
+        k = key_of(case_id, step_no)
+        index[k] = absorb_evidence(item, index.get(k, {}))
+
+    for item in observations.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        case_id = str(item.get("caseId") or "")
+        if case_id == "":
+            continue
+        k = key_of(case_id, step_no_of(item))
+        index[k] = absorb_evidence(item, index.get(k, {}))
+
     return index
 
 
@@ -1067,11 +1131,44 @@ def load_or_create_plan(snapshot: dict, run_id: str, report_dir: Path) -> tuple:
 # ─────────────────────────────────────────────────────────────
 
 
-def case_payload(case: dict, evidence: dict, step_rows: list) -> dict:
+def case_payload(case: dict, evidence: dict, step_rows: list, run_dir=None) -> dict:
     """把快照里的一条用例 + 执行证据，转成生成器要的 case 结构。"""
     case_id = str(case.get("caseId") or "")
     steps = []
     outcomes = []
+
+    def resolve_shot(raw) -> str:
+        """把 evidence[] 里的一条路径解析成**存在的绝对路径**；解析不到返回空串。
+
+        路径可能写成三种形式（历史上都出现过）：
+          · `shots/x.png`                     —— 相对 run 目录
+          · `runs/<runId>/shots/x.png`         —— 相对 session_root（= run_dir 的上级）
+          · `F:\\...\\shots\\x.png`             —— 绝对路径
+        生成器不该猜，所以在这里一次性收敛成绝对路径；文件不存在就丢掉，
+        免得 docx 里出现打不开的图片占位。
+        """
+        text = str(raw or "").strip()
+        if text == "":
+            return ""
+        p = Path(text)
+        candidates = []
+        if p.is_absolute():
+            candidates.append(p)
+        if run_dir is not None:
+            candidates.append(Path(run_dir) / text)
+            # `runs/<runId>/shots/x.png` → 去掉 `runs/<runId>/` 前缀再试
+            parts = p.parts
+            if len(parts) >= 2 and parts[0] == "runs":
+                candidates.append(Path(run_dir).joinpath(*parts[2:]))
+            else:
+                candidates.append(Path(run_dir).parent / text)
+        for candidate in candidates:
+            try:
+                if candidate.is_file():
+                    return str(candidate.resolve())
+            except OSError:
+                continue
+        return ""
 
     for i, step in enumerate(step_rows, start=1):
         # `steps.json` 里的步骤序号键名兼容（no / stepNo / step）
@@ -1093,6 +1190,13 @@ def case_payload(case: dict, evidence: dict, step_rows: list) -> dict:
             if outcome == "notRun":
                 observed = "未执行（本次未执行该步）"
 
+        # 该步骤的截图：解析成存在的绝对路径，报告「备注信息」要用
+        shots = []
+        for raw in ev.get("evidence") or []:
+            resolved = resolve_shot(raw)
+            if resolved and resolved not in shots:
+                shots.append(resolved)
+
         steps.append({
             "no": no,
             "action": step.get("action") or "",
@@ -1100,6 +1204,7 @@ def case_payload(case: dict, evidence: dict, step_rows: list) -> dict:
             "expected": step.get("expected") or "",
             "observed": observed,
             "outcome": outcome,
+            "evidence": shots,
         })
         outcomes.append(outcome)
 
@@ -1137,7 +1242,7 @@ def case_payload(case: dict, evidence: dict, step_rows: list) -> dict:
 
 
 def build_data(snapshot: dict, steps_doc: dict, evidence: dict, plan: dict,
-               run_id: str, meta_overrides: dict) -> dict:
+               run_id: str, meta_overrides: dict, run_dir_abs=None) -> dict:
     """按 plan 把功能项和用例组织成生成器要的 stages 结构。"""
     feature_by_id = {str(f.get("id") or ""): f for f in snapshot.get("features") or []}
     case_by_id = {str(c.get("caseId") or ""): c for c in snapshot.get("cases") or []}
@@ -1169,7 +1274,7 @@ def build_data(snapshot: dict, steps_doc: dict, evidence: dict, plan: dict,
             feature_cases = []
             for case in cases_of_feature.get(fid) or []:
                 cid = str(case.get("caseId") or "")
-                payload = case_payload(case, evidence, steps_of_case.get(cid) or [])
+                payload = case_payload(case, evidence, steps_of_case.get(cid) or [], run_dir=run_dir_abs)
                 feature_cases.append(payload)
                 # 未通过的用例 → 一条问题（附录 A/B 的来源）
                 if payload["outcome"] == "failed":
@@ -1256,6 +1361,10 @@ def build_data(snapshot: dict, steps_doc: dict, evidence: dict, plan: dict,
     return {
         "runId": run_id,
         "generatedAt": datetime.now(timezone.utc).isoformat(),
+        # 本次执行目录（abs），生成器解析截图相对路径时要用：
+        #   evidence[] 里可能写 "shots/x.png" / "runs/<runId>/shots/x.png" / 绝对路径
+        # 三种都得能落到真实文件，所以把基准目录显式带过去，不让生成器猜。
+        "runDir": str(run_dir_abs) if run_dir_abs else "",
         "meta": meta,
         "people": people,
         "stages": stages,
@@ -1714,7 +1823,7 @@ def main(argv) -> int:
         "designer": args.designer,
         "reviewer": args.reviewer,
         "tester": args.tester,
-    })
+    }, run_dir_abs=run_dir)
     data_path = report_dir / "report-data.json"
     summary = data.get("summary") or {}
     print("      用例 %d 条，步骤 %d 个，结论分布 %s"

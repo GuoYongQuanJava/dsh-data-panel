@@ -27,6 +27,7 @@ from pathlib import Path
 
 from docx import Document
 from docx.oxml.ns import qn
+from docx.shared import Cm
 from docx.table import Table
 from docx.text.paragraph import Paragraph
 
@@ -629,6 +630,128 @@ def pick_case_code(case: dict, meta: dict | None = None, fallback_seq: int = 1) 
         return "T%03d" % int(fallback_seq)
 
 
+# 某一步没有可用截图时，在步骤文字下面写的占位说明。
+# 单独抽成常量：测试要断言它，Skill 文档也要引用同一句话。
+_NO_SHOT_TEXT = "无截图"
+
+
+def fill_remark_cell(cell, case: dict, steps: list) -> None:
+    """填「备注信息」格：按步骤顺序写「输入步骤文字 + 该步截图」。
+
+    用户 2026-11-28 明确要求：既然改用 CUA 真点界面，就必须工作留痕 ——
+    报告备注栏要能看到「第 N 步点了什么」以及「点完界面长什么样」。
+
+    版式（一个单元格内的纵向段落序列，Word 单元格不支持图文并排混排）：
+        1. 点击进入「结算页」
+           [截图 step-1.png]
+        2. 点击切换到「待付款」
+           无截图
+        3. 点击「确认支付」
+           [截图 step-3.png]
+
+    规则：
+      · 只有真的解析到图片文件才插图；路径失效则跳过，不产生破图占位。
+      · 该步没有可用截图时，紧跟文字写一行「无截图」—— 留痕要求下
+        「没有」本身也是信息，让人一眼看出缺证据，而不是以为排版漏了。
+      · 整条用例一张图都没有 → 维持原来的「无」，与历史报告观感一致。
+      · 图片宽度固定 10cm（该格宽 11.3cm，留出内边距），高度按原图比例自适应。
+    """
+    note_text = str(case.get("note") or "").strip()
+
+    # 收集「有文字或有图」的步骤
+    entries = []
+    for index, step in enumerate(steps or []):
+        no = step.get("no", index + 1)
+        operation = str(step.get("operation") or step.get("action") or "").strip()
+        shots = [s for s in (step.get("evidence") or []) if str(s or "").strip()]
+        if operation == "" and not shots:
+            continue
+        entries.append((no, operation, shots))
+
+    # 判断「整条用例是不是一张图都没有」。
+    # 这里要真的看文件在不在 —— bridge 通常已经把失效路径滤掉了，
+    # 但生成器也可能被直接调用（比如补历史数据），不能假设上游一定干净。
+    has_any_shot = False
+    for _, _, shots in entries:
+        for path in shots:
+            try:
+                if os.path.isfile(path):
+                    has_any_shot = True
+                    break
+            except (OSError, TypeError):
+                continue
+        if has_any_shot:
+            break
+    if not entries or not has_any_shot:
+        # 没有截图：保持原有行为（用户备注优先，否则「无」）
+        set_cell_text(cell, note_text or "无")
+        return
+
+    # 清空单元格，保留首段落的格式（字号/行距沿用模板）
+    for paragraph in cell.paragraphs[1:]:
+        paragraph._element.getparent().remove(paragraph._element)
+    first_para = cell.paragraphs[0]
+    for child in list(first_para._p):
+        if child.tag != qn("w:pPr"):
+            first_para._p.remove(child)
+
+    # 首个段落复用（不能丢）：清空后它是空段，若直接 add_paragraph 会多出一个空行，
+    # 而且用户备注会落到第 2 段之后。用 _first 标记下一个要写的是不是首段。
+    state = {"first_used": False}
+
+    def new_paragraph():
+        """返回下一个可用段落：第一次返回首段（模板格式在那里），之后追加新段。"""
+        if not state["first_used"]:
+            state["first_used"] = True
+            return first_para
+        paragraph = cell.add_paragraph()
+        paragraph.paragraph_format.space_before = 0
+        paragraph.paragraph_format.space_after = 0
+        return paragraph
+
+    def add_text_line(text: str) -> None:
+        paragraph = new_paragraph()
+        paragraph.add_run(text)
+
+    def add_shot_line(path: str) -> bool:
+        """插一张图；成功返回 True。失败时把空段撤掉并返回 False。"""
+        paragraph = new_paragraph()
+        run = paragraph.add_run()
+        try:
+            # 只给宽度，高度按图片原始长宽比自动缩放
+            run.add_picture(path, width=Cm(10))
+            return True
+        except Exception:
+            # 图片损坏/格式不支持：把这一段整个撤掉，
+            # 若撤的是首段就退回未使用状态，免得后面没地方落。
+            target = paragraph._p
+            parent = target.getparent()
+            if parent is not None:
+                parent.remove(target)
+            if paragraph is first_para:
+                state["first_used"] = False
+            return False
+
+    # 用户额外填的备注放最前面（历史行为里 note 就是这个位置）
+    if note_text:
+        add_text_line(note_text)
+
+    for no, operation, shots in entries:
+        label = ("%s. %s" % (no, operation)).strip()
+        if label == "":
+            label = "%s. (无输入步骤描述)" % no
+        add_text_line(label)
+        inserted = 0
+        for path in shots:
+            if add_shot_line(path):
+                inserted += 1
+        if inserted == 0:
+            # 没图（或路径全失效）就明说「无截图」—— 留痕要求下
+            # 「没有」本身也是信息，让人一眼看出这一步缺证据，
+            # 而不是以为排版漏了。
+            add_text_line(_NO_SHOT_TEXT)
+
+
 def fill_case_table(
     table: Table,
     case: dict,
@@ -711,9 +834,17 @@ def fill_case_table(
     # 通过准则行：值在 cells[2]
     set_cell_text(table.rows[pass_row].cells[2], "实际测试结果与预期结果一致")
 
-    # 备注信息
+    # 备注信息：按步骤顺序贴「输入步骤文字 + 该步截图」。
+    #   用户 2026-11-28 要求：既然用 CUA 真点，就必须工作留痕。
+    #   备注格里写成
+    #       1. 点击进入「结算页」
+    #          [截图]
+    #       2. 点击切换到「待付款」
+    #          [截图]
+    #   没截图的步骤只写文字（不写「无截图」，避免满屏噪音）；
+    #   一条用例一张图都没有时维持原来的「无」。
     note_row = pass_row + 1
-    set_cell_text(table.rows[note_row].cells[2], case.get("note") or "无")
+    fill_remark_cell(table.rows[note_row].cells[2], case, steps)
 
     # 异常现象描述 + 软件问题单编号
     #   素材只取**真实观察**（observed）。观察为空时明确写「未采集到实际数据」，

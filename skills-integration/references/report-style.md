@@ -125,18 +125,6 @@ python bridge.py --session-root <会话>\integration `
                  --report-version <面板分配的版本号>
 ```
 
-> **软件规模 / 编程语言 / 开发环境 / 运行环境不用传** —— `bridge.py` 会从被测项目源码自动探测：
-> 语言按源码文件数统计、规模数源码文件与 Controller/Service、开发环境读 `*.csproj` 的
-> `TargetFramework` 与 `package.json` 的依赖版本、运行环境读 `launchSettings.json` 与
-> `appsettings*.json` 的连接串。探测结果会在 `[4/6]` 那一步逐项打印出来。
->
-> 只有两类情况需要手动传 `--software-scale` / `--language` / `--dev-env` / `--run-env`：
-> ① 被测项目不在本机、探测不到；② 你要覆盖探测值。**显式传的值优先。**
->
-> ⚠️ **2026-11-24 事故**：这份示例以前只列 4 个参数，模型照抄后报告表头
-> 四格全是「未采集」（`bridge.py` 的 `or "未采集"` 兜底）。参数能省，
-> 但**别以为省了就等于采集到了** —— 跑完要看 `[4/6]` 打印的四行是不是都有值。
-
 它负责：读步骤/快照/执行结果 → 写 `report-plan.json` + `report-data.json` → 调生成器出 docx。
 
 **两步分工（与单元测试一致）**：
@@ -149,23 +137,10 @@ report-plan.json + report-data.json
 总体报告 + cases/*.docx
 ```
 
-**为什么不要再自己写转换脚本**（这条踩过两次）：
-
-1. 转换逻辑散落在会话目录的临时脚本里，别人拉仓库后根本没有那份脚本；
-   而且每次重写都容易错字段（已踩过：`result.json` 的步骤号是 `stepNo` 不是 `no`，
-   写错会让 173 个步骤只匹配到 74 条证据、结论全变成「未执行」）。
-2. **2026-11-24 事故**：有人写了 `tools/build_run_result.py` 把 `junit.xml` 转成
-   `result.json`，其中通过路径硬编码成
-
-   ```python
-   observed = "断言全部通过（接口返回与落库字段均符合预期）"   # ← 180 次一模一样
-   ```
-
-   结果报告「实际测试结果」列 243 行里有 180 行是同一句套话，
-   「异常现象描述」也跟着变成「第 3 步：断言未通过：…」这种没头没尾的句子。
-   **转换脚本自己就会造假，这就是不要再自己写转换脚本的第二个理由。**
-   `bridge.py` 现在直接吃 `tests[]`（含 `actual`）与 `run.log` 里的
-   `ACTUAL[...]` 标记，并且会**主动丢弃**这类固定话术。
+**为什么不要再自己写转换脚本**（这条踩过）：
+转换逻辑散落在会话目录的临时脚本里，别人拉仓库后根本没有那份脚本；
+而且每次重写都容易错字段（已踩过：`result.json` 的步骤号是 `stepNo` 不是 `no`，
+写错会让 173 个步骤只匹配到 74 条证据、结论全变成「未执行」）。
 
 自建脚本只在 `bridge.py` 不够用时才写，职责仍然只有「取数据 + 调生成器」：
 
@@ -185,57 +160,9 @@ report-plan.json + report-data.json
 **不读当前用例版本**。这样即使用例后来被改得面目全非，报告依然可复现。
 
 - 结论粒度是**一个步骤一条**（不是一条用例一条）
-- **必须标注结论来源**：`runner+model`（默认：`code` / `service` / `runner` / `cmd` 四种 channel 的产出）与
-  `model`（仅肉眼补充的描述性观察），两者视觉上要能区分，不混成一类可信度
+- **必须标注结论来源**：`runner+model`（5 类，代码真跑过 + 模型补充观察）与
+  `model`（功能测试，只有模型记录），两者视觉上要能区分，不混成一类可信度
 - 报告里**不出现测试代码、测试函数名、codeRef**
-
-### 2.3.1 ★★ 「实际测试结果」这一列写什么（**照着这条，别自创**）
-
-报告用例表第 5 行是「序号 | 输入步骤 | 预期结果 | **实际测试结果**」。
-这一列的内容**完全来自 `steps[].observed`**，`integration_report.py` 不会补任何智能文案
-（填空时只会写「未记录实际值」，那是**兜底**，不是合格值）。
-
-**要求：写真实返回值。** 具体到接口/字段/数值，让验收方不看日志就知道跑出了什么。
-
-| 场景 | ✅ 合格 | ❌ 不合格 | 为什么不行 |
-|---|---|---|---|
-| 通过的接口步骤 | `{"code":0,"data":{"id":1379,"phone":"199****8888"}}` | `断言全部通过` | 没告诉人返回了什么 |
-| 通过的接口步骤 | `HTTP 200，code=0，data.list 长度 12，首条 id=262` | `接口返回与落库字段均符合预期` | 全是断言结论，不是数据 |
-| 通过的落库校验 | `SELECT 返回 1 行：IsLock=0，YongHuId=1379` | `断言全部通过` | 没给查询结果 |
-| 失败的步骤 | `HTTP 409 {"code":409,"msg":"旧会员等级已停用，请使用团购开团授权"}` | `实际结果与预期不符` | 你没写他错在哪 |
-| 异常 | `KeyError: 'orderId'，响应体 {"code":0,"data":{"list":[]}}` | `断言未通过` | 缺异常类型和现场数据 |
-| 未执行 | `未执行（本次只执行第 3 步）` | `无` | 要能区分「没跑」和「跑了没问题」 |
-| 确实没采到 | **留空** | `断言全部通过（接口返回与落库字段均符合预期）` | 用套话遮住「没采集」 |
-
-**三条硬规则**：
-
-1. **通过路径也要写值** —— 这是最容易漏的。「通过」只说明断言成立，不代表读者知道读到了什么。
-2. **禁止固定话术**。以下这些一律视为「没有记录」：`断言全部通过`、`实际结果与预期一致`、
-   `符合预期`、`测试通过`、`无异常`、`一切正常`、`实际结果与预期不符`。
-   `bridge.py` 的 `is_boilerplate_observed()` 会**主动丢弃**它们，然后报告里显示空。
-3. **没采到就留空，不要编**。留空显示「未记录实际值」→ 你能发现并去补；
-   写一句套话 → 问题被永久掩盖，没人会再查。
-
-**怎么让真实值进得来**：测试代码必须打印 `ACTUAL` 标记。
-
-```python
-# Python
-print(f"ACTUAL[{case_id}]: {result!r}")
-```
-
-```javascript
-// JS / TS
-console.log(`ACTUAL[${caseId}]:`, JSON.stringify(result));
-```
-
-`run_tests.py` 会把它收进 `result.json` 的 `tests[].actual`；
-没走 `run_tests.py` 的话，`bridge.py` 也会从 `run.log` 与 `junit.xml` 里捞 `ACTUAL[...]`。
-**两条路都没捞到就说明测试代码没打印** —— 去补打印，不要手填套话。
-
-> **2026-11-24 实测事故**：243 个步骤里 180 个的 `observed` 是
-> 「断言全部通过（接口返回与落库字段均符合预期）」，来自模型自写转换脚本的硬编码。
-> 结果整列 180 行一模一样，用户的原话是「应该为真实输出的数据，
-> 而不是一句与预期不符或者未记录实际值」。
 
 ---
 
@@ -330,10 +257,7 @@ console.log(`ACTUAL[${caseId}]:`, JSON.stringify(result));
 
 1. **不要只写执行的那一步**。整条用例的步骤都要列出来，未执行的写 `notRun` 并注明原因。
 2. 未执行步骤的 `observed` 写「未执行（本次只执行第 N 步）」，不要留空，也不要写「通过」。
-3. `outcome` 取值：`passed` / `failed` / `error` / `notRun`（未执行）/ `unconfirmed`（未确认）
-   / `blocked`（界面上不可观测）/ `unknown`（找不到证据）。
-   **完整合法值以 `bridge.py` 的 `OUTCOME_CONCLUSION` 与 `check_contract.py` 的
-   `VALID_OUTCOMES` 为准**；不存在的值是 `pass`、`skipped`。
+3. `outcome` 取值：`passed` / `failed` / `error` / `notRun`（未执行）。
 4. 报告里**不出现测试代码、测试函数名、codeRef**。
 5. 单用例表是模板表4（**5 列 16 行**），步骤行按实际步骤数**自动增删**（4 步→17 行，2 步→15 行）。
 
@@ -428,65 +352,6 @@ console.log(`ACTUAL[${caseId}]:`, JSON.stringify(result));
 **一个阶段可以包含多个功能项**（如 sprint1 含「用户注册与登录」「商品浏览」）。
 
 > 阶段必须在**生成用例时**就定好（`features[].stage`），报告侧只做归组，**绝不重新划分**。
-
-### 5.8 ★★ 标题必须能被 Word 导航窗格识别（`outlineLvl`）
-
-**用户明确要求（2026-11-20，2026-11-25 复现）**：报告打开后，Word 左侧「导航窗格」
-要能看到完整的章节树，点一下就能跳转。
-
-**做法**：不给标题套 Word 内置「标题 1/2/3」样式，而是**直接给段落写 `w:outlineLvl`**
-—— 因为模板全是 `Normal` 样式，一挂内置标题会带出 `numbering.xml` 的
-`numId=3` 自动编号，章节号变成 `1.`、`1.1`、`1.1.1` 的双重编号。
-
-```
-一级标题（1.范围 / 附录A…）  →  <w:outlineLvl w:val="0"/>
-二级标题（1.1标识）          →  <w:outlineLvl w:val="1"/>
-三级标题（4.1.1测试结果总结） →  <w:outlineLvl w:val="2"/>
-```
-
-#### ★ 极易踩的坑：`w:pPr` 子元素顺序错了，`outlineLvl` 会被 Word **静默忽略**
-
-**2026-11-25 实测事故**：报告里 53 个标题段落**都写了** `<w:outlineLvl>`，
-但 Word 导航窗格**一个标题都不显示**。查下来是 `pPr` 里元素顺序违反 OOXML schema。
-
-```
-❌ 错误顺序（python-docx 的 makeelement + append 总是追加到末尾）：
-   <w:jc>  <w:rPr>…</w:rPr>  <w:spacing>  <w:outlineLvl>
-
-✅ 正确顺序（CT_PPr 规定的相对次序）：
-   <w:spacing>  <w:jc>  <w:outlineLvl>  <w:rPr>…
-```
-
-**Word 对顺序错误不报错、不提示，直接忽略后面的元素。** 这就是为什么
-「XML 里明明有 outlineLvl，界面上却没有目录」。
-
-**修法**：每次改完 `pPr` 后**统一按 schema 重排一遍**（生成器的
-`_reorder_ppr()` 已实现），不要靠「记住往哪插」。
-
-**本节相关元素的正确相对顺序**（从前往后）：
-
-```
-pStyle → keepNext → keepLines → pageBreakBefore → widowControl → numPr
-  → pBdr → shd → tabs → spacing → ind → contextualSpacing → jc
-  → outlineLvl → rPr → sectPr → pPrChange
-```
-
-#### 怎么验证真的生效（**别只看 XML**）
-
-**读 XML 里有没有 `<w:outlineLvl>` 是不够的** —— 顺序错了它也在。要用 Word 实际解析：
-
-```powershell
-$word = New-Object -ComObject Word.Application
-$word.Visible = $false
-$d = $word.Documents.Open($path, [ref]$false, [ref]$true)
-# ★ 读 Range.ParagraphFormat.OutlineLevel，不是 Style.ParagraphFormat
-$d.Paragraphs.Item($i).Range.ParagraphFormat.OutlineLevel
-$d.Close([ref]$false); $word.Quit()
-```
-
-- 返回值 **1/2/3** = 对应级别标题（`10` = 正文，导航窗格不显示）
-- **不要读 `Style.ParagraphFormat.OutlineLevel`** —— 那是样式的级别，
-  我们没改样式，它永远是 `10`（正文），会误判成「没生效」
 > 生成用例时没写 `stage`，整份报告只能退化成「全是第一阶段」，**事后无法补救**。
 
 ---
@@ -528,29 +393,6 @@ $d.Close([ref]$false); $word.Quit()
   "impact": "处理影响分析", "owner": "处理责任人", "fixDate": "处理日期"
 }
 ```
-
-### 6.3 ★★ 「异常现象描述」/「问题现象描述」写什么
-
-用例表里的「异常现象描述」和附录 A 的「问题现象描述」是**同一个东西**：
-不给 `issue.desc` 时，生成器会用**失败步骤的 `observed`** 自动拼
-（`integration_report.py` 的 `failed_steps` 那段）。
-
-所以：**`observed` 写得越具体，这两处就越具体；`observed` 是套话，两处必然一起烂。**
-
-| 位置 | 只有步骤号时（❌） | 写清现象时（✅） |
-|---|---|---|
-| 用例表「异常现象描述」 | `第 3 步：断言未通过` | `第 3 步：PUT /api/admin/users/1379/level 返回 409 {"code":409,"msg":"旧会员等级已停用，请使用团购开团授权"}，预期 code=0` |
-| 附录 A「问题现象描述」 | `第 3 步：实际结果与预期不符` | `后台修改会员等级接口对已停用的旧等级返回 409，未按需求描述自动迁移到团购授权，导致运营无法批量升级用户等级` |
-
-**硬要求**：一条异常描述必须回答三个问题，缺一个就是不合格。
-
-1. **在哪**：接口路径 / 表名 / 字段名（不是「第 N 步」）
-2. **读到了什么**：真实返回值或实际库值（带具体数据）
-3. **差在哪**：预期是什么，实际差在哪个字段（不是「不符预期」）
-
-> `bridge.py` 会自动把失败步骤的 `observed` 拼成 `第 N 步：<observed>`。
-> 所以只要 `observed` 合格，这处就自动合格；`observed` 是空的，
-> 这里就只剩一句光秃秃的「第 N 步：」，**一眼就能看出没采集**。
 
 ---
 
@@ -635,3 +477,226 @@ GN-651-JYSG_SRS_UI_TESTING-1-T001.CTD
 | 14 | 报告版本号来自面板 `createVersion`，不是手写 `V0.0.1` |
 
 > 前 13 条靠人核对；第 14 条可用 `check_contract.py` 自动校验。
+
+### 2.3.1 ★★ 「实际测试结果」这一列写什么（**照着这条，别自创**）
+
+报告用例表第 5 行是「序号 | 输入步骤 | 预期结果 | **实际测试结果**」。
+这一列的内容**完全来自 `steps[].observed`**，`integration_report.py` 不会补任何智能文案
+（填空时只会写「未记录实际值」，那是**兜底**，不是合格值）。
+
+**要求：写真实返回值。** 具体到接口/字段/数值，让验收方不看日志就知道跑出了什么。
+
+| 场景 | ✅ 合格 | ❌ 不合格 | 为什么不行 |
+|---|---|---|---|
+| 通过的接口步骤 | `{"code":0,"data":{"id":1379,"phone":"199****8888"}}` | `断言全部通过` | 没告诉人返回了什么 |
+| 通过的接口步骤 | `HTTP 200，code=0，data.list 长度 12，首条 id=262` | `接口返回与落库字段均符合预期` | 全是断言结论，不是数据 |
+| 通过的落库校验 | `SELECT 返回 1 行：IsLock=0，YongHuId=1379` | `断言全部通过` | 没给查询结果 |
+| 失败的步骤 | `HTTP 409 {"code":409,"msg":"旧会员等级已停用，请使用团购开团授权"}` | `实际结果与预期不符` | 你没写他错在哪 |
+| 异常 | `KeyError: 'orderId'，响应体 {"code":0,"data":{"list":[]}}` | `断言未通过` | 缺异常类型和现场数据 |
+| 未执行 | `未执行（本次只执行第 3 步）` | `无` | 要能区分「没跑」和「跑了没问题」 |
+| 确实没采到 | **留空** | `断言全部通过（接口返回与落库字段均符合预期）` | 用套话遮住「没采集」 |
+
+**三条硬规则**：
+
+1. **通过路径也要写值** —— 这是最容易漏的。「通过」只说明断言成立，不代表读者知道读到了什么。
+2. **禁止固定话术**。以下这些一律视为「没有记录」：`断言全部通过`、`实际结果与预期一致`、
+   `符合预期`、`测试通过`、`无异常`、`一切正常`、`实际结果与预期不符`。
+   `bridge.py` 的 `is_boilerplate_observed()` 会**主动丢弃**它们，然后报告里显示空。
+3. **没采到就留空，不要编**。留空显示「未记录实际值」→ 你能发现并去补；
+   写一句套话 → 问题被永久掩盖，没人会再查。
+
+**怎么让真实值进得来**：测试代码必须打印 `ACTUAL` 标记。
+
+```python
+# Python
+print(f"ACTUAL[{case_id}]: {result!r}")
+```
+
+```javascript
+// JS / TS
+console.log(`ACTUAL[${caseId}]:`, JSON.stringify(result));
+```
+
+`run_tests.py` 会把它收进 `result.json` 的 `tests[].actual`；
+没走 `run_tests.py` 的话，`bridge.py` 也会从 `run.log` 与 `junit.xml` 里捞 `ACTUAL[...]`。
+**两条路都没捞到就说明测试代码没打印** —— 去补打印，不要手填套话。
+
+> **2026-11-24 实测事故**：243 个步骤里 180 个的 `observed` 是
+> 「断言全部通过（接口返回与落库字段均符合预期）」，来自模型自写转换脚本的硬编码。
+> 结果整列 180 行一模一样，用户的原话是「应该为真实输出的数据，
+> 而不是一句与预期不符或者未记录实际值」。
+
+---
+
+### 2.3.2 ★★ 「备注信息」这一栏放截图（执行留痕）
+
+用户 2026-11-28 明确要求：**既然改用 CUA 真点界面，就必须工作留痕** ——
+报告用例表的「备注信息」栏要能看到「每一步点了什么」以及「点完界面长什么样」。
+
+生成器（`integration_report.py` 的 `fill_remark_cell`）已经实现，**不要手写**。
+它按下面规则产出：
+
+```
+备注信息 | 1. 点击进入「结算页」
+         |    [截图 V0_0_1-IT-001-step-1.png]
+         | 2. 点击切换到「待付款」
+         |    无截图                          ← 这步缺图，明说
+         | 3. 点击「确认支付」
+         |    [截图 V0_0_1-IT-001-step-3.png]
+```
+
+| 规则 | 说明 |
+|---|---|
+| **图片来源** | 该步骤的 `steps[].evidence[]`（`bridge.py` 会解析成真实文件，解析不到就丢） |
+| **排版** | 一个单元格内纵向段落：`序号. 输入步骤文字` → 下面紧跟该步截图 |
+| **图片宽度** | 固定 **10cm**（备注格宽 11.3cm，留内边距）；**高度按原图比例自适应** |
+| **某步没截图** | 文字下面写一行 **`无截图`** —— 留痕要求下「没有」本身也是信息，<br>让人一眼看出该步缺证据，而不是以为排版漏了 |
+| **整条用例都没截图** | 保持原来的「无」（不写一堆「无截图」） |
+| **图片路径失效** | 跳过该图，该步按「没截图」处理（写「无截图」），不留破图占位 |
+
+**所以你能控制的只有一件事：执行时把截图存对地方。**
+
+| 要求 | 值 |
+|---|---|
+| 存哪 | `<SESSION_ROOT>/runs/<runId>/shots/` |
+| 文件名 | **`<caseId>-step-<N>.png`**（必须带 `caseId`，否则同 run 内多用例互相覆盖） |
+| 记进 | 该步 `evidence[]` 写 `shots/<caseId>-step-<N>.png`（相对 run 目录即可） |
+
+> **截图是留痕，不是判据**：`outcome` 仍由 `verify_state` 决定，两者都要有。
+> 截图失败就留空 `evidence`，不要编路径 —— 报告会自动降级成只有文字。
+
+---
+
+### 5.8 ★★ 标题必须能被 Word 导航窗格识别（`outlineLvl`）
+
+**用户明确要求（2026-11-20，2026-11-25 复现）**：报告打开后，Word 左侧「导航窗格」
+要能看到完整的章节树，点一下就能跳转。
+
+**做法**：不给标题套 Word 内置「标题 1/2/3」样式，而是**直接给段落写 `w:outlineLvl`**
+—— 因为模板全是 `Normal` 样式，一挂内置标题会带出 `numbering.xml` 的
+`numId=3` 自动编号，章节号变成 `1.`、`1.1`、`1.1.1` 的双重编号。
+
+```
+一级标题（1.范围 / 附录A…）  →  <w:outlineLvl w:val="0"/>
+二级标题（1.1标识）          →  <w:outlineLvl w:val="1"/>
+三级标题（4.1.1测试结果总结） →  <w:outlineLvl w:val="2"/>
+```
+
+#### ★ 极易踩的坑：`w:pPr` 子元素顺序错了，`outlineLvl` 会被 Word **静默忽略**
+
+**2026-11-25 实测事故**：报告里 53 个标题段落**都写了** `<w:outlineLvl>`，
+但 Word 导航窗格**一个标题都不显示**。查下来是 `pPr` 里元素顺序违反 OOXML schema。
+
+```
+❌ 错误顺序（python-docx 的 makeelement + append 总是追加到末尾）：
+   <w:jc>  <w:rPr>…</w:rPr>  <w:spacing>  <w:outlineLvl>
+
+✅ 正确顺序（CT_PPr 规定的相对次序）：
+   <w:spacing>  <w:jc>  <w:outlineLvl>  <w:rPr>…
+```
+
+**Word 对顺序错误不报错、不提示，直接忽略后面的元素。** 这就是为什么
+「XML 里明明有 outlineLvl，界面上却没有目录」。
+
+**修法**：每次改完 `pPr` 后**统一按 schema 重排一遍**（生成器的
+`_reorder_ppr()` 已实现），不要靠「记住往哪插」。
+
+**本节相关元素的正确相对顺序**（从前往后）：
+
+```
+pStyle → keepNext → keepLines → pageBreakBefore → widowControl → numPr
+  → pBdr → shd → tabs → spacing → ind → contextualSpacing → jc
+  → outlineLvl → rPr → sectPr → pPrChange
+```
+
+#### 怎么验证真的生效（**别只看 XML**）
+
+**读 XML 里有没有 `<w:outlineLvl>` 是不够的** —— 顺序错了它也在。要用 Word 实际解析：
+
+```powershell
+$word = New-Object -ComObject Word.Application
+$word.Visible = $false
+$d = $word.Documents.Open($path, [ref]$false, [ref]$true)
+# ★ 读 Range.ParagraphFormat.OutlineLevel，不是 Style.ParagraphFormat
+$d.Paragraphs.Item($i).Range.ParagraphFormat.OutlineLevel
+$d.Close([ref]$false); $word.Quit()
+```
+
+- 返回值 **1/2/3** = 对应级别标题（`10` = 正文，导航窗格不显示）
+- **不要读 `Style.ParagraphFormat.OutlineLevel`** —— 那是样式的级别，
+  我们没改样式，它永远是 `10`（正文），会误判成「没生效」
+> 生成用例时没写 `stage`，整份报告只能退化成「全是第一阶段」，**事后无法补救**。
+
+---
+
+#### ★ 极易踩的坑：`w:pPr` 子元素顺序错了，`outlineLvl` 会被 Word **静默忽略**
+
+**2026-11-25 实测事故**：报告里 53 个标题段落**都写了** `<w:outlineLvl>`，
+但 Word 导航窗格**一个标题都不显示**。查下来是 `pPr` 里元素顺序违反 OOXML schema。
+
+```
+❌ 错误顺序（python-docx 的 makeelement + append 总是追加到末尾）：
+   <w:jc>  <w:rPr>…</w:rPr>  <w:spacing>  <w:outlineLvl>
+
+✅ 正确顺序（CT_PPr 规定的相对次序）：
+   <w:spacing>  <w:jc>  <w:outlineLvl>  <w:rPr>…
+```
+
+**Word 对顺序错误不报错、不提示，直接忽略后面的元素。** 这就是为什么
+「XML 里明明有 outlineLvl，界面上却没有目录」。
+
+**修法**：每次改完 `pPr` 后**统一按 schema 重排一遍**（生成器的
+`_reorder_ppr()` 已实现），不要靠「记住往哪插」。
+
+**本节相关元素的正确相对顺序**（从前往后）：
+
+```
+pStyle → keepNext → keepLines → pageBreakBefore → widowControl → numPr
+  → pBdr → shd → tabs → spacing → ind → contextualSpacing → jc
+  → outlineLvl → rPr → sectPr → pPrChange
+```
+
+#### 怎么验证真的生效（**别只看 XML**）
+
+**读 XML 里有没有 `<w:outlineLvl>` 是不够的** —— 顺序错了它也在。要用 Word 实际解析：
+
+```powershell
+$word = New-Object -ComObject Word.Application
+$word.Visible = $false
+$d = $word.Documents.Open($path, [ref]$false, [ref]$true)
+# ★ 读 Range.ParagraphFormat.OutlineLevel，不是 Style.ParagraphFormat
+$d.Paragraphs.Item($i).Range.ParagraphFormat.OutlineLevel
+$d.Close([ref]$false); $word.Quit()
+```
+
+- 返回值 **1/2/3** = 对应级别标题（`10` = 正文，导航窗格不显示）
+- **不要读 `Style.ParagraphFormat.OutlineLevel`** —— 那是样式的级别，
+  我们没改样式，它永远是 `10`（正文），会误判成「没生效」
+> 生成用例时没写 `stage`，整份报告只能退化成「全是第一阶段」，**事后无法补救**。
+
+---
+
+### 6.3 ★★ 「异常现象描述」/「问题现象描述」写什么
+
+用例表里的「异常现象描述」和附录 A 的「问题现象描述」是**同一个东西**：
+不给 `issue.desc` 时，生成器会用**失败步骤的 `observed`** 自动拼
+（`integration_report.py` 的 `failed_steps` 那段）。
+
+所以：**`observed` 写得越具体，这两处就越具体；`observed` 是套话，两处必然一起烂。**
+
+| 位置 | 只有步骤号时（❌） | 写清现象时（✅） |
+|---|---|---|
+| 用例表「异常现象描述」 | `第 3 步：断言未通过` | `第 3 步：PUT /api/admin/users/1379/level 返回 409 {"code":409,"msg":"旧会员等级已停用，请使用团购开团授权"}，预期 code=0` |
+| 附录 A「问题现象描述」 | `第 3 步：实际结果与预期不符` | `后台修改会员等级接口对已停用的旧等级返回 409，未按需求描述自动迁移到团购授权，导致运营无法批量升级用户等级` |
+
+**硬要求**：一条异常描述必须回答三个问题，缺一个就是不合格。
+
+1. **在哪**：接口路径 / 表名 / 字段名（不是「第 N 步」）
+2. **读到了什么**：真实返回值或实际库值（带具体数据）
+3. **差在哪**：预期是什么，实际差在哪个字段（不是「不符预期」）
+
+> `bridge.py` 会自动把失败步骤的 `observed` 拼成 `第 N 步：<observed>`。
+> 所以只要 `observed` 合格，这处就自动合格；`observed` 是空的，
+> 这里就只剩一句光秃秃的「第 N 步：」，**一眼就能看出没采集**。
+
+---

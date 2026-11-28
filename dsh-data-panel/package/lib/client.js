@@ -646,6 +646,44 @@ div.dp-stat:hover { border-color: color-mix(in srgb, var(--dp-brand) 4%, var(--d
 .it-switch-count { color: var(--dp-text3); font-size: 11px; font-variant-numeric: tabular-nums; }
 .it-switch-item.is-active .it-switch-count { color: var(--dp-brand); }
 .it-switch-item { display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 100%; padding: 6px 9px; border: 0; border-radius: 7px; background: transparent; color: var(--dp-text2); font: inherit; font-size: 12.5px; text-align: left; cursor: pointer; }
+
+/*
+ * 侧边栏右键菜单（单元测试「用例层级」与集成测试「功能项」共用一套外观）。
+ *
+ * position: fixed + 坐标由 JS 按鼠标位置算：菜单要能溢出侧栏，
+ * 用 absolute 会被 .dp-cat-scroll / .it-side-scroll 的 overflow 裁掉。
+ */
+.dp-ctx-menu {
+	position: fixed;
+	z-index: 9999;
+	display: flex;
+	flex-direction: column;
+	min-width: 132px;
+	padding: 4px;
+	border: 1px solid var(--dp-border);
+	border-radius: 9px;
+	background: var(--dp-bg);
+	box-shadow: 0 8px 24px rgba(15, 23, 42, .16);
+}
+.dp-ctx-item {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	width: 100%;
+	padding: 6px 9px;
+	border: 0;
+	border-radius: 7px;
+	background: transparent;
+	color: var(--dp-text2);
+	font: inherit;
+	font-size: 12.5px;
+	text-align: left;
+	cursor: pointer;
+}
+.dp-ctx-item:hover { background: var(--dp-bg2); color: var(--dp-text); }
+.dp-ctx-item.danger { color: var(--dp-danger); }
+.dp-ctx-item.danger:hover { background: color-mix(in srgb, var(--dp-danger) 10%, transparent); }
+.dp-ctx-item svg { flex: 0 0 auto; }
 .it-switch-item:hover { background: var(--dp-bg2); color: var(--dp-text); }
 .it-switch-item.is-active { background: color-mix(in srgb, var(--dp-brand) 10%, transparent); color: var(--dp-brand); font-weight: 600; }
 .it-switch-count { color: var(--dp-text3); font-size: 11px; font-variant-numeric: tabular-nums; }
@@ -1857,6 +1895,114 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 		}
 		//#endregion
 
+		//#region context menu
+		/**
+		 * 侧边栏行右键菜单（单元测试「用例层级」与集成测试「功能项」共用）。
+		 *
+		 * 为什么不用浏览器原生右键菜单：原生菜单没法带「重命名 / 删除」这种应用动作，
+		 * 而且用户明确要求「右键出来一个菜单，里面有重命名和删除文字」。
+		 *
+		 * 定位用 position: fixed + 鼠标坐标：侧栏滚动容器是 overflow:auto，
+		 * 用 absolute 会被裁掉（菜单一靠近底部就看不见）。
+		 * 同时做视口边缘翻转 —— 靠近右下角时往回收，避免菜单跑出屏幕。
+		 */
+		function ContextMenu(props) {
+			var items = Array.isArray(props.items) ? props.items : [];
+			var x = Number(props.x) || 0;
+			var y = Number(props.y) || 0;
+			var menuRef = useRef(null);
+			var posState = useState({ left: x, top: y });
+			// pos 缺字段时兜底：状态槽位在测试桩/热重载下可能拿到旧值，
+			// 少一层保护就会在 render 时抛错，菜单整个不显示。
+			var pos = (posState[0] && typeof posState[0] === "object") ? posState[0] : { left: x, top: y };
+			var left = Number(pos.left);
+			var top = Number(pos.top);
+			if (!Number.isFinite(left)) left = x;
+			if (!Number.isFinite(top)) top = y;
+			var setPos = posState[1];
+
+			// 首帧渲染后量一次真实尺寸，再决定要不要翻转（内容宽度随文字长度变）
+			useEffect(function () {
+				var el = menuRef.current;
+				if (!el) return undefined;
+				var rect = el.getBoundingClientRect();
+				var margin = 8;
+				var maxX = Math.max(margin, window.innerWidth - rect.width - margin);
+				var maxY = Math.max(margin, window.innerHeight - rect.height - margin);
+				setPos({
+					left: Math.min(Math.max(margin, x), maxX),
+					top: Math.min(Math.max(margin, y), maxY)
+				});
+				return undefined;
+			}, [x, y, items.length]);
+
+			// 点别处 / 按 Esc / 滚动 / 窗口变化都关掉，避免菜单「粘」在屏幕上。
+			//
+			// ★ 只在 mousedown / click 落在菜单外时才关：
+			//   早先用「任何 mousedown 都关」+ 菜单内 stopPropagation，看似可行，
+			//   但捕获阶段的监听拿到的是同一个事件对象，菜单在 pointerdown 时就被卸载，
+			//   随后浏览器算出的 click 目标变成了已脱离文档的节点 ——
+			//   于是「点了菜单项，什么也没发生」（2026-11-28 用户实测踩到）。
+			//   改成按 target 判定内外，菜单项自己的 onClick 就能正常跑。
+			useEffect(function () {
+				function isInside(target) {
+					var el = menuRef.current;
+					if (!el || !target) return false;
+					try { return el.contains(target); } catch (e) { return false; }
+				}
+				function onDown(event) {
+					if (isInside(event && event.target)) return;
+					if (typeof props.onClose === "function") props.onClose();
+				}
+				function onKey(event) {
+					if (event && event.key === "Escape") {
+						if (typeof props.onClose === "function") props.onClose();
+					}
+				}
+				function close() { if (typeof props.onClose === "function") props.onClose(); }
+				document.addEventListener("mousedown", onDown, true);
+				document.addEventListener("click", onDown, true);
+				document.addEventListener("keydown", onKey, true);
+				window.addEventListener("resize", close);
+				window.addEventListener("scroll", close, true);
+				return function () {
+					document.removeEventListener("mousedown", onDown, true);
+					document.removeEventListener("click", onDown, true);
+					document.removeEventListener("keydown", onKey, true);
+					window.removeEventListener("resize", close);
+					window.removeEventListener("scroll", close, true);
+				};
+			}, [props.onClose]);
+
+			return h("div", {
+				ref: menuRef,
+				className: "dp-ctx-menu",
+				role: "menu",
+				"data-it": props.testId || "ctx-menu",
+				// 菜单自己吞掉 mousedown，否则「点菜单项」会被上面的全局关闭先吃掉
+				onMouseDown: function (event) { event.stopPropagation(); },
+				onContextMenu: function (event) { event.preventDefault(); event.stopPropagation(); },
+				style: { left: left + "px", top: top + "px" }
+			}, items.map(function (item) {
+				return h("button", {
+					key: item.key || item.label,
+					type: "button",
+					role: "menuitem",
+					className: cn("dp-ctx-item", item.danger ? "danger" : ""),
+					"data-it": item.testId || null,
+					onClick: function (event) {
+						event.stopPropagation();
+						if (typeof props.onClose === "function") props.onClose();
+						if (typeof item.onSelect === "function") item.onSelect();
+					}
+				},
+					item.icon ? h(Icon, { name: item.icon, size: 13 }) : null,
+					h("span", null, item.label)
+				);
+			}));
+		}
+		//#endregion
+
 		//#region store
 		function createStore() {
 			var getSessionId = function () { return ""; };
@@ -2132,6 +2278,23 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 					return mutate({ op: "deleteCategory", category: category }, function () {
 						commit(snapshot.records.map(function (record) {
 							return record.category === category ? Object.assign({}, record, { category: "" }) : record;
+						}));
+					}, forcedSessionId);
+				},
+				/**
+				 * 「按被测函数」分组重命名：把它下面的用例批量改 subjectFunction。
+				 *
+				 * 与层级改名不同：函数分组是记录字段自动聚合的，没有显式清单，
+				 * 所以只能逐条改。空分组改不动（后端会 404），这也符合直觉 ——
+				 * 没有用例的分组本来就不会显示出来。
+				 */
+				renameFunction: function (from, to, forcedSessionId) {
+					return mutate({ op: "renameFunction", from: from, to: to }, function (data) {
+						var target = data && typeof data.to === "string" ? data.to : to;
+						commit(snapshot.records.map(function (record) {
+							return subjectFunctionOf(record) === from
+								? Object.assign({}, record, { subjectFunction: target })
+								: record;
 						}));
 					}, forcedSessionId);
 				}
@@ -2487,7 +2650,13 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 				busy: props.busy,
 				footer: [
 					h(Button, { key: "cancel", onClick: props.onCancel, disabled: props.busy }, "取消"),
-					h(Button, { key: "ok", variant: "danger", onClick: props.onConfirm, disabled: props.busy }, props.busy ? "处理中…" : (props.confirmLabel || "删除"))
+					h(Button, {
+						key: "ok",
+						variant: "danger",
+						"data-it": props.confirmTestId || null,
+						onClick: props.onConfirm,
+						disabled: props.busy
+					}, props.busy ? "处理中…" : (props.confirmLabel || "删除"))
 				]
 			}, props.detail ? h("p", { className: "dp-confirm-text" }, props.detail) : null);
 		}
@@ -2793,9 +2962,10 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			function submit() {
 				var name = value.trim();
 				if (layerMode) {
-					if (name === "") { setError("层级名不能为空"); return; }
-					if (name === "默认") { setError("「默认」是内置层级，换个名字"); return; }
-					if (name.length > 60) { setError("层级名最多 60 个字符"); return; }
+					if (name === "") { setError("名字不能为空"); return; }
+					// 函数组重命名不复用层级的命名约束（层级不叫「默认」，函数可以）
+					if (!props.skipLayerChecks && name === "默认") { setError("「默认」是内置层级，换个名字"); return; }
+					if (name.length > 60) { setError(props.skipLayerChecks ? "函数名最多 60 个字符" : "层级名最多 60 个字符"); return; }
 					props.onSubmit(name);
 					return;
 				}
@@ -2852,16 +3022,25 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 				props.onSubmit(name);
 			}
 
+			var renaming = props.mode === "rename";
 			return h(Modal, {
-				title: "新建功能项",
-				subtitle: "功能项是用例的分组维度，属于当前用例版本",
+				title: renaming ? "重命名功能项" : "新建功能项",
+				subtitle: renaming
+					? "当前：" + (props.initialValue || "")
+					: "功能项是用例的分组维度，属于当前用例版本",
 				onClose: props.onClose,
 				footer: [
 					h(Button, { key: "cancel", onClick: props.onClose }, "取消"),
 					h(Button, { key: "ok", variant: "primary", "data-it": "feature-name-ok", onClick: submit }, "确定")
 				]
 			},
-				h(Field, { label: "功能项名称", full: true, hint: "建好后可以把用例归到这一项下；名称在当前版本内不能重复。" },
+				h(Field, {
+					label: "功能项名称",
+					full: true,
+					hint: renaming
+						? "改名后，测试用例页与测试步骤页里的这一段会同时换名字。"
+						: "建好后可以把用例归到这一项下；名称在当前版本内不能重复。"
+				},
 					h("input", {
 						className: "dp-input",
 						value: value,
@@ -3463,6 +3642,11 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			var boardHeight = Number(props.boardHeight) || 0;
 			// 不再分页：层级多时靠 .dp-cat-scroll 自己滚动。
 			var listRows = rows;
+			// 右键菜单的当前目标（行 + 鼠标坐标）；null = 菜单不显示。
+			var ctxState = useState(null);
+			var ctxRow = ctxState[0];
+			var setCtxRow = ctxState[1];
+			// 点别处关闭由 ContextMenu 内部的全局监听负责，这里只提供 setter。
 
 
 			return h("aside", {
@@ -3510,9 +3694,26 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 							);
 						}
 						var selected = row.kind === "layer" ? activeLayer === row.value : activeCategory === row.value;
+						// 右键菜单：层级行与函数组行都支持（「全部用例」在上一分支已 return）。
+						// 记下鼠标坐标并点亮菜单 —— 菜单在组件尾部统一渲染，
+						// 放行内会被滚动容器裁掉。
+						var menuable = row.value !== "" && row.value !== null;
 						return h("div", {
 							key: row.key,
 							className: cn("dp-cat", selected ? "is-active" : ""),
+							onContextMenu: menuable
+								? function (event) {
+									event.preventDefault();
+									event.stopPropagation();
+									// ★ 必须在这里落状态，否则菜单永远不显示
+									//   （2026-11-28：只写了 setCtxRow 的读取与 onClose，
+									//    漏了设置点，右键「毫无反应」）。
+									setCtxRow({ row: row, x: event.clientX, y: event.clientY });
+									if (typeof props.onContextMenuRow === "function") {
+										props.onContextMenuRow(row, event.clientX, event.clientY);
+									}
+								}
+								: null,
 						},
 							h("button", {
 								type: "button",
@@ -3524,28 +3725,62 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 								h("span", { className: "dp-cat-name" }, row.label),
 								h("span", { className: "dp-cat-count" }, String(row.count))
 							),
-							// 只有自定义层级才有改名/删除；函数行是自动聚合的。
-							row.kind === "layer"
-								? h("span", { className: "dp-cat-ops" },
-									h("span", {
-										role: "button",
-										className: "dp-icon-btn",
-										title: "重命名层级",
-										"data-it": "cat-rename-" + row.value,
-										onClick: function () { if (typeof props.onRename === "function") props.onRename(row.value); }
-									}, h(Icon, { name: "edit", size: 12 })),
-									h("span", {
-										role: "button",
-										className: "dp-icon-btn danger",
-										title: "删除层级（用例退回默认层）",
-										"data-it": "cat-delete-" + row.value,
-										onClick: function () { if (typeof props.onDelete === "function") props.onDelete(row.value); }
-									}, h(Icon, { name: "trash", size: 12 }))
-								)
-								: null
+							// 常驻图标已移除（2026-11-28 用户要求）：改名/删除统一走右键菜单，
+							// 免得鼠标移上去就冒出一排图标，干扰读列表。
 						);
 					})
 				),
+				/*
+				 * 右键菜单只在有目标行时渲染，且挂在 aside 最后 ——
+				 * 放滚动容器里会被 overflow:auto 裁掉。
+				 *
+				 * 判空要连 row 一起判：状态槽位在测试桩里可能被复用，
+				 * 只判 ctxRow !== null 会拿到没有 row 字段的值而崩。
+				 */
+				ctxRow && ctxRow.row
+					? h(ContextMenu, {
+						x: ctxRow.x,
+						y: ctxRow.y,
+						testId: "cat-ctx-menu",
+						onClose: function () { setCtxRow(null); },
+						/*
+						 * ★ 闭包捕获当前行：ContextMenu 的 onClick 会先 onClose() 再 onSelect()，
+						 *   那时 ctxRow 已经是 null，直接用 ctxRow.row 会抛错
+						 *   （菜单点了没反应 / 控制台报 undefined）。用参数按值捕获。
+						 */
+						items: (function (target) {
+							if (target.kind === "layer") {
+								return [
+									{
+										key: "rename", label: "重命名", icon: "edit",
+										testId: "cat-ctx-rename",
+										onSelect: function () {
+											if (typeof props.onRename === "function") props.onRename(target.value);
+										}
+									},
+									{
+										key: "delete", label: "删除", icon: "trash", danger: true,
+										testId: "cat-ctx-delete",
+										onSelect: function () {
+											if (typeof props.onDelete === "function") props.onDelete(target.value);
+										}
+									}
+								];
+							}
+							// 函数组是自动聚合的，没有「删除」概念（删记录等于删用例），
+							// 所以只给重命名。
+							return [
+								{
+									key: "rename", label: "重命名", icon: "edit",
+									testId: "cat-ctx-rename",
+									onSelect: function () {
+										if (typeof props.onRenameRow === "function") props.onRenameRow(target);
+									}
+								}
+							];
+						})(ctxRow.row)
+					})
+					: null,
 			);
 		}
 
@@ -4229,6 +4464,22 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 				if (pending === null) return;
 				setCategoryPrompt(null);
 				setBusy(true);
+				// 函数组重命名：批量改该分组下所有用例的 subjectFunction。
+				// 走另一条接口（renameFunction），因为函数分组是字段聚合的，没有显式清单。
+				if (pending.mode === "rename" && pending.kind === "function") {
+					store.renameFunction(pending.from, name)
+						.then(function () {
+							// 改名后当前筛选要跟着换到新名字，否则列表看着像清空了。
+							setActiveAxisLayer(name);
+							store.setError("");
+						})
+						.catch(function (failure) {
+							store.setError("重命名被测函数失败："
+								+ (failure && failure.message ? failure.message : String(failure)));
+						})
+						.finally(function () { setBusy(false); });
+					return;
+				}
 				var action = pending.mode === "rename"
 					? store.renameCategory(pending.from, name).then(function () {
 						setActiveAxisLayer(name);
@@ -4567,6 +4818,22 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 						onAxisChange: pickAxis,
 						onCreate: function () { setCategoryPrompt({ mode: "layer" }); },
 						onRename: function (name) { setCategoryPrompt({ mode: "rename", from: name }); },
+						/*
+						 * ★ 必须有这个 prop，否则侧栏的行根本不挂 onContextMenu，
+						 * 表现就是「右键毫无反应」（2026-11-28 用户实测踩到）。
+						 * 菜单的显隐与坐标由 CategorySidebar 内部维护。
+						 */
+						onContextMenuRow: function () {},
+						onRenameRow: function (row) {
+							if (!row || row.value === "" || row.value === null || row.value === undefined) return;
+							setCategoryPrompt({
+								mode: "rename",
+								from: row.value,
+								kind: row.kind === "function" ? "function" : "layer",
+								// 函数组的校验与层级不同（不占层级名，也不禁用「默认」）
+								title: row.kind === "function" ? "重命名被测函数" : "重命名层级"
+							});
+						},
 						onDelete: deleteLayer
 					}),
 					h("div", {
@@ -4810,7 +5077,10 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 				categoryPrompt !== null ? (categoryPrompt.mode === "layer" || categoryPrompt.mode === "rename"
 					? h(CategoryPrompt, {
 						mode: "layer",
-						title: categoryPrompt.mode === "rename" ? "重命名层级" : "新建层级",
+						// 函数组不占层级名，也不该被「默认」这个层级限制拦住。
+						skipLayerChecks: categoryPrompt.kind === "function",
+						title: categoryPrompt.title
+							|| (categoryPrompt.mode === "rename" ? "重命名层级" : "新建层级"),
 						subtitle: categoryPrompt.mode === "rename"
 							? "当前：" + categoryPrompt.from
 							: "层级用来把用例按业务模块分组，不影响「按被测函数」那一套。",
@@ -6884,16 +7154,18 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 					"",
 					"## 生成要求",
 					"1. 为**每条用例的每个步骤**生成步骤三元组：action（动作）/ operation（输入步骤）/ expected（预期结果）。",
-					"2. 同时产出一一对应的测试代码（模型内部产物）：一个步骤 = 一个测试函数，",
-					"   每个步骤函数**自带前置准备**，保证单独执行第 N 步也能跑通。",
+					"2. **这一步的界面操作怎么落地，要写进 target**：界面步骤必须写清点哪个控件",
+					"   （AutomationId / Name / ControlType），执行时就按 target 定位去点，不靠截图猜坐标。",
+					"   只有纯代码断言的步骤（runner）才对应测试函数，其余一律是「一次可独立执行的界面操作」。",
 					"3. 步骤写到 integration/step-versions/<新版本>/steps.json，",
 					"   用例快照写到同目录 cases.snapshot.json（生成步骤时冻结，执行只认快照）。",
-					"4. 代码写到 integration/tests/。",
+					"4. 只有存在 runner 步骤时才把测试函数写到 integration/tests/；全是界面步骤就不产代码文件。",
 					"",
 					"## 硬性约束",
 					"- **测试代码是内部产物**：面板、API、报告里只出现步骤，不出现测试函数名、代码片段、codeRef。",
 					"- 步骤格式：{ no, action, operation, expected, target, channel }。",
-					"  channel 说明这一步走哪条通道：code=产品源码白盒编入，service=启停被测服务，runner=调工装测试函数（主力），cmd=构建门/环境检查。",
+					"  channel 说明这一步走哪条通道：**cua=在真实界面上点击/输入/读控件树断言（主力）**，runner=跑测试代码，cmd=构建门/环境检查，uia=CUA 不可用时读控件树兜底。",
+					"- **界面步骤必须写 target**，写不出 target 说明还没分析到位，回去读源码。",
 					"- 本次新建一个步骤版本，**不要覆盖已有版本**；旧版本保留。",
 					"- 步骤版本要记 sourceCaseVersion = " + version + "。",
 					"- 强度测试不做。",
@@ -7314,12 +7586,13 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 				}
 				var typeLabel = (IT_TYPES[record.type] && IT_TYPES[record.type].label) || record.type || "—";
 				var promptSteps = steps.map(function (item) {
-					var channel = item.channel === "code" ? "白盒编入（code）" : (item.channel === "service" ? "启停服务（service）" : (item.channel === "runner" ? "测试函数（runner）" : (item.channel === "cmd" ? "命令步骤（cmd）" : (item.channel === "cua" || item.channel === "uia" ? "界面操作（历史，已停用）" : "未标注"))));
+					var channel = item.channel === "cua" ? "界面点击（cua）" : (item.channel === "uia" ? "界面兜底（uia）" : (item.channel === "runner" ? "测试代码（runner）" : (item.channel === "cmd" ? "命令步骤（cmd）" : (item.channel === "code" || item.channel === "service" ? "白盒/服务（" + item.channel + "，历史值）" : "未标注"))));
 					return [
 						"  第 " + (item.no || 0) + " 步",
 						"    动作：" + (item.action || "—"),
 						"    输入步骤：" + (item.operation || "—"),
 						"    预期结果：" + (item.expected || "—"),
+						"    操作目标：" + (item.target || "（未写 target）"),
 						"    通道：" + channel
 					].join("\n");
 				}).join("\n");
@@ -7342,7 +7615,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 					"",
 					"## 执行要求",
 					"1. 严格按上面列出的步骤执行，**只认步骤版本冻结的用例快照**，不读当前用例版本。",
-					"2. 按步骤的 channel 执行：code=把产品源码编进测试做白盒验证，service=启停被测服务，runner=调工装测试函数走 run_tests.py，cmd=跑构建门/环境检查。自己直接执行，不要回来问我。",
+					"2. 按步骤的 channel 执行：**cua=你直接调 mcp__cua__* 在真实界面上点击/输入/读控件树断言（主力）**，runner=跑测试代码走 run_tests.py，cmd=跑构建门/环境检查，uia=CUA 不可用时读控件树兜底。自己直接执行，不要回来问我。",
 					"3. 这是**单步执行**：结果写到测试步骤页这条用例的子表里，",
 					"   **不产生报告版本、不进测试报告页**。",
 					"   （每次执行对这条用例只追加一条执行记录。）",
@@ -7404,7 +7677,7 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 					"",
 					"## 执行要求",
 					"1. 严格按步骤版本执行，**只认 cases.snapshot.json 冻结的用例**，不读当前用例版本。",
-					"2. 按步骤的 channel 执行：code=把产品源码编进测试做白盒验证，service=启停被测服务，runner=调工装测试函数走 run_tests.py，cmd=跑构建门/环境检查。自己直接执行，四种并存是正常的，分别记录、分别标来源。",
+					"2. 按步骤的 channel 执行：**cua=你直接调 mcp__cua__* 在真实界面上点击/输入/读控件树断言（主力）**，runner=跑测试代码走 run_tests.py，cmd=跑构建门/环境检查，uia=CUA 不可用时读控件树兜底。自己直接执行，四种并存是正常的，分别记录、分别标来源。",
 					"3. 执行记录要挂到测试步骤页主表每一行下面的子表里（每次一键执行对每条用例只加一条）。",
 					"   **每条记录必须标 source = \"all\"**（表示这是一键执行），否则报告页看不到它：",
 					"   面板靠 source 区分「单步执行（step，只在步骤页）」和「一键执行（all，进报告页）」。",
@@ -7575,10 +7848,17 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			 * `source` 固定写 "manual"：它与 Skill 的三种来源（requirement / skill /
 			 * code-derived）区分开，报告侧一眼能看出「这条是人在面板上手动加的」。
 			 */
-			function persistFeatures(nextNames) {
+			function persistFeatures(nextNames, readyFeatures) {
 				if (typeof fetch !== "function") return;
 				if (sessionId === "") return;
 				if (loadState !== "ready") return;
+
+				// 改名路径已经算好了完整清单（含原 id/name 的替换），直接用它，
+				// 不能再按名字重建 —— 那会把改过的 name 当成新条目重新分配 id。
+				if (Array.isArray(readyFeatures)) {
+					writeFeatures(readyFeatures);
+					return;
+				}
 
 				var existing = (remote && Array.isArray(remote.features)) ? remote.features : [];
 				var byName = Object.create(null);
@@ -7629,6 +7909,51 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 					});
 			}
 
+			/**
+			 * 把一份**已经算好**的功能项清单写盘（新建与改名共用）。
+			 *
+			 * 与 persistFeatures 的分工：那边负责「按名字清单补出新条目」，
+			 * 这边只负责把成品落盘 + 同步内存 + 刷新页面映射。
+			 * 改名必须走这里，否则按名字重建会把改过的名字当新条目、重新分配 id，
+			 * 所有用例的 featureId 就断链了。
+			 */
+			function writeFeatures(nextFeatures) {
+				if (typeof fetch !== "function") return Promise.resolve();
+				if (sessionId === "") return Promise.resolve();
+				if (loadState !== "ready") return Promise.resolve();
+				return fetch("/data-panel/integration", {
+					method: "POST",
+					headers: { "content-type": "application/json", accept: "application/json" },
+					body: JSON.stringify({
+						sessionId: sessionId,
+						kind: "case",
+						op: "saveVersion",
+						version: version,
+						features: nextFeatures
+					})
+				})
+					.then(function (response) {
+						return response.json().catch(function () { return {}; }).then(function (data) {
+							if (!response.ok || data.ok === false) {
+								throw new Error((data && data.error) || ("保存失败（HTTP " + response.status + "）"));
+							}
+							return data;
+						});
+					})
+					.then(function () {
+						setRemote(function (previous) {
+							if (!previous) return previous;
+							return Object.assign({}, previous, { features: nextFeatures });
+						});
+						// 重新拉一次：featureId → name 的映射要立刻更新，
+						// 用例页「功能项」列与步骤页左栏才能同时换名。
+						return loadIntegration(true).catch(function () {});
+					})
+					.catch(function (error) {
+						setNotice("功能项保存到磁盘失败：" + (error && error.message ? error.message : String(error)) + "。界面上的改动还在，可以再点一次保存。");
+					});
+			}
+
 			/** 新建功能项：先改界面（侧栏立刻出现一条 0 条目的功能项），再写盘。 */
 			function createFeature(name) {
 				var trimmed = String(name || "").trim();
@@ -7646,6 +7971,136 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 				// 新建完直接切到这一项，否则列表里多一行却还停在「全部用例」，看不出变化。
 				setScenario(trimmed);
 				resetPages();
+			}
+
+			/**
+			 * 重命名功能项（侧栏右键触发）。
+			 *
+			 * 只改 `features.json` 里的 `name`，**`id` 一律不动** —— 用例靠
+			 * `featureId`（id）挂到功能项上，改 id 会让所有用例断链。
+			 *
+			 * 用例页与步骤页的分组名都来自 `featureId → name` 的查表，
+			 * 所以改完 name 后两个页面同时生效，不需要分别改一遍。
+			 */
+			function renameFeature(from, to) {
+				var oldName = String(from || "").trim();
+				var newName = String(to || "").trim();
+				if (oldName === "" || newName === "") return;
+				if (oldName === newName) {
+					setFeaturePrompt(null);
+					return;
+				}
+				// 与已有功能项重名就拦下（名字是侧栏里的唯一标识）
+				if (featureNames.indexOf(newName) !== -1) {
+					setNotice("功能项「" + newName + "」已存在，换个名字。");
+					return;
+				}
+
+				var existing = (remote && Array.isArray(remote.features)) ? remote.features : [];
+				// 按名字找目标条目；找不到说明它只是「用例里用到但 features.json 没登记」，
+				// 这种情况要补一条，否则改完 name 也落不到盘上。
+				var target = null;
+				existing.forEach(function (item) {
+					if (item && typeof item.name === "string" && item.name.trim() === oldName) target = item;
+				});
+
+				var baseFeatures = existing.slice();
+				if (target === null) {
+					var usedIds = Object.create(null);
+					existing.forEach(function (item) {
+						if (item && typeof item.id === "string") usedIds[item.id] = true;
+					});
+					var newId = "ft_manual_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 6);
+					while (usedIds[newId]) newId += "x";
+					baseFeatures.push({ id: newId, name: oldName, source: "manual" });
+				}
+				var nextFeatures = baseFeatures.map(function (item) {
+					if (!item) return item;
+					var isTarget = target !== null
+						? item === target
+						: (typeof item.name === "string" && item.name.trim() === oldName);
+					if (!isTarget) return item;
+					// id / code / stage 原样保留，只换 name（并留个旧名便于倒查）
+					return Object.assign({}, item, { name: newName });
+				});
+
+				// 先改界面：侧栏与两个页面立刻换名，再写盘
+				var nextNames = featureNames.map(function (name) { return name === oldName ? newName : name; });
+				if (nextNames.indexOf(newName) === -1) nextNames.push(newName);
+				setFeatureNames(nextNames);
+				setFeaturePrompt(null);
+				// 当前正停在这一项上就跟着切到新名字，否则筛选会失效看成空列表
+				setScenario(function (previous) { return previous === oldName ? newName : previous; });
+				// 用算好的完整清单写盘（不能让 persistFeatures 按名字重建，那会重分配 id）
+				writeFeatures(nextFeatures);
+			}
+
+			/**
+			 * 删除功能项（侧栏右键触发）。
+			 *
+			 * 用户 2026-11-28 明确要求：**删掉功能项时，它下面的用例也一并删除**
+			 * （与单元测试的层级删除不同 —— 那边是「只解散分组、用例退回默认层」）。
+			 *
+			 * 所以这里要做两件事，缺一不可：
+			 *   1. 从 features.json 去掉这条功能项
+			 *   2. 从 cases.json 去掉所有 featureId 指向它的用例
+			 * 两件事必须**一起写盘**：只删功能项会让用例变成孤儿（featureId 悬空、
+			 * 落到「未分组」里），用户看到的就是「删了但用例还在」，会以为没生效。
+			 *
+			 * 步骤数据（step-versions/<V>/steps.json）不在这里处理：
+			 * 它的 caseId 找不到对应用例时，面板会自动忽略那些步骤，
+			 * 下一次「生成测试步骤」会重新冻结快照，不会污染报告。
+			 */
+			function removeFeature(name) {
+				var target = String(name || "").trim();
+				if (target === "") return;
+				setFeatureRemove(null);
+
+				var existing = (remote && Array.isArray(remote.features)) ? remote.features : [];
+				// 先找出要删的功能项 id（用例靠 id 挂靠，不是靠名字）
+				var doomedIds = Object.create(null);
+				existing.forEach(function (item) {
+					if (item && typeof item.name === "string" && item.name.trim() === target && typeof item.id === "string") {
+						doomedIds[item.id] = true;
+					}
+				});
+				var nextFeatures = existing.filter(function (item) {
+					return !(item && typeof item.name === "string" && item.name.trim() === target);
+				});
+
+				// 连带删掉该功能项下的用例：
+				// 既按 featureId 判断（正常数据），也按 scenario 兜底
+				// （历史数据里可能只有 scenario 没有 featureId）。
+				var removedCases = 0;
+				var nextCases = records.filter(function (record) {
+					var fid = record && record.featureId;
+					var byId = typeof fid === "string" && doomedIds[fid] === true;
+					var byName = itScenarioOf(record) === target;
+					if (byId || byName) {
+						removedCases += 1;
+						return false;
+					}
+					return true;
+				});
+
+				// 侧栏清单同步去掉
+				var nextNames = featureNames.filter(function (item) { return item !== target; });
+				setFeatureNames(nextNames);
+				// 当前正停在这一项上就退回「全部用例」，否则列表会空
+				setScenario(function (previous) {
+					return previous === target ? IT_SCENARIOS_ALL : previous;
+				});
+
+				// 先更新界面（用例表立刻少掉那些行），再把两份数据一起写盘
+				if (removedCases > 0) {
+					patchRecords(nextCases);
+					persistCases(nextCases);
+				}
+				writeFeatures(nextFeatures);
+
+				if (removedCases > 0) {
+					setNotice("已删除功能项「" + target + "」及其 " + removedCases + " 条用例。");
+				}
 			}
 
 			/**
@@ -7736,6 +8191,14 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 			}
 
 			var scenarios = itScenarioRows(records, featureNames);
+			// 功能项右键菜单的目标（名称 + 坐标）；null = 不显示。
+			var featureCtxState = useState(null);
+			var featureCtx = featureCtxState[0];
+			var setFeatureCtx = featureCtxState[1];
+			// 删除功能项的确认框目标；null = 不显示。
+			var featureRemoveState = useState(null);
+			var featureRemove = featureRemoveState[0];
+			var setFeatureRemove = featureRemoveState[1];
 			var typeCounts = {};
 			IT_TYPE_KEYS.forEach(function (key) { typeCounts[key] = 0; });
 			records.forEach(function (record) {
@@ -7783,18 +8246,63 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 							? h("div", { className: "it-side-empty" }, "还没有功能项，点上边的 + 新建一个。")
 							: null,
 						scenarios.map(function (row) {
+							// 「全部用例」是固定行，不参与重命名/删除。
+							var menuable = row.name !== IT_SCENARIOS_ALL;
 							return h("button", {
 								key: row.key,
 								type: "button",
 								className: cn("it-side-item", scenario === row.name ? "is-active" : ""),
 								"data-it": "scenario-" + row.name,
-								onClick: function () { setScenario(row.name); resetPages(); }
+								onClick: function () { setScenario(row.name); resetPages(); },
+								// 右键菜单：重命名 / 删除。坐标交给尾部统一渲染的 ContextMenu。
+								onContextMenu: menuable
+									? function (event) {
+										event.preventDefault();
+										event.stopPropagation();
+										setFeatureCtx({ name: row.name, count: row.count, x: event.clientX, y: event.clientY });
+									}
+									: null
 							},
 								h("span", { className: "it-side-name" }, row.name),
 								h("span", { className: "it-side-count" }, String(row.count))
 							);
 						})
-					)
+					),
+					/*
+					 * 功能项右键菜单。挂在 aside 内、滚动容器外 ——
+					 * .it-side-scroll 是 overflow:auto，放里面会被裁掉。
+					 */
+					featureCtx && featureCtx.name
+						? h(ContextMenu, {
+							x: featureCtx.x,
+							y: featureCtx.y,
+							testId: "feature-ctx-menu",
+							onClose: function () { setFeatureCtx(null); },
+							/*
+							 * ★ 闭包捕获当前目标：ContextMenu 的 onClick 会先 onClose()
+							 *   再 onSelect()，那时 featureCtx 已经是 null，
+							 *   直接用 featureCtx.name 会拿到 undefined（确认框因 name 为空而判断失败）。
+							 */
+							items: (function (target) {
+								return [
+									{
+										key: "rename", label: "重命名", icon: "edit",
+										testId: "feature-ctx-rename",
+										onSelect: function () {
+											setFeaturePrompt({ mode: "rename", from: target.name, initialValue: target.name });
+										}
+									},
+									{
+										key: "delete", label: "删除", icon: "trash", danger: true,
+										testId: "feature-ctx-delete",
+										onSelect: function () {
+											setFeatureRemove({ name: target.name, count: target.count });
+										}
+									}
+								];
+							})(featureCtx)
+						})
+						: null
 				);
 			}
 
@@ -9155,17 +9663,45 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 				// 新建功能项：弹窗。
 				featurePrompt !== null
 					? h(FeaturePrompt, {
-						onSubmit: createFeature,
+						// 右键重命名与新建共用同一个弹窗，靠 mode 区分文案与提交去向。
+						mode: featurePrompt.mode === "rename" ? "rename" : "create",
+						initialValue: featurePrompt.initialValue || "",
+						onSubmit: featurePrompt.mode === "rename"
+							? function (name) { renameFeature(featurePrompt.from, name); }
+							: createFeature,
 						onClose: function () { setFeaturePrompt(null); }
 					})
 					: null,
-				// 删除确认：短确认框，只删演示数据。
+				// 删除功能项：用户要求「连它下面的用例一起删」，所以文案必须说清后果。
+				featureRemove !== null
+					? h(ConfirmDialog, {
+						title: "删除功能项「" + featureRemove.name + "」？",
+						message: featureRemove.count > 0
+							? "它下面的 " + featureRemove.count + " 条测试用例会一并删除，无法恢复。"
+							: "这个功能项下没有用例，删除后无法恢复。",
+						detail: h("span", null, "测试步骤页里与这些用例相关的步骤也会一并失效。"),
+						confirmLabel: "删除功能项和用例",
+						confirmTestId: "feature-remove-confirm",
+						onCancel: function () { setFeatureRemove(null); },
+						onConfirm: function () { removeFeature(featureRemove.name); }
+					})
+					: null,
+				// 删除用例：用弹窗而不是页内横幅。
+				//   原来它渲染在 reportsView 里（测试报告页），用户在用例页点垃圾桶
+				//   什么也看不到，观感就是「点了没反应」（2026-11-28 用户实测反馈）。
+				//   弹窗挂在整个面板的顶层，三个 tab 都可见。
 				confirm !== null && confirm.record
-					? h("div", { className: "it-batch", style: { borderColor: "color-mix(in srgb, var(--dp-danger) 32%, transparent)", background: "color-mix(in srgb, var(--dp-danger) 6%, transparent)" } },
-						h("span", null, "删除用例 ", h("b", null, confirm.record.caseId || ""), "？这只影响演示数据。"),
-						h(Button, { size: "sm", variant: "ghost", onClick: function () { confirmSet(null); } }, "取消"),
-						h(Button, { size: "sm", variant: "danger", "data-it": "confirm-delete", onClick: function () { removeCase(confirm.record); } }, "删除")
-					)
+					? h(ConfirmDialog, {
+						title: "删除用例「" + (confirm.record.caseCode || confirm.record.caseId || "") + "」？",
+						message: confirm.record.title
+							? "「" + confirm.record.title + "」及其测试步骤会被删除，无法恢复。"
+							: "这条用例及其测试步骤会被删除，无法恢复。",
+						detail: h("span", null, "只删除用例本身；已生成的历史执行记录仍保留在磁盘上。"),
+						confirmLabel: "删除用例",
+						confirmTestId: "confirm-delete",
+						onCancel: function () { confirmSet(null); },
+						onConfirm: function () { removeCase(confirm.record); }
+					})
 					: null
 			);
 		}
@@ -10312,6 +10848,8 @@ var CASE_TONE = { passed: "ok", failed: "bad", error: "bad", skipped: "idle", un
 		exports.inject = inject;
 		exports.__test = {
 			store: store,
+			/** 右键菜单组件本身：测试要验证「点菜单项到底有没有触发动作」。 */
+			ContextMenu: ContextMenu,
 			parseCodeRef: parseCodeRef,
 			openCode: openCode,
 			prefillDraft: prefillDraft,

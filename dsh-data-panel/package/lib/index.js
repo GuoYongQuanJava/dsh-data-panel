@@ -790,6 +790,39 @@ async function handle(req, res) {
       return
     }
 
+    /*
+     * 「按被测函数」分组重命名：把所有 subjectFunction === from 的用例批量改成 to。
+     *
+     * 与 renameCategory 的区别：层级名存在 store.categories 显式清单里，
+     * 而「按被测函数」是记录字段自动聚合出来的分组，没有显式清单可改 ——
+     * 只能逐条改字段。所以这里不做「空分组也能改名」，改不到就是 404。
+     */
+    if (op === 'renameFunction') {
+      const from = normalizeSubjectFunction(body.from)
+      const to = normalizeSubjectFunction(body.to)
+      if (from === '') throw bad(400, '请提供原被测函数名')
+      if (to === '') throw bad(400, '新函数名不能为空')
+      if (from === to) {
+        send(res, 200, { ok: true, moved: 0, from, to })
+        return
+      }
+      const moved = await serial(async () => {
+        const store = await readStore(sessionId)
+        const updatedAt = new Date().toISOString()
+        let count = 0
+        const next = store.records.map((record) => {
+          if (normalizeSubjectFunction(record.subjectFunction) !== from) return record
+          count += 1
+          return { ...record, subjectFunction: to, updatedAt }
+        })
+        if (count === 0) throw bad(404, `找不到被测函数「${from}」下的用例`)
+        await persist(next, store.seeded, sessionId, store.categories)
+        return count
+      })
+      send(res, 200, { ok: true, moved, from, to })
+      return
+    }
+
     // 旧分类兼容接口：保留已有 category/categories，不影响 subjectFunction。
     /* 先建层级、再归入用例：不要求此刻就有用例挂上去。 */
     if (op === 'createCategory') {

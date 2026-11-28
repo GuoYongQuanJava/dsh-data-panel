@@ -168,7 +168,32 @@ test('新增编辑删除演示用例、步骤修改在三个子页同步，版�
   find(render(), 'version-V0.0.1').props.onClick()
   find(render(), 'search').props.onChange({ target: { value: '跨服务新流程' } })
   find(render(), 'delete-' + id).props.onClick()
-  find(render(), 'confirm-delete').props.onClick()
+  // 删除确认现在是**弹窗**（ConfirmDialog）：
+  //   1. 按钮在 props.footer 里，不在 children
+  //   2. ConfirmDialog 是函数组件，要展开才能拿到 Modal 的 footer
+  ;(function clickConfirmDelete() {
+    const findDeep = (node, depth = 0) => {
+      if (!node || typeof node !== 'object' || depth > 20) return null
+      if (Array.isArray(node)) {
+        for (const n of node) { const r = findDeep(n, depth); if (r) return r }
+        return null
+      }
+      if (node.props?.['data-it'] === 'confirm-delete') return node
+      for (const c of node.children || []) { const r = findDeep(c, depth + 1); if (r) return r }
+      for (const k of ['footer', 'header', 'title', 'detail']) {
+        if (node.props?.[k]) { const r = findDeep(node.props[k], depth + 1); if (r) return r }
+      }
+      if (typeof node.type === 'function') {
+        let inner = null
+        try { inner = node.type(node.props) } catch (e) { inner = null }
+        if (inner) { const r = findDeep(inner, depth + 1); if (r) return r }
+      }
+      return null
+    }
+    const btn = findDeep(render())
+    assert.ok(btn, '删除确认弹窗里要有「删除」按钮')
+    btn.props.onClick()
+  })()
   assert.equal(rowIds(render()).includes(id), false)
   assert.equal(h.requests.length, 0)
 })
